@@ -511,7 +511,10 @@ impl Inner {
         let root = txn.finish(&mut sink).map_err(rejected)?;
         let next_page = sink.next_page;
 
-        // Data barrier: every byte the new generation references must be durable first.
+        // Data barrier: every byte the new generation references must be durable first. Capture
+        // the allocation boundary before it: staging may append past it concurrently, and only
+        // bytes the barrier covers may be published.
+        let content_len = *lock(&self.alloc);
         self.io.sync(FileId::Content).map_err(rejected)?;
         self.io.sync(FileId::Meta).map_err(rejected)?;
 
@@ -520,7 +523,7 @@ impl Inner {
             generation,
             root,
             next_page,
-            content_len: *lock(&self.alloc),
+            content_len,
             history_pos: pos,
         };
         let published = self
