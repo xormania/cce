@@ -257,3 +257,79 @@ fn surface_check_rejects_public_physical_modules() {
     assert!(surface_violations("mod tree;\npub struct NativeStore;").is_empty());
     assert_eq!(surface_violations("pub mod tree;").len(), 1);
 }
+
+/// True if `code` mentions `pat` as a whole path segment (`SimFile::` does not mention `File::`).
+fn mentions(code: &str, pat: &str) -> bool {
+    code.match_indices(pat).any(|(i, _)| {
+        code[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+    })
+}
+
+/// Violations of the I/O-seam rule: only the I/O adapter module may touch the filesystem.
+fn io_routing_violations(files: &[(String, String)]) -> Vec<String> {
+    const FS: &[&str] = &["std::fs", "File::", "OpenOptions", "FileExt", "fs::"];
+    let mut v = Vec::new();
+    for (name, src) in files {
+        if name == "io.rs" || name.starts_with("bin/") || name.ends_with("_tests.rs") {
+            continue;
+        }
+        for (i, line) in src.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if FS.iter().any(|p| mentions(code, p)) {
+                v.push(format!(
+                    "{name}:{}: filesystem access outside the I/O adapter",
+                    i + 1
+                ));
+            }
+        }
+    }
+    v
+}
+
+fn source_files() -> Vec<(String, String)> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    let mut stack = vec![src.clone()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let rel = p.strip_prefix(&src).unwrap().to_string_lossy().into_owned();
+                out.push((rel, std::fs::read_to_string(&p).unwrap()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn production_storage_io_goes_through_the_adapter() {
+    let files = source_files();
+    assert!(
+        files.iter().any(|(n, _)| n == "engine.rs"),
+        "engine source not found"
+    );
+    assert_eq!(io_routing_violations(&files), Vec::<String>::new());
+}
+
+#[test]
+fn io_routing_check_rejects_a_bypass() {
+    let ok = vec![
+        ("io.rs".to_string(), "use std::fs::File;".to_string()),
+        (
+            "engine.rs".to_string(),
+            "self.io.write_at(f, 0, b)".to_string(),
+        ),
+    ];
+    assert!(io_routing_violations(&ok).is_empty());
+    let bypass = vec![(
+        "engine.rs".to_string(),
+        "let f = std::fs::OpenOptions::new();".to_string(),
+    )];
+    assert_eq!(io_routing_violations(&bypass).len(), 1);
+}
