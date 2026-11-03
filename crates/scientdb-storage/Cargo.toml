@@ -1,0 +1,16 @@
+[package]
+name = "scientdb-storage"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+scientdb-kernel = { path = "../scientdb-kernel" }
+
+[[bin]]
+name = "storage-driver"
+path = "src/bin/storage-driver.rs"
+
+[lints]
+workspace = true
