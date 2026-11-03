@@ -290,7 +290,7 @@ pub(crate) fn encode_history(position: u64, attempt: &AttemptId, changes: &Chang
 pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
     let mut d = Dec::new(b, "history entry");
     let position = HistoryPosition(d.u64()?);
-    let attempt = dec_id(&mut d, |v| AttemptId::new(v))?;
+    let attempt = dec_id(&mut d, AttemptId::new)?;
     let req = d.bytes()?;
     d.finish()?;
     let mut d = Dec::new(req, "history request");
@@ -302,7 +302,7 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
     for _ in 0..n {
         changes.push(match d.u8()? {
             1 => {
-                let id = dec_id(&mut d, |v| ContextId::new(v))?;
+                let id = dec_id(&mut d, ContextId::new)?;
                 let expect = dec_expect(&mut d)?;
                 let body = d.bytes()?.to_vec();
                 let content = match d.u8()? {
@@ -318,18 +318,18 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
                 }
             }
             2 => Change::RemoveContext {
-                id: dec_id(&mut d, |v| ContextId::new(v))?,
+                id: dec_id(&mut d, ContextId::new)?,
                 expect: dec_expect(&mut d)?,
             },
             3 => Change::PutRelationship {
-                id: dec_id(&mut d, |v| RelationshipId::new(v))?,
+                id: dec_id(&mut d, RelationshipId::new)?,
                 expect: dec_expect(&mut d)?,
-                kind: dec_id(&mut d, |v| RelationshipKind::new(v))?,
-                source: dec_id(&mut d, |v| ContextId::new(v))?,
-                target: dec_id(&mut d, |v| ContextId::new(v))?,
+                kind: dec_id(&mut d, RelationshipKind::new)?,
+                source: dec_id(&mut d, ContextId::new)?,
+                target: dec_id(&mut d, ContextId::new)?,
             },
             4 => Change::RemoveRelationship {
-                id: dec_id(&mut d, |v| RelationshipId::new(v))?,
+                id: dec_id(&mut d, RelationshipId::new)?,
                 expect: dec_expect(&mut d)?,
             },
             t => return Err(corrupt(format!("history change tag {t}"))),

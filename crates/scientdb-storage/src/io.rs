@@ -31,6 +31,7 @@ impl FileId {
     }
 }
 
+#[cfg(test)]
 /// One traced physical operation, normalized (no descriptors, timings or syscall counts).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -58,12 +59,14 @@ pub(crate) trait Io: Send + Sync {
     fn sync_dir(&self) -> Result<(), StorageError>;
 }
 
+#[cfg(test)]
 /// Records the normalized operation sequence of any adapter.
 pub(crate) struct Traced<I> {
     pub inner: I,
     pub trace: Arc<Mutex<Vec<Op>>>,
 }
 
+#[cfg(test)]
 impl<I: Io> Io for Traced<I> {
     fn create(&self) -> Result<(), StorageError> {
         self.inner.create()

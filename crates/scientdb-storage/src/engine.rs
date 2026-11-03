@@ -90,8 +90,7 @@ impl Inner {
             page: FIRST_NODE_PAGE,
             incarnation: 1,
         };
-        // Slot 0 stays empty; generation 1 is published in slot 1.
-        io.write_at(FileId::Meta, 0, &vec![0; PAGE_SIZE])?;
+        // Slot 0 stays empty (a file hole reads as zeros); generation 1 is published in slot 1.
         io.write_at(
             FileId::Meta,
             root.page * PAGE_SIZE as u64,

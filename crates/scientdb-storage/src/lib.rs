@@ -5,6 +5,8 @@
 //! and `docs/storage-failure-model.md` for the implemented format and guarantees.
 
 mod codec;
+#[cfg(test)]
+mod crash_tests;
 mod engine;
 mod format;
 mod io;
@@ -41,6 +43,11 @@ impl NativeStore {
         Ok(Self {
             inner: Inner::create(Box::new(io::FsIo::new(dir)), format::StoreId(store_id))?,
         })
+    }
+
+    /// Recovery diagnostics from opening this store, such as an ignored damaged publication slot.
+    pub fn recovery_diagnostics(&self) -> &[String] {
+        &self.inner.diagnostics
     }
 
     /// Opens an existing store in `dir`. Never initializes a new store in its place.

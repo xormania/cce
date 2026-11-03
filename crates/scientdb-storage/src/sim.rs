@@ -97,10 +97,6 @@ impl SimIo {
         self.st.lock().expect("sim").ops
     }
 
-    pub fn crashed(&self) -> bool {
-        self.st.lock().expect("sim").crashed
-    }
-
     /// The image a fresh process would see after a crash now, under `persist`.
     pub fn after_crash(&self, persist: Persist) -> SimIo {
         let st = self.st.lock().expect("sim");
@@ -123,11 +119,11 @@ impl SimIo {
                 Persist::Seeded(_) => {
                     let mut out = Vec::new();
                     for p in &f.pending {
-                        if xorshift(&mut rng) % 2 != 0 {
+                        if !xorshift(&mut rng).is_multiple_of(2) {
                             continue;
                         }
                         let sectors = p.data.len().div_ceil(SECTOR) as u64;
-                        let keep = if sectors > 1 && xorshift(&mut rng) % 3 == 0 {
+                        let keep = if sectors > 1 && xorshift(&mut rng).is_multiple_of(3) {
                             (xorshift(&mut rng) % sectors) as usize * SECTOR
                         } else {
                             p.data.len()
