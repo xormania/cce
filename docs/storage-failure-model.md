@@ -100,5 +100,5 @@ a mismatch fails the read instead of reporting a complete stream.
 
 ## Not implemented yet
 
-Space reuse, removal modes, multi-level trees, concurrent commit validation beyond preconditions,
+Space reuse, removal modes, concurrent commit validation beyond preconditions,
 and recovery from an uncertain outcome without reopening.
