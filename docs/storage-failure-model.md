@@ -73,6 +73,60 @@ kill-and-reopen test exercises process exit, not power loss. Power loss is teste
 simulator, which runs the production engine and models the assumptions above: it drops, keeps, tears
 or reorders unsynced writes and forgets unsynced directory entries.
 
+## Failure combinations the tests explore
+
+The simulator tests run the production engine with a simulated I/O adapter. They explore:
+
+- **A crash at every operation of a commit.** In a store with one committed transaction, a second
+  commit (staging included) is cut after each of its mutating operations, from none to all. Each
+  crashed image is recovered under 14 choices of which unsynced writes survive: none, all, and 12
+  seeded subsets. In a seeded subset each unsynced write independently survives or is lost, a
+  surviving write longer than one sector may keep only a whole number of its first 512-byte
+  sectors, and surviving writes are applied in shuffled order. Recovery must produce the whole
+  old or the whole new state, and an acknowledged commit must survive.
+- **A crash at every operation of store creation**, with no unsynced writes surviving and with all
+  of them surviving. Opening then yields the complete empty store or an explicit refusal; it never
+  initializes a store.
+- **Injected I/O errors at chosen operations:** the content and metadata syncs of the data barrier,
+  the sync of the publication record, each mutating operation of opening, the first read of
+  opening, and a read while streaming content.
+- **Lossy sync failures:** a failed sync may discard the file's unsynced writes, as an operating
+  system may when write-back fails, so a later successful sync cannot make them durable. This is
+  injected at the content and metadata syncs of the data barrier and at the publication sync.
+- **Faults during recovery:** every crashed image of the commit sweep above, under all 14 survival
+  choices, is opened with an I/O error at each mutating operation of opening, with a failed first
+  read, and with a crash after each number of those operations followed by loss of unsynced
+  writes. The faulty open must leave the durable bytes unchanged; a clean open must then give the
+  same state and attempt outcomes as an uninterrupted recovery of that image, and opening again
+  must leave the store files unchanged.
+- **Damaged durable bytes** in specific places: a newest publication record with a bad checksum or
+  torn after any number of bytes, both publication records damaged, the newest root page damaged,
+  a content file shorter than the newest record claims, and a damaged content segment.
+
+Separately, real processes are killed and the store is reopened by a fresh process (process exit,
+not power loss); one scenario run on the filesystem adapter and on the simulator must issue the
+same persistence operations in the same order; and on a real filesystem, a file size limit makes a
+commit's write stop part-way and fail, as on a full disk, which must fail the commit explicitly.
+
+When a case of the store-creation sweep or of the faults-during-recovery sweep fails, its durable
+crash image and operation trace are written to a new directory under the system temporary
+directory, named in the failure message. Passing runs write nothing there.
+
+The tests do **not** explore:
+
+- crashes of several processes at once, or several processes writing one store (ownership admits a
+  single owner; a second owner is refused);
+- survival subsets beyond the 14 per cut: the seeded subsets are a sample, not an enumeration, and
+  a surviving write is never cut except after a whole number of its 512-byte sectors;
+- cut sweeps of larger stores: every sweep starts from at most one committed transaction (deeper
+  trees are tested for reopening after power loss, but not cut at every operation);
+- damage to durable bytes beyond the cases listed, such as random or multiple-location corruption,
+  damaged interior tree nodes, or writes that are lost or misdirected after a successful sync;
+- other errors of a real filesystem: `EINTR` inside the filesystem adapter, `ENOSPC` from a full
+  disk, and a failed `fsync` are not provoked through the filesystem adapter; apart from the file
+  size limit above, I/O errors are injected only in the simulator;
+- a lossy failure of a directory sync: lossy failures are modelled for file syncs only.
+
 ## Store files on disk
 
 The store directory is created with mode `0700` and its files with `0600`; the parent of every
