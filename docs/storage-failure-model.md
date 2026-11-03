@@ -39,6 +39,13 @@ reported through `NativeStore::recovery_diagnostics`. If neither slot is usable,
 the store is left untouched; the engine never initializes a new store over existing files. An
 unsupported format version is refused without modification.
 
+Before the recovered state is used, its cursors are checked against the files (the root lies below
+the next unallocated page, the metadata file holds every allocated page, the content file holds the
+committed content length), and both files are synced. The previous owner may have exited after
+writing a publication record but before syncing it; that record could still be visible in the
+operating system's cache, and syncing it at open keeps a later retry from acknowledging a commit that
+is not yet durable.
+
 Cut points:
 
 | Interruption | Result after reopening |
@@ -65,6 +72,19 @@ Killing the owning process leaves unsynced writes in the operating system's cach
 kill-and-reopen test exercises process exit, not power loss. Power loss is tested with the storage
 simulator, which runs the production engine and models the assumptions above: it drops, keeps, tears
 or reorders unsynced writes and forgets unsynced directory entries.
+
+## Store files on disk
+
+The store directory is created with mode `0700` and its files with `0600`; the parent of every
+directory the engine creates is synced. Store files must be regular files: a symlink or special file
+in their place is refused before it is opened, and the opened handle must be the file at that path.
+
+Reads stay within the committed content length and require a content record to match the requested
+digest and length. Commits refuse to continue when the generation or page counter would overflow.
+
+**Limitation:** checksums detect accidental damage, not deliberate forgery. A store crafted with
+valid checksums but inconsistent structures is only partly validated today (cursor bounds, extent
+bounds, digest matching); full structural validation of hostile stores is not implemented yet.
 
 ## Ownership
 

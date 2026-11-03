@@ -132,6 +132,12 @@ impl Inner {
             slots.push(decode_slot(&buf));
         }
         let (desc, diagnostics) = select(&slots)?;
+        validate_cursors(&*io, &desc)?;
+        // The selected record and everything it references may still be only in the operating
+        // system's cache (the previous owner exited before its barrier). Make them durable before
+        // any receipt or new commit can rely on them.
+        io.sync(FileId::Content)?;
+        io.sync(FileId::Meta)?;
         Ok(Arc::new(Self::new(io, desc, diagnostics)))
     }
 
@@ -159,7 +165,7 @@ impl Inner {
         })
     }
 
-    fn node(&self, at: PageRef) -> Result<Arc<Entries>, StorageError> {
+    pub(crate) fn node(&self, at: PageRef) -> Result<Arc<Entries>, StorageError> {
         if let Some(e) = lock(&self.cache).get(&at) {
             return Ok(e.clone());
         }
@@ -180,7 +186,17 @@ impl Inner {
         Ok(entries)
     }
 
-    fn read_extent(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+    pub(crate) fn read_extent(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+        let committed = lock(&self.state).current.content_len;
+        if x.offset
+            .checked_add(x.len)
+            .is_none_or(|end| end > committed)
+        {
+            return Err(corrupt(format!(
+                "extent {}+{} lies outside committed content ({committed} bytes)",
+                x.offset, x.len
+            )));
+        }
         let len = usize::try_from(x.len).map_err(|_| corrupt("extent too large"))?;
         let mut buf = vec![0; len];
         self.io.read_at(FileId::Content, x.offset, &mut buf)?;
@@ -364,7 +380,13 @@ impl Inner {
             .encode(),
         );
 
-        let generation = cur.generation + 1;
+        let (Some(generation), Some(next_page)) =
+            (cur.generation.checked_add(1), cur.next_page.checked_add(1))
+        else {
+            return Err(rejected(StorageError::InvalidRequest(
+                "generation or page counter exhausted".into(),
+            )));
+        };
         let root = PageRef {
             page: cur.next_page,
             incarnation: generation,
@@ -383,7 +405,7 @@ impl Inner {
             store: self.store,
             generation,
             root,
-            next_page: cur.next_page + 1,
+            next_page,
             content_len: *lock(&self.alloc),
             history_pos: pos,
         };
@@ -529,8 +551,17 @@ impl Inner {
                 StorageError::InvalidRequest("content is not committed in this view".into())
             })?;
         let x = ExtentRef::decode(x)?;
-        if x.len != c.len {
-            return Err(corrupt("content length disagrees with its record"));
+        if x.len != c.len || x.digest != c.digest.0 {
+            return Err(corrupt(
+                "content record does not match the requested digest and length",
+            ));
+        }
+        let committed = lock(&self.state).current.content_len;
+        if x.offset
+            .checked_add(x.len)
+            .is_none_or(|end| end > committed)
+        {
+            return Err(corrupt("content extent lies outside committed content"));
         }
         Ok(ExtentReader {
             inner: self.clone(),
@@ -540,6 +571,25 @@ impl Inner {
             failed: false,
         })
     }
+}
+
+/// Checks the selected record's cursors against the files before anything is written.
+fn validate_cursors(io: &dyn Io, d: &Descriptor) -> Result<(), StorageError> {
+    let meta = io.len(FileId::Meta)?;
+    let content = io.len(FileId::Content)?;
+    let pages_end = d.next_page.checked_mul(PAGE_SIZE as u64);
+    let ok = d.root.page >= FIRST_NODE_PAGE
+        && d.root.page < d.next_page
+        && pages_end.is_some_and(|end| end <= meta)
+        && d.content_len <= content;
+    if !ok {
+        return Err(corrupt(format!(
+            "publication record generation {} contradicts the store files (root page {}, next page {}, \
+             content {} of {content} bytes, metadata {meta} bytes)",
+            d.generation, d.root.page, d.next_page, d.content_len
+        )));
+    }
+    Ok(())
 }
 
 /// Chooses the publication record to recover from. Never initializes.

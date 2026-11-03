@@ -215,3 +215,232 @@ fn a_retry_with_an_unrepresentable_content_index_is_not_matched_to_the_original(
         "a different request under the same attempt identity was accepted: {r:?}"
     );
 }
+
+// ----- security review findings ------------------------------------------------------------------
+
+use crate::format::{Descriptor, PAGE_SIZE, PageKind, PageRef, encode_page};
+use crate::io::{FileId, Io};
+use crate::records::{ExtentRef, P_CONTENT, key};
+use crate::sim::Persist;
+use crate::tree::encode_leaf;
+
+fn sim_store(sim: &SimIo) -> NativeStore {
+    NativeStore {
+        inner: Inner::create(Box::new(sim.clone()), StoreId([3; 16])).unwrap(),
+    }
+}
+
+fn reopen(sim: &SimIo) -> NativeStore {
+    NativeStore {
+        inner: Inner::open(Box::new(sim.clone())).expect("open"),
+    }
+}
+
+#[test]
+fn a_retry_after_reopen_acknowledges_only_durable_state() {
+    // Count one commit's operations, then stop just before its publication barrier.
+    let probe = SimIo::new();
+    let p = sim_store(&probe);
+    let before = probe.ops();
+    commit(
+        &p,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let per_commit = probe.ops() - before;
+
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    sim.crash_after(per_commit - 1);
+    assert!(
+        commit(
+            &s,
+            "x",
+            changes(vec![put("A", Precondition::Absent, b"a", None)])
+        )
+        .is_err()
+    );
+    drop(s);
+    // The process exited; the OS still holds the unsynced publication record.
+    let cached = sim.after_process_exit();
+    let s = reopen(&cached);
+    let retry = commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    );
+    assert_eq!(
+        retry.unwrap(),
+        1,
+        "identical retry returns the original receipt"
+    );
+    drop(s);
+    // Power is lost after that acknowledgment: the acknowledged commit must survive.
+    let after_power_loss = cached.after_crash(Persist::None);
+    let s = reopen(&after_power_loss);
+    assert!(
+        revision(&s, "A").is_some(),
+        "retry acknowledged a commit that was not durable"
+    );
+}
+
+#[test]
+fn a_history_extent_outside_committed_content_is_rejected_before_reading() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let bogus = ExtentRef {
+        offset: 0,
+        len: 1 << 20,
+        digest: [0; 32],
+    };
+    let err = s.inner.read_extent(&bogus).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("outside committed content"),
+        "{err:?}"
+    );
+    let overflow = ExtentRef {
+        offset: u64::MAX - 1,
+        len: 16,
+        digest: [0; 32],
+    };
+    assert!(
+        format!("{:?}", s.inner.read_extent(&overflow).unwrap_err())
+            .contains("outside committed content")
+    );
+}
+
+#[test]
+fn opening_rejects_cursors_that_contradict_the_store_files() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    let staged = s.stage_content(&mut &[5u8; 4096][..]).unwrap();
+    let cs = ChangeSet {
+        changes: vec![put("A", Precondition::Absent, b"a", Some(0))],
+        content: vec![ContentBinding::from(&staged)],
+        ..ChangeSet::default()
+    };
+    commit(&s, "x", cs).unwrap();
+    drop(s);
+    sim.release();
+    // Positive neighbour: an intact store opens.
+    drop(reopen(&sim));
+    sim.release();
+    // Committed content length beyond the content file: refuse rather than overwrite later.
+    let short = sim.after_crash(Persist::All);
+    short.truncate_for_test(FileId::Content, 100);
+    let err = Inner::open(Box::new(short)).err().expect("open must fail");
+    assert!(matches!(err, StorageError::Integrity(_)), "{err:?}");
+}
+
+#[test]
+fn generation_exhaustion_is_rejected_without_losing_the_store() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let mut d = s.inner.snapshot().unwrap().desc;
+    drop(s);
+    // A publication record at the last representable generation.
+    d.generation = u64::MAX;
+    sim.write_at(
+        FileId::Meta,
+        Descriptor::slot(d.generation) * PAGE_SIZE as u64,
+        &d.encode(),
+    )
+    .unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    sim.release();
+    let s = reopen(&sim);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        commit(
+            &s,
+            "y",
+            changes(vec![put("B", Precondition::Absent, b"b", None)]),
+        )
+    }))
+    .expect("commit panicked at generation exhaustion");
+    assert!(matches!(r, Err(CommitError::Rejected(_))), "{r:?}");
+    assert!(revision(&s, "A").is_some());
+}
+
+#[test]
+fn content_is_served_only_for_the_requested_digest() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    let b = s.stage_content(&mut &b"bytes of B"[..]).unwrap();
+    let cs = ChangeSet {
+        changes: vec![put("B", Precondition::Absent, b"b", Some(0))],
+        content: vec![ContentBinding::from(&b)],
+        ..ChangeSet::default()
+    };
+    commit(&s, "x", cs).unwrap();
+    // Crafted metadata maps a different digest of the same length to B's extent.
+    let cur = s.inner.snapshot().unwrap().desc;
+    let mut entries = (*s.inner.node(cur.root).unwrap()).clone();
+    let bx = ExtentRef::decode(&entries[&key(P_CONTENT, &[&b.content.digest.0])]).unwrap();
+    let forged = [0xAB; 32];
+    entries.insert(key(P_CONTENT, &[&forged]), bx.encode());
+    let root = PageRef {
+        page: cur.next_page,
+        incarnation: cur.generation + 1,
+    };
+    sim.write_at(
+        FileId::Meta,
+        root.page * PAGE_SIZE as u64,
+        &encode_page(
+            StoreId([3; 16]),
+            PageKind::Leaf,
+            root,
+            &encode_leaf(&entries),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let d = Descriptor {
+        generation: cur.generation + 1,
+        root,
+        next_page: cur.next_page + 1,
+        ..cur
+    };
+    sim.write_at(
+        FileId::Meta,
+        Descriptor::slot(d.generation) * PAGE_SIZE as u64,
+        &d.encode(),
+    )
+    .unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    drop(s);
+    sim.release();
+    let s = reopen(&sim);
+    let mut v = s.begin().unwrap();
+    let want = scientdb_kernel::storage::ContentRef {
+        digest: scientdb_kernel::storage::ContentDigest(forged),
+        len: b.content.len,
+    };
+    let served = v.content(&want).map(|mut r| {
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).map(|_| out)
+    });
+    assert!(
+        !matches!(served, Ok(Ok(_))),
+        "served other content under a forged digest: {served:?}"
+    );
+    // Positive neighbour: the genuine reference still reads.
+    let mut out = Vec::new();
+    v.content(&b.content)
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+    assert_eq!(out, b"bytes of B");
+}

@@ -5,7 +5,7 @@
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -165,13 +165,21 @@ impl FsIo {
     }
 
     fn take_lock(&self) -> Result<File, StorageError> {
+        let path = self.dir.join(LOCK_FILE);
+        match refuse_non_regular(&path) {
+            // A missing lock file is created below.
+            Err(StorageError::StoreState(m)) if m.ends_with("does not exist") => {}
+            other => other?,
+        }
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(self.dir.join(LOCK_FILE))
+            .mode(0o600)
+            .open(&path)
             .map_err(|e| io_err("open lock file", e))?;
+        same_regular_file(&path, &lock)?;
         match lock.try_lock() {
             Ok(()) => Ok(lock),
             Err(TryLockError::WouldBlock) => Err(StorageError::Busy(format!(
@@ -197,6 +205,36 @@ impl FsIo {
     }
 }
 
+/// Refuses a path that exists but is not a regular file (for example a symlink or a FIFO), before
+/// anything opens it. A missing path is left for the caller to report.
+fn refuse_non_regular(path: &Path) -> Result<(), StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_file() => Ok(()),
+        Ok(_) => Err(StorageError::StoreState(format!(
+            "{} is not a regular file; store files may not be symlinks or special files",
+            path.display()
+        ))),
+        Err(e) if e.kind() == ErrorKind::NotFound => Err(StorageError::StoreState(format!(
+            "{} does not exist",
+            path.display()
+        ))),
+        Err(e) => Err(io_err("inspect store file", e)),
+    }
+}
+
+/// Confirms that the opened handle is the regular file at `path` itself.
+fn same_regular_file(path: &Path, f: &File) -> Result<(), StorageError> {
+    let at = fs::symlink_metadata(path).map_err(|e| io_err("inspect store file", e))?;
+    let opened = f.metadata().map_err(|e| io_err("inspect store file", e))?;
+    if !at.file_type().is_file() || at.dev() != opened.dev() || at.ino() != opened.ino() {
+        return Err(StorageError::StoreState(format!(
+            "{} changed or is not a regular file; refusing it",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn pick(files: &Files, f: FileId) -> &File {
     match f {
         FileId::Meta => &files.meta,
@@ -218,7 +256,11 @@ impl Io for FsIo {
             }
         }
         new_dirs.reverse();
-        fs::create_dir_all(&self.dir).map_err(|e| io_err("create store directory", e))?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.dir)
+            .map_err(|e| io_err("create store directory", e))?;
         for d in &new_dirs {
             let parent = d
                 .parent()
@@ -236,12 +278,16 @@ impl Io for FsIo {
             }
         }
         let new = |name: &str| {
-            OpenOptions::new()
+            let path = self.dir.join(name);
+            let f = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create_new(true)
-                .open(self.dir.join(name))
-                .map_err(|e| io_err(name, e))
+                .mode(0o600)
+                .open(&path)
+                .map_err(|e| io_err(name, e))?;
+            same_regular_file(&path, &f)?;
+            Ok::<File, StorageError>(f)
         };
         let files = Files {
             meta: new(META_FILE)?,
@@ -260,17 +306,30 @@ impl Io for FsIo {
             )));
         }
         let lock = self.take_lock()?;
-        let existing = |name: &str| match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.dir.join(name))
-        {
-            Ok(f) => Ok(f),
-            Err(e) if e.kind() == ErrorKind::NotFound => Err(StorageError::StoreState(format!(
-                "required store file {name} is missing in {}",
-                self.dir.display()
-            ))),
-            Err(e) => Err(io_err(name, e)),
+        let existing = |name: &str| match refuse_non_regular(&self.dir.join(name)).and_then(|()| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.dir.join(name))
+                .map_err(|e| match e.kind() {
+                    ErrorKind::NotFound => StorageError::StoreState(format!(
+                        "required store file {name} is missing in {}",
+                        self.dir.display()
+                    )),
+                    _ => io_err(name, e),
+                })
+        }) {
+            Ok(f) => {
+                same_regular_file(&self.dir.join(name), &f)?;
+                Ok(f)
+            }
+            Err(StorageError::StoreState(m)) if m.contains("does not exist") => {
+                Err(StorageError::StoreState(format!(
+                    "required store file {name} is missing in {}",
+                    self.dir.display()
+                )))
+            }
+            Err(e) => Err(e),
         };
         let files = Files {
             meta: existing(META_FILE)?,
@@ -350,6 +409,54 @@ mod tests {
             );
         }
         // Positive neighbour: an existing directory's parent is not required to change.
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("scientdb-io-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn opening_refuses_store_files_that_are_symlinks() {
+        let base = scratch("symlink");
+        let store = base.join("store");
+        let io = FsIo::new(&store);
+        io.create().unwrap();
+        drop(io);
+        // Positive neighbour: the untouched store opens.
+        FsIo::new(&store).open().unwrap();
+        let outside = base.join("victim");
+        fs::write(&outside, b"must not change").unwrap();
+        fs::remove_file(store.join(CONTENT_FILE)).unwrap();
+        std::os::unix::fs::symlink(&outside, store.join(CONTENT_FILE)).unwrap();
+        let err = FsIo::new(&store)
+            .open()
+            .expect_err("symlinked store file accepted");
+        assert!(
+            matches!(
+                err,
+                StorageError::StoreState(_) | StorageError::Integrity(_)
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"must not change");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new_store_files_are_private_to_their_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("perms");
+        let store = base.join("store");
+        FsIo::new(&store).create().unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&store), 0o700, "store directory mode");
+        for f in [META_FILE, CONTENT_FILE, LOCK_FILE] {
+            assert_eq!(mode(&store.join(f)), 0o600, "{f} mode");
+        }
         let _ = fs::remove_dir_all(&base);
     }
 }

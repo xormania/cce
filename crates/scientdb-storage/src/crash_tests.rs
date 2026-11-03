@@ -157,11 +157,13 @@ fn every_cut_of_a_commit_recovers_a_whole_old_or_new_state() {
     let probe = SimIo::new();
     let s = create(Box::new(probe.clone()));
     assert!(commit_step(&s, 1));
-    let before = probe.ops();
     let trace = Arc::new(Mutex::new(Vec::new()));
     drop(s);
     probe.release();
     let s = open(traced(probe.clone(), &trace));
+    // Count only the commit's own operations (opening also syncs).
+    trace.lock().unwrap().clear();
+    let before = probe.ops();
     assert!(commit_step(&s, 2));
     let total = probe.ops() - before;
     let ops = trace.lock().unwrap().clone();

@@ -163,6 +163,28 @@ impl SimIo {
         }
     }
 
+    /// The state a fresh process sees after the owner exits without a power loss: the operating
+    /// system still holds unsynced writes (readable, but still not durable), and the lock is free.
+    pub fn after_process_exit(&self) -> SimIo {
+        let st = self.st.lock().expect("sim");
+        SimIo {
+            st: Arc::new(Mutex::new(State {
+                files: st.files.clone(),
+                durable_entries: st.durable_entries.clone(),
+                ..State::default()
+            })),
+        }
+    }
+
+    /// Shortens a file's durable and volatile images (test setup for damaged stores).
+    pub fn truncate_for_test(&self, file: FileId, len: usize) {
+        let mut st = self.st.lock().expect("sim");
+        if let Some(f) = st.files.get_mut(&file) {
+            f.durable.truncate(len);
+            f.volatile.truncate(len);
+        }
+    }
+
     /// Releases the simulated ownership lock (the owning "process" ended).
     pub fn release(&self) {
         self.st.lock().expect("sim").locked = false;
