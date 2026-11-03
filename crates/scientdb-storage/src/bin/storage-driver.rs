@@ -37,6 +37,13 @@ use scientdb_kernel::storage::{
 };
 use scientdb_storage::NativeStore;
 
+/// Deterministic store identity for a path: an explicit, reproducible input to `create`.
+fn store_id(dir: &str) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(dir.as_bytes());
+    d[..16].try_into().expect("16 bytes")
+}
+
 /// Byte `i` of the deterministic generated stream for `seed`. Mirrored independently by tests.
 fn gen_byte(seed: u64, i: u64) -> u8 {
     let mut x = seed ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -180,7 +187,10 @@ impl Driver {
                 }
             }
             ["create", dir] => {
-                self.store = Some(NativeStore::create(Path::new(dir)).map_err(|e| e.to_string())?);
+                self.store = Some(
+                    NativeStore::create(Path::new(dir), store_id(dir))
+                        .map_err(|e| e.to_string())?,
+                );
                 self.say("ok created");
             }
             ["open", dir] => {

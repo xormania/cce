@@ -10,6 +10,7 @@
 //! | `0x04` | target, kind, source, relationship id    | empty (incoming index)    |
 //! | `0x05` | history position (u64 big-endian)        | [`ExtentRef`] of entry    |
 //! | `0x06` | attempt id                               | [`AttemptValue`]          |
+//! | `0x07` | content digest                           | [`ExtentRef`] of bytes    |
 //!
 //! Components use the order-preserving encoding in `codec::key_component`.
 
@@ -27,6 +28,7 @@ pub(crate) const P_OUT: u8 = 0x03;
 pub(crate) const P_IN: u8 = 0x04;
 pub(crate) const P_HISTORY: u8 = 0x05;
 pub(crate) const P_ATTEMPT: u8 = 0x06;
+pub(crate) const P_CONTENT: u8 = 0x07;
 
 /// Version tag of the canonical request encoding used for attempt fingerprints.
 const REQUEST_ENCODING_V1: u8 = 1;

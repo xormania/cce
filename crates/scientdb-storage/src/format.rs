@@ -1,4 +1,4 @@
-//! On-disk format, version 1. Documented in `docs/native-storage-format.md`.
+//! On-disk format, version 1. Documented in `docs/storage-format.md`.
 //!
 //! The metadata file is a sequence of `PAGE_SIZE` pages. Pages 0 and 1 are the two publication
 //! slots; pages from 2 hold tree nodes. All integers are little-endian.

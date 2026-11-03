@@ -1,15 +1,21 @@
 //! Native storage engine for ScientDB.
 //!
 //! Physical structures are private. The public surface is the logical port from
-//! `scientdb-kernel` plus constructors for a native store.
+//! `scientdb-kernel` plus constructors for a native store. See `docs/storage-format.md`
+//! and `docs/storage-failure-model.md` for the implemented format and guarantees.
 
 mod codec;
+mod engine;
 mod format;
 mod io;
 mod records;
+#[cfg(test)]
+mod sim;
+mod tree;
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use scientdb_kernel::storage::{
     AttemptId, AttemptOutcome, ChangeSet, CommitError, CommitReceipt, ContentReader, ContentRef,
@@ -17,51 +23,68 @@ use scientdb_kernel::storage::{
     RelationshipQuery, StagedContent, StorageEngine, StorageError,
 };
 
+use engine::{Inner, Snapshot};
+
 /// A native store owned by this process.
+///
+/// Ownership of the store directory is exclusive and lasts until this handle and every view or
+/// content reader derived from it are dropped.
 pub struct NativeStore {
-    _private: (),
+    inner: Arc<Inner>,
 }
 
 impl NativeStore {
-    /// Creates a new store in `dir`, which must not already contain a store.
-    pub fn create(_dir: &Path) -> Result<Self, StorageError> {
-        Err(StorageError::NotImplemented("create"))
+    /// Creates a new store in `dir`. `store_id` is the caller-supplied identity recorded in every
+    /// page; it lets the engine reject pages and handles from other stores. Refuses to create over
+    /// an existing store.
+    pub fn create(dir: &Path, store_id: [u8; 16]) -> Result<Self, StorageError> {
+        Ok(Self {
+            inner: Inner::create(Box::new(io::FsIo::new(dir)), format::StoreId(store_id))?,
+        })
     }
 
-    /// Opens an existing store in `dir`.
-    pub fn open(_dir: &Path) -> Result<Self, StorageError> {
-        Err(StorageError::NotImplemented("open"))
+    /// Opens an existing store in `dir`. Never initializes a new store in its place.
+    pub fn open(dir: &Path) -> Result<Self, StorageError> {
+        Ok(Self {
+            inner: Inner::open(Box::new(io::FsIo::new(dir)))?,
+        })
     }
 }
 
 /// A consistent view of one committed state of a [`NativeStore`].
 pub struct NativeView {
-    _private: (),
+    inner: Arc<Inner>,
+    snap: Snapshot,
 }
 
 impl ReadView for NativeView {
-    fn context(&mut self, _id: &ContextId) -> Result<Option<ContextRecord>, StorageError> {
-        Err(StorageError::NotImplemented("context"))
+    fn context(&mut self, id: &ContextId) -> Result<Option<ContextRecord>, StorageError> {
+        self.inner.context(&self.snap, id)
     }
 
     fn relationships(
         &mut self,
-        _query: &RelationshipQuery,
+        query: &RelationshipQuery,
     ) -> Result<Box<dyn Iterator<Item = Result<Relationship, StorageError>> + '_>, StorageError>
     {
-        Err(StorageError::NotImplemented("relationships"))
+        Ok(Box::new(
+            self.inner
+                .relationships(&self.snap, query)?
+                .into_iter()
+                .map(Ok),
+        ))
     }
 
     fn history(
         &mut self,
-        _start: HistoryPosition,
+        start: HistoryPosition,
     ) -> Result<Box<dyn Iterator<Item = Result<HistoryEntry, StorageError>> + '_>, StorageError>
     {
-        Err(StorageError::NotImplemented("history"))
+        Ok(Box::new(self.inner.history(&self.snap, start)?))
     }
 
-    fn content(&mut self, _content: &ContentRef) -> Result<Box<dyn ContentReader>, StorageError> {
-        Err(StorageError::NotImplemented("content"))
+    fn content(&mut self, content: &ContentRef) -> Result<Box<dyn ContentReader>, StorageError> {
+        Ok(Box::new(self.inner.content(&self.snap, content)?))
     }
 }
 
@@ -69,29 +92,33 @@ impl StorageEngine for NativeStore {
     type View = NativeView;
 
     fn begin(&self) -> Result<NativeView, StorageError> {
-        Err(StorageError::NotImplemented("begin"))
+        Ok(NativeView {
+            inner: self.inner.clone(),
+            snap: self.inner.snapshot()?,
+        })
     }
 
-    fn stage_content(&self, _bytes: &mut dyn Read) -> Result<StagedContent, StorageError> {
-        Err(StorageError::NotImplemented("stage_content"))
+    fn stage_content(&self, bytes: &mut dyn Read) -> Result<StagedContent, StorageError> {
+        self.inner.stage(bytes)
     }
 
     fn commit(
         &self,
-        _attempt: AttemptId,
-        _basis: NativeView,
-        _changes: ChangeSet,
+        attempt: AttemptId,
+        basis: NativeView,
+        changes: ChangeSet,
     ) -> Result<CommitReceipt, CommitError> {
-        Err(CommitError::Rejected(StorageError::NotImplemented(
-            "commit",
-        )))
+        if !Arc::ptr_eq(&basis.inner, &self.inner) {
+            return Err(CommitError::Rejected(StorageError::ForeignHandle));
+        }
+        self.inner.commit(attempt, basis.snap, changes)
     }
 
-    fn outcome(&self, _attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
-        Err(StorageError::NotImplemented("outcome"))
+    fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
+        self.inner.outcome(attempt)
     }
 
     fn close(self) -> Result<(), StorageError> {
-        Err(StorageError::NotImplemented("close"))
+        self.inner.close()
     }
 }
