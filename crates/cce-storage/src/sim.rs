@@ -202,6 +202,15 @@ impl SimIo {
         }
     }
 
+    /// A file's durable and volatile images, or `None` if the file does not exist (test checks
+    /// that an operation left the store bytes unchanged).
+    pub fn file_images_for_test(&self, file: FileId) -> Option<(Vec<u8>, Vec<u8>)> {
+        let st = self.st.lock().expect("sim");
+        st.files
+            .get(&file)
+            .map(|f| (f.durable.clone(), f.volatile.clone()))
+    }
+
     /// Releases the simulated ownership lock (the owning "process" ended).
     pub fn release(&self) {
         self.st.lock().expect("sim").locked = false;
