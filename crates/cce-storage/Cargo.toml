@@ -1,12 +1,12 @@
 [package]
-name = "scientdb-storage"
+name = "cce-storage"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-scientdb-kernel = { path = "../scientdb-kernel" }
+cce-core = { path = "../cce-core" }
 crc32fast = "1"
 sha2 = "0.11"
 

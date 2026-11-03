@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use scientdb_kernel::storage::StorageError;
+use cce_core::storage::StorageError;
 
 use crate::codec::{Dec, Enc, corrupt};
 use crate::format::{PAGE_PAYLOAD_MAX, PageRef};

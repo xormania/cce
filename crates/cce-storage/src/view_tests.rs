@@ -1,7 +1,7 @@
 //! Concurrent views and logical conflict validation. Schedules are explicit: the test decides the
 //! order of view creation, intervening commits and the final commit.
 
-use scientdb_kernel::storage::{
+use cce_core::storage::{
     AttemptId, Change, ChangeSet, CommitError, ContextId, Direction, Precondition, ReadView,
     RelationshipId, RelationshipKind, RelationshipQuery, StorageEngine,
 };
@@ -255,7 +255,7 @@ fn a_basis_older_than_retained_conflict_history_is_refused_explicitly() {
 
 #[test]
 fn an_old_view_keeps_its_whole_state_while_new_views_see_the_update() {
-    use scientdb_kernel::storage::ContentBinding;
+    use cce_core::storage::ContentBinding;
     use std::io::Read;
     let s = store();
     let v1 = s.stage_content(&mut &b"first content"[..]).unwrap();
@@ -320,7 +320,7 @@ fn an_old_view_keeps_its_whole_state_while_new_views_see_the_update() {
 
 #[test]
 fn a_basis_from_another_store_is_rejected() {
-    use scientdb_kernel::storage::StorageError;
+    use cce_core::storage::StorageError;
     let a = store();
     let b = store();
     let foreign = b.begin().unwrap();
@@ -335,8 +335,8 @@ fn store_with(opts: crate::engine::Options) -> NativeStore {
     }
 }
 
-fn wait_resolved(s: &NativeStore, a: &AttemptId) -> scientdb_kernel::storage::AttemptOutcome {
-    use scientdb_kernel::storage::AttemptOutcome;
+fn wait_resolved(s: &NativeStore, a: &AttemptId) -> cce_core::storage::AttemptOutcome {
+    use cce_core::storage::AttemptOutcome;
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match s.outcome(a).unwrap() {
@@ -350,7 +350,7 @@ fn wait_resolved(s: &NativeStore, a: &AttemptId) -> scientdb_kernel::storage::At
 
 #[test]
 fn an_admitted_commit_completes_after_its_caller_goes_away() {
-    use scientdb_kernel::storage::{AttemptOutcome, HistoryPosition};
+    use cce_core::storage::{AttemptOutcome, HistoryPosition};
     let s = store();
     let gate = s.inner.pause_worker_for_test();
     let a = AttemptId::new(*b"abandoned").unwrap();
@@ -375,7 +375,7 @@ fn an_admitted_commit_completes_after_its_caller_goes_away() {
 
 #[test]
 fn a_full_commit_queue_refuses_admission_explicitly_and_reads_continue() {
-    use scientdb_kernel::storage::StorageError;
+    use cce_core::storage::StorageError;
     let s = store_with(crate::engine::Options {
         commit_queue: 1,
         ..Default::default()

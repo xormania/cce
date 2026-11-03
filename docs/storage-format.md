@@ -1,6 +1,6 @@
 # Storage format (version 1)
 
-This describes the bytes the `scientdb-storage` engine writes today. It changes with the code; a
+This describes the bytes the `cce-storage` engine writes today. It changes with the code; a
 change that alters how existing bytes are read must change the version and either migrate or refuse
 older stores without modifying them.
 
@@ -23,8 +23,8 @@ Node page header (48 bytes), followed by the payload and zero padding:
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 4 | magic `SDBP` |
-| 4 | 2 | format version (1) |
+| 0 | 4 | magic `CCEP` |
+| 4 | 2 | format version (4) |
 | 6 | 1 | page kind (1 = leaf) |
 | 7 | 1 | reserved (0) |
 | 8 | 16 | store identity |
@@ -61,7 +61,7 @@ overwritten by the next commit. Record layout (76 bytes, rest of the page zero):
 
 | Field | Size |
 |---|---|
-| magic `SDBD` | 4 |
+| magic `CCED` | 4 |
 | format version | 2 |
 | store identity | 16 |
 | generation | 8 |
@@ -119,7 +119,7 @@ Staging tokens and physical locations are not part of it. Every content index mu
 binding of the same request; a request with an out-of-range index is rejected before it is
 fingerprinted. History entries return the bound content references with the changes.
 
-The attempt fingerprint is SHA-256 over `"scientdb.attempt.v1\0"`, the attempt id (length-prefixed),
+The attempt fingerprint is SHA-256 over `"cce.attempt.v1\0"`, the attempt id (length-prefixed),
 and that canonical encoding. Retrying an attempt with an identical logical request returns the
 original receipt; any difference is rejected as a mismatch.
 

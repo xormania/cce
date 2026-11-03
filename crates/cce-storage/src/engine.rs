@@ -15,7 +15,7 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 
-use scientdb_kernel::storage::{
+use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
     ContentReader, ContentRef, ContextId, ContextRecord, Direction, HistoryEntry, HistoryPosition,
     Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery, Revision,
@@ -338,7 +338,7 @@ impl Inner {
         let (tx, rx) = mpsc::sync_channel::<Job>(capacity.max(1));
         *lock(&self.worker) = Some(tx);
         std::thread::Builder::new()
-            .name("scientdb-commit".into())
+            .name("cce-commit".into())
             .spawn(move || {
                 for job in rx {
                     let inner = job.inner.clone();

@@ -36,13 +36,13 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use scientdb_kernel::storage::{
+use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, ContentBinding, ContentDigest, ContentRef,
     ContextId, Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId,
     RelationshipKind, RelationshipPosition, RelationshipQuery, Revision, StagedContent,
     StorageEngine,
 };
-use scientdb_storage::{NativeStore, StoreOptions};
+use cce_storage::{NativeStore, StoreOptions};
 
 /// Deterministic store identity for a path: an explicit, reproducible input to `create`.
 fn store_id(dir: &str) -> [u8; 16] {
@@ -160,7 +160,7 @@ fn change_tokens(c: &Change) -> String {
 
 struct Driver {
     store: Option<NativeStore>,
-    readers: Vec<Box<dyn scientdb_kernel::storage::ContentReader>>,
+    readers: Vec<Box<dyn cce_core::storage::ContentReader>>,
     staged: HashMap<String, StagedContent>,
     pending: ChangeSet,
     out: io::Stdout,
