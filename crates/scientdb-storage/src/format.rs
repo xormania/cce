@@ -8,7 +8,9 @@ use scientdb_kernel::storage::StorageError;
 use crate::codec::{Dec, Enc, corrupt};
 
 pub(crate) const PAGE_SIZE: usize = 4096;
-pub(crate) const FORMAT_VERSION: u16 = 1;
+/// Version 2: tagged leaf/branch tree nodes (version 1 had single-leaf trees). Older versions are
+/// refused, never reinterpreted.
+pub(crate) const FORMAT_VERSION: u16 = 2;
 pub(crate) const PAGE_MAGIC: [u8; 4] = *b"SDBP";
 pub(crate) const DESC_MAGIC: [u8; 4] = *b"SDBD";
 /// Pages 0 and 1 are publication slots.
@@ -275,9 +277,9 @@ mod tests {
         torn[20] ^= 0x40;
         assert!(matches!(decode_slot(&torn), Slot::Invalid(_)));
         let mut future = bytes.clone();
-        future[4..6].copy_from_slice(&2u16.to_le_bytes());
+        future[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         let crc = crc32fast::hash(&future[..DESC_LEN - 4]);
         future[DESC_LEN - 4..DESC_LEN].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(decode_slot(&future), Slot::Unsupported(2));
+        assert_eq!(decode_slot(&future), Slot::Unsupported(FORMAT_VERSION + 1));
     }
 }

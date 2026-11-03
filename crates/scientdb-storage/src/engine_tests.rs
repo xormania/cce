@@ -450,3 +450,36 @@ fn content_is_served_only_for_the_requested_digest() {
         .unwrap();
     assert_eq!(out, b"bytes of B");
 }
+
+#[test]
+fn a_store_in_the_previous_format_version_is_refused_without_modification() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let d = s.inner.snapshot().unwrap().desc;
+    drop(s);
+    // Rewrite the publication record as format version 1 (the single-leaf node encoding).
+    let slot = Descriptor::slot(d.generation) * PAGE_SIZE as u64;
+    let mut rec = d.encode();
+    rec[4..6].copy_from_slice(&1u16.to_le_bytes());
+    // magic 4 + version 2 + store 16 + six u64 fields = 70 bytes, then the CRC-32.
+    let crc = crc32fast::hash(&rec[..70]);
+    rec[70..74].copy_from_slice(&crc.to_le_bytes());
+    sim.write_at(FileId::Meta, slot, &rec).unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    let mut before = vec![0; sim.len(FileId::Meta).unwrap() as usize];
+    sim.read_at(FileId::Meta, 0, &mut before).unwrap();
+    sim.release();
+    let err = Inner::open(Box::new(sim.clone()), Default::default())
+        .err()
+        .expect("an older format version opened");
+    assert!(matches!(err, StorageError::Unsupported(_)), "{err:?}");
+    let mut after = vec![0; before.len()];
+    sim.read_at(FileId::Meta, 0, &mut after).unwrap();
+    assert_eq!(before, after, "refusing the store modified it");
+}
