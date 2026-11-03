@@ -252,3 +252,79 @@ fn a_basis_older_than_retained_conflict_history_is_refused_explicitly() {
     // The store is unaffected and a fresh basis commits.
     commit_now(&s, "fresh", vec![put("Z")]);
 }
+
+#[test]
+fn an_old_view_keeps_its_whole_state_while_new_views_see_the_update() {
+    use scientdb_kernel::storage::ContentBinding;
+    use std::io::Read;
+    let s = store();
+    let v1 = s.stage_content(&mut &b"first content"[..]).unwrap();
+    s.commit(
+        AttemptId::new(*b"c1").unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![Change::PutContext {
+                id: cid("A"),
+                expect: Precondition::Absent,
+                body: b"old".to_vec(),
+                content: Some(0),
+            }],
+            content: vec![ContentBinding::from(&v1)],
+            ..ChangeSet::default()
+        },
+    )
+    .unwrap();
+    let mut old = s.begin().unwrap();
+    let v2 = s.stage_content(&mut &b"second content"[..]).unwrap();
+    s.commit(
+        AttemptId::new(*b"c2").unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![
+                Change::PutContext {
+                    id: cid("A"),
+                    expect: Precondition::Any,
+                    body: b"new".to_vec(),
+                    content: Some(0),
+                },
+                rel("r", "cites", "A", "B"),
+            ],
+            content: vec![ContentBinding::from(&v2)],
+            ..ChangeSet::default()
+        },
+    )
+    .unwrap();
+    let mut new = s.begin().unwrap();
+    assert_eq!(old.context(&cid("A")).unwrap().unwrap().body, b"old");
+    assert_eq!(new.context(&cid("A")).unwrap().unwrap().body, b"new");
+    let q = RelationshipQuery {
+        from: cid("A"),
+        direction: Direction::Outgoing,
+        kind: None,
+        after: None,
+    };
+    assert_eq!(
+        old.relationships(&q).unwrap().count(),
+        0,
+        "old view saw a later relationship"
+    );
+    assert_eq!(new.relationships(&q).unwrap().count(), 1);
+    // A content reader opened from the old view stays valid after that view is dropped.
+    let c = old.context(&cid("A")).unwrap().unwrap().content.unwrap();
+    let mut r = old.content(&c).unwrap();
+    drop(old);
+    let mut got = Vec::new();
+    r.read_to_end(&mut got).unwrap();
+    assert_eq!(got, b"first content");
+}
+
+#[test]
+fn a_basis_from_another_store_is_rejected() {
+    use scientdb_kernel::storage::StorageError;
+    let a = store();
+    let b = store();
+    let foreign = b.begin().unwrap();
+    let r = a.commit(AttemptId::new(*b"x").unwrap(), foreign, cs(vec![put("A")]));
+    assert_eq!(r, Err(CommitError::Rejected(StorageError::ForeignHandle)));
+    commit_now(&a, "own", vec![put("A")]);
+}

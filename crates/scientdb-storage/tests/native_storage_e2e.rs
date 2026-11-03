@@ -307,3 +307,51 @@ fn store_files_are_real_and_damage_yields_explicit_errors() {
         bundle.expected_dump(1)
     );
 }
+
+#[test]
+fn a_store_has_one_owning_process_until_every_guard_is_gone() {
+    let dir = test_dir("ownership");
+    let store = dir.join("store");
+    let bundle = first_bundle();
+    let mut owner = Driver::spawn();
+    answered(owner.step(&format!("create {}", store.display())), "create");
+    for cmd in bundle.commands() {
+        answered(owner.step(&cmd), &cmd);
+    }
+    answered(owner.step(&format!("commit {}", bundle.attempt)), "commit");
+
+    let busy = |what: &str| {
+        let mut other = Driver::spawn();
+        let err = failed(other.step(&format!("open {}", store.display())), what);
+        assert!(err.contains("Busy"), "{what}: {err}");
+    };
+    busy("second opener while owned");
+
+    // Dropping the store handle does not release ownership while a content reader remains.
+    answered(owner.step("keep-reader A"), "keep reader");
+    answered(owner.step("drop-store"), "drop store");
+    busy("second opener while a reader keeps the engine");
+    answered(owner.step("drop-readers"), "drop readers");
+    let mut next = Driver::spawn();
+    answered(
+        next.step(&format!("open {}", store.display())),
+        "open after release",
+    );
+    drop(next);
+
+    // After the owner process dies, a fresh process acquires ownership and recovers.
+    let mut owner = Driver::spawn();
+    answered(owner.step(&format!("open {}", store.display())), "reopen");
+    assert_eq!(owner.wait_for("hold", "holding"), Step::Answered(vec![]));
+    busy("second opener while a holding process lives");
+    assert!(owner.kill().code().is_none());
+    let mut fresh = Driver::spawn();
+    answered(
+        fresh.step(&format!("open {}", store.display())),
+        "open after owner death",
+    );
+    assert_eq!(
+        answered(fresh.step("dump A,B,C"), "dump"),
+        bundle.expected_dump(1)
+    );
+}
