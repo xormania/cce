@@ -338,3 +338,61 @@ fn partially_consumed_ranges_resume_exactly_after_their_boundary() {
     assert_eq!(bad.len(), 1);
     assert!(bad[0].starts_with("query-error InvalidRequest"), "{bad:?}");
 }
+
+fn stat(d: &mut Driver, name: &str) -> u64 {
+    let s = answered(d.step("stats"), "stats").join(" ");
+    s.split(' ')
+        .find_map(|f| f.strip_prefix(&format!("{name}=")))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("{name} in {s}"))
+}
+
+#[test]
+fn a_small_update_in_a_large_tree_rewrites_one_path_and_reads_stay_lazy() {
+    let dir = test_dir("rels-write-amplification");
+    let store = dir.join("store");
+    let mut model = Model::default();
+    let mut cmds = populate(&mut model);
+    for i in 0..4000 {
+        cmds.push(model.put(
+            &format!("bulk-{i:06}"),
+            "depends",
+            &format!("B{:05}", i % 97),
+            &format!("C{i:06}"),
+        ));
+    }
+    let mut w = Driver::spawn();
+    answered(w.step(&format!("create {}", store.display())), "create");
+    commit_all(&mut w, &mut model, &cmds, 500, "fill");
+    answered(w.step("close"), "close");
+    drop(w);
+
+    let mut d = Driver::spawn();
+    answered(d.step(&format!("open {} 8", store.display())), "open");
+    let height = stat(&mut d, "height");
+    assert!(height >= 3);
+    // One small record changes: only the touched root-to-leaf path is rewritten.
+    let before = stat(&mut d, "pages_written");
+    answered(
+        d.step(&format!("put-context Z absent {} -", hex(b"z"))),
+        "put",
+    );
+    answered(d.step("commit small-update"), "commit");
+    let written = stat(&mut d, "pages_written") - before;
+    // The context record, its history entry and its receipt live in separate key ranges, so at most
+    // three paths change; the tree holds thousands of pages.
+    assert!(
+        written >= height && written <= 3 * height,
+        "pages written for one small update: {written} (height {height})"
+    );
+
+    // The first relationship of a 1500-edge hub arrives after loading only one path of pages.
+    let misses = stat(&mut d, "misses");
+    let first = answered(d.step("rels HUB out - 1"), "first");
+    assert_eq!(first.len(), 1);
+    let loaded = stat(&mut d, "misses") - misses;
+    assert!(
+        loaded <= 2 * height,
+        "first result loaded {loaded} pages (height {height})"
+    );
+}
