@@ -269,13 +269,26 @@ impl Io for FsIo {
             self.sync_path(parent)?;
         }
         let lock = self.take_lock()?;
-        for name in [META_FILE, CONTENT_FILE] {
-            if self.dir.join(name).exists() {
-                return Err(StorageError::StoreState(format!(
-                    "{} already contains a store ({name}); refusing to create over it",
-                    self.dir.display()
-                )));
+        // Only an absent or empty directory (or one holding just the lock file, left by a creation
+        // that stopped early) may receive a new store: never initialize beside existing data.
+        let entries = fs::read_dir(&self.dir).map_err(|e| io_err("read store directory", e))?;
+        for entry in entries {
+            let name = entry
+                .map_err(|e| io_err("read store directory", e))?
+                .file_name();
+            let name = name.to_string_lossy();
+            if name == LOCK_FILE {
+                continue;
             }
+            let why = if name == META_FILE || name == CONTENT_FILE {
+                "already contains a store"
+            } else {
+                "is not empty"
+            };
+            return Err(StorageError::StoreState(format!(
+                "{} {why} ({name}); refusing to create a store there",
+                self.dir.display()
+            )));
         }
         let new = |name: &str| {
             let path = self.dir.join(name);
@@ -458,5 +471,43 @@ mod tests {
             assert_eq!(mode(&store.join(f)), 0o600, "{f} mode");
         }
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn creating_refuses_a_directory_that_already_holds_other_files() {
+        let names = |d: &PathBuf| {
+            let mut v: Vec<String> = fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        // Files of an older layout, or anything else, must never be silently joined by a new store.
+        for stray in ["meta.old", "notes.txt"] {
+            let store = scratch(&format!("create-stray-{stray}"));
+            fs::create_dir_all(&store).unwrap();
+            fs::write(store.join(stray), b"x").unwrap();
+            let before = names(&store);
+            let err = FsIo::new(&store).create().unwrap_err();
+            assert!(
+                matches!(&err, StorageError::StoreState(m) if m.contains("not empty")),
+                "{stray}: {err:?}"
+            );
+            let after: Vec<String> = names(&store)
+                .into_iter()
+                .filter(|n| n != LOCK_FILE)
+                .collect();
+            assert_eq!(after, before, "{stray}: nothing created beside it");
+        }
+        // Positive neighbours: an existing empty directory, and one left with only the lock file
+        // by a creation that stopped before writing any store file.
+        let empty = scratch("create-empty-dir");
+        fs::create_dir_all(&empty).unwrap();
+        FsIo::new(&empty).create().unwrap();
+        let lock_only = scratch("create-lock-only");
+        fs::create_dir_all(&lock_only).unwrap();
+        fs::write(lock_only.join(LOCK_FILE), b"").unwrap();
+        FsIo::new(&lock_only).create().unwrap();
     }
 }
