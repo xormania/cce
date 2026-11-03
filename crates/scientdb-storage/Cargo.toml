@@ -14,3 +14,6 @@ path = "src/bin/storage-driver.rs"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+sha2 = "0.11"
