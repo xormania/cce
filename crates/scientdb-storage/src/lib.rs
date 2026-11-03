@@ -177,6 +177,14 @@ impl StorageEngine for NativeStore {
         self.inner.stage(bytes)
     }
 
+    fn stage_content_expecting(
+        &self,
+        bytes: &mut dyn Read,
+        expected: &ContentRef,
+    ) -> Result<StagedContent, StorageError> {
+        self.inner.stage_checked(bytes, Some(expected))
+    }
+
     fn commit(
         &self,
         attempt: AttemptId,

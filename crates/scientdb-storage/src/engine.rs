@@ -311,6 +311,17 @@ impl Inner {
     // ----- staging -----------------------------------------------------------------------------
 
     pub fn stage(&self, bytes: &mut dyn Read) -> Result<StagedContent, StorageError> {
+        self.stage_checked(bytes, None)
+    }
+
+    /// Stages content, enforcing a declared reference if given: a stream longer than declared is
+    /// cut off as soon as it exceeds it, and length and digest are compared before anything is
+    /// registered. Nothing is staged on a mismatch.
+    pub fn stage_checked(
+        &self,
+        bytes: &mut dyn Read,
+        expected: Option<&ContentRef>,
+    ) -> Result<StagedContent, StorageError> {
         if let Some(f) = &lock(&self.state).fenced {
             return Err(StorageError::StoreState(format!("writes fenced: {f}")));
         }
@@ -335,6 +346,14 @@ impl Inner {
             if filled == 0 {
                 break;
             }
+            if let Some(e) = expected
+                && len + filled as u64 > e.len
+            {
+                return Err(StorageError::InvalidRequest(format!(
+                    "staged stream is longer than the declared {} bytes",
+                    e.len
+                )));
+            }
             let seg = &buf[..filled];
             self.io.write_at(FileId::Content, at, seg)?;
             self.counters
@@ -356,6 +375,14 @@ impl Inner {
             digest: ContentDigest(total.finalize().into()),
             len,
         };
+        if let Some(e) = expected
+            && *e != content
+        {
+            return Err(StorageError::InvalidRequest(format!(
+                "staged stream ({} bytes) does not match the declared content ({} bytes) or its digest",
+                content.len, e.len
+            )));
+        }
         let manifest = Manifest { content, segments }.encode();
         self.io.write_at(FileId::Content, at, &manifest)?;
         self.counters

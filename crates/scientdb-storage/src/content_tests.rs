@@ -163,3 +163,53 @@ fn staging_tolerates_short_and_interrupted_reads_and_reports_permanent_failure()
         "{err:?}"
     );
 }
+
+#[test]
+fn staging_against_a_declared_length_and_digest_rejects_any_mismatch() {
+    use scientdb_kernel::storage::{ContentDigest, ContentRef, StorageError};
+    use sha2::{Digest, Sha256};
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    let payload = bytes(2 * CONTENT_CHUNK + 5, 1);
+    let right = ContentRef {
+        digest: ContentDigest(Sha256::digest(&payload).into()),
+        len: payload.len() as u64,
+    };
+
+    // Positive neighbour: the declared stream stages and commits.
+    let ok = s
+        .stage_content_expecting(&mut &payload[..], &right)
+        .expect("matching stream must stage");
+    assert_eq!(ok.content, right);
+
+    let shorter = ContentRef {
+        len: right.len - 1,
+        ..right
+    };
+    let longer = ContentRef {
+        len: right.len + 1,
+        ..right
+    };
+    let other = ContentRef {
+        digest: ContentDigest([9; 32]),
+        ..right
+    };
+    for (what, expect, input) in [
+        ("declared shorter than the stream", shorter, &payload[..]),
+        (
+            "declared longer than the stream (truncated input)",
+            longer,
+            &payload[..],
+        ),
+        ("different digest", other, &payload[..]),
+        ("truncated input", right, &payload[..payload.len() - 1]),
+    ] {
+        let err = s
+            .stage_content_expecting(&mut &input[..], &expect)
+            .expect_err(what);
+        assert!(
+            matches!(err, StorageError::InvalidRequest(_)),
+            "{what}: {err:?}"
+        );
+    }
+}
