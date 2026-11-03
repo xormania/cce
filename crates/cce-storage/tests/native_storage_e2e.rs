@@ -237,8 +237,8 @@ fn store_files_are_real_and_damage_yields_explicit_errors() {
     drop(d);
 
     // The store consists of real files with real content.
-    let meta = store.join("meta.sdb");
-    let content = store.join("content.sdb");
+    let meta = store.join("meta.cce");
+    let content = store.join("content.cce");
     assert!(std::fs::metadata(&meta).unwrap().len() >= 3 * 4096);
     assert!(std::fs::metadata(&content).unwrap().len() >= common::story::LARGE_LEN);
 
@@ -272,9 +272,9 @@ fn store_files_are_real_and_damage_yields_explicit_errors() {
     // A missing content file is reported, not recreated.
     let copy = dir.join("copy-missing-content");
     std::fs::create_dir_all(&copy).unwrap();
-    std::fs::copy(&meta, copy.join("meta.sdb")).unwrap();
-    assert!(open_error(&copy).contains("content.sdb is missing"));
-    assert!(!copy.join("content.sdb").exists());
+    std::fs::copy(&meta, copy.join("meta.cce")).unwrap();
+    assert!(open_error(&copy).contains("content.cce is missing"));
+    assert!(!copy.join("content.cce").exists());
 
     // Damaged publication records: refuse, never reinitialize, never rewrite.
     let damaged = dir.join("copy-damaged-slots");
@@ -283,11 +283,11 @@ fn store_files_are_real_and_damage_yields_explicit_errors() {
     for b in &mut bytes[..2 * 4096] {
         *b ^= 0x5a;
     }
-    std::fs::write(damaged.join("meta.sdb"), &bytes).unwrap();
-    std::fs::copy(&content, damaged.join("content.sdb")).unwrap();
+    std::fs::write(damaged.join("meta.cce"), &bytes).unwrap();
+    std::fs::copy(&content, damaged.join("content.cce")).unwrap();
     assert!(open_error(&damaged).contains("no valid publication record"));
     assert_eq!(
-        std::fs::read(damaged.join("meta.sdb")).unwrap(),
+        std::fs::read(damaged.join("meta.cce")).unwrap(),
         bytes,
         "failed open modified the store"
     );
@@ -295,8 +295,8 @@ fn store_files_are_real_and_damage_yields_explicit_errors() {
     // A truncated metadata file is an explicit incomplete-initialization error.
     let short = dir.join("copy-truncated");
     std::fs::create_dir_all(&short).unwrap();
-    std::fs::write(short.join("meta.sdb"), &before[..100]).unwrap();
-    std::fs::copy(&content, short.join("content.sdb")).unwrap();
+    std::fs::write(short.join("meta.cce"), &before[..100]).unwrap();
+    std::fs::copy(&content, short.join("content.cce")).unwrap();
     assert!(open_error(&short).contains("initialization never completed"));
 
     // Positive neighbour: the untouched store still opens with its full state.
@@ -421,8 +421,8 @@ fn an_identical_retry_from_a_fresh_process_returns_the_original_receipt() {
 fn a_short_write_at_the_file_size_limit_fails_the_commit_explicitly() {
     let dir = test_dir("short-write");
     let store = dir.join("store");
-    let content = store.join("content.sdb");
-    let meta = store.join("meta.sdb");
+    let content = store.join("content.cce");
+    let meta = store.join("meta.cce");
     // Evidence is recorded only in the history entry, so it sets that write's size.
     let evidence = format!("evidence {} {}", common::hex(b"big"), "ab".repeat(30_000));
 

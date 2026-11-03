@@ -15,11 +15,11 @@ What the `cce-storage` engine promises today, under which assumptions, and how i
 ## Commit protocol
 
 1. Validate the attempt identity and the change's preconditions against the newest committed state.
-2. Write the history entry to `content.sdb` and the new tree node to a fresh page of `meta.sdb`.
+2. Write the history entry to `content.cce` and the new tree node to a fresh page of `meta.cce`.
    No page referenced by any publication record is modified.
-3. Sync `content.sdb`, then `meta.sdb`.
+3. Sync `content.cce`, then `meta.cce`.
 4. Write the publication record for generation `g+1` into slot `(g+1) mod 2`.
-5. Sync `meta.sdb`.
+5. Sync `meta.cce`.
 6. Make the generation visible to new views and acknowledge the commit.
 
 Store creation syncs the parent of every directory it had to create, then the store directory after

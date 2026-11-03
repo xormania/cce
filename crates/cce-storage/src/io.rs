@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 
 use cce_core::storage::StorageError;
 
-pub(crate) const META_FILE: &str = "meta.sdb";
-pub(crate) const CONTENT_FILE: &str = "content.sdb";
+pub(crate) const META_FILE: &str = "meta.cce";
+pub(crate) const CONTENT_FILE: &str = "content.cce";
 pub(crate) const LOCK_FILE: &str = "LOCK";
 
 /// A store file.
