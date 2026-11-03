@@ -222,6 +222,95 @@ fn failed(step: Step, what: &str) -> String {
         .unwrap_or_else(|| panic!("{what}: expected an explicit error, got {lines:?}"))
 }
 
+/// Every entry of the store directory with the SHA-256 of its bytes, in name order.
+fn directory_image(store: &std::path::Path) -> Vec<(String, String)> {
+    use sha2::{Digest, Sha256};
+    let mut entries: Vec<(String, String)> = std::fs::read_dir(store)
+        .expect("read store directory")
+        .map(|e| {
+            let e = e.expect("directory entry");
+            let bytes = std::fs::read(e.path()).expect("read store file");
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                common::hex(&Sha256::digest(&bytes)),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+#[test]
+fn read_only_opens_are_refused_while_owned_and_never_change_the_store() {
+    let dir = test_dir("read-only-open");
+    let store = dir.join("store");
+    let open = format!("open {}", store.display());
+    let open_ro = format!("open-ro {}", store.display());
+    let bundle = first_bundle();
+
+    let mut owner = Driver::spawn();
+    answered(owner.step(&format!("create {}", store.display())), "create");
+    for cmd in bundle.commands() {
+        answered(owner.step(&cmd), &cmd);
+    }
+    assert_eq!(
+        answered(owner.step(&format!("commit {}", bundle.attempt)), "commit"),
+        ["committed 1"]
+    );
+    // While a process owns the store, both kinds of open from another process are busy.
+    for cmd in [&open, &open_ro] {
+        let mut other = Driver::spawn();
+        let err = failed(other.step(cmd), cmd);
+        assert!(err.contains("Busy"), "{cmd}: {err}");
+    }
+    assert_eq!(owner.wait_for("hold", "holding"), Step::Answered(vec![]));
+    assert!(owner.kill().code().is_none(), "owner must die by signal");
+    let before = directory_image(&store);
+
+    // After the owner died: read-only opens succeed, coexist, and see the committed state.
+    let mut ro = Driver::spawn();
+    answered(ro.step(&open_ro), "first read-only open");
+    let mut ro2 = Driver::spawn();
+    answered(ro2.step(&open_ro), "second read-only open");
+    for (what, d) in [("first", &mut ro), ("second", &mut ro2)] {
+        assert_eq!(
+            answered(d.step("dump A,B,C"), "dump"),
+            bundle.expected_dump(1),
+            "{what} read-only view"
+        );
+    }
+    // A read-only holder keeps writers out.
+    let mut writer = Driver::spawn();
+    let err = failed(writer.step(&open), "writer under readers");
+    assert!(err.contains("Busy"), "{err}");
+    answered(ro2.step("close"), "close second");
+    assert_eq!(ro2.finish().and_then(|s| s.code()), Some(0));
+    // A content reader keeps the read-only hold after its handle is dropped.
+    answered(ro.step("keep-reader A"), "keep reader");
+    answered(ro.step("drop-store"), "drop read-only handle");
+    let mut writer = Driver::spawn();
+    let err = failed(writer.step(&open), "writer under a kept reader");
+    assert!(err.contains("Busy"), "{err}");
+    answered(ro.step("drop-readers"), "drop readers");
+    assert_eq!(ro.finish().and_then(|s| s.code()), Some(0));
+
+    // Read-only sessions changed nothing on disk, not even the lock file.
+    assert_eq!(
+        directory_image(&store),
+        before,
+        "read-only opens modified the store"
+    );
+
+    // A read-write open now acquires ownership and recovers the committed state.
+    let mut fresh = Driver::spawn();
+    answered(fresh.step(&open), "read-write open after readers");
+    assert_eq!(
+        answered(fresh.step("dump A,B,C"), "dump"),
+        bundle.expected_dump(1)
+    );
+    answered(fresh.step("close"), "close");
+}
+
 #[test]
 fn store_files_are_real_and_damage_yields_explicit_errors() {
     let dir = test_dir("files-explicit-errors");

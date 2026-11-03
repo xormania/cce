@@ -83,17 +83,7 @@ impl NativeStore {
 
     /// Instrumentation counters and current tree shape. Counters never affect engine behavior.
     pub fn stats(&self) -> Result<StoreStats, StorageError> {
-        let c = &self.inner.counters;
-        let get = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
-        Ok(StoreStats {
-            pages_written: get(&c.pages_written),
-            page_bytes_written: get(&c.page_bytes_written),
-            content_bytes_written: get(&c.content_bytes_written),
-            node_cache_misses: get(&c.cache_misses),
-            node_cache_evictions: get(&c.cache_evictions),
-            node_cache_capacity: self.inner.cache_capacity(),
-            tree_height: self.inner.height()?,
-        })
+        stats_of(&self.inner)
     }
 
     /// Admits a commit without waiting for it. The commit proceeds even if the ticket is dropped.
@@ -122,6 +112,69 @@ impl NativeStore {
     pub fn open(dir: &Path) -> Result<Self, StorageError> {
         Self::open_with(dir, StoreOptions::default())
     }
+
+    /// Opens an existing store in `dir` for read-only inspection. See [`NativeReadOnly`].
+    pub fn open_read_only(dir: &Path) -> Result<NativeReadOnly, StorageError> {
+        Self::open_read_only_with(dir, StoreOptions::default())
+    }
+
+    /// Like [`NativeStore::open_read_only`], with explicit tuning options.
+    pub fn open_read_only_with(
+        dir: &Path,
+        options: StoreOptions,
+    ) -> Result<NativeReadOnly, StorageError> {
+        let inner = Inner::open_read_only(Box::new(io::FsIo::new(dir)), options.into())?;
+        Ok(NativeReadOnly { inner })
+    }
+}
+
+/// A read-only inspection handle on a store that no process owns.
+///
+/// Opening selects the committed state exactly as a read-write open does, in memory only: it never
+/// writes, syncs, repairs or creates anything. While a process owns the store, the open fails with
+/// [`StorageError::Busy`]; while this handle, or any view or content reader derived from it, is
+/// alive, read-write opens fail with `Busy` and further read-only opens succeed.
+///
+/// A state the previous owner wrote but never synced may be visible here without being durable; it
+/// becomes durable only when a read-write open recovers the store. Attempt outcomes are therefore
+/// not offered: reconcile them through a read-write [`NativeStore`].
+pub struct NativeReadOnly {
+    inner: Arc<Inner>,
+}
+
+impl NativeReadOnly {
+    /// A consistent view of the selected committed state.
+    pub fn begin(&self) -> Result<NativeView, StorageError> {
+        Ok(NativeView {
+            inner: self.inner.clone(),
+            snap: self.inner.snapshot()?,
+            observed: Vec::new(),
+        })
+    }
+
+    /// Recovery diagnostics from opening, such as an ignored damaged publication slot.
+    pub fn recovery_diagnostics(&self) -> &[String] {
+        &self.inner.diagnostics
+    }
+
+    /// Instrumentation counters and current tree shape.
+    pub fn stats(&self) -> Result<StoreStats, StorageError> {
+        stats_of(&self.inner)
+    }
+}
+
+fn stats_of(inner: &Inner) -> Result<StoreStats, StorageError> {
+    let c = &inner.counters;
+    let get = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    Ok(StoreStats {
+        pages_written: get(&c.pages_written),
+        page_bytes_written: get(&c.page_bytes_written),
+        content_bytes_written: get(&c.content_bytes_written),
+        node_cache_misses: get(&c.cache_misses),
+        node_cache_evictions: get(&c.cache_evictions),
+        node_cache_capacity: inner.cache_capacity(),
+        tree_height: inner.height()?,
+    })
 }
 
 /// An admitted commit. Dropping the ticket does not cancel the commit; reconcile its outcome with

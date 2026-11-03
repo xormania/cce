@@ -148,6 +148,8 @@ pub(crate) struct Inner {
     max_segments: usize,
     /// Largest variable-length request field or list (see `Options::max_request_field`).
     max_request_field: u64,
+    /// Opened for inspection only: no commit worker, no staging, no commits, no syncs.
+    read_only: bool,
     pub counters: Counters,
     /// Recovery diagnostics from open (for example an ignored damaged slot).
     pub diagnostics: Vec<String>,
@@ -294,20 +296,7 @@ impl Inner {
 
     pub fn open(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
         io.open()?;
-        let len = io.len(FileId::Meta)?;
-        if len < 2 * PAGE_SIZE as u64 {
-            return Err(StorageError::Integrity(format!(
-                "metadata file is {len} bytes; store initialization never completed (not reinitializing)"
-            )));
-        }
-        let mut slots = Vec::new();
-        for s in 0..2u64 {
-            let mut buf = vec![0; PAGE_SIZE];
-            io.read_at(FileId::Meta, s * PAGE_SIZE as u64, &mut buf)?;
-            slots.push(decode_slot(&buf));
-        }
-        let (desc, diagnostics) = select(&slots)?;
-        validate_cursors(&*io, &desc)?;
+        let (desc, diagnostics) = read_publication(&*io)?;
         // The selected record and everything it references may still be only in the operating
         // system's cache (the previous owner exited before its barrier). Make them durable before
         // any receipt or new commit can rely on them.
@@ -316,6 +305,26 @@ impl Inner {
         let inner = Arc::new(Self::new(io, desc, diagnostics, opts));
         inner.start_worker(opts.commit_queue)?;
         Ok(inner)
+    }
+
+    /// Opens an existing store for inspection: the same publication record selection as `open`,
+    /// in memory only. Nothing is written or synced, no commit worker runs, and the handle holds
+    /// the store's lock in shared mode, so owners are refused while it lives.
+    pub fn open_read_only(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
+        io.open_read_only()?;
+        let (desc, diagnostics) = read_publication(&*io)?;
+        let mut inner = Self::new(io, desc, diagnostics, opts);
+        inner.read_only = true;
+        Ok(Arc::new(inner))
+    }
+
+    fn refuse_if_read_only(&self, what: &str) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::StoreState(format!(
+                "{what} refused on a read-only store handle"
+            )));
+        }
+        Ok(())
     }
 
     fn new(io: Box<dyn Io>, desc: Descriptor, diagnostics: Vec<String>, opts: Options) -> Self {
@@ -351,6 +360,7 @@ impl Inner {
             }),
             max_segments: opts.max_content_segments,
             max_request_field: opts.max_request_field,
+            read_only: false,
             counters: Counters::default(),
             diagnostics,
         }
@@ -424,6 +434,7 @@ impl Inner {
         observed: Vec<Observation>,
         changes: ChangeSet,
     ) -> Result<mpsc::Receiver<Result<CommitReceipt, CommitError>>, CommitError> {
+        self.refuse_if_read_only("commits are").map_err(rejected)?;
         let (reply, rx) = mpsc::channel();
         let tx = lock(&self.worker).clone().ok_or_else(|| {
             rejected(StorageError::StoreState("commit worker not running".into()))
@@ -526,6 +537,7 @@ impl Inner {
         bytes: &mut dyn Read,
         expected: Option<&ContentRef>,
     ) -> Result<StagedContent, StorageError> {
+        self.refuse_if_read_only("staging is")?;
         if let Some(f) = &lock(&self.state).fenced {
             return Err(StorageError::StoreState(format!(
                 "writes fenced: {}",
@@ -681,6 +693,7 @@ impl Inner {
         observed: &[Observation],
         cs: ChangeSet,
     ) -> Result<CommitReceipt, CommitError> {
+        self.refuse_if_read_only("commits are").map_err(rejected)?;
         let _w = lock(&self.writer);
         // Before anything is encoded: no field may overflow its length prefix.
         crate::records::check_request_bounds(&cs, self.max_request_field).map_err(rejected)?;
@@ -1162,6 +1175,26 @@ impl ConflictLog {
             }
         }
     }
+}
+
+/// Reads both publication slots and selects the record to recover from, checking its cursors
+/// against the files. Reads only.
+fn read_publication(io: &dyn Io) -> Result<(Descriptor, Vec<String>), StorageError> {
+    let len = io.len(FileId::Meta)?;
+    if len < 2 * PAGE_SIZE as u64 {
+        return Err(StorageError::Integrity(format!(
+            "metadata file is {len} bytes; store initialization never completed (not reinitializing)"
+        )));
+    }
+    let mut slots = Vec::new();
+    for s in 0..2u64 {
+        let mut buf = vec![0; PAGE_SIZE];
+        io.read_at(FileId::Meta, s * PAGE_SIZE as u64, &mut buf)?;
+        slots.push(decode_slot(&buf));
+    }
+    let (desc, diagnostics) = select(&slots)?;
+    validate_cursors(io, &desc)?;
+    Ok((desc, diagnostics))
 }
 
 /// Checks the selected record's cursors against the files before anything is written.

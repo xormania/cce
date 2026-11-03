@@ -48,6 +48,14 @@ pub(crate) trait Io: Send + Sync {
     fn create(&self) -> Result<(), StorageError>;
     /// Opens an existing store and takes exclusive ownership. Missing files are an error.
     fn open(&self) -> Result<(), StorageError>;
+    /// Opens an existing store for reading only, under a shared lock: refused while an owner
+    /// holds the store, and holding it keeps owners out. The handle then refuses writes and
+    /// syncs. Never creates anything. Adapters without a read-only mode refuse.
+    fn open_read_only(&self) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported(
+            "read-only open is not supported by this I/O adapter".into(),
+        ))
+    }
     /// Reads exactly `buf.len()` bytes at `offset`.
     fn read_at(&self, file: FileId, offset: u64, buf: &mut [u8]) -> Result<(), StorageError>;
     /// Writes all of `data` at `offset` (positioned; never append).
@@ -73,6 +81,9 @@ impl<I: Io> Io for Traced<I> {
     }
     fn open(&self) -> Result<(), StorageError> {
         self.inner.open()
+    }
+    fn open_read_only(&self) -> Result<(), StorageError> {
+        self.inner.open_read_only()
     }
     fn read_at(&self, file: FileId, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         self.inner.read_at(file, offset, buf)
@@ -105,6 +116,9 @@ impl<I: Io + ?Sized> Io for Box<I> {
     fn open(&self) -> Result<(), StorageError> {
         (**self).open()
     }
+    fn open_read_only(&self) -> Result<(), StorageError> {
+        (**self).open_read_only()
+    }
     fn read_at(&self, file: FileId, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         (**self).read_at(file, offset, buf)
     }
@@ -131,6 +145,19 @@ struct Files {
     content: File,
     /// Held for the life of the adapter; the OS lock is released when it closes.
     _lock: File,
+    /// Opened for reading only, under a shared lock: writes and syncs are refused.
+    read_only: bool,
+}
+
+impl Files {
+    fn writable(&self) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::StoreState(
+                "read-only store handle: writes and syncs are refused".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Real filesystem adapter for one store directory.
@@ -188,6 +215,81 @@ impl FsIo {
             ))),
             Err(TryLockError::Error(e)) => Err(io_err("lock store", e)),
         }
+    }
+
+    /// Takes the ownership lock in shared mode for a read-only open. The lock file must already
+    /// exist: a read-only open creates nothing, and without the file it cannot keep owners out.
+    fn take_shared_lock(&self) -> Result<File, StorageError> {
+        let path = self.dir.join(LOCK_FILE);
+        match refuse_non_regular(&path) {
+            Err(StorageError::StoreState(m)) if m.ends_with("does not exist") => {
+                return Err(StorageError::StoreState(format!(
+                    "{} has no {LOCK_FILE} file; a read-only open cannot keep owners out without \
+                     it (a read-write open creates it)",
+                    self.dir.display()
+                )));
+            }
+            other => other?,
+        }
+        let lock = File::open(&path).map_err(|e| io_err("open lock file", e))?;
+        same_regular_file(&path, &lock)?;
+        match lock.try_lock_shared() {
+            Ok(()) => Ok(lock),
+            Err(TryLockError::WouldBlock) => Err(StorageError::Busy(format!(
+                "store {} is owned by another process",
+                self.dir.display()
+            ))),
+            Err(TryLockError::Error(e)) => Err(io_err("lock store", e)),
+        }
+    }
+
+    /// Opens the existing store files with ownership: exclusive for read-write, shared for
+    /// read-only (files opened without write access).
+    fn open_files(&self, read_only: bool) -> Result<(), StorageError> {
+        if !self.dir.is_dir() {
+            return Err(StorageError::StoreState(format!(
+                "no store directory at {}",
+                self.dir.display()
+            )));
+        }
+        let lock = if read_only {
+            self.take_shared_lock()?
+        } else {
+            self.take_lock()?
+        };
+        let existing = |name: &str| match refuse_non_regular(&self.dir.join(name)).and_then(|()| {
+            OpenOptions::new()
+                .read(true)
+                .write(!read_only)
+                .open(self.dir.join(name))
+                .map_err(|e| match e.kind() {
+                    ErrorKind::NotFound => StorageError::StoreState(format!(
+                        "required store file {name} is missing in {}",
+                        self.dir.display()
+                    )),
+                    _ => io_err(name, e),
+                })
+        }) {
+            Ok(f) => {
+                same_regular_file(&self.dir.join(name), &f)?;
+                Ok(f)
+            }
+            Err(StorageError::StoreState(m)) if m.contains("does not exist") => {
+                Err(StorageError::StoreState(format!(
+                    "required store file {name} is missing in {}",
+                    self.dir.display()
+                )))
+            }
+            Err(e) => Err(e),
+        };
+        let files = Files {
+            meta: existing(META_FILE)?,
+            content: existing(CONTENT_FILE)?,
+            _lock: lock,
+            read_only,
+        };
+        *self.files.lock().expect("files") = Some(Arc::new(files));
+        Ok(())
     }
 }
 
@@ -306,51 +408,18 @@ impl Io for FsIo {
             meta: new(META_FILE)?,
             content: new(CONTENT_FILE)?,
             _lock: lock,
+            read_only: false,
         };
         *self.files.lock().expect("files") = Some(Arc::new(files));
         Ok(())
     }
 
     fn open(&self) -> Result<(), StorageError> {
-        if !self.dir.is_dir() {
-            return Err(StorageError::StoreState(format!(
-                "no store directory at {}",
-                self.dir.display()
-            )));
-        }
-        let lock = self.take_lock()?;
-        let existing = |name: &str| match refuse_non_regular(&self.dir.join(name)).and_then(|()| {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(self.dir.join(name))
-                .map_err(|e| match e.kind() {
-                    ErrorKind::NotFound => StorageError::StoreState(format!(
-                        "required store file {name} is missing in {}",
-                        self.dir.display()
-                    )),
-                    _ => io_err(name, e),
-                })
-        }) {
-            Ok(f) => {
-                same_regular_file(&self.dir.join(name), &f)?;
-                Ok(f)
-            }
-            Err(StorageError::StoreState(m)) if m.contains("does not exist") => {
-                Err(StorageError::StoreState(format!(
-                    "required store file {name} is missing in {}",
-                    self.dir.display()
-                )))
-            }
-            Err(e) => Err(e),
-        };
-        let files = Files {
-            meta: existing(META_FILE)?,
-            content: existing(CONTENT_FILE)?,
-            _lock: lock,
-        };
-        *self.files.lock().expect("files") = Some(Arc::new(files));
-        Ok(())
+        self.open_files(false)
+    }
+
+    fn open_read_only(&self) -> Result<(), StorageError> {
+        self.open_files(true)
     }
 
     fn read_at(&self, file: FileId, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
@@ -369,6 +438,7 @@ impl Io for FsIo {
 
     fn write_at(&self, file: FileId, offset: u64, data: &[u8]) -> Result<(), StorageError> {
         let (files, f) = self.file(file)?;
+        files.writable()?;
         pick(&files, f)
             .write_all_at(data, offset)
             .map_err(|e| io_err(file.name(), e))
@@ -384,12 +454,16 @@ impl Io for FsIo {
 
     fn sync(&self, file: FileId) -> Result<(), StorageError> {
         let (files, f) = self.file(file)?;
+        files.writable()?;
         pick(&files, f)
             .sync_all()
             .map_err(|e| io_err(file.name(), e))
     }
 
     fn sync_dir(&self) -> Result<(), StorageError> {
+        if let Ok(files) = self.files() {
+            files.writable()?;
+        }
         self.sync_path(&self.dir.clone())
     }
 }

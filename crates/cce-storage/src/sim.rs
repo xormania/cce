@@ -7,6 +7,7 @@
 //! so. The engine under test is the production engine; only the I/O adapter differs.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::StorageError;
@@ -64,7 +65,7 @@ struct State {
     files: HashMap<FileId, SimFile>,
     /// Files whose directory entry is durable.
     durable_entries: HashSet<FileId>,
-    locked: bool,
+    lock: SimLock,
     /// Remaining mutating operations before the simulated crash (`None` = no crash planned).
     budget: Option<u64>,
     crashed: bool,
@@ -79,10 +80,33 @@ struct State {
     lossy_sync: bool,
 }
 
-/// A simulated store directory. Clones share the same state.
-#[derive(Clone, Default)]
+/// The simulated ownership lock on the store directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SimLock {
+    #[default]
+    Free,
+    /// One read-write owner.
+    Exclusive,
+    /// This many read-only holders.
+    Shared(u32),
+}
+
+/// A simulated store directory. Clones share the same directory state; each clone is a separate
+/// handle onto it, with its own access mode.
+#[derive(Default)]
 pub(crate) struct SimIo {
     st: Arc<Mutex<State>>,
+    /// This handle was opened read-only: it refuses every mutating operation.
+    read_only: AtomicBool,
+}
+
+impl Clone for SimIo {
+    fn clone(&self) -> Self {
+        Self {
+            st: self.st.clone(),
+            read_only: AtomicBool::new(false),
+        }
+    }
 }
 
 fn xorshift(s: &mut u64) -> u64 {
@@ -188,6 +212,7 @@ impl SimIo {
                 files,
                 ..State::default()
             })),
+            read_only: AtomicBool::new(false),
         }
     }
 
@@ -201,6 +226,7 @@ impl SimIo {
                 durable_entries: st.durable_entries.clone(),
                 ..State::default()
             })),
+            read_only: AtomicBool::new(false),
         }
     }
 
@@ -223,9 +249,22 @@ impl SimIo {
             .map(|f| (f.durable.clone(), f.volatile.clone()))
     }
 
-    /// Releases the simulated ownership lock (the owning "process" ended).
+    /// Releases the simulated ownership lock, read-write or read-only (the holding "processes"
+    /// ended).
     pub fn release(&self) {
-        self.st.lock().expect("sim").locked = false;
+        self.st.lock().expect("sim").lock = SimLock::Free;
+    }
+
+    fn require_files(st: &State) -> Result<(), StorageError> {
+        for f in [FileId::Meta, FileId::Content] {
+            if !st.files.contains_key(&f) {
+                return Err(StorageError::StoreState(format!(
+                    "required store file {} is missing",
+                    f.name()
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn mutate<T>(&self, f: impl FnOnce(&mut State) -> T) -> Result<T, StorageError> {
@@ -238,6 +277,11 @@ impl SimIo {
         f: impl FnOnce(&mut State) -> T,
         on_injected_failure: impl FnOnce(&mut State),
     ) -> Result<T, StorageError> {
+        if self.read_only.load(Ordering::SeqCst) {
+            return Err(StorageError::StoreState(
+                "read-only handle: writes and syncs are refused".into(),
+            ));
+        }
         let mut st = self.st.lock().expect("sim");
         if st.crashed {
             return Err(StorageError::Io("simulated crash".into()));
@@ -269,10 +313,10 @@ impl Io for SimIo {
                 "simulated directory already contains a store".into(),
             ));
         }
-        if st.locked {
+        if st.lock != SimLock::Free {
             return Err(StorageError::Busy("simulated store is owned".into()));
         }
-        st.locked = true;
+        st.lock = SimLock::Exclusive;
         st.files.insert(FileId::Meta, SimFile::default());
         st.files.insert(FileId::Content, SimFile::default());
         Ok(())
@@ -280,18 +324,25 @@ impl Io for SimIo {
 
     fn open(&self) -> Result<(), StorageError> {
         let mut st = self.st.lock().expect("sim");
-        if st.locked {
+        if st.lock != SimLock::Free {
             return Err(StorageError::Busy("simulated store is owned".into()));
         }
-        for f in [FileId::Meta, FileId::Content] {
-            if !st.files.contains_key(&f) {
-                return Err(StorageError::StoreState(format!(
-                    "required store file {} is missing",
-                    f.name()
-                )));
-            }
+        Self::require_files(&st)?;
+        st.lock = SimLock::Exclusive;
+        Ok(())
+    }
+
+    fn open_read_only(&self) -> Result<(), StorageError> {
+        let mut st = self.st.lock().expect("sim");
+        if st.lock == SimLock::Exclusive {
+            return Err(StorageError::Busy("simulated store is owned".into()));
         }
-        st.locked = true;
+        Self::require_files(&st)?;
+        st.lock = match st.lock {
+            SimLock::Shared(n) => SimLock::Shared(n + 1),
+            _ => SimLock::Shared(1),
+        };
+        self.read_only.store(true, Ordering::SeqCst);
         Ok(())
     }
 

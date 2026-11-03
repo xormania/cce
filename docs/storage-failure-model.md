@@ -176,7 +176,33 @@ fail with `Busy` without admitting anything, and reads continue normally.
 
 One process owns a store at a time, through an exclusive lock on `LOCK` taken at open and held until
 the store handle and every view and content reader derived from it are dropped. A second opener gets
-`Busy`.
+`Busy`. A read-write open creates `LOCK` if it is missing; creating a store creates it before the
+data files.
+
+### Read-only inspection open
+
+`NativeStore::open_read_only` opens a store that no process owns for reading only. It takes the
+lock on `LOCK` in shared mode and opens the data files without write access:
+
+- While a process owns the store, a read-only open fails with `Busy`, as a read-write open does.
+- While a read-only handle, or any view or content reader derived from it, is alive, read-write opens
+  fail with `Busy`; further read-only opens succeed.
+- It selects the committed state exactly as a read-write open does (both slots, the same validity
+  and cursor checks, the same diagnostics, the same refusals), in memory only. It never writes,
+  syncs, repairs, truncates or creates anything, including `LOCK`: without `LOCK` it refuses,
+  because it could not keep an owner out.
+- The handle offers views (records, relationships, history, content) and diagnostics. Staging,
+  commits and attempt outcomes are not offered, and the engine refuses staging and commits on a
+  read-only handle.
+
+**Visible is not durable.** The previous owner may have exited after writing a publication record
+but before syncing it. A read-only open sees that state, because the operating system still holds
+it, but does not sync it, so a power loss before the next read-write open can still lose it. Only a
+read-write open makes the recovered state durable. This is why a read-only handle does not answer
+attempt outcomes.
+
+The lock is an advisory `flock` lock: it excludes processes that use this engine, on local
+filesystems. Network filesystems may not provide it.
 
 ## Readers and content integrity
 

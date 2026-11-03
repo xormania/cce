@@ -9,6 +9,7 @@
 //! ```text
 //! probe ok|fail|hang                      harness self-check; does not touch storage
 //! create <dir> | open <dir> [<cache-nodes>]
+//! open-ro <dir>                           read-only inspection open (reads only; no commits)
 //! stats                                   prints instrumentation counters and tree height
 //! stage <name> hex <bytes>                stage literal bytes
 //! stage <name> gen <len> <seed>           stage a generated stream (see `gen_byte`)
@@ -42,7 +43,7 @@ use cce_core::storage::{
     RelationshipKind, RelationshipPosition, RelationshipQuery, Revision, StagedContent,
     StorageEngine,
 };
-use cce_storage::{NativeStore, StoreOptions};
+use cce_storage::{NativeReadOnly, NativeStore, NativeView, StoreOptions};
 
 /// Deterministic store identity for a path: an explicit, reproducible input to `create`.
 fn store_id(dir: &str) -> [u8; 16] {
@@ -160,6 +161,7 @@ fn change_tokens(c: &Change) -> String {
 
 struct Driver {
     store: Option<NativeStore>,
+    read_only: Option<NativeReadOnly>,
     readers: Vec<Box<dyn cce_core::storage::ContentReader>>,
     staged: HashMap<String, StagedContent>,
     pending: ChangeSet,
@@ -177,6 +179,16 @@ impl Driver {
         self.store
             .as_ref()
             .ok_or_else(|| "no store open".to_string())
+    }
+
+    /// A view from whichever handle is open, read-write or read-only.
+    fn begin(&self) -> Result<NativeView, String> {
+        match (&self.store, &self.read_only) {
+            (Some(s), _) => s.begin(),
+            (None, Some(r)) => r.begin(),
+            (None, None) => return Err("no store open".into()),
+        }
+        .map_err(|e| e.to_string())
     }
 
     fn run(&mut self, line: &str) -> Result<(), String> {
@@ -204,6 +216,11 @@ impl Driver {
             ["open", dir] => {
                 self.store = Some(NativeStore::open(Path::new(dir)).map_err(|e| e.to_string())?);
                 self.say("ok opened");
+            }
+            ["open-ro", dir] => {
+                self.read_only =
+                    Some(NativeStore::open_read_only(Path::new(dir)).map_err(|e| e.to_string())?);
+                self.say("ok opened read-only");
             }
             ["open", dir, cache] => {
                 let opts = StoreOptions {
@@ -314,7 +331,7 @@ impl Driver {
             }
             ["dump", ids] => self.dump(ids)?,
             ["keep-reader", id] => {
-                let mut view = self.store()?.begin().map_err(|e| e.to_string())?;
+                let mut view = self.begin()?;
                 let cid = ContextId::new(id.as_bytes().to_vec()).map_err(|e| e.to_string())?;
                 let c = view
                     .context(&cid)
@@ -327,6 +344,7 @@ impl Driver {
             }
             ["drop-store"] => {
                 self.store = None;
+                self.read_only = None;
                 self.say("ok store dropped");
             }
             ["drop-readers"] => {
@@ -361,7 +379,7 @@ impl Driver {
                     kind,
                     after,
                 };
-                let mut view = self.store()?.begin().map_err(|e| e.to_string())?;
+                let mut view = self.begin()?;
                 let mut lines = Vec::new();
                 match view.relationships(&q) {
                     Err(e) => lines.push(format!("query-error {e:?}")),
@@ -394,7 +412,7 @@ impl Driver {
                     digest: ContentDigest(d),
                     len: len.parse().map_err(|_| "bad len")?,
                 };
-                let mut view = self.store()?.begin().map_err(|e| e.to_string())?;
+                let mut view = self.begin()?;
                 match view.content(&c) {
                     Ok(mut r) => {
                         let mut bytes = Vec::new();
@@ -410,6 +428,11 @@ impl Driver {
                     std::thread::park();
                 }
             }
+            ["close"] if self.store.is_none() && self.read_only.is_some() => {
+                // A read-only handle has nothing to flush: closing drops it.
+                self.read_only = None;
+                self.say("ok closed");
+            }
             ["close"] => {
                 let store = self.store.take().ok_or("no store open")?;
                 store.close().map_err(|e| e.to_string())?;
@@ -422,7 +445,7 @@ impl Driver {
 
     fn dump(&mut self, ids: &str) -> Result<(), String> {
         let mut lines = Vec::new();
-        let mut view = self.store()?.begin().map_err(|e| e.to_string())?;
+        let mut view = self.begin()?;
         for raw in ids.split(',') {
             let cid = ContextId::new(raw.as_bytes().to_vec()).map_err(|e| e.to_string())?;
             match view.context(&cid).map_err(|e| e.to_string())? {
@@ -492,6 +515,7 @@ impl Driver {
 fn main() -> ExitCode {
     let mut d = Driver {
         store: None,
+        read_only: None,
         readers: Vec::new(),
         staged: HashMap::new(),
         pending: ChangeSet::default(),
