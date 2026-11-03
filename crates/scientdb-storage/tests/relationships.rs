@@ -11,21 +11,34 @@ use common::{Driver, Step, answered, hex, test_dir};
 #[derive(Default)]
 struct Model {
     rels: BTreeMap<String, (String, String, String, u64)>,
+    /// Changed ids awaiting the history position of their commit (a revision is that position).
+    pending: Vec<String>,
 }
 
 impl Model {
     fn put(&mut self, id: &str, kind: &str, src: &str, dst: &str) -> String {
-        let (expect, rev) = match self.rels.get(id) {
-            None => ("absent".to_string(), 1),
-            Some(r) => (format!("rev:{}", r.3), r.3 + 1),
+        let expect = match self.rels.get(id) {
+            None => "absent".to_string(),
+            Some(r) => format!("rev:{}", r.3),
         };
         self.rels
-            .insert(id.into(), (kind.into(), src.into(), dst.into(), rev));
+            .insert(id.into(), (kind.into(), src.into(), dst.into(), 0));
+        self.pending.push(id.into());
         format!("put-rel {id} {expect} {kind} {src} {dst}")
+    }
+
+    /// The first `n` pending changes were committed at history position `pos`.
+    fn settle(&mut self, n: usize, pos: u64) {
+        for id in self.pending.drain(..n) {
+            if let Some(r) = self.rels.get_mut(&id) {
+                r.3 = pos;
+            }
+        }
     }
 
     fn remove(&mut self, id: &str) -> String {
         let r = self.rels.remove(id).expect("modelled");
+        self.pending.push(id.into());
         format!("remove-rel {id} rev:{}", r.3)
     }
 
@@ -65,14 +78,18 @@ fn rel_lines(dump: Vec<String>) -> Vec<String> {
 }
 
 /// Commits the commands in batches of `batch` changes.
-fn commit_all(d: &mut Driver, cmds: &[String], batch: usize, tag: &str) {
+fn commit_all(d: &mut Driver, model: &mut Model, cmds: &[String], batch: usize, tag: &str) {
     for (n, chunk) in cmds.chunks(batch).enumerate() {
         for c in chunk {
             answered(d.step(c), c);
         }
         let got = answered(d.step(&format!("commit {tag}-{n:04}")), "commit");
         assert_eq!(got.len(), 1);
-        assert!(got[0].starts_with("committed "), "{tag} batch {n}: {got:?}");
+        let pos = got[0]
+            .strip_prefix("committed ")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or_else(|| panic!("{tag} batch {n}: {got:?}"));
+        model.settle(chunk.len(), pos);
     }
 }
 
@@ -116,7 +133,7 @@ fn relationship_indexes_span_many_pages_and_survive_writer_kill() {
 
     let mut w = Driver::spawn();
     answered(w.step(&format!("create {}", store.display())), "create");
-    commit_all(&mut w, &cmds, 300, "fill");
+    commit_all(&mut w, &mut model, &cmds, 300, "fill");
     assert_eq!(w.wait_for("hold", "holding"), Step::Answered(vec![]));
     assert!(w.kill().code().is_none());
 
@@ -138,7 +155,7 @@ fn replaced_and_removed_relationships_leave_no_stale_index_entries() {
 
     let mut w = Driver::spawn();
     answered(w.step(&format!("create {}", store.display())), "create");
-    commit_all(&mut w, &cmds, 300, "fill");
+    commit_all(&mut w, &mut model, &cmds, 300, "fill");
 
     // Remove the first, middle and last hub edges and every third one; retarget others.
     let mut edits = Vec::new();
@@ -157,7 +174,7 @@ fn replaced_and_removed_relationships_leave_no_stale_index_entries() {
     for i in 0..600 {
         edits.push(model.remove(&format!("hub-in-{i:05}")));
     }
-    commit_all(&mut w, &edits, 250, "edit");
+    commit_all(&mut w, &mut model, &edits, 250, "edit");
     answered(w.step("close"), "close");
     drop(w);
 
@@ -179,7 +196,7 @@ fn replaced_and_removed_relationships_leave_no_stale_index_entries() {
             )
         })
         .collect();
-    commit_all(&mut r, &refill, 300, "refill");
+    commit_all(&mut r, &mut model, &refill, 300, "refill");
     let got = rel_lines(answered(r.step("dump HUB"), "dump"));
     assert_eq!(got, model.expected("HUB"));
 }
@@ -200,7 +217,7 @@ fn metadata_grows_past_one_branch_and_traverses_with_a_tiny_cache() {
     }
     let mut w = Driver::spawn();
     answered(w.step(&format!("create {}", store.display())), "create");
-    commit_all(&mut w, &cmds, 500, "fill");
+    commit_all(&mut w, &mut model, &cmds, 500, "fill");
     answered(w.step("close"), "close");
     drop(w);
 
@@ -227,7 +244,7 @@ fn metadata_grows_past_one_branch_and_traverses_with_a_tiny_cache() {
 /// Pages through a query with the exclusive resume position, as a caller consuming a bounded cursor.
 fn page_all(d: &mut Driver, node: &str, dir: &str, kind: &str, size: usize) -> Vec<String> {
     let mut got: Vec<String> = Vec::new();
-    loop {
+    for _ in 0..10_000 {
         let after = got
             .last()
             .map(|l| format!(" {}", l.trim_start_matches("page ")))
@@ -237,12 +254,17 @@ fn page_all(d: &mut Driver, node: &str, dir: &str, kind: &str, size: usize) -> V
             "rels",
         );
         assert!(page.len() <= size);
+        // Every page must start strictly after the previous page's last entry.
+        if let (Some(prev), Some(first)) = (got.last(), page.first()) {
+            assert!(first > prev, "resume did not advance: {prev} then {first}");
+        }
         let done = page.len() < size;
         got.extend(page);
         if done {
             return got;
         }
     }
+    panic!("paging did not terminate");
 }
 
 #[test]
@@ -253,7 +275,7 @@ fn partially_consumed_ranges_resume_exactly_after_their_boundary() {
     let cmds = populate(&mut model);
     let mut d = Driver::spawn();
     answered(d.step(&format!("create {}", store.display())), "create");
-    commit_all(&mut d, &cmds, 300, "fill");
+    commit_all(&mut d, &mut model, &cmds, 300, "fill");
 
     // Expected page lines from the model, in result order.
     let expect = |dir: &str, kind: Option<&str>| -> Vec<String> {
