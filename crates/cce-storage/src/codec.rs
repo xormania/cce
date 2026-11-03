@@ -3,7 +3,7 @@
 //! Every decoder validates lengths before slicing and never trusts a length field to size an
 //! allocation beyond the bytes actually present.
 
-use scientdb_kernel::storage::StorageError;
+use cce_core::storage::StorageError;
 
 pub(crate) fn corrupt(what: impl Into<String>) -> StorageError {
     StorageError::Integrity(what.into())

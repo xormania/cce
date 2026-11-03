@@ -14,7 +14,7 @@
 //!
 //! Components use the order-preserving encoding in `codec::key_component`.
 
-use scientdb_kernel::storage::{
+use cce_core::storage::{
     AttemptId, Change, ChangeSet, ContentDigest, ContentRef, ContextId, Evidence, HistoryEntry,
     HistoryPosition, Precondition, RelationshipId, RelationshipKind, Revision, StorageError,
 };
@@ -268,7 +268,7 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
 /// Fingerprint binding an attempt identity to its exact logical request.
 pub(crate) fn fingerprint(attempt: &AttemptId, changes: &ChangeSet) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"scientdb.attempt.v1\0");
+    h.update(b"cce.attempt.v1\0");
     h.update((attempt.as_bytes().len() as u32).to_le_bytes());
     h.update(attempt.as_bytes());
     h.update(encode_request(changes));
@@ -369,7 +369,7 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scientdb_kernel::storage::{ContentBinding, StagingToken};
+    use cce_core::storage::{ContentBinding, StagingToken};
 
     fn sample(token: &[u8]) -> ChangeSet {
         ChangeSet {

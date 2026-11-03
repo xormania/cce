@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use scientdb_kernel::storage::StorageError;
+use cce_core::storage::StorageError;
 
 use crate::io::{FileId, Io};
 

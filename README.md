@@ -1,6 +1,6 @@
 # cce
 
-Repository for the ScientDB kernel work.
+Repository for the CCE kernel work.
 
 Start with [AGENTS.md](AGENTS.md) and the
 [local development setup specification](docs/local-development.md).

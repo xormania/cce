@@ -1,6 +1,6 @@
 # Storage failure model
 
-What the `scientdb-storage` engine promises today, under which assumptions, and how it is tested.
+What the `cce-storage` engine promises today, under which assumptions, and how it is tested.
 
 ## Platform assumptions
 

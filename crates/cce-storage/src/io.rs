@@ -9,7 +9,7 @@ use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use scientdb_kernel::storage::StorageError;
+use cce_core::storage::StorageError;
 
 pub(crate) const META_FILE: &str = "meta.sdb";
 pub(crate) const CONTENT_FILE: &str = "content.sdb";
@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn creating_a_store_makes_every_new_directory_entry_durable() {
-        let base = std::env::temp_dir().join(format!("scientdb-dirsync-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("cce-dirsync-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let store = base.join("a").join("b").join("store");
@@ -413,7 +413,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("scientdb-io-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("cce-io-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d

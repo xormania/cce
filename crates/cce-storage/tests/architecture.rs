@@ -8,8 +8,8 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 
-const KERNEL: &str = "scientdb-kernel";
-const STORAGE: &str = "scientdb-storage";
+const KERNEL: &str = "cce-core";
+const STORAGE: &str = "cce-storage";
 
 /// Database/storage engines that must never become the persistence path.
 const FORBIDDEN_ENGINES: &[&str] = &[
@@ -116,7 +116,7 @@ fn dependency_violations(meta: &Value) -> Vec<String> {
 fn driver_violations(source: &str) -> Vec<String> {
     let mut v = Vec::new();
     for line in source.lines().map(str::trim) {
-        if let Some(rest) = line.strip_prefix("use scientdb_storage::")
+        if let Some(rest) = line.strip_prefix("use cce_storage::")
             && !matches!(
                 rest.trim_end_matches(';'),
                 "NativeStore" | "{NativeStore, StoreOptions}"
@@ -235,15 +235,10 @@ fn driver_uses_only_the_logical_port() {
 #[test]
 fn driver_check_rejects_internal_imports_and_direct_file_access() {
     assert!(
-        driver_violations(
-            "use scientdb_storage::NativeStore;\nuse scientdb_kernel::storage::Change;"
-        )
-        .is_empty()
+        driver_violations("use cce_storage::NativeStore;\nuse cce_core::storage::Change;")
+            .is_empty()
     );
-    assert_eq!(
-        driver_violations("use scientdb_storage::tree::Page;").len(),
-        1
-    );
+    assert_eq!(driver_violations("use cce_storage::tree::Page;").len(), 1);
     assert_eq!(driver_violations("let f = std::fs::read(path);").len(), 1);
 }
 
