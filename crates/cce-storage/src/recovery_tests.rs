@@ -460,17 +460,61 @@ fn is_fenced_refusal(r: &Result<impl std::fmt::Debug, CommitError>) -> bool {
     matches!(r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.contains("writes fenced"))
 }
 
-/// Commit 1 succeeds; commit 2 hits a lossy failure of `barrier`. Returns the store, its
-/// simulator, the commit error, and both staged contents.
-fn lossy_failure_of(
-    barrier: Barrier,
-) -> (
-    NativeStore,
-    SimIo,
-    CommitError,
-    StagedContent,
-    StagedContent,
-) {
+/// A store after a lossy barrier failure of its second commit, with the results of the writes
+/// attempted afterwards (checked by the caller, after reopening, so that a missing fence is
+/// also observed by its effect on what reopening finds).
+struct LossyRun {
+    store: NativeStore,
+    sim: SimIo,
+    err: CommitError,
+    x: StagedContent,
+    y: StagedContent,
+    /// (what was attempted, refused as fenced, the result).
+    later: Vec<(&'static str, bool, String)>,
+}
+
+fn assert_later_writes_fenced(barrier: Barrier, later: &[(&'static str, bool, String)]) {
+    for (what, fenced, result) in later {
+        assert!(fenced, "{barrier:?}: {what} after the failure: {result}");
+    }
+}
+
+/// After reopening: every attempt reported committed has its history entry, and every content
+/// that entry binds reads back completely, as the bytes its request staged.
+fn assert_committed_content_readable(barrier: Barrier, s: &NativeStore) {
+    let mut v = s.begin().unwrap();
+    let history: Vec<_> = v
+        .history(HistoryPosition(0))
+        .unwrap()
+        .map(|h| h.unwrap())
+        .collect();
+    for step in 1..=4 {
+        let AttemptOutcome::Committed(r) = s.outcome(&attempt(step)).unwrap() else {
+            continue;
+        };
+        let entry = history
+            .iter()
+            .find(|h| h.position == r.position)
+            .unwrap_or_else(|| panic!("{barrier:?}: committed attempt {step} has no history"));
+        assert_eq!(entry.attempt, attempt(step), "{barrier:?}");
+        for c in &entry.content {
+            let mut bytes = Vec::new();
+            let read = v.content(c).and_then(|mut r| {
+                r.read_to_end(&mut bytes)
+                    .map_err(|e| StorageError::Io(e.to_string()))
+            });
+            assert!(
+                read.is_ok(),
+                "{barrier:?}: attempt {step} is committed but its content is unreadable: {read:?}"
+            );
+            assert_eq!(bytes, payload(step), "{barrier:?}: attempt {step} content");
+        }
+    }
+}
+
+/// Commit 1 succeeds; commit 2 hits a lossy failure of `barrier`; then a commit of content staged
+/// before the failure, a commit without content, and new staging are attempted.
+fn lossy_failure_of(barrier: Barrier) -> LossyRun {
     let n = barrier_op(barrier);
     let sim = SimIo::new();
     sim.lossy_sync_failures();
@@ -481,14 +525,16 @@ fn lossy_failure_of(
     let (a, cs) = request_with(&x, 2);
     let err = s.commit(a, s.begin().unwrap(), cs).unwrap_err();
 
-    // Writes stay fenced: neither the content staged before the failure nor anything new may be
-    // committed, and nothing new may be staged.
+    // Writes must stay fenced: neither the content staged before the failure nor anything new
+    // may be committed, and nothing new may be staged.
+    let mut later = Vec::new();
     let (a3, cs3) = request_with(&y, 3);
     let late = s.commit(a3, s.begin().unwrap(), cs3);
-    assert!(
+    later.push((
+        "commit of content staged before the failed barrier",
         is_fenced_refusal(&late),
-        "{barrier:?}: commit of content staged before the failed barrier: {late:?}"
-    );
+        format!("{late:?}"),
+    ));
     let unbound = ChangeSet {
         changes: vec![Change::PutContext {
             id: cid("D"),
@@ -499,13 +545,35 @@ fn lossy_failure_of(
         ..ChangeSet::default()
     };
     let late = s.commit(attempt(4), s.begin().unwrap(), unbound);
-    assert!(is_fenced_refusal(&late), "{barrier:?}: {late:?}");
+    later.push((
+        "commit without content",
+        is_fenced_refusal(&late),
+        format!("{late:?}"),
+    ));
     let staged = s.stage_content(&mut &b"more"[..]);
-    assert!(
+    later.push((
+        "staging",
         matches!(&staged, Err(StorageError::StoreState(m)) if m.contains("writes fenced")),
-        "{barrier:?}: staging after the failure: {staged:?}"
-    );
-    (s, sim, err, x, y)
+        format!("{staged:?}"),
+    ));
+    LossyRun {
+        store: s,
+        sim,
+        err,
+        x,
+        y,
+        later,
+    }
+}
+
+/// Opens each image once for the semantic check, leaving it reusable.
+fn check_content_after_reopen(barrier: Barrier, images: &[SimIo]) {
+    for img in images {
+        let s = open(Box::new(img.clone()));
+        assert_committed_content_readable(barrier, &s);
+        drop(s);
+        img.release();
+    }
 }
 
 /// Opens each image after a failed second commit: the store must show exactly the state after
@@ -564,30 +632,47 @@ fn a_lossy_failure_of_the_metadata_data_barrier_fences_and_recovers_the_old_stat
 }
 
 fn data_barrier_case(barrier: Barrier) {
-    let states = reference_states(1);
-    let (s, sim, err, x, y) = lossy_failure_of(barrier);
+    let LossyRun {
+        store,
+        sim,
+        err,
+        x,
+        y,
+        later,
+    } = lossy_failure_of(barrier);
     assert!(
         matches!(&err, CommitError::Rejected(StorageError::Io(m)) if m.contains("simulated I/O error")),
         "{barrier:?}: {err:?}"
     );
-    assert_eq!(s.outcome(&attempt(2)).unwrap(), AttemptOutcome::Absent);
-    assert_eq!(logical_state(&s), states[1], "{barrier:?}");
-    drop(s);
+    assert_eq!(store.outcome(&attempt(2)).unwrap(), AttemptOutcome::Absent);
     let power_loss = sim.after_crash(Persist::None);
+    drop(store);
     sim.release();
-    assert_recovers_pre_failure_state(barrier, vec![sim, power_loss], &x, &y);
+    let images = vec![sim, power_loss];
+    // Semantic check first: whatever was acknowledged must be readable after reopening.
+    check_content_after_reopen(barrier, &images);
+    assert_later_writes_fenced(barrier, &later);
+    assert_recovers_pre_failure_state(barrier, images, &x, &y);
 }
 
 #[test]
 fn a_lossy_failure_of_the_publication_barrier_is_indeterminate_and_recovers_a_whole_state() {
     let barrier = Barrier::Publication;
     let states = reference_states(1);
-    let (s, sim, err, x, y) = lossy_failure_of(barrier);
+    let LossyRun {
+        store: s,
+        sim,
+        err,
+        x,
+        y,
+        later,
+    } = lossy_failure_of(barrier);
     assert!(
         matches!(&err, CommitError::Indeterminate(m) if m.contains("uncertain")),
         "{err:?}"
     );
     assert_eq!(s.outcome(&attempt(2)).unwrap(), AttemptOutcome::Unknown);
+    assert_later_writes_fenced(barrier, &later);
     assert_eq!(logical_state(&s), states[1]);
     drop(s);
     let images = vec![
@@ -597,5 +682,6 @@ fn a_lossy_failure_of_the_publication_barrier_is_indeterminate_and_recovers_a_wh
     ];
     // The failed barrier dropped the unsynced publication record, so every image holds the old
     // generation; recovery must present it whole, with outcomes that agree with it.
+    check_content_after_reopen(barrier, &images);
     assert_recovers_pre_failure_state(barrier, images, &x, &y);
 }
