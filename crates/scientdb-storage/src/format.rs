@@ -33,7 +33,8 @@ pub(crate) struct PageRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum PageKind {
-    Leaf = 1,
+    /// A copy-on-write tree node (leaf or branch; see `tree::Node`).
+    Node = 1,
 }
 
 /// Encodes a node page. Fails with an explicit capacity error if the payload does not fit.
@@ -45,7 +46,7 @@ pub(crate) fn encode_page(
 ) -> Result<Vec<u8>, StorageError> {
     if payload.len() > PAGE_PAYLOAD_MAX {
         return Err(StorageError::InvalidRequest(format!(
-            "capacity: node payload {} exceeds {PAGE_PAYLOAD_MAX} bytes (single-leaf limit)",
+            "capacity: node payload {} exceeds {PAGE_PAYLOAD_MAX} bytes ",
             payload.len()
         )));
     }
@@ -230,28 +231,28 @@ mod tests {
             page: 5,
             incarnation: 3,
         };
-        let p = encode_page(S, PageKind::Leaf, at, b"payload").unwrap();
+        let p = encode_page(S, PageKind::Node, at, b"payload").unwrap();
         assert_eq!(p.len(), PAGE_SIZE);
-        assert_eq!(decode_page(S, PageKind::Leaf, at, &p).unwrap(), b"payload");
+        assert_eq!(decode_page(S, PageKind::Node, at, &p).unwrap(), b"payload");
         let stale = PageRef {
             page: 5,
             incarnation: 2,
         };
         assert!(
-            decode_page(S, PageKind::Leaf, stale, &p).is_err(),
+            decode_page(S, PageKind::Node, stale, &p).is_err(),
             "old incarnation accepted"
         );
         assert!(
-            decode_page(StoreId([8; 16]), PageKind::Leaf, at, &p).is_err(),
+            decode_page(StoreId([8; 16]), PageKind::Node, at, &p).is_err(),
             "foreign page accepted"
         );
         let mut flipped = p.clone();
         flipped[PAGE_HEADER_LEN + 2] ^= 1;
         assert!(
-            decode_page(S, PageKind::Leaf, at, &flipped).is_err(),
+            decode_page(S, PageKind::Node, at, &flipped).is_err(),
             "corrupt payload accepted"
         );
-        assert!(encode_page(S, PageKind::Leaf, at, &vec![0; PAGE_PAYLOAD_MAX + 1]).is_err());
+        assert!(encode_page(S, PageKind::Node, at, &vec![0; PAGE_PAYLOAD_MAX + 1]).is_err());
     }
 
     #[test]
