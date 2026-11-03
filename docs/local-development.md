@@ -184,10 +184,10 @@ faults, rerun the checks, and confirm that setup left no fixture or generated
 output staged for the production repository.
 
 If xor supplies an implementation brief with additional tool requirements,
-identify and prepare them before claiming readiness for those checks. In the
-current native-storage brief, coverage-guided fuzzing uses separately pinned
-nightly Rust and cargo-fuzz on a supported host; product builds stay on stable.
-Record that capability separately. This does not authorize implementing the
+identify and prepare them before claiming readiness for those checks. Tools
+that need a separately pinned toolchain (for example, nightly-only tooling)
+stay isolated from product builds, which use stable. Record such capabilities
+separately. This does not authorize implementing the
 kernel or making nightly the user's default as part of environment setup.
 
 ## 6. Record the handoff

@@ -1,0 +1,41 @@
+name: leak-guard
+# Fails a PR if its title, body, commit messages or added lines match private markers.
+# The marker regex lives in a repo variable (Settings > Secrets and variables > Actions >
+# Variables > PRIVATE_MARKERS), so the list itself is never committed.
+# Re-runs when the PR body is edited.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      MARKERS: ${{ vars.PRIVATE_MARKERS }}
+      BASE: ${{ github.event.pull_request.base.sha }}
+      HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan PR text, commits and diff
+        run: |
+          set -euo pipefail
+          if [ -z "${MARKERS}" ]; then echo "PRIVATE_MARKERS not set; skipping"; exit 0; fi
+          jq -r '.pull_request.title, (.pull_request.body // "")' "$GITHUB_EVENT_PATH" > /tmp/pr.txt
+          git log --format='%B' "$BASE..$HEAD" > /tmp/commits.txt
+          git diff "$BASE...$HEAD" -U0 | grep '^+' | grep -v '^+++' > /tmp/added.txt || true
+          git diff --name-only "$BASE...$HEAD" > /tmp/files.txt
+          fail=0
+          for f in pr commits added files; do
+            if grep -nEi -- "$MARKERS" "/tmp/$f.txt" > "/tmp/$f.hits"; then
+              echo "::error::private marker found in PR $f (rewrite it; matches not echoed)"
+              wc -l < "/tmp/$f.hits"
+              fail=1
+            fi
+          done
+          exit $fail
