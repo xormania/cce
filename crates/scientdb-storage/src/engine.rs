@@ -30,8 +30,8 @@ use crate::format::{
 };
 use crate::io::{FileId, Io};
 use crate::records::{
-    AttemptValue, ContextValue, ExtentRef, P_ATTEMPT, P_CONTENT, P_CONTEXT, P_HISTORY, P_IN, P_OUT,
-    P_REL, RelValue, decode_history, encode_history, fingerprint, history_key, key,
+    AttemptValue, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT, P_HISTORY,
+    P_IN, P_OUT, P_REL, RelValue, decode_history, encode_history, fingerprint, history_key, key,
 };
 use crate::tree::{self, Cursor, Node, NodeSink, NodeSource, TreeTxn};
 
@@ -39,6 +39,9 @@ use crate::tree::{self, Cursor, Node, NodeSink, NodeSource, TreeTxn};
 pub(crate) const CONTENT_CHUNK: usize = 64 * 1024;
 /// Default number of decoded tree nodes kept in memory.
 pub(crate) const DEFAULT_CACHE_NODES: usize = 256;
+
+/// Staged or bound content: its manifest's location and its logical reference.
+type BoundContent = (ExtentRef, ContentRef);
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
@@ -75,7 +78,7 @@ pub(crate) struct Snapshot {
 struct State {
     current: Descriptor,
     /// Staged, not yet committed extents of this open instance: serial → extent.
-    staged: HashMap<u64, ExtentRef>,
+    staged: HashMap<u64, BoundContent>,
     /// Next staging serial; each staging gets a distinct handle even for zero-length content.
     next_stage: u64,
     /// Set when a publication outcome is uncertain; further writes are refused.
@@ -312,38 +315,63 @@ impl Inner {
             return Err(StorageError::StoreState(format!("writes fenced: {f}")));
         }
         let mut cursor = lock(&self.alloc);
-        let offset = *cursor;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0; CONTENT_CHUNK];
+        let start = *cursor;
+        let mut at = start;
+        let mut total = Sha256::new();
         let mut len = 0u64;
+        let mut segments = Vec::new();
+        let mut buf = vec![0; CONTENT_CHUNK];
         loop {
-            let n = match bytes.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(StorageError::Io(format!("staging source: {e}"))),
-            };
-            self.io.write_at(FileId::Content, offset + len, &buf[..n])?;
+            // Fill one segment (short reads and interruptions are retried), then write it.
+            let mut filled = 0;
+            while filled < buf.len() {
+                match bytes.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(StorageError::Io(format!("staging source: {e}"))),
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            let seg = &buf[..filled];
+            self.io.write_at(FileId::Content, at, seg)?;
             self.counters
                 .content_bytes_written
-                .fetch_add(n as u64, Ordering::Relaxed);
-            hasher.update(&buf[..n]);
-            len += n as u64;
+                .fetch_add(filled as u64, Ordering::Relaxed);
+            segments.push(ExtentRef {
+                offset: at,
+                len: filled as u64,
+                digest: sha256(seg),
+            });
+            total.update(seg);
+            at += filled as u64;
+            len += filled as u64;
+            if filled < buf.len() {
+                break;
+            }
         }
-        *cursor = offset + len;
-        let digest: [u8; 32] = hasher.finalize().into();
+        let content = ContentRef {
+            digest: ContentDigest(total.finalize().into()),
+            len,
+        };
+        let manifest = Manifest { content, segments }.encode();
+        self.io.write_at(FileId::Content, at, &manifest)?;
+        self.counters
+            .content_bytes_written
+            .fetch_add(manifest.len() as u64, Ordering::Relaxed);
+        let mref = ExtentRef {
+            offset: at,
+            len: manifest.len() as u64,
+            digest: sha256(&manifest),
+        };
+        *cursor = at + mref.len;
         let serial = {
             let mut st = lock(&self.state);
             let serial = st.next_stage;
             st.next_stage += 1;
-            st.staged.insert(
-                serial,
-                ExtentRef {
-                    offset,
-                    len,
-                    digest,
-                },
-            );
+            st.staged.insert(serial, (mref, content));
             serial
         };
         let mut t = Enc::default();
@@ -351,12 +379,9 @@ impl Inner {
             .u64(self.instance)
             .u64(serial)
             .u64(len)
-            .raw(&digest);
+            .raw(&content.digest.0);
         Ok(StagedContent {
-            content: ContentRef {
-                digest: ContentDigest(digest),
-                len,
-            },
+            content,
             token: StagingToken(t.buf),
         })
     }
@@ -366,7 +391,7 @@ impl Inner {
         &self,
         token: &StagingToken,
         content: &ContentRef,
-    ) -> Result<(u64, ExtentRef), StorageError> {
+    ) -> Result<(u64, BoundContent), StorageError> {
         let mut d = Dec::new(&token.0, "staging token");
         let parsed = (|| -> Result<_, StorageError> {
             let s: [u8; 16] = d.array()?;
@@ -384,13 +409,8 @@ impl Inner {
         }
         let staged = lock(&self.state).staged.get(&serial).copied();
         match staged {
-            Some(x)
-                if x.len == len
-                    && x.digest == dig
-                    && content.len == len
-                    && content.digest.0 == dig =>
-            {
-                Ok((serial, x))
+            Some((m, c)) if c.len == len && c.digest.0 == dig && *content == c => {
+                Ok((serial, (m, c)))
             }
             _ => Err(StorageError::ForeignHandle),
         }
@@ -451,7 +471,7 @@ impl Inner {
             ))
         })?;
         let bound = self.resolve_content(&cs)?;
-        let extents: Vec<ExtentRef> = bound.iter().map(|(_, x)| *x).collect();
+        let extents: Vec<BoundContent> = bound.iter().map(|(_, x)| *x).collect();
         apply(&mut txn, &cs, &extents, pos)?;
 
         // History entry → content file; then touched tree nodes → fresh metadata pages.
@@ -535,7 +555,7 @@ impl Inner {
         })
     }
 
-    fn resolve_content(&self, cs: &ChangeSet) -> Result<Vec<(u64, ExtentRef)>, CommitError> {
+    fn resolve_content(&self, cs: &ChangeSet) -> Result<Vec<(u64, BoundContent)>, CommitError> {
         cs.content
             .iter()
             .map(|b| self.staged_extent(&b.token, &b.content).map_err(rejected))
@@ -580,7 +600,7 @@ impl Inner {
             id: id.clone(),
             revision: Revision(v.revision),
             body: v.body,
-            content: v.content.map(|x| x.content_ref()),
+            content: v.content,
         }))
     }
 
@@ -654,34 +674,54 @@ impl Inner {
         }))
     }
 
+    /// Physical segments holding committed content, in stream order (inspection for tests and tools).
+    /// The committed manifest of `c` in this view, checked against the request.
+    fn manifest(&self, s: &Snapshot, c: &ContentRef) -> Result<Manifest, StorageError> {
+        let x =
+            tree::get(self, s.desc.root, &key(P_CONTENT, &[&c.digest.0]))?.ok_or_else(|| {
+                StorageError::InvalidRequest("content is not committed in this view".into())
+            })?;
+        let m = Manifest::decode(&self.read_extent(&ExtentRef::decode(&x)?)?)?;
+        if m.content != *c {
+            return Err(corrupt(
+                "content manifest does not match the requested digest and length",
+            ));
+        }
+        let committed = lock(&self.state).current.content_len;
+        if m.segments.iter().any(|x| {
+            x.offset
+                .checked_add(x.len)
+                .is_none_or(|end| end > committed)
+        }) {
+            return Err(corrupt("content segment lies outside committed content"));
+        }
+        Ok(m)
+    }
+
+    /// Physical segments holding committed content, in stream order (inspection for tests).
+    #[cfg(test)]
+    pub(crate) fn content_segments(
+        &self,
+        s: &Snapshot,
+        c: &ContentRef,
+    ) -> Result<Vec<ExtentRef>, StorageError> {
+        Ok(self.manifest(s, c)?.segments)
+    }
+
     pub fn content(
         self: &Arc<Self>,
         s: &Snapshot,
         c: &ContentRef,
-    ) -> Result<ExtentReader, StorageError> {
-        let x =
-            tree::get(&**self, s.desc.root, &key(P_CONTENT, &[&c.digest.0]))?.ok_or_else(|| {
-                StorageError::InvalidRequest("content is not committed in this view".into())
-            })?;
-        let x = ExtentRef::decode(&x)?;
-        if x.len != c.len || x.digest != c.digest.0 {
-            return Err(corrupt(
-                "content record does not match the requested digest and length",
-            ));
-        }
-        let committed = lock(&self.state).current.content_len;
-        if x.offset
-            .checked_add(x.len)
-            .is_none_or(|end| end > committed)
-        {
-            return Err(corrupt("content extent lies outside committed content"));
-        }
-        Ok(ExtentReader {
+    ) -> Result<SegmentReader, StorageError> {
+        let m = self.manifest(s, c)?;
+        Ok(SegmentReader {
             inner: self.clone(),
-            extent: x,
+            manifest: m,
+            next: 0,
+            buf: Vec::new(),
             pos: 0,
-            hasher: Sha256::new(),
-            failed: false,
+            total: Sha256::new(),
+            failed: None,
         })
     }
 }
@@ -744,7 +784,7 @@ fn select(slots: &[Slot]) -> Result<(Descriptor, Vec<String>), StorageError> {
 fn apply(
     t: &mut TreeTxn,
     cs: &ChangeSet,
-    bound: &[ExtentRef],
+    bound: &[BoundContent],
     pos: u64,
 ) -> Result<(), CommitError> {
     let invalid = |m: String| CommitError::Rejected(StorageError::InvalidRequest(m));
@@ -809,10 +849,10 @@ fn apply(
                             .ok_or_else(|| invalid(format!("content index {i} out of range")))?,
                     ),
                 };
-                if let Some(x) = content {
-                    let ck = key(P_CONTENT, &[&x.digest]);
+                if let Some((manifest, c)) = content {
+                    let ck = key(P_CONTENT, &[&c.digest.0]);
                     if t.get(&ck).map_err(rejected)?.is_none() {
-                        t.put(ck, x.encode()).map_err(rejected)?;
+                        t.put(ck, manifest.encode()).map_err(rejected)?;
                     }
                 }
                 let revision = pos;
@@ -821,7 +861,7 @@ fn apply(
                     ContextValue {
                         revision,
                         body: body.clone(),
-                        content,
+                        content: content.map(|(_, c)| c),
                     }
                     .encode(),
                 )
@@ -905,52 +945,61 @@ fn apply(
     Ok(())
 }
 
-/// Streams committed content in bounded chunks and verifies its digest before reporting EOF.
+/// Streams committed content one segment at a time.
 ///
-/// Integrity contract: the digest covers the whole extent and is checked when the stream ends.
-/// Bytes delivered before a mismatch are not verified; a mismatch makes the read fail instead of
-/// reporting a complete stream.
-pub(crate) struct ExtentReader {
+/// Integrity contract: each segment (at most one streaming buffer) is read whole and checked against
+/// its digest before any of its bytes are delivered; the digest of the complete stream is checked
+/// before end of stream is reported. After a failed check every further read fails, naming the
+/// segment that did not verify.
+pub(crate) struct SegmentReader {
     inner: Arc<Inner>,
-    extent: ExtentRef,
-    pos: u64,
-    hasher: Sha256,
-    failed: bool,
+    manifest: Manifest,
+    next: usize,
+    buf: Vec<u8>,
+    pos: usize,
+    total: Sha256,
+    failed: Option<String>,
 }
 
-impl Read for ExtentReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.failed {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "content integrity check failed",
-            ));
+impl Read for SegmentReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if let Some(f) = &self.failed {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, f.clone()));
         }
-        let left = self.extent.len - self.pos;
-        if left == 0 {
-            let got: [u8; 32] = self.hasher.clone().finalize().into();
-            if got != self.extent.digest {
-                self.failed = true;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("content at {}: digest mismatch", self.extent.offset),
-                ));
+        if self.pos == self.buf.len() {
+            let Some(x) = self.manifest.segments.get(self.next).copied() else {
+                let got: [u8; 32] = self.total.clone().finalize().into();
+                if got != self.manifest.content.digest.0 {
+                    let why = "content stream digest mismatch".to_string();
+                    self.failed = Some(why.clone());
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, why));
+                }
+                return Ok(0);
+            };
+            self.buf.resize(x.len as usize, 0);
+            self.inner
+                .io
+                .read_at(FileId::Content, x.offset, &mut self.buf)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            if sha256(&self.buf) != x.digest {
+                let why = format!(
+                    "content segment {} at offset {}: digest mismatch",
+                    self.next, x.offset
+                );
+                self.failed = Some(why.clone());
+                self.buf.clear();
+                self.pos = 0;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, why));
             }
-            return Ok(0);
+            self.total.update(&self.buf);
+            self.next += 1;
+            self.pos = 0;
         }
-        let n = buf.len().min(CONTENT_CHUNK).min(left as usize);
-        self.inner
-            .io
-            .read_at(
-                FileId::Content,
-                self.extent.offset + self.pos,
-                &mut buf[..n],
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        self.hasher.update(&buf[..n]);
-        self.pos += n as u64;
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
         Ok(n)
     }
 }
 
-impl ContentReader for ExtentReader {}
+impl ContentReader for SegmentReader {}

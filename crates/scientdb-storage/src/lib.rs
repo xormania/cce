@@ -6,6 +6,8 @@
 
 mod codec;
 #[cfg(test)]
+mod content_tests;
+#[cfg(test)]
 mod crash_tests;
 mod engine;
 #[cfg(test)]
