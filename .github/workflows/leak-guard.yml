@@ -1,7 +1,8 @@
 name: leak-guard
 # Fails a PR if its title, body, commit messages or added lines match private markers.
-# The marker regex lives in a repo variable (Settings > Secrets and variables > Actions >
-# Variables > PRIVATE_MARKERS), so the list itself is never committed.
+# The marker regex lives in a repository secret (Settings > Secrets and variables > Actions >
+# Secrets > PRIVATE_MARKERS), so the list itself is never committed or shown in logs.
+# A missing secret fails the check: an unscanned PR must never look clean.
 # Re-runs when the PR body is edited.
 
 on:
@@ -15,7 +16,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     env:
-      MARKERS: ${{ vars.PRIVATE_MARKERS }}
+      MARKERS: ${{ secrets.PRIVATE_MARKERS }}
       BASE: ${{ github.event.pull_request.base.sha }}
       HEAD: ${{ github.event.pull_request.head.sha }}
     steps:
@@ -25,7 +26,7 @@ jobs:
       - name: Scan PR text, commits and diff
         run: |
           set -euo pipefail
-          if [ -z "${MARKERS}" ]; then echo "PRIVATE_MARKERS not set; skipping"; exit 0; fi
+          if [ -z "${MARKERS}" ]; then echo "::error::PRIVATE_MARKERS secret is not available; nothing was scanned"; exit 1; fi
           jq -r '.pull_request.title, (.pull_request.body // "")' "$GITHUB_EVENT_PATH" > /tmp/pr.txt
           git log --format='%B' "$BASE..$HEAD" > /tmp/commits.txt
           git diff "$BASE...$HEAD" -U0 | grep '^+' | grep -v '^+++' > /tmp/added.txt || true
