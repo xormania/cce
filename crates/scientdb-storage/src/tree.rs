@@ -336,6 +336,8 @@ pub(crate) struct TreeTxn<'a> {
     src: &'a dyn NodeSource,
     arena: Vec<Work>,
     root: Child,
+    /// Every key put or deleted, in order (the transaction's write set).
+    touched: Vec<Vec<u8>>,
 }
 
 enum Outcome {
@@ -352,6 +354,7 @@ impl<'a> TreeTxn<'a> {
             src,
             arena: Vec::new(),
             root: Child::Clean(root),
+            touched: Vec::new(),
         }
     }
 
@@ -394,6 +397,7 @@ impl<'a> TreeTxn<'a> {
                 value.len()
             )));
         }
+        self.touched.push(key.clone());
         let root = self.dirty(self.root)?;
         self.root = Child::Dirty(root);
         if let Outcome::Split(sep, right) = self.put_in(root, key, value, 0)? {
@@ -506,6 +510,7 @@ impl<'a> TreeTxn<'a> {
         if self.get(key)?.is_none() {
             return Ok(false);
         }
+        self.touched.push(key.to_vec());
         let root = self.dirty(self.root)?;
         self.root = Child::Dirty(root);
         match self.delete_in(root, key, 0)? {
@@ -622,6 +627,11 @@ impl<'a> TreeTxn<'a> {
         children.remove(r);
         seps.remove(r - 1);
         Ok(())
+    }
+
+    /// Keys put or deleted by this transaction.
+    pub fn touched(&self) -> &[Vec<u8>] {
+        &self.touched
     }
 
     /// Writes every touched node to fresh pages (children first) and returns the new root.

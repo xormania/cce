@@ -18,6 +18,8 @@ mod records;
 #[cfg(test)]
 mod sim;
 mod tree;
+#[cfg(test)]
+mod view_tests;
 
 use std::io::Read;
 use std::path::Path;
@@ -29,7 +31,7 @@ use scientdb_kernel::storage::{
     RelationshipQuery, StagedContent, StorageEngine, StorageError,
 };
 
-use engine::{Inner, Options, Snapshot};
+use engine::{Inner, Observation, Options, Snapshot};
 
 /// A native store owned by this process.
 ///
@@ -114,6 +116,7 @@ impl From<StoreOptions> for Options {
     fn from(o: StoreOptions) -> Self {
         Options {
             cache_nodes: o.cache_nodes,
+            ..Options::default()
         }
     }
 }
@@ -135,10 +138,14 @@ pub struct StoreStats {
 pub struct NativeView {
     inner: Arc<Inner>,
     snap: Snapshot,
+    /// Logical reads made through this view; a commit from it is validated against them.
+    observed: Vec<Observation>,
 }
 
 impl ReadView for NativeView {
     fn context(&mut self, id: &ContextId) -> Result<Option<ContextRecord>, StorageError> {
+        self.observed
+            .push(Observation::Point(engine::context_key(id)));
         self.inner.context(&self.snap, id)
     }
 
@@ -147,6 +154,9 @@ impl ReadView for NativeView {
         query: &RelationshipQuery,
     ) -> Result<Box<dyn Iterator<Item = Result<Relationship, StorageError>> + '_>, StorageError>
     {
+        // Registered before any result is produced, so an empty or partly consumed range is protected.
+        self.observed
+            .push(Observation::Range(engine::relationship_range(query)));
         Ok(Box::new(self.inner.relationships(&self.snap, query)?))
     }
 
@@ -170,6 +180,7 @@ impl StorageEngine for NativeStore {
         Ok(NativeView {
             inner: self.inner.clone(),
             snap: self.inner.snapshot()?,
+            observed: Vec::new(),
         })
     }
 
@@ -194,7 +205,8 @@ impl StorageEngine for NativeStore {
         if !Arc::ptr_eq(&basis.inner, &self.inner) {
             return Err(CommitError::Rejected(StorageError::ForeignHandle));
         }
-        self.inner.commit(attempt, basis.snap, changes)
+        self.inner
+            .commit(attempt, basis.snap, &basis.observed, changes)
     }
 
     fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {

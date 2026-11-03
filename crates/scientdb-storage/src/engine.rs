@@ -49,12 +49,18 @@ static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Options {
     pub cache_nodes: usize,
+    /// Commits whose write sets are retained for validating older read bases.
+    pub conflict_window: usize,
 }
+
+/// Default number of recent commits whose write sets are kept for conflict validation.
+pub(crate) const DEFAULT_CONFLICT_WINDOW: usize = 4096;
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             cache_nodes: DEFAULT_CACHE_NODES,
+            conflict_window: DEFAULT_CONFLICT_WINDOW,
         }
     }
 }
@@ -102,6 +108,8 @@ pub(crate) struct Inner {
     /// Content-file allocation cursor; held while streaming an allocation.
     alloc: Mutex<u64>,
     cache: Mutex<NodeCache>,
+    /// Logical write sets of recent commits, for validating older read bases.
+    conflicts: Mutex<ConflictLog>,
     pub counters: Counters,
     /// Recovery diagnostics from open (for example an ignored damaged slot).
     pub diagnostics: Vec<String>,
@@ -278,6 +286,11 @@ impl Inner {
                 map: HashMap::new(),
                 order: VecDeque::new(),
                 capacity: opts.cache_nodes,
+            }),
+            conflicts: Mutex::new(ConflictLog {
+                floor: desc.history_pos,
+                entries: VecDeque::new(),
+                capacity: opts.conflict_window.max(1),
             }),
             counters: Counters::default(),
             diagnostics,
@@ -462,7 +475,8 @@ impl Inner {
     pub fn commit(
         &self,
         attempt: AttemptId,
-        _basis: Snapshot,
+        basis: Snapshot,
+        observed: &[Observation],
         cs: ChangeSet,
     ) -> Result<CommitReceipt, CommitError> {
         let _w = lock(&self.writer);
@@ -506,6 +520,9 @@ impl Inner {
             };
         }
 
+        // The basis must still hold: nothing it observed may have been written since.
+        lock(&self.conflicts).validate(basis.desc.history_pos, observed)?;
+
         let pos = cur.history_pos.checked_add(1).ok_or_else(|| {
             rejected(StorageError::InvalidRequest(
                 "history position overflow".into(),
@@ -514,6 +531,12 @@ impl Inner {
         let bound = self.resolve_content(&cs)?;
         let extents: Vec<BoundContent> = bound.iter().map(|(_, x)| *x).collect();
         apply(&mut txn, &cs, &extents, pos)?;
+        let written: Vec<Vec<u8>> = txn
+            .touched()
+            .iter()
+            .filter(|k| matches!(k.first(), Some(&P_CONTEXT | &P_REL | &P_OUT | &P_IN)))
+            .cloned()
+            .collect();
 
         // History entry → content file; then touched tree nodes → fresh metadata pages.
         let hist = encode_history(pos, &attempt, &cs);
@@ -585,6 +608,7 @@ impl Inner {
             return Err(CommitError::Indeterminate(why));
         }
 
+        lock(&self.conflicts).record(pos, written);
         let mut st = lock(&self.state);
         st.current = desc;
         for (serial, _) in &bound {
@@ -655,11 +679,7 @@ impl Inner {
             Direction::Outgoing => P_OUT,
             Direction::Incoming => P_IN,
         };
-        let mut prefix = vec![p];
-        key_component(&mut prefix, q.from.as_bytes());
-        if let Some(k) = &q.kind {
-            key_component(&mut prefix, k.as_bytes());
-        }
+        let prefix = relationship_range(q);
         let start = match &q.after {
             None => None,
             Some(a) => {
@@ -770,6 +790,105 @@ impl Inner {
             total: Sha256::new(),
             failed: None,
         })
+    }
+}
+
+/// A logical read a view made, protected until the view's commit is validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Observation {
+    /// A point read of one record key, including a read that found nothing.
+    Point(Vec<u8>),
+    /// A range read: every key with this prefix. The whole queried domain is protected, however
+    /// much of the range the caller consumed.
+    Range(Vec<u8>),
+}
+
+impl Observation {
+    fn covers(&self, key: &[u8]) -> bool {
+        match self {
+            Observation::Point(k) => k.as_slice() == key,
+            Observation::Range(p) => key.starts_with(p),
+        }
+    }
+}
+
+/// The key a context point read observes.
+pub(crate) fn context_key(id: &ContextId) -> Vec<u8> {
+    key(P_CONTEXT, &[id.as_bytes()])
+}
+
+/// The key range a relationship query observes: one direction, one node, optionally one kind.
+pub(crate) fn relationship_range(q: &RelationshipQuery) -> Vec<u8> {
+    let mut prefix = vec![match q.direction {
+        Direction::Outgoing => P_OUT,
+        Direction::Incoming => P_IN,
+    }];
+    key_component(&mut prefix, q.from.as_bytes());
+    if let Some(k) = &q.kind {
+        key_component(&mut prefix, k.as_bytes());
+    }
+    prefix
+}
+
+/// Logical write sets of recent commits. `floor` is the newest history position whose successors'
+/// writes are all retained; a basis older than that cannot be validated.
+struct ConflictLog {
+    floor: u64,
+    entries: VecDeque<(u64, Vec<Vec<u8>>)>,
+    capacity: usize,
+}
+
+fn describe(key: &[u8]) -> String {
+    let family = match key.first() {
+        Some(&P_CONTEXT) => "context",
+        Some(&P_REL) => "relationship",
+        Some(&P_OUT) => "outgoing relationship index",
+        Some(&P_IN) => "incoming relationship index",
+        _ => "record",
+    };
+    let parts = key_components(key.get(1..).unwrap_or_default()).unwrap_or_default();
+    let parts: Vec<String> = parts
+        .iter()
+        .map(|p| format!("{:?}", String::from_utf8_lossy(p)))
+        .collect();
+    format!("{family} {}", parts.join("/"))
+}
+
+impl ConflictLog {
+    fn validate(&self, basis: u64, observed: &[Observation]) -> Result<(), CommitError> {
+        if observed.is_empty() {
+            return Ok(());
+        }
+        if basis < self.floor {
+            return Err(CommitError::Conflict(format!(
+                "read basis at history position {basis} is older than the retained conflict history (from {}); prepare again",
+                self.floor
+            )));
+        }
+        for (pos, keys) in self.entries.iter().filter(|(pos, _)| *pos > basis) {
+            for k in keys {
+                if let Some(o) = observed.iter().find(|o| o.covers(k)) {
+                    let what = match o {
+                        Observation::Point(_) => "a record read",
+                        Observation::Range(_) => "a range read",
+                    };
+                    return Err(CommitError::Conflict(format!(
+                        "{} was written at history position {pos}, after {what} at {basis}",
+                        describe(k)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, pos: u64, keys: Vec<Vec<u8>>) {
+        self.entries.push_back((pos, keys));
+        while self.entries.len() > self.capacity {
+            if let Some((old, _)) = self.entries.pop_front() {
+                self.floor = old;
+            }
+        }
     }
 }
 
