@@ -718,3 +718,65 @@ fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
     let s = reopen(&after_power_loss);
     assert!(revision(&s, "A").is_some());
 }
+
+#[test]
+fn a_page_counter_whose_byte_offset_is_unrepresentable_refuses_the_commit() {
+    let s = store();
+    commit(
+        &s,
+        "a",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    // The next node page would lie beyond the largest representable file offset.
+    s.inner
+        .set_cursors_for_test(Some(u64::MAX / PAGE_SIZE as u64 + 1), None);
+    let r = commit(
+        &s,
+        "b",
+        changes(vec![put("B", Precondition::Absent, b"b", None)]),
+    );
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.contains("exhausted")),
+        "{r:?}"
+    );
+    assert!(revision(&s, "A").is_some(), "existing state stays readable");
+    assert!(
+        revision(&s, "B").is_none(),
+        "nothing from the refused commit is visible"
+    );
+}
+
+#[test]
+fn a_content_cursor_near_its_limit_refuses_staging_without_wrapping() {
+    let s = store();
+    s.inner.set_cursors_for_test(None, Some(u64::MAX - 50));
+    let r = s.stage_content(&mut &[1u8; 100][..]).map(|_| ());
+    assert!(
+        matches!(&r, Err(StorageError::InvalidRequest(m)) if m.contains("exhausted")),
+        "{r:?}"
+    );
+    // A manifest that would cross the limit is refused too (an empty stream writes only a manifest).
+    s.inner.set_cursors_for_test(None, Some(u64::MAX - 20));
+    let r = s.stage_content(&mut &[][..]).map(|_| ());
+    assert!(
+        matches!(&r, Err(StorageError::InvalidRequest(m)) if m.contains("exhausted")),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn a_history_extent_that_would_cross_the_content_limit_refuses_the_commit() {
+    let s = store();
+    s.inner.set_cursors_for_test(None, Some(u64::MAX - 8));
+    let r = commit(
+        &s,
+        "a",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    );
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.contains("exhausted")),
+        "{r:?}"
+    );
+    assert!(revision(&s, "A").is_none());
+}
