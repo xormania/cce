@@ -146,7 +146,10 @@ pub enum Change {
         target: ContextId,
     },
     /// Remove one relationship and its access paths.
-    RemoveRelationship { id: RelationshipId, expect: Precondition },
+    RemoveRelationship {
+        id: RelationshipId,
+        expect: Precondition,
+    },
 }
 
 /// One complete logical change submitted atomically.
@@ -168,7 +171,10 @@ pub struct ContentBinding {
 
 impl From<&StagedContent> for ContentBinding {
     fn from(s: &StagedContent) -> Self {
-        Self { content: s.content, token: s.token.clone() }
+        Self {
+            content: s.content,
+            token: s.token.clone(),
+        }
     }
 }
 
