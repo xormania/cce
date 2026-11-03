@@ -11,6 +11,8 @@ mod codec;
 mod content_tests;
 #[cfg(test)]
 mod crash_tests;
+#[cfg(test)]
+mod descriptor_tests;
 mod engine;
 #[cfg(test)]
 mod engine_tests;
