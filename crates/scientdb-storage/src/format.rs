@@ -8,9 +8,11 @@ use scientdb_kernel::storage::StorageError;
 use crate::codec::{Dec, Enc, corrupt};
 
 pub(crate) const PAGE_SIZE: usize = 4096;
-/// Version 2: tagged leaf/branch tree nodes (version 1 had single-leaf trees). Older versions are
+/// Version 3: content stored as verified segments with manifests, and context records holding logical
+/// content references (version 2 had single-extent content; version 1 single-leaf trees). Older
+/// versions are
 /// refused, never reinterpreted.
-pub(crate) const FORMAT_VERSION: u16 = 2;
+pub(crate) const FORMAT_VERSION: u16 = 3;
 pub(crate) const PAGE_MAGIC: [u8; 4] = *b"SDBP";
 pub(crate) const DESC_MAGIC: [u8; 4] = *b"SDBD";
 /// Pages 0 and 1 are publication slots.
