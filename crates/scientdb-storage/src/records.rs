@@ -443,6 +443,11 @@ pub(crate) struct Manifest {
 }
 
 impl Manifest {
+    /// Encoded size of a manifest with `segments` segments.
+    pub fn encoded_len(segments: usize) -> u64 {
+        1 + 32 + 8 + 4 + 48 * segments as u64
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut e = Enc::default();
         e.u8(MANIFEST_V1)
@@ -452,6 +457,7 @@ impl Manifest {
         for x in &self.segments {
             x.enc(&mut e);
         }
+        debug_assert_eq!(e.buf.len() as u64, Self::encoded_len(self.segments.len()));
         e.buf
     }
 

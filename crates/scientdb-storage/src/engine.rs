@@ -37,6 +37,8 @@ use crate::tree::{self, Cursor, Node, NodeSink, NodeSource, TreeTxn};
 
 /// Content streaming buffer. Payloads of any length stream through a buffer of this size.
 pub(crate) const CONTENT_CHUNK: usize = 64 * 1024;
+/// Default segment quota per content stream: 2^20 segments of 64 KiB (64 GiB).
+pub(crate) const DEFAULT_MAX_CONTENT_SEGMENTS: usize = 1 << 20;
 /// Default number of decoded tree nodes kept in memory.
 pub(crate) const DEFAULT_CACHE_NODES: usize = 256;
 
@@ -53,6 +55,8 @@ pub(crate) struct Options {
     pub conflict_window: usize,
     /// Admitted commits that may wait for the commit worker before admission is refused.
     pub commit_queue: usize,
+    /// Largest number of segments one content stream may have (bounds staging and manifest memory).
+    pub max_content_segments: usize,
 }
 
 /// Default number of recent commits whose write sets are kept for conflict validation.
@@ -66,6 +70,7 @@ impl Default for Options {
             cache_nodes: DEFAULT_CACHE_NODES,
             conflict_window: DEFAULT_CONFLICT_WINDOW,
             commit_queue: DEFAULT_COMMIT_QUEUE,
+            max_content_segments: DEFAULT_MAX_CONTENT_SEGMENTS,
         }
     }
 }
@@ -121,6 +126,8 @@ pub(crate) struct Inner {
     pending: Mutex<HashMap<AttemptId, u32>>,
     #[cfg(test)]
     gate: Mutex<()>,
+    /// Largest number of segments one content stream may have.
+    max_segments: usize,
     pub counters: Counters,
     /// Recovery diagnostics from open (for example an ignored damaged slot).
     pub diagnostics: Vec<String>,
@@ -311,6 +318,7 @@ impl Inner {
                 entries: VecDeque::new(),
                 capacity: opts.conflict_window.max(1),
             }),
+            max_segments: opts.max_content_segments,
             counters: Counters::default(),
             diagnostics,
         }
@@ -458,24 +466,40 @@ impl Inner {
         let mut buf = vec![0; CONTENT_CHUNK];
         loop {
             // Fill one segment (short reads and interruptions are retried), then write it.
+            // With a declared length, never ask for more than one byte past it, and reject as
+            // soon as it is exceeded.
             let mut filled = 0;
             while filled < buf.len() {
-                match bytes.read(&mut buf[filled..]) {
+                let want = match expected {
+                    Some(e) => {
+                        let left = e.len - (len + filled as u64);
+                        (buf.len() - filled)
+                            .min(usize::try_from(left).map_or(usize::MAX, |l| l.saturating_add(1)))
+                    }
+                    None => buf.len() - filled,
+                };
+                match bytes.read(&mut buf[filled..filled + want]) {
                     Ok(0) => break,
                     Ok(n) => filled += n,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => return Err(StorageError::Io(format!("staging source: {e}"))),
                 }
+                if let Some(e) = expected
+                    && len + filled as u64 > e.len
+                {
+                    return Err(StorageError::InvalidRequest(format!(
+                        "staged stream is longer than the declared {} bytes",
+                        e.len
+                    )));
+                }
             }
             if filled == 0 {
                 break;
             }
-            if let Some(e) = expected
-                && len + filled as u64 > e.len
-            {
+            if segments.len() >= self.max_segments {
                 return Err(StorageError::InvalidRequest(format!(
-                    "staged stream is longer than the declared {} bytes",
-                    e.len
+                    "staged stream exceeds the limit of {} segments",
+                    self.max_segments
                 )));
             }
             let seg = &buf[..filled];
@@ -678,7 +702,10 @@ impl Inner {
         let root = txn.finish(&mut sink).map_err(rejected)?;
         let next_page = sink.next_page;
 
-        // Data barrier: every byte the new generation references must be durable first.
+        // Data barrier: every byte the new generation references must be durable first. Capture
+        // the allocation boundary before it: staging may append past it concurrently, and only
+        // bytes the barrier covers may be published.
+        let content_len = *lock(&self.alloc);
         self.io.sync(FileId::Content).map_err(rejected)?;
         self.io.sync(FileId::Meta).map_err(rejected)?;
 
@@ -687,7 +714,7 @@ impl Inner {
             generation,
             root,
             next_page,
-            content_len: *lock(&self.alloc),
+            content_len,
             history_pos: pos,
         };
         let published = self
@@ -848,7 +875,15 @@ impl Inner {
             tree::get(self, s.desc.root, &key(P_CONTENT, &[&c.digest.0]))?.ok_or_else(|| {
                 StorageError::InvalidRequest("content is not committed in this view".into())
             })?;
-        let m = Manifest::decode(&self.read_extent(&ExtentRef::decode(&x)?)?)?;
+        let x = ExtentRef::decode(&x)?;
+        let limit = Manifest::encoded_len(self.max_segments);
+        if x.len > limit {
+            return Err(corrupt(format!(
+                "content manifest of {} bytes exceeds the {limit} byte limit",
+                x.len
+            )));
+        }
+        let m = Manifest::decode(&self.read_extent(&x)?)?;
         if m.content != *c {
             return Err(corrupt(
                 "content manifest does not match the requested digest and length",
@@ -1225,8 +1260,8 @@ fn apply(
 ///
 /// Integrity contract: each segment (at most one streaming buffer) is read whole and checked against
 /// its digest before any of its bytes are delivered; the digest of the complete stream is checked
-/// before end of stream is reported. After a failed check every further read fails, naming the
-/// segment that did not verify.
+/// before end of stream is reported. After a failed check or a failed segment read every further
+/// read fails, naming the segment; a new reader starts over.
 pub(crate) struct SegmentReader {
     inner: Arc<Inner>,
     manifest: Manifest,
@@ -1253,10 +1288,18 @@ impl Read for SegmentReader {
                 return Ok(0);
             };
             self.buf.resize(x.len as usize, 0);
-            self.inner
+            if let Err(e) = self
+                .inner
                 .io
                 .read_at(FileId::Content, x.offset, &mut self.buf)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            {
+                // Nothing of a segment that was not read and verified may stay readable.
+                let why = format!("content segment {} at offset {}: {e}", self.next, x.offset);
+                self.failed = Some(why.clone());
+                self.buf.clear();
+                self.pos = 0;
+                return Err(io::Error::other(why));
+            }
             if sha256(&self.buf) != x.digest {
                 let why = format!(
                     "content segment {} at offset {}: digest mismatch",

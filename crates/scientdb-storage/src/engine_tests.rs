@@ -567,3 +567,154 @@ fn history_position_exhaustion_is_rejected_without_wrapping() {
         "existing state must stay readable"
     );
 }
+
+#[test]
+fn an_oversized_manifest_reference_is_refused_before_allocation() {
+    // A small segment quota keeps the largest valid manifest small, so a crafted reference only a
+    // little beyond it (backed by real bytes, within committed content) shows the size bound.
+    let opts = crate::engine::Options {
+        max_content_segments: 4,
+        ..Default::default()
+    };
+    let sim = SimIo::new();
+    let s = NativeStore {
+        inner: Inner::create(Box::new(sim.clone()), StoreId([3; 16]), opts).unwrap(),
+    };
+    let staged = s.stage_content(&mut &b"bytes"[..]).unwrap();
+    let cs = ChangeSet {
+        changes: vec![put("B", Precondition::Absent, b"b", Some(0))],
+        content: vec![ContentBinding::from(&staged)],
+        ..ChangeSet::default()
+    };
+    commit(&s, "x", cs).unwrap();
+    let cur = s.inner.snapshot().unwrap().desc;
+    // Crafted metadata: the content record points at a manifest far larger than any valid one.
+    let filler = vec![7u8; 1 << 20];
+    sim.write_at(FileId::Content, cur.content_len, &filler)
+        .unwrap();
+    sim.sync(FileId::Content).unwrap();
+    let huge = ExtentRef {
+        offset: 0,
+        len: filler.len() as u64,
+        digest: [0; 32],
+    };
+    let mut t = TreeTxn::new(&*s.inner, cur.root);
+    t.put(key(P_CONTENT, &[&staged.content.digest.0]), huge.encode())
+        .unwrap();
+    struct Sink<'a>(&'a SimIo, u64, u64);
+    impl NodeSink for Sink<'_> {
+        fn write(&mut self, n: &Node) -> Result<PageRef, StorageError> {
+            let at = PageRef {
+                page: self.1,
+                incarnation: self.2,
+            };
+            self.0.write_at(
+                FileId::Meta,
+                at.page * PAGE_SIZE as u64,
+                &encode_page(StoreId([3; 16]), PageKind::Node, at, &n.encode())?,
+            )?;
+            self.1 += 1;
+            Ok(at)
+        }
+    }
+    let mut sink = Sink(&sim, cur.next_page, cur.generation + 1);
+    let root = t.finish(&mut sink).unwrap();
+    // Enough committed content that the bounds check alone would not stop the read.
+    let d = Descriptor {
+        generation: cur.generation + 1,
+        root,
+        next_page: sink.1,
+        content_len: cur.content_len + filler.len() as u64,
+        ..cur
+    };
+    sim.write_at(
+        FileId::Meta,
+        Descriptor::slot(d.generation) * PAGE_SIZE as u64,
+        &d.encode(),
+    )
+    .unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    drop(s);
+    sim.release();
+    let s = NativeStore {
+        inner: Inner::open(Box::new(sim.clone()), opts).expect("open"),
+    };
+    let r = s.begin().unwrap().content(&staged.content).map(|_| ());
+    assert!(
+        matches!(&r, Err(StorageError::Integrity(m)) if m.contains("manifest") && m.contains("limit")),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock, Weak};
+
+    use crate::io::{FileId, Io};
+
+    // Stages more content right after the commit's content barrier, as a concurrent staging
+    // call could: those bytes are not durable and must not be published.
+    struct StageAfterContentSync {
+        sim: SimIo,
+        store: Arc<OnceLock<Weak<Inner>>>,
+        fired: AtomicBool,
+    }
+    impl Io for StageAfterContentSync {
+        fn create(&self) -> Result<(), StorageError> {
+            self.sim.create()
+        }
+        fn open(&self) -> Result<(), StorageError> {
+            self.sim.open()
+        }
+        fn read_at(&self, file: FileId, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+            self.sim.read_at(file, offset, buf)
+        }
+        fn write_at(&self, file: FileId, offset: u64, data: &[u8]) -> Result<(), StorageError> {
+            self.sim.write_at(file, offset, data)
+        }
+        fn len(&self, file: FileId) -> Result<u64, StorageError> {
+            self.sim.len(file)
+        }
+        fn sync(&self, file: FileId) -> Result<(), StorageError> {
+            self.sim.sync(file)?;
+            if file == FileId::Content
+                && let Some(inner) = self.store.get().and_then(Weak::upgrade)
+                && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                inner.stage(&mut &[9u8; 100][..])?;
+            }
+            Ok(())
+        }
+        fn sync_dir(&self) -> Result<(), StorageError> {
+            self.sim.sync_dir()
+        }
+    }
+
+    let sim = SimIo::new();
+    let hook = Arc::new(OnceLock::new());
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(StageAfterContentSync {
+                sim: sim.clone(),
+                store: hook.clone(),
+                fired: AtomicBool::new(false),
+            }),
+            StoreId([3; 16]),
+            Default::default(),
+        )
+        .unwrap(),
+    };
+    hook.set(Arc::downgrade(&s.inner)).unwrap();
+    commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .expect("commit acknowledged");
+    drop(s);
+    // Power is lost: unsynced writes vanish. The acknowledged commit must still open.
+    let after_power_loss = sim.after_crash(Persist::None);
+    let s = reopen(&after_power_loss);
+    assert!(revision(&s, "A").is_some());
+}
