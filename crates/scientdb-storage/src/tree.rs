@@ -195,6 +195,9 @@ pub(crate) struct Cursor<'a> {
     next: Vec<u8>,
     prefix: Vec<u8>,
     done: bool,
+    /// Nodes this cursor may still load. A valid tree never loads a page twice, so the store's
+    /// page count bounds the work; a shared or cyclic subtree exhausts it.
+    budget: u64,
 }
 
 impl<'a> Cursor<'a> {
@@ -204,6 +207,7 @@ impl<'a> Cursor<'a> {
         root: PageRef,
         prefix: &[u8],
         start: Option<&[u8]>,
+        budget: u64,
     ) -> Result<Self, StorageError> {
         let next = start.unwrap_or(prefix).to_vec();
         let mut c = Cursor {
@@ -213,9 +217,17 @@ impl<'a> Cursor<'a> {
             next,
             prefix: prefix.to_vec(),
             done: false,
+            budget,
         };
         c.descend(root)?;
         Ok(c)
+    }
+
+    fn load(&mut self, at: PageRef) -> Result<Arc<Node>, StorageError> {
+        self.budget = self.budget.checked_sub(1).ok_or_else(|| {
+            corrupt("tree traversal exceeded the store's page count (shared or cyclic subtree)")
+        })?;
+        self.src.load(at)
     }
 
     fn descend(&mut self, mut at: PageRef) -> Result<(), StorageError> {
@@ -223,7 +235,7 @@ impl<'a> Cursor<'a> {
             if self.stack.len() >= MAX_HEIGHT {
                 return Err(corrupt("tree deeper than the supported maximum"));
             }
-            let node = self.src.load(at)?;
+            let node = self.load(at)?;
             match &*node {
                 Node::Leaf(_) => {
                     self.leaf = Some(node);
@@ -252,7 +264,7 @@ impl<'a> Cursor<'a> {
                     if self.stack.len() >= MAX_HEIGHT {
                         return Err(corrupt("tree deeper than the supported maximum"));
                     }
-                    let n = self.src.load(at)?;
+                    let n = self.load(at)?;
                     match &*n {
                         Node::Leaf(_) => {
                             self.leaf = Some(n);
@@ -330,6 +342,8 @@ enum Outcome {
     Same,
     Split(Vec<u8>, usize),
     Empty,
+    /// The branch was left with one child; its parent should refer to that child directly.
+    Single(Child),
 }
 
 impl<'a> TreeTxn<'a> {
@@ -433,32 +447,50 @@ impl<'a> TreeTxn<'a> {
         if total <= PAGE_PAYLOAD_MAX {
             return Outcome::Same;
         }
-        // Split at the first key where the left half reaches half the encoded size, keeping at
-        // least one entry on each side.
-        let mut acc = 5;
-        let mut split_key = None;
-        for (idx, (k, v)) in e.iter().enumerate() {
-            if idx > 0 && acc >= total / 2 {
-                split_key = Some(k.clone());
-                break;
+        // Choose the split point that minimizes the larger half while both halves fit. Every entry
+        // is at most MAX_ENTRY, so such a point exists.
+        let sizes: Vec<usize> = e.iter().map(|(k, v)| 4 + k.len() + v.len()).collect();
+        let mut left = 5;
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, sz) in sizes.iter().enumerate().take(sizes.len() - 1) {
+            left += sz;
+            let right = total - left + 5;
+            if left <= PAGE_PAYLOAD_MAX
+                && right <= PAGE_PAYLOAD_MAX
+                && best.is_none_or(|(_, worst)| left.max(right) < worst)
+            {
+                best = Some((idx + 1, left.max(right)));
             }
-            acc += 4 + k.len() + v.len();
         }
-        let k = split_key.unwrap_or_else(|| e.keys().next_back().expect("entries").clone());
+        let (at, _) = best.expect("an oversized leaf of bounded entries has a fitting split");
+        let k = e.keys().nth(at).expect("split key").clone();
         let right = e.split_off(&k);
-        let sep = right.keys().next().expect("right half").clone();
         self.arena.push(Work::Leaf(right));
-        Outcome::Split(sep, self.arena.len() - 1)
+        Outcome::Split(k, self.arena.len() - 1)
     }
 
     fn split_branch_if_needed(&mut self, i: usize) -> Outcome {
         let Work::Branch { seps, children } = &mut self.arena[i] else {
             unreachable!()
         };
-        if branch_size(seps, children.len()) <= PAGE_PAYLOAD_MAX {
+        let n = children.len();
+        if branch_size(seps, n) <= PAGE_PAYLOAD_MAX {
             return Outcome::Same;
         }
-        let m = children.len() / 2;
+        // Left keeps children[..m] and seps[..m-1]; seps[m-1] moves up; right keeps the rest.
+        // Each side keeps at least two children; pick the most balanced m where both fit.
+        let mut best: Option<(usize, usize)> = None;
+        for m in 2..=n.saturating_sub(2) {
+            let l = branch_size(&seps[..m - 1], m);
+            let r = branch_size(&seps[m..], n - m);
+            if l <= PAGE_PAYLOAD_MAX
+                && r <= PAGE_PAYLOAD_MAX
+                && best.is_none_or(|(_, worst)| l.max(r) < worst)
+            {
+                best = Some((m, l.max(r)));
+            }
+        }
+        let (m, _) = best.expect("an oversized branch of bounded separators has a fitting split");
         let right_children = children.split_off(m);
         let mut right_seps = seps.split_off(m - 1);
         let promoted = right_seps.remove(0);
@@ -476,8 +508,10 @@ impl<'a> TreeTxn<'a> {
         }
         let root = self.dirty(self.root)?;
         self.root = Child::Dirty(root);
-        if let Outcome::Empty = self.delete_in(root, key, 0)? {
-            self.arena[root] = Work::Leaf(Entries::new());
+        match self.delete_in(root, key, 0)? {
+            Outcome::Empty => self.arena[root] = Work::Leaf(Entries::new()),
+            Outcome::Single(c) => self.root = c,
+            _ => {}
         }
         // Collapse root branches with a single child.
         while let Child::Dirty(r) = self.root
@@ -509,25 +543,44 @@ impl<'a> TreeTxn<'a> {
         };
         let d = self.dirty(child)?;
         let out = self.delete_in(d, key, depth + 1)?;
-        {
+        let removed = {
             let Work::Branch { seps, children } = &mut self.arena[i] else {
                 unreachable!()
             };
-            children[ci] = Child::Dirty(d);
-            if let Outcome::Empty = out {
-                children.remove(ci);
-                if ci > 0 {
-                    seps.remove(ci - 1);
-                } else if !seps.is_empty() {
-                    seps.remove(0);
+            match out {
+                Outcome::Empty => {
+                    children.remove(ci);
+                    if ci > 0 {
+                        seps.remove(ci - 1);
+                    } else if !seps.is_empty() {
+                        seps.remove(0);
+                    }
+                    if children.is_empty() {
+                        return Ok(Outcome::Empty);
+                    }
+                    true
                 }
-                if children.is_empty() {
-                    return Ok(Outcome::Empty);
+                // The child branch kept one child: refer to that grandchild directly.
+                Outcome::Single(c) => {
+                    children[ci] = c;
+                    false
                 }
-                return Ok(Outcome::Same);
+                _ => {
+                    children[ci] = Child::Dirty(d);
+                    false
+                }
             }
+        };
+        if !removed {
+            self.merge_leaf_if_small(i, ci)?;
         }
-        self.merge_leaf_if_small(i, ci)?;
+        // A branch left with one child is replaced by that child in its parent.
+        let Work::Branch { children, .. } = &self.arena[i] else {
+            unreachable!()
+        };
+        if children.len() == 1 {
+            return Ok(Outcome::Single(children[0]));
+        }
         Ok(Outcome::Same)
     }
 
@@ -657,7 +710,7 @@ mod tests {
     }
 
     fn all(m: &Mem, root: PageRef) -> Vec<(Vec<u8>, Vec<u8>)> {
-        Cursor::new(m, root, b"", None)
+        Cursor::new(m, root, b"", None, u64::MAX)
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
@@ -701,7 +754,7 @@ mod tests {
                 t.put(key, vec![1; 40]).unwrap();
             }
         });
-        let b: Vec<_> = Cursor::new(&m, root, b"b", None)
+        let b: Vec<_> = Cursor::new(&m, root, b"b", None, u64::MAX)
             .unwrap()
             .map(|r| r.unwrap().0)
             .collect();
@@ -709,14 +762,22 @@ mod tests {
         assert!(b.windows(2).all(|w| w[0] < w[1]));
         let mut start = b"b".to_vec();
         start.extend(k(2001));
-        let tail: Vec<_> = Cursor::new(&m, root, b"b", Some(&start))
+        let tail: Vec<_> = Cursor::new(&m, root, b"b", Some(&start), u64::MAX)
             .unwrap()
             .map(|r| r.unwrap().0)
             .collect();
         assert_eq!(tail.first(), Some(&start));
         assert_eq!(tail.len(), 500);
-        assert_eq!(Cursor::new(&m, root, b"c", None).unwrap().count(), 0);
-        assert_eq!(Cursor::new(&m, root, b"a\xff", None).unwrap().count(), 0);
+        assert_eq!(
+            Cursor::new(&m, root, b"c", None, u64::MAX).unwrap().count(),
+            0
+        );
+        assert_eq!(
+            Cursor::new(&m, root, b"a\xff", None, u64::MAX)
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -849,6 +910,141 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn heavy_deletion_never_publishes_a_single_child_branch() {
+        let m = Mem::default();
+        let mut root = commit(&m, empty(&m), 1, |t| {
+            for i in 0..20_000u32 {
+                t.put(k(i), vec![1; 40]).unwrap();
+            }
+        });
+        assert!(height(&m, root).unwrap() >= 3);
+        // Delete in waves that empty most leaves under each branch but keep a few scattered keys.
+        let mut survivors: Vec<u32> = (0..20_000).collect();
+        for (g, keep) in [(2u64, 7u32), (3, 61), (4, 997), (5, 4999)] {
+            root = commit(&m, root, g, |t| {
+                for i in 0..20_000u32 {
+                    if i % keep != 0 {
+                        t.delete(&k(i)).unwrap();
+                    }
+                }
+            });
+            survivors.retain(|i| i % keep == 0);
+            let want: Vec<_> = survivors.iter().copied().map(k).collect();
+            let got: Vec<_> = all(&m, root).into_iter().map(|e| e.0).collect();
+            assert_eq!(got, want, "after keeping every {keep}th key");
+        }
+    }
+
+    #[test]
+    fn uneven_entries_split_into_pages_that_fit() {
+        let m = Mem::default();
+        let entry = |n: usize, tag: u8| (vec![tag; 20], vec![0u8; n - 20]);
+        // Key+value sizes 1200, 1200, 1500 in order, then 1800 inserted between them.
+        let mut root = commit(&m, empty(&m), 1, |t| {
+            for (n, tag) in [(1200, 1u8), (1200, 2), (1500, 4)] {
+                let (key, v) = entry(n, tag);
+                t.put(key, v).unwrap();
+            }
+        });
+        root = commit(&m, root, 2, |t| {
+            let (key, v) = entry(1800, 3);
+            t.put(key, v).unwrap();
+        });
+        assert_eq!(all(&m, root).len(), 4);
+    }
+
+    #[test]
+    fn branches_with_long_separators_split_into_pages_that_fit() {
+        let m = Mem::default();
+        let mut model = Entries::new();
+        // A run of 1000-byte keys followed by many short keys: separators cluster by size, so a
+        // split by child count would leave the long separators together on one side.
+        let mut keys: Vec<Vec<u8>> = (0..60u32)
+            .map(|i| {
+                let mut key = format!("a{i:04}").into_bytes();
+                key.resize(1000, b'L');
+                key
+            })
+            .collect();
+        keys.extend((0..4000u32).map(|i| format!("b{i:06}").into_bytes()));
+        let mut root = empty(&m);
+        for (g, chunk) in keys.chunks(400).enumerate() {
+            root = commit(&m, root, g as u64 + 1, |t| {
+                for key in chunk {
+                    t.put(key.clone(), vec![3; 20]).unwrap();
+                    model.insert(key.clone(), vec![3; 20]);
+                }
+            });
+        }
+        assert_eq!(all(&m, root), model.into_iter().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_branch_split_keeps_both_halves_within_a_page() {
+        let m = Mem::default();
+        let mut t = TreeTxn::new(&m, empty(&m));
+        // Ten children: four 1024-byte separators followed by five short ones (oversized branch).
+        let mut seps: Vec<Vec<u8>> = (0..4u8)
+            .map(|i| {
+                let mut s = vec![b'a', i];
+                s.resize(1024, b'L');
+                s
+            })
+            .collect();
+        seps.extend((0..5u8).map(|i| vec![b'b', i]));
+        let children = (0..10)
+            .map(|p| {
+                Child::Clean(PageRef {
+                    page: p,
+                    incarnation: 1,
+                })
+            })
+            .collect();
+        t.arena.push(Work::Branch { seps, children });
+        let Outcome::Split(_, right) = t.split_branch_if_needed(0) else {
+            panic!("oversized branch did not split")
+        };
+        for i in [0, right] {
+            let Work::Branch { seps, children } = &t.arena[i] else {
+                panic!("branch")
+            };
+            assert!(
+                branch_size(seps, children.len()) <= PAGE_PAYLOAD_MAX,
+                "half {i} is {} bytes",
+                branch_size(seps, children.len())
+            );
+            assert!(children.len() >= 2 && seps.len() == children.len() - 1);
+        }
+    }
+
+    #[test]
+    fn a_shared_subtree_graph_cannot_make_a_cursor_unbounded() {
+        let m = Mem::default();
+        // A crafted graph: 24 branches, each referring to the next one twice, over one leaf.
+        let leaf = Sink(&m, 1)
+            .write(&Node::Leaf(
+                [(b"k".to_vec(), Vec::new())].into_iter().collect(),
+            ))
+            .unwrap();
+        let mut top = leaf;
+        for _ in 0..24 {
+            top = Sink(&m, 1)
+                .write(&Node::Branch {
+                    seps: vec![b"k".to_vec()],
+                    children: vec![top, top],
+                })
+                .unwrap();
+        }
+        let pages = *m.next.borrow();
+        let r: Result<Vec<_>, _> = Cursor::new(&m, top, b"", None, pages).unwrap().collect();
+        assert!(
+            matches!(&r, Err(StorageError::Integrity(_))),
+            "cursor walked a shared subtree: {:?}",
+            r.map(|v| v.len())
+        );
     }
 
     #[test]

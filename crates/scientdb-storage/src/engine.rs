@@ -155,13 +155,26 @@ impl NodeSink for PageWriter<'_> {
 
 impl NodeSource for Inner {
     fn load(&self, at: PageRef) -> Result<Arc<Node>, StorageError> {
+        let cur = lock(&self.state).current;
+        let offset = at.page.checked_mul(PAGE_SIZE as u64);
+        if at.page < FIRST_NODE_PAGE
+            || at.page >= cur.next_page
+            || at.incarnation == 0
+            || at.incarnation > cur.generation
+            || offset.is_none()
+        {
+            return Err(corrupt(format!(
+                "node reference {}@{} is not committed metadata (pages below {}, generations up to {})",
+                at.page, at.incarnation, cur.next_page, cur.generation
+            )));
+        }
         if let Some(n) = lock(&self.cache).map.get(&at) {
             return Ok(n.clone());
         }
         self.counters.cache_misses.fetch_add(1, Ordering::Relaxed);
         let mut buf = vec![0; PAGE_SIZE];
         self.io
-            .read_at(FileId::Meta, at.page * PAGE_SIZE as u64, &mut buf)?;
+            .read_at(FileId::Meta, offset.unwrap_or_default(), &mut buf)?;
         let node = Arc::new(Node::decode(&decode_page(
             self.store,
             PageKind::Node,
@@ -278,7 +291,8 @@ impl Inner {
     }
 
     pub fn height(&self) -> Result<usize, StorageError> {
-        tree::height(self, lock(&self.state).current.root)
+        let root = lock(&self.state).current.root;
+        tree::height(self, root)
     }
 
     pub fn cache_capacity(&self) -> usize {
@@ -665,7 +679,7 @@ impl Inner {
             }
         };
         let root = s.desc.root;
-        let cursor = Cursor::new(self, root, &prefix, start.as_deref())?;
+        let cursor = Cursor::new(self, root, &prefix, start.as_deref(), s.desc.next_page)?;
         Ok(cursor.map(move |entry| {
             let (k, _) = entry?;
             let parts = key_components(&k[1..])?;
@@ -694,7 +708,13 @@ impl Inner {
         start: HistoryPosition,
     ) -> Result<impl Iterator<Item = Result<HistoryEntry, StorageError>> + 'a, StorageError> {
         let from = history_key(start.0.max(1));
-        let cursor = Cursor::new(self, s.desc.root, &[P_HISTORY], Some(&from))?;
+        let cursor = Cursor::new(
+            self,
+            s.desc.root,
+            &[P_HISTORY],
+            Some(&from),
+            s.desc.next_page,
+        )?;
         Ok(cursor.map(move |entry| {
             let (_, v) = entry?;
             decode_history(&self.read_extent(&ExtentRef::decode(&v)?)?)
