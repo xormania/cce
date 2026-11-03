@@ -3,6 +3,11 @@
 //! Physical structures are private. The public surface is the logical port from
 //! `scientdb-kernel` plus constructors for a native store.
 
+mod codec;
+mod format;
+mod io;
+mod records;
+
 use std::io::Read;
 use std::path::Path;
 
