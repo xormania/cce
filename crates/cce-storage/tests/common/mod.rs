@@ -51,7 +51,21 @@ pub struct Driver {
 
 impl Driver {
     pub fn spawn() -> Self {
-        let mut child = Command::new(DRIVER)
+        Self::spawn_command(Command::new(DRIVER))
+    }
+
+    /// Spawns the driver through `bash` with `setup` run first (for example a resource limit);
+    /// `exec` keeps the driver as the child the harness talks to and kills.
+    pub fn spawn_with_shell(setup: &str) -> Self {
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg(format!("{setup}; exec \"$0\""))
+            .arg(DRIVER);
+        Self::spawn_command(cmd)
+    }
+
+    fn spawn_command(mut cmd: Command) -> Self {
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

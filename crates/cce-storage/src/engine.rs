@@ -57,6 +57,9 @@ pub(crate) struct Options {
     pub commit_queue: usize,
     /// Largest number of segments one content stream may have (bounds staging and manifest memory).
     pub max_content_segments: usize,
+    /// Largest length of any variable-length request field (record body, evidence label or bytes)
+    /// and of any request list; bounded by the 32-bit length prefixes of the encoding.
+    pub max_request_field: u64,
 }
 
 /// Default number of recent commits whose write sets are kept for conflict validation.
@@ -71,6 +74,7 @@ impl Default for Options {
             conflict_window: DEFAULT_CONFLICT_WINDOW,
             commit_queue: DEFAULT_COMMIT_QUEUE,
             max_content_segments: DEFAULT_MAX_CONTENT_SEGMENTS,
+            max_request_field: u32::MAX as u64,
         }
     }
 }
@@ -135,6 +139,8 @@ pub(crate) struct Inner {
     gate: Mutex<()>,
     /// Largest number of segments one content stream may have.
     max_segments: usize,
+    /// Largest variable-length request field or list (see `Options::max_request_field`).
+    max_request_field: u64,
     pub counters: Counters,
     /// Recovery diagnostics from open (for example an ignored damaged slot).
     pub diagnostics: Vec<String>,
@@ -333,6 +339,7 @@ impl Inner {
                 capacity: opts.conflict_window.max(1),
             }),
             max_segments: opts.max_content_segments,
+            max_request_field: opts.max_request_field,
             counters: Counters::default(),
             diagnostics,
         }
@@ -635,6 +642,8 @@ impl Inner {
         cs: ChangeSet,
     ) -> Result<CommitReceipt, CommitError> {
         let _w = lock(&self.writer);
+        // Before anything is encoded: no field may overflow its length prefix.
+        crate::records::check_request_bounds(&cs, self.max_request_field).map_err(rejected)?;
         let (cur, fence) = {
             let st = lock(&self.state);
             (st.current, st.fenced.clone())

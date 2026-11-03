@@ -265,6 +265,34 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
     e.buf
 }
 
+/// Checks that every variable-length field and list of a request fits the encoding's 32-bit length
+/// prefixes (`limit` is at most `u32::MAX`), so encoding never truncates a length or panics.
+pub(crate) fn check_request_bounds(changes: &ChangeSet, limit: u64) -> Result<(), StorageError> {
+    let limit = limit.min(u32::MAX as u64);
+    let check = |what: &str, len: usize| {
+        if len as u64 > limit {
+            Err(StorageError::InvalidRequest(format!(
+                "{what} of {len} exceeds the limit of {limit}"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    check("change list", changes.changes.len())?;
+    check("content binding list", changes.content.len())?;
+    check("evidence list", changes.evidence.len())?;
+    for c in &changes.changes {
+        if let Change::PutContext { body, .. } = c {
+            check("record body", body.len())?;
+        }
+    }
+    for ev in &changes.evidence {
+        check("evidence label", ev.label.len())?;
+        check("evidence bytes", ev.bytes.len())?;
+    }
+    Ok(())
+}
+
 /// Fingerprint binding an attempt identity to its exact logical request.
 pub(crate) fn fingerprint(attempt: &AttemptId, changes: &ChangeSet) -> [u8; 32] {
     let mut h = Sha256::new();

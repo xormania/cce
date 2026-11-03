@@ -355,3 +355,140 @@ fn a_store_has_one_owning_process_until_every_guard_is_gone() {
         bundle.expected_dump(1)
     );
 }
+
+#[test]
+fn an_identical_retry_from_a_fresh_process_returns_the_original_receipt() {
+    let dir = test_dir("retry-fresh-process");
+    let store = dir.join("store");
+    let bundle = first_bundle();
+    let commit = format!("commit {}", bundle.attempt);
+    let outcome = format!("outcome {}", bundle.attempt);
+
+    // Process A commits, is acknowledged, and is killed before any shutdown.
+    let mut a = Driver::spawn();
+    answered(a.step(&format!("create {}", store.display())), "create");
+    for cmd in bundle.commands() {
+        answered(a.step(&cmd), &cmd);
+    }
+    assert_eq!(answered(a.step(&commit), "commit"), ["committed 1"]);
+    assert_eq!(a.wait_for("hold", "holding"), Step::Answered(vec![]));
+    let status = a.kill();
+    assert!(status.code().is_none(), "A must die by signal: {status:?}");
+
+    // Process B: the outcome is already known, and re-staging the identical bytes under new
+    // handles and retrying the identical request returns the original receipt without a new
+    // history entry.
+    let mut b = Driver::spawn();
+    answered(b.step(&format!("open {}", store.display())), "open");
+    assert_eq!(
+        answered(b.step(&outcome), "outcome"),
+        ["outcome committed 1"]
+    );
+    for cmd in bundle.commands() {
+        answered(b.step(&cmd), &cmd);
+    }
+    assert_eq!(answered(b.step(&commit), "retry"), ["committed 1"]);
+    assert_eq!(
+        answered(b.step("dump A,B,C"), "dump"),
+        bundle.expected_dump(1)
+    );
+    answered(b.step("close"), "close");
+    assert_eq!(b.finish().and_then(|s| s.code()), Some(0));
+
+    // Process C: the same attempt with one more piece of evidence is a different request.
+    let mut c = Driver::spawn();
+    answered(c.step(&format!("open {}", store.display())), "open");
+    for cmd in bundle.commands() {
+        answered(c.step(&cmd), &cmd);
+    }
+    answered(c.step("evidence 6578747261 6d6f7265"), "evidence");
+    assert_eq!(
+        answered(c.step(&commit), "mismatched retry"),
+        ["commit-error AttemptMismatch"]
+    );
+    assert_eq!(
+        answered(c.step("dump A,B,C"), "dump"),
+        bundle.expected_dump(1)
+    );
+    assert_eq!(
+        answered(c.step(&outcome), "outcome"),
+        ["outcome committed 1"]
+    );
+    answered(c.step("close"), "close");
+}
+
+#[test]
+fn a_short_write_at_the_file_size_limit_fails_the_commit_explicitly() {
+    let dir = test_dir("short-write");
+    let store = dir.join("store");
+    let content = store.join("content.sdb");
+    let meta = store.join("meta.sdb");
+    // Evidence is recorded only in the history entry, so it sets that write's size.
+    let evidence = format!("evidence {} {}", common::hex(b"big"), "ab".repeat(30_000));
+
+    let mut setup = Driver::spawn();
+    answered(setup.step(&format!("create {}", store.display())), "create");
+    // Enough committed content that the content file outgrows the metadata file: the limit below
+    // then constrains only the history write, not the metadata pages after it.
+    answered(setup.step("stage big gen 100000 7"), "stage");
+    answered(setup.step("put-context A absent 61 big"), "put A");
+    assert_eq!(
+        answered(setup.step("commit a1"), "commit a1"),
+        ["committed 1"]
+    );
+    answered(setup.step("close"), "close");
+    assert_eq!(setup.finish().and_then(|s| s.code()), Some(0));
+
+    // A file size limit 1-2 KiB past the committed content: the next history entry (about
+    // 30 KB) is written partly, then the kernel refuses the rest. SIGXFSZ is ignored so the
+    // refusal arrives as an error, as it would for a full disk.
+    let committed = std::fs::metadata(&content).unwrap().len();
+    let limit_kib = committed / 1024 + 2;
+    let limit = limit_kib * 1024;
+    assert!(limit - committed > 1024 && limit - committed <= 2048);
+    let meta_len = std::fs::metadata(&meta).unwrap().len();
+    assert!(
+        meta_len + 64 * 1024 < limit,
+        "metadata ({meta_len} bytes) must stay well below the limit ({limit})"
+    );
+    let mut limited = Driver::spawn_with_shell(&format!("trap '' XFSZ; ulimit -f {limit_kib}"));
+    answered(limited.step(&format!("open {}", store.display())), "open");
+    answered(limited.step("put-context B absent 62 -"), "put B");
+    answered(limited.step(&evidence), "evidence");
+    let r = answered(limited.step("commit a2"), "commit a2");
+    assert!(
+        r.len() == 1 && r[0].starts_with("commit-error Rejected(Io("),
+        "a partially written commit must fail explicitly: {r:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&content).unwrap().len(),
+        limit,
+        "the history write did not stop short at the limit"
+    );
+    assert_eq!(
+        answered(limited.step("outcome a2"), "outcome"),
+        ["outcome absent"]
+    );
+    let dump = answered(limited.step("dump A,B"), "dump");
+    assert!(dump.iter().any(|l| l == "context B absent"), "{dump:?}");
+    drop(limited);
+
+    // A fresh process without the limit sees only the first commit, and the retry commits.
+    let mut fresh = Driver::spawn();
+    answered(fresh.step(&format!("open {}", store.display())), "open");
+    assert_eq!(
+        answered(fresh.step("outcome a2"), "outcome"),
+        ["outcome absent"]
+    );
+    let dump = answered(fresh.step("dump A,B"), "dump");
+    assert!(dump.iter().any(|l| l == "context B absent"), "{dump:?}");
+    assert_eq!(
+        dump.iter().filter(|l| l.starts_with("history ")).count(),
+        1,
+        "{dump:?}"
+    );
+    answered(fresh.step("put-context B absent 62 -"), "put B");
+    answered(fresh.step(&evidence), "evidence");
+    assert_eq!(answered(fresh.step("commit a2"), "retry"), ["committed 2"]);
+    answered(fresh.step("close"), "close");
+}
