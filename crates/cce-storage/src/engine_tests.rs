@@ -780,3 +780,114 @@ fn a_history_extent_that_would_cross_the_content_limit_refuses_the_commit() {
     );
     assert!(revision(&s, "A").is_none());
 }
+
+/// Operations one small content-free commit performs (its last four: content sync, metadata sync,
+/// publication record write, publication sync).
+fn ops_per_small_commit() -> u64 {
+    let probe = SimIo::new();
+    let p = sim_store(&probe);
+    commit(
+        &p,
+        "p1",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let before = probe.ops();
+    commit(
+        &p,
+        "p2",
+        changes(vec![put("B", Precondition::Absent, b"b", None)]),
+    )
+    .unwrap();
+    probe.ops() - before
+}
+
+#[test]
+fn a_fenced_store_still_answers_definitively_for_attempts_it_can_see() {
+    use cce_core::storage::{AttemptOutcome, CommitReceipt};
+    let per_commit = ops_per_small_commit();
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    let a1 = changes(vec![put("A", Precondition::Absent, b"a", None)]);
+    let b = || changes(vec![put("B", Precondition::Absent, b"b", None)]);
+    commit(&s, "a1", a1.clone()).unwrap();
+    sim.fail_nth_op(per_commit);
+    let r = commit(&s, "a2", b());
+    assert!(matches!(r, Err(CommitError::Indeterminate(_))), "{r:?}");
+
+    assert_eq!(
+        s.outcome(&attempt("a1")).unwrap(),
+        AttemptOutcome::Committed(CommitReceipt {
+            attempt: attempt("a1"),
+            position: HistoryPosition(1),
+        }),
+        "a commit published before the fence is still definitive"
+    );
+    assert_eq!(s.outcome(&attempt("a2")).unwrap(), AttemptOutcome::Unknown);
+    assert_eq!(
+        s.outcome(&attempt("never")).unwrap(),
+        AttemptOutcome::Absent
+    );
+
+    // A committed attempt keeps its receipt; a different request under its id is a mismatch.
+    assert_eq!(commit(&s, "a1", a1).unwrap(), 1);
+    let r = commit(
+        &s,
+        "a1",
+        changes(vec![put("A", Precondition::Absent, b"other", None)]),
+    );
+    assert!(matches!(r, Err(CommitError::AttemptMismatch)), "{r:?}");
+    // The uncertain attempt stays uncertain: never reported as rejected.
+    let r = commit(&s, "a2", b());
+    assert!(matches!(r, Err(CommitError::Indeterminate(_))), "{r:?}");
+    // A new attempt is refused without effect while fenced.
+    let r = commit(
+        &s,
+        "a3",
+        changes(vec![put("C", Precondition::Absent, b"c", None)]),
+    );
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.contains("fenced")),
+        "{r:?}"
+    );
+    assert!(revision(&s, "C").is_none());
+}
+
+#[test]
+fn a_failed_data_barrier_fences_writes() {
+    use cce_core::storage::AttemptOutcome;
+    let per_commit = ops_per_small_commit();
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    commit(
+        &s,
+        "a1",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    // Fail the content sync of the next commit's data barrier.
+    sim.fail_nth_op(per_commit - 3);
+    let r = commit(
+        &s,
+        "a2",
+        changes(vec![put("B", Precondition::Absent, b"b", None)]),
+    );
+    assert!(
+        matches!(r, Err(CommitError::Rejected(StorageError::Io(_)))),
+        "{r:?}"
+    );
+    // Nothing was published for it.
+    assert_eq!(s.outcome(&attempt("a2")).unwrap(), AttemptOutcome::Absent);
+    // Bytes the failed barrier covered may be lost: no later write may rely on them.
+    let r = commit(
+        &s,
+        "a3",
+        changes(vec![put("C", Precondition::Absent, b"c", None)]),
+    );
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.contains("fenced")),
+        "{r:?}"
+    );
+    assert!(s.stage_content(&mut &b"x"[..]).is_err());
+    assert!(revision(&s, "A").is_some());
+}

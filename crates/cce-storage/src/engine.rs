@@ -97,8 +97,15 @@ struct State {
     staged: HashMap<u64, BoundContent>,
     /// Next staging serial; each staging gets a distinct handle even for zero-length content.
     next_stage: u64,
-    /// Set when a publication outcome is uncertain; further writes are refused.
-    fenced: Option<String>,
+    /// Set when durability became uncertain; further writes are refused until reopen.
+    fenced: Option<Fence>,
+}
+
+/// Why writes are fenced, and which attempt (if any) has an unknown publication outcome.
+#[derive(Clone)]
+struct Fence {
+    why: String,
+    uncertain: Option<AttemptId>,
 }
 
 /// Bounded node cache keyed by location *and* incarnation, evicting in insertion order.
@@ -473,7 +480,10 @@ impl Inner {
         expected: Option<&ContentRef>,
     ) -> Result<StagedContent, StorageError> {
         if let Some(f) = &lock(&self.state).fenced {
-            return Err(StorageError::StoreState(format!("writes fenced: {f}")));
+            return Err(StorageError::StoreState(format!(
+                "writes fenced: {}",
+                f.why
+            )));
         }
         let mut cursor = lock(&self.alloc);
         let start = *cursor;
@@ -625,15 +635,17 @@ impl Inner {
         cs: ChangeSet,
     ) -> Result<CommitReceipt, CommitError> {
         let _w = lock(&self.writer);
-        let cur = {
+        let (cur, fence) = {
             let st = lock(&self.state);
-            if let Some(f) = &st.fenced {
-                return Err(rejected(StorageError::StoreState(format!(
-                    "writes fenced: {f}"
-                ))));
-            }
-            st.current
+            (st.current, st.fenced.clone())
         };
+        // The attempt whose publication is uncertain stays uncertain; it is never reported as
+        // rejected. Other attempts are still answered from the last published state below.
+        if let Some(f) = &fence
+            && f.uncertain.as_ref() == Some(&attempt)
+        {
+            return Err(CommitError::Indeterminate(f.why.clone()));
+        }
         let mut txn = TreeTxn::new(self, cur.root);
 
         // Every content index must name a binding before the request is fingerprinted.
@@ -663,6 +675,12 @@ impl Inner {
             } else {
                 Err(CommitError::AttemptMismatch)
             };
+        }
+        if let Some(f) = fence {
+            return Err(rejected(StorageError::StoreState(format!(
+                "writes fenced: {}",
+                f.why
+            ))));
         }
 
         // The basis must still hold: nothing it observed may have been written since.
@@ -735,8 +753,19 @@ impl Inner {
         // the allocation boundary before it: staging may append past it concurrently, and only
         // bytes the barrier covers may be published.
         let content_len = *lock(&self.alloc);
-        self.io.sync(FileId::Content).map_err(rejected)?;
-        self.io.sync(FileId::Meta).map_err(rejected)?;
+        if let Err(e) = self
+            .io
+            .sync(FileId::Content)
+            .and_then(|()| self.io.sync(FileId::Meta))
+        {
+            // Nothing is published, but a failed barrier may have dropped written bytes that
+            // staged content or later commits would reference: fence writes until reopen.
+            lock(&self.state).fenced = Some(Fence {
+                why: format!("data barrier failed: {e}"),
+                uncertain: None,
+            });
+            return Err(rejected(e));
+        }
 
         let desc = Descriptor {
             store: self.store,
@@ -757,7 +786,10 @@ impl Inner {
         if let Err(e) = published {
             // The record may or may not be durable: fence writes until reconciled.
             let why = format!("publication of generation {generation} uncertain: {e}");
-            lock(&self.state).fenced = Some(why.clone());
+            lock(&self.state).fenced = Some(Fence {
+                why: why.clone(),
+                uncertain: Some(attempt.clone()),
+            });
             return Err(CommitError::Indeterminate(why));
         }
 
@@ -785,7 +817,11 @@ impl Inner {
             return Ok(AttemptOutcome::Pending);
         }
         let st = lock(&self.state);
-        if st.fenced.is_some() {
+        if st
+            .fenced
+            .as_ref()
+            .is_some_and(|f| f.uncertain.as_ref() == Some(attempt))
+        {
             return Ok(AttemptOutcome::Unknown);
         }
         let cur = st.current;
