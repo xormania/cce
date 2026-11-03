@@ -19,6 +19,7 @@
 //! commit <attempt>                        submits the changes accumulated since the last commit
 //! outcome <attempt>
 //! dump <id>[,<id>...]                     prints the committed state reachable from those ids
+//! read-content <digest> <len>             reads content by logical reference through a new view
 //! hold                                    prints `holding` and blocks until killed
 //! close
 //! ```
@@ -31,9 +32,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use scientdb_kernel::storage::{
-    AttemptId, AttemptOutcome, Change, ChangeSet, ContentBinding, ContextId, Direction, Evidence,
-    HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind, RelationshipQuery,
-    Revision, StagedContent, StorageEngine,
+    AttemptId, AttemptOutcome, Change, ChangeSet, ContentBinding, ContentDigest, ContentRef,
+    ContextId, Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId,
+    RelationshipKind, RelationshipQuery, Revision, StagedContent, StorageEngine,
 };
 use scientdb_storage::NativeStore;
 
@@ -289,6 +290,24 @@ impl Driver {
                 }
             }
             ["dump", ids] => self.dump(ids)?,
+            ["read-content", digest, len] => {
+                let d: [u8; 32] = unhex(digest)?
+                    .try_into()
+                    .map_err(|_| "digest must be 32 bytes")?;
+                let c = ContentRef {
+                    digest: ContentDigest(d),
+                    len: len.parse().map_err(|_| "bad len")?,
+                };
+                let mut view = self.store()?.begin().map_err(|e| e.to_string())?;
+                match view.content(&c) {
+                    Ok(mut r) => {
+                        let mut bytes = Vec::new();
+                        r.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                        self.say(&format!("content {}", hex(&bytes)));
+                    }
+                    Err(e) => self.say(&format!("content-error {e:?}")),
+                }
+            }
             ["hold"] => {
                 self.say("holding");
                 loop {
