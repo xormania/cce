@@ -11,13 +11,13 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, ContentBinding, ContextId,
     Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
-    RelationshipQuery, StorageEngine, StorageError,
+    RelationshipQuery, StagedContent, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;
 use crate::engine::Inner;
 use crate::format::{PAGE_SIZE, StoreId};
-use crate::io::{FileId, Io};
+use crate::io::{FileId, Io, Op, Traced};
 use crate::sim::{Persist, SimIo};
 
 const STORE: StoreId = StoreId(*b"recovery-store-1");
@@ -55,12 +55,20 @@ fn images(sim: &SimIo) -> Vec<Option<(Vec<u8>, Vec<u8>)>> {
 
 /// A complete logical request: records, both relationship directions, content, evidence.
 fn request(store: &NativeStore, step: u32) -> Option<(AttemptId, ChangeSet)> {
-    let payload: Vec<u8> = (0..(150_000 + step as usize * 7))
+    let staged = store.stage_content(&mut &payload(step)[..]).ok()?;
+    Some(request_with(&staged, step))
+}
+
+fn payload(step: u32) -> Vec<u8> {
+    (0..(150_000 + step as usize * 7))
         .map(|i| (i * 31 + step as usize) as u8)
-        .collect();
-    let staged = store.stage_content(&mut &payload[..]).ok()?;
+        .collect()
+}
+
+/// The request of `step`, binding already staged content.
+fn request_with(staged: &StagedContent, step: u32) -> (AttemptId, ChangeSet) {
     let mut cs = ChangeSet {
-        content: vec![ContentBinding::from(&staged)],
+        content: vec![ContentBinding::from(staged)],
         ..ChangeSet::default()
     };
     let (a, b) = (IDS[step as usize % 4], IDS[(step as usize + 1) % 4]);
@@ -81,10 +89,11 @@ fn request(store: &NativeStore, step: u32) -> Option<(AttemptId, ChangeSet)> {
         label: b"decision".to_vec(),
         bytes: format!("evidence {step}").into_bytes(),
     });
-    Some((
-        AttemptId::new(format!("attempt-{step}").into_bytes()).unwrap(),
-        cs,
-    ))
+    (attempt(step), cs)
+}
+
+fn attempt(step: u32) -> AttemptId {
+    AttemptId::new(format!("attempt-{step}").into_bytes()).unwrap()
 }
 
 fn commit_step(store: &NativeStore, step: u32) -> bool {
@@ -395,4 +404,198 @@ fn an_indeterminate_publication_leaves_new_views_on_the_old_state() {
     assert_eq!(generation(&s), old, "uncertain generation became visible");
     assert_eq!(logical_state(&s), states[1]);
     assert_eq!(history_len(&s), 1);
+}
+
+/// A barrier of a commit that a lossy sync failure can hit.
+#[derive(Clone, Copy, Debug)]
+enum Barrier {
+    DataContent,
+    DataMeta,
+    Publication,
+}
+
+/// Stages the content of step 2 (bound by the commit under test) and of step 3 (staged before
+/// that commit, bound only by a later one).
+fn stage_two(s: &NativeStore) -> (StagedContent, StagedContent) {
+    let x = s.stage_content(&mut &payload(2)[..]).expect("stage");
+    let y = s.stage_content(&mut &payload(3)[..]).expect("stage");
+    (x, y)
+}
+
+/// Which mutating operation, counted from just after the first commit, is `barrier` of the
+/// second commit (staging of both contents included).
+fn barrier_op(barrier: Barrier) -> u64 {
+    let probe = SimIo::new();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let s = create(Box::new(Traced {
+        inner: probe.clone(),
+        trace: trace.clone(),
+    }));
+    assert!(commit_step(&s, 1));
+    trace.lock().unwrap().clear();
+    let before = probe.ops();
+    let (x, _y) = stage_two(&s);
+    let (a, cs) = request_with(&x, 2);
+    s.commit(a, s.begin().unwrap(), cs).expect("probe commit");
+    let ops = trace.lock().unwrap().clone();
+    assert_eq!(ops.len() as u64, probe.ops() - before);
+    let slot = ops
+        .iter()
+        .rposition(|op| matches!(op, Op::Write { file: FileId::Meta, offset, .. } if *offset < 2 * PAGE_SIZE as u64))
+        .expect("publication record write");
+    let sync = |file| move |op: &Op| *op == Op::Sync { file };
+    let i = match barrier {
+        Barrier::DataContent => ops[..slot].iter().rposition(sync(FileId::Content)),
+        Barrier::DataMeta => ops[..slot].iter().rposition(sync(FileId::Meta)),
+        Barrier::Publication => ops[slot + 1..]
+            .iter()
+            .position(sync(FileId::Meta))
+            .map(|j| slot + 1 + j),
+    }
+    .expect("barrier");
+    i as u64 + 1
+}
+
+fn is_fenced_refusal(r: &Result<impl std::fmt::Debug, CommitError>) -> bool {
+    matches!(r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.contains("writes fenced"))
+}
+
+/// Commit 1 succeeds; commit 2 hits a lossy failure of `barrier`. Returns the store, its
+/// simulator, the commit error, and both staged contents.
+fn lossy_failure_of(
+    barrier: Barrier,
+) -> (
+    NativeStore,
+    SimIo,
+    CommitError,
+    StagedContent,
+    StagedContent,
+) {
+    let n = barrier_op(barrier);
+    let sim = SimIo::new();
+    sim.lossy_sync_failures();
+    let s = create(Box::new(sim.clone()));
+    assert!(commit_step(&s, 1));
+    sim.fail_nth_op(n);
+    let (x, y) = stage_two(&s);
+    let (a, cs) = request_with(&x, 2);
+    let err = s.commit(a, s.begin().unwrap(), cs).unwrap_err();
+
+    // Writes stay fenced: neither the content staged before the failure nor anything new may be
+    // committed, and nothing new may be staged.
+    let (a3, cs3) = request_with(&y, 3);
+    let late = s.commit(a3, s.begin().unwrap(), cs3);
+    assert!(
+        is_fenced_refusal(&late),
+        "{barrier:?}: commit of content staged before the failed barrier: {late:?}"
+    );
+    let unbound = ChangeSet {
+        changes: vec![Change::PutContext {
+            id: cid("D"),
+            expect: Precondition::Any,
+            body: b"after failure".to_vec(),
+            content: None,
+        }],
+        ..ChangeSet::default()
+    };
+    let late = s.commit(attempt(4), s.begin().unwrap(), unbound);
+    assert!(is_fenced_refusal(&late), "{barrier:?}: {late:?}");
+    let staged = s.stage_content(&mut &b"more"[..]);
+    assert!(
+        matches!(&staged, Err(StorageError::StoreState(m)) if m.contains("writes fenced")),
+        "{barrier:?}: staging after the failure: {staged:?}"
+    );
+    (s, sim, err, x, y)
+}
+
+/// Opens each image after a failed second commit: the store must show exactly the state after
+/// commit 1, no failed or refused attempt, no content the failed commit referenced, and keep
+/// working.
+fn assert_recovers_pre_failure_state(
+    barrier: Barrier,
+    images: Vec<SimIo>,
+    x: &StagedContent,
+    y: &StagedContent,
+) {
+    let states = reference_states(3);
+    for img in images {
+        let s = open(Box::new(img));
+        assert_eq!(logical_state(&s), states[1], "{barrier:?}");
+        assert!(
+            matches!(s.outcome(&attempt(1)).unwrap(), AttemptOutcome::Committed(r) if r.position == HistoryPosition(1)),
+            "{barrier:?}: acknowledged commit lost"
+        );
+        for step in [2, 3, 4] {
+            assert_eq!(
+                s.outcome(&attempt(step)).unwrap(),
+                AttemptOutcome::Absent,
+                "{barrier:?}: attempt {step}"
+            );
+        }
+        let mut v = s.begin().unwrap();
+        for c in [x, y] {
+            let r = v.content(&c.content).map(|_| ());
+            assert!(
+                matches!(&r, Err(StorageError::InvalidRequest(m)) if m.contains("not committed")),
+                "{barrier:?}: content of a failed commit is reachable: {r:?}"
+            );
+        }
+        // The store keeps working and converges on the uninterrupted run.
+        assert!(
+            commit_step(&s, 2),
+            "{barrier:?}: store unusable after recovery"
+        );
+        assert!(
+            commit_step(&s, 3),
+            "{barrier:?}: store unusable after recovery"
+        );
+        assert_eq!(logical_state(&s), states[3], "{barrier:?}");
+    }
+}
+
+#[test]
+fn a_lossy_failure_of_the_content_data_barrier_fences_and_recovers_the_old_state() {
+    data_barrier_case(Barrier::DataContent);
+}
+
+#[test]
+fn a_lossy_failure_of_the_metadata_data_barrier_fences_and_recovers_the_old_state() {
+    data_barrier_case(Barrier::DataMeta);
+}
+
+fn data_barrier_case(barrier: Barrier) {
+    let states = reference_states(1);
+    let (s, sim, err, x, y) = lossy_failure_of(barrier);
+    assert!(
+        matches!(&err, CommitError::Rejected(StorageError::Io(m)) if m.contains("simulated I/O error")),
+        "{barrier:?}: {err:?}"
+    );
+    assert_eq!(s.outcome(&attempt(2)).unwrap(), AttemptOutcome::Absent);
+    assert_eq!(logical_state(&s), states[1], "{barrier:?}");
+    drop(s);
+    let power_loss = sim.after_crash(Persist::None);
+    sim.release();
+    assert_recovers_pre_failure_state(barrier, vec![sim, power_loss], &x, &y);
+}
+
+#[test]
+fn a_lossy_failure_of_the_publication_barrier_is_indeterminate_and_recovers_a_whole_state() {
+    let barrier = Barrier::Publication;
+    let states = reference_states(1);
+    let (s, sim, err, x, y) = lossy_failure_of(barrier);
+    assert!(
+        matches!(&err, CommitError::Indeterminate(m) if m.contains("uncertain")),
+        "{err:?}"
+    );
+    assert_eq!(s.outcome(&attempt(2)).unwrap(), AttemptOutcome::Unknown);
+    assert_eq!(logical_state(&s), states[1]);
+    drop(s);
+    let images = vec![
+        sim.after_process_exit(),
+        sim.after_crash(Persist::None),
+        sim.after_crash(Persist::All),
+    ];
+    // The failed barrier dropped the unsynced publication record, so every image holds the old
+    // generation; recovery must present it whole, with outcomes that agree with it.
+    assert_recovers_pre_failure_state(barrier, images, &x, &y);
 }

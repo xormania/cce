@@ -74,6 +74,9 @@ struct State {
     fail_op: Option<u64>,
     /// Fail the next read with an I/O error.
     fail_next_read: bool,
+    /// An injected `sync` failure discards the file's pending writes (see
+    /// [`SimIo::lossy_sync_failures`]).
+    lossy_sync: bool,
 }
 
 /// A simulated store directory. Clones share the same state.
@@ -108,6 +111,14 @@ impl SimIo {
     /// Makes the next read fail with an I/O error (once).
     pub fn fail_next_read(&self) {
         self.st.lock().expect("sim").fail_next_read = true;
+    }
+
+    /// From now on, an injected failure of `sync(file)` models an operating system that drops
+    /// the dirty data it failed to write back: the file's pending writes are discarded (its
+    /// volatile image reverts to its durable image), so a later successful sync cannot make them
+    /// durable. Without this, a failed sync leaves pending writes pending.
+    pub fn lossy_sync_failures(&self) {
+        self.st.lock().expect("sim").lossy_sync = true;
     }
 
     pub fn ops(&self) -> u64 {
@@ -217,6 +228,15 @@ impl SimIo {
     }
 
     fn mutate<T>(&self, f: impl FnOnce(&mut State) -> T) -> Result<T, StorageError> {
+        self.mutate_or(f, |_| {})
+    }
+
+    /// Like `mutate`, but runs `on_injected_failure` when this operation is the injected failure.
+    fn mutate_or<T>(
+        &self,
+        f: impl FnOnce(&mut State) -> T,
+        on_injected_failure: impl FnOnce(&mut State),
+    ) -> Result<T, StorageError> {
         let mut st = self.st.lock().expect("sim");
         if st.crashed {
             return Err(StorageError::Io("simulated crash".into()));
@@ -230,6 +250,7 @@ impl SimIo {
         }
         st.ops += 1;
         if st.fail_op == Some(st.ops) {
+            on_injected_failure(&mut st);
             return Err(StorageError::Io(format!(
                 "simulated I/O error at op {}",
                 st.ops
@@ -312,12 +333,22 @@ impl Io for SimIo {
     }
 
     fn sync(&self, file: FileId) -> Result<(), StorageError> {
-        self.mutate(|st| {
-            if let Some(f) = st.files.get_mut(&file) {
-                f.durable = f.volatile.clone();
-                f.pending.clear();
-            }
-        })
+        self.mutate_or(
+            |st| {
+                if let Some(f) = st.files.get_mut(&file) {
+                    f.durable = f.volatile.clone();
+                    f.pending.clear();
+                }
+            },
+            |st| {
+                if st.lossy_sync
+                    && let Some(f) = st.files.get_mut(&file)
+                {
+                    f.volatile = f.durable.clone();
+                    f.pending.clear();
+                }
+            },
+        )
     }
 
     fn sync_dir(&self) -> Result<(), StorageError> {
@@ -400,5 +431,43 @@ mod tests {
         assert!(matches!(io.open(), Err(StorageError::Busy(_))));
         io.release();
         io.open().unwrap();
+    }
+
+    #[test]
+    fn a_failed_sync_keeps_pending_writes_unless_failures_are_lossy() {
+        for lossy in [false, true] {
+            let io = SimIo::new();
+            io.create().unwrap();
+            io.sync_dir().unwrap();
+            io.write_at(FileId::Meta, 0, b"durable").unwrap();
+            io.sync(FileId::Meta).unwrap();
+            if lossy {
+                io.lossy_sync_failures();
+            }
+            io.write_at(FileId::Meta, 0, b"lost").unwrap();
+            io.write_at(FileId::Meta, 7, b"tail").unwrap();
+            io.fail_nth_op(1);
+            assert!(matches!(
+                io.sync(FileId::Meta),
+                Err(StorageError::Io(m)) if m.contains("simulated I/O error")
+            ));
+            // The other file is untouched by a failed sync.
+            io.write_at(FileId::Content, 0, b"side").unwrap();
+            let after_failure = read(&io, 0, io.len(FileId::Meta).unwrap() as usize);
+            io.sync(FileId::Meta).unwrap();
+            io.sync(FileId::Content).unwrap();
+            let survived = io.after_crash(Persist::None);
+            let durable = read(&survived, 0, survived.len(FileId::Meta).unwrap() as usize);
+            if lossy {
+                assert_eq!(after_failure.as_deref(), Some(&b"durable"[..]));
+                assert_eq!(durable.as_deref(), Some(&b"durable"[..]), "resurrected");
+            } else {
+                assert_eq!(after_failure.as_deref(), Some(&b"lostbletail"[..]));
+                assert_eq!(durable.as_deref(), Some(&b"lostbletail"[..]));
+            }
+            let mut m = [0; 4];
+            survived.read_at(FileId::Content, 0, &mut m).unwrap();
+            assert_eq!(&m, b"side");
+        }
     }
 }
