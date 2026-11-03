@@ -14,7 +14,7 @@ use crate::sim::SimIo;
 
 fn store() -> NativeStore {
     NativeStore {
-        inner: Inner::create(Box::new(SimIo::new()), StoreId([3; 16])).unwrap(),
+        inner: Inner::create(Box::new(SimIo::new()), StoreId([3; 16]), Default::default()).unwrap(),
     }
 }
 
@@ -222,17 +222,17 @@ use crate::format::{Descriptor, PAGE_SIZE, PageKind, PageRef, encode_page};
 use crate::io::{FileId, Io};
 use crate::records::{ExtentRef, P_CONTENT, key};
 use crate::sim::Persist;
-use crate::tree::encode_leaf;
+use crate::tree::{Node, NodeSink, TreeTxn};
 
 fn sim_store(sim: &SimIo) -> NativeStore {
     NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), StoreId([3; 16])).unwrap(),
+        inner: Inner::create(Box::new(sim.clone()), StoreId([3; 16]), Default::default()).unwrap(),
     }
 }
 
 fn reopen(sim: &SimIo) -> NativeStore {
     NativeStore {
-        inner: Inner::open(Box::new(sim.clone())).expect("open"),
+        inner: Inner::open(Box::new(sim.clone()), Default::default()).expect("open"),
     }
 }
 
@@ -335,7 +335,9 @@ fn opening_rejects_cursors_that_contradict_the_store_files() {
     // Committed content length beyond the content file: refuse rather than overwrite later.
     let short = sim.after_crash(Persist::All);
     short.truncate_for_test(FileId::Content, 100);
-    let err = Inner::open(Box::new(short)).err().expect("open must fail");
+    let err = Inner::open(Box::new(short), Default::default())
+        .err()
+        .expect("open must fail");
     assert!(matches!(err, StorageError::Integrity(_)), "{err:?}");
 }
 
@@ -387,30 +389,34 @@ fn content_is_served_only_for_the_requested_digest() {
     commit(&s, "x", cs).unwrap();
     // Crafted metadata maps a different digest of the same length to B's extent.
     let cur = s.inner.snapshot().unwrap().desc;
-    let mut entries = (*s.inner.node(cur.root).unwrap()).clone();
-    let bx = ExtentRef::decode(&entries[&key(P_CONTENT, &[&b.content.digest.0])]).unwrap();
+    let bx = crate::tree::get(&*s.inner, cur.root, &key(P_CONTENT, &[&b.content.digest.0]))
+        .unwrap()
+        .unwrap();
     let forged = [0xAB; 32];
-    entries.insert(key(P_CONTENT, &[&forged]), bx.encode());
-    let root = PageRef {
-        page: cur.next_page,
-        incarnation: cur.generation + 1,
-    };
-    sim.write_at(
-        FileId::Meta,
-        root.page * PAGE_SIZE as u64,
-        &encode_page(
-            StoreId([3; 16]),
-            PageKind::Leaf,
-            root,
-            &encode_leaf(&entries),
-        )
-        .unwrap(),
-    )
-    .unwrap();
+    let mut t = TreeTxn::new(&*s.inner, cur.root);
+    t.put(key(P_CONTENT, &[&forged]), bx).unwrap();
+    struct Sink<'a>(&'a SimIo, u64, u64);
+    impl NodeSink for Sink<'_> {
+        fn write(&mut self, n: &Node) -> Result<PageRef, StorageError> {
+            let at = PageRef {
+                page: self.1,
+                incarnation: self.2,
+            };
+            self.0.write_at(
+                FileId::Meta,
+                at.page * PAGE_SIZE as u64,
+                &encode_page(StoreId([3; 16]), PageKind::Node, at, &n.encode())?,
+            )?;
+            self.1 += 1;
+            Ok(at)
+        }
+    }
+    let mut sink = Sink(&sim, cur.next_page, cur.generation + 1);
+    let root = t.finish(&mut sink).unwrap();
     let d = Descriptor {
         generation: cur.generation + 1,
         root,
-        next_page: cur.next_page + 1,
+        next_page: sink.1,
         ..cur
     };
     sim.write_at(
@@ -443,6 +449,81 @@ fn content_is_served_only_for_the_requested_digest() {
         .read_to_end(&mut out)
         .unwrap();
     assert_eq!(out, b"bytes of B");
+}
+
+#[test]
+fn a_store_in_the_previous_format_version_is_refused_without_modification() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let d = s.inner.snapshot().unwrap().desc;
+    drop(s);
+    // Rewrite the publication record as format version 1 (the single-leaf node encoding).
+    let slot = Descriptor::slot(d.generation) * PAGE_SIZE as u64;
+    let mut rec = d.encode();
+    rec[4..6].copy_from_slice(&1u16.to_le_bytes());
+    // magic 4 + version 2 + store 16 + six u64 fields = 70 bytes, then the CRC-32.
+    let crc = crc32fast::hash(&rec[..70]);
+    rec[70..74].copy_from_slice(&crc.to_le_bytes());
+    sim.write_at(FileId::Meta, slot, &rec).unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    let mut before = vec![0; sim.len(FileId::Meta).unwrap() as usize];
+    sim.read_at(FileId::Meta, 0, &mut before).unwrap();
+    sim.release();
+    let err = Inner::open(Box::new(sim.clone()), Default::default())
+        .err()
+        .expect("an older format version opened");
+    assert!(matches!(err, StorageError::Unsupported(_)), "{err:?}");
+    let mut after = vec![0; before.len()];
+    sim.read_at(FileId::Meta, 0, &mut after).unwrap();
+    assert_eq!(before, after, "refusing the store modified it");
+}
+
+#[test]
+fn node_references_outside_committed_metadata_are_refused_before_reading() {
+    use crate::tree::NodeSource;
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let d = s.inner.snapshot().unwrap().desc;
+    let bad = [
+        PageRef {
+            page: d.next_page,
+            incarnation: d.generation + 1,
+        },
+        PageRef {
+            page: d.root.page,
+            incarnation: d.generation + 1,
+        },
+        PageRef {
+            page: 0,
+            incarnation: 1,
+        },
+        PageRef {
+            page: u64::MAX / 2,
+            incarnation: 1,
+        },
+    ];
+    for at in bad {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.inner.load(at)));
+        let r = r.unwrap_or_else(|_| panic!("loading {at:?} panicked"));
+        assert!(
+            matches!(&r, Err(StorageError::Integrity(m)) if m.contains("not committed")),
+            "{at:?}: {r:?}"
+        );
+    }
+    // Positive neighbour: the committed root loads.
+    assert!(s.inner.load(d.root).is_ok());
 }
 
 #[test]
@@ -500,6 +581,7 @@ fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
                 fired: AtomicBool::new(false),
             }),
             StoreId([3; 16]),
+            Default::default(),
         )
         .unwrap(),
     };

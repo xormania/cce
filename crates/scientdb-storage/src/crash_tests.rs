@@ -33,13 +33,13 @@ fn traced<I: Io + 'static>(io: I, trace: &Arc<Mutex<Vec<Op>>>) -> Box<dyn Io> {
 
 fn create(io: Box<dyn Io>) -> NativeStore {
     NativeStore {
-        inner: Inner::create(io, STORE).expect("create"),
+        inner: Inner::create(io, STORE, Default::default()).expect("create"),
     }
 }
 
 fn open(io: Box<dyn Io>) -> NativeStore {
     NativeStore {
-        inner: Inner::open(io).expect("recovery must open the store"),
+        inner: Inner::open(io, Default::default()).expect("recovery must open the store"),
     }
 }
 
@@ -116,6 +116,7 @@ fn logical_state(store: &NativeStore) -> Vec<String> {
                 from: id.clone(),
                 direction: d,
                 kind: None,
+                after: None,
             };
             for r in v.relationships(&q).expect("rels") {
                 out.push(format!("{id:?} {d:?} {:?}", r.expect("rel")));

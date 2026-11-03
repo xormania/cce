@@ -27,7 +27,7 @@ use scientdb_kernel::storage::{
     RelationshipQuery, StagedContent, StorageEngine, StorageError,
 };
 
-use engine::{Inner, Snapshot};
+use engine::{Inner, Options, Snapshot};
 
 /// A native store owned by this process.
 ///
@@ -42,8 +42,42 @@ impl NativeStore {
     /// page; it lets the engine reject pages and handles from other stores. Refuses to create over
     /// an existing store.
     pub fn create(dir: &Path, store_id: [u8; 16]) -> Result<Self, StorageError> {
+        Self::create_with(dir, store_id, StoreOptions::default())
+    }
+
+    /// Like [`NativeStore::create`], with explicit tuning options.
+    pub fn create_with(
+        dir: &Path,
+        store_id: [u8; 16],
+        options: StoreOptions,
+    ) -> Result<Self, StorageError> {
+        let inner = Inner::create(
+            Box::new(io::FsIo::new(dir)),
+            format::StoreId(store_id),
+            options.into(),
+        )?;
+        Ok(Self { inner })
+    }
+
+    /// Like [`NativeStore::open`], with explicit tuning options.
+    pub fn open_with(dir: &Path, options: StoreOptions) -> Result<Self, StorageError> {
         Ok(Self {
-            inner: Inner::create(Box::new(io::FsIo::new(dir)), format::StoreId(store_id))?,
+            inner: Inner::open(Box::new(io::FsIo::new(dir)), options.into())?,
+        })
+    }
+
+    /// Instrumentation counters and current tree shape. Counters never affect engine behavior.
+    pub fn stats(&self) -> Result<StoreStats, StorageError> {
+        let c = &self.inner.counters;
+        let get = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        Ok(StoreStats {
+            pages_written: get(&c.pages_written),
+            page_bytes_written: get(&c.page_bytes_written),
+            content_bytes_written: get(&c.content_bytes_written),
+            node_cache_misses: get(&c.cache_misses),
+            node_cache_evictions: get(&c.cache_evictions),
+            node_cache_capacity: self.inner.cache_capacity(),
+            tree_height: self.inner.height()?,
         })
     }
 
@@ -54,10 +88,45 @@ impl NativeStore {
 
     /// Opens an existing store in `dir`. Never initializes a new store in its place.
     pub fn open(dir: &Path) -> Result<Self, StorageError> {
-        Ok(Self {
-            inner: Inner::open(Box::new(io::FsIo::new(dir)))?,
-        })
+        Self::open_with(dir, StoreOptions::default())
     }
+}
+
+/// Tuning that does not change stored bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct StoreOptions {
+    /// Decoded metadata nodes kept in memory. Larger stores still work with a small cache; they
+    /// read more pages.
+    pub cache_nodes: usize,
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        Self {
+            cache_nodes: engine::DEFAULT_CACHE_NODES,
+        }
+    }
+}
+
+impl From<StoreOptions> for Options {
+    fn from(o: StoreOptions) -> Self {
+        Options {
+            cache_nodes: o.cache_nodes,
+        }
+    }
+}
+
+/// Instrumentation for one open store (since it was opened).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreStats {
+    pub pages_written: u64,
+    pub page_bytes_written: u64,
+    pub content_bytes_written: u64,
+    pub node_cache_misses: u64,
+    pub node_cache_evictions: u64,
+    pub node_cache_capacity: usize,
+    /// Height of the current metadata tree (1 = a single leaf).
+    pub tree_height: usize,
 }
 
 /// A consistent view of one committed state of a [`NativeStore`].
@@ -76,12 +145,7 @@ impl ReadView for NativeView {
         query: &RelationshipQuery,
     ) -> Result<Box<dyn Iterator<Item = Result<Relationship, StorageError>> + '_>, StorageError>
     {
-        Ok(Box::new(
-            self.inner
-                .relationships(&self.snap, query)?
-                .into_iter()
-                .map(Ok),
-        ))
+        Ok(Box::new(self.inner.relationships(&self.snap, query)?))
     }
 
     fn history(

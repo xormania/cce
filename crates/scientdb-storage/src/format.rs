@@ -8,7 +8,9 @@ use scientdb_kernel::storage::StorageError;
 use crate::codec::{Dec, Enc, corrupt};
 
 pub(crate) const PAGE_SIZE: usize = 4096;
-pub(crate) const FORMAT_VERSION: u16 = 1;
+/// Version 2: tagged leaf/branch tree nodes (version 1 had single-leaf trees). Older versions are
+/// refused, never reinterpreted.
+pub(crate) const FORMAT_VERSION: u16 = 2;
 pub(crate) const PAGE_MAGIC: [u8; 4] = *b"SDBP";
 pub(crate) const DESC_MAGIC: [u8; 4] = *b"SDBD";
 /// Pages 0 and 1 are publication slots.
@@ -33,7 +35,8 @@ pub(crate) struct PageRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum PageKind {
-    Leaf = 1,
+    /// A copy-on-write tree node (leaf or branch; see `tree::Node`).
+    Node = 1,
 }
 
 /// Encodes a node page. Fails with an explicit capacity error if the payload does not fit.
@@ -45,7 +48,7 @@ pub(crate) fn encode_page(
 ) -> Result<Vec<u8>, StorageError> {
     if payload.len() > PAGE_PAYLOAD_MAX {
         return Err(StorageError::InvalidRequest(format!(
-            "capacity: node payload {} exceeds {PAGE_PAYLOAD_MAX} bytes (single-leaf limit)",
+            "capacity: node payload {} exceeds {PAGE_PAYLOAD_MAX} bytes ",
             payload.len()
         )));
     }
@@ -230,28 +233,28 @@ mod tests {
             page: 5,
             incarnation: 3,
         };
-        let p = encode_page(S, PageKind::Leaf, at, b"payload").unwrap();
+        let p = encode_page(S, PageKind::Node, at, b"payload").unwrap();
         assert_eq!(p.len(), PAGE_SIZE);
-        assert_eq!(decode_page(S, PageKind::Leaf, at, &p).unwrap(), b"payload");
+        assert_eq!(decode_page(S, PageKind::Node, at, &p).unwrap(), b"payload");
         let stale = PageRef {
             page: 5,
             incarnation: 2,
         };
         assert!(
-            decode_page(S, PageKind::Leaf, stale, &p).is_err(),
+            decode_page(S, PageKind::Node, stale, &p).is_err(),
             "old incarnation accepted"
         );
         assert!(
-            decode_page(StoreId([8; 16]), PageKind::Leaf, at, &p).is_err(),
+            decode_page(StoreId([8; 16]), PageKind::Node, at, &p).is_err(),
             "foreign page accepted"
         );
         let mut flipped = p.clone();
         flipped[PAGE_HEADER_LEN + 2] ^= 1;
         assert!(
-            decode_page(S, PageKind::Leaf, at, &flipped).is_err(),
+            decode_page(S, PageKind::Node, at, &flipped).is_err(),
             "corrupt payload accepted"
         );
-        assert!(encode_page(S, PageKind::Leaf, at, &vec![0; PAGE_PAYLOAD_MAX + 1]).is_err());
+        assert!(encode_page(S, PageKind::Node, at, &vec![0; PAGE_PAYLOAD_MAX + 1]).is_err());
     }
 
     #[test]
@@ -274,9 +277,9 @@ mod tests {
         torn[20] ^= 0x40;
         assert!(matches!(decode_slot(&torn), Slot::Invalid(_)));
         let mut future = bytes.clone();
-        future[4..6].copy_from_slice(&2u16.to_le_bytes());
+        future[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         let crc = crc32fast::hash(&future[..DESC_LEN - 4]);
         future[DESC_LEN - 4..DESC_LEN].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(decode_slot(&future), Slot::Unsupported(2));
+        assert_eq!(decode_slot(&future), Slot::Unsupported(FORMAT_VERSION + 1));
     }
 }

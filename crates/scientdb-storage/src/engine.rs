@@ -2,14 +2,15 @@
 //!
 //! Commit protocol (see `docs/storage-failure-model.md`):
 //! 1. validate the basis and the attempt identity against the latest committed state;
-//! 2. build the new tree from the newest committed tree, write the history entry to the content file and the
-//!    new tree node to a fresh metadata page (no live page is ever overwritten);
+//! 2. edit a copy-on-write working copy of the newest committed tree, write the history entry to
+//!    the content file and every touched tree node to a fresh metadata page (no page reachable from
+//!    a publication record is ever overwritten);
 //! 3. data barrier: sync the content file, then the metadata file;
 //! 4. write the publication record for generation g+1 into slot (g+1) mod 2;
 //! 5. publication barrier: sync the metadata file;
 //! 6. expose the new generation to new views and acknowledge.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -32,14 +33,38 @@ use crate::records::{
     AttemptValue, ContextValue, ExtentRef, P_ATTEMPT, P_CONTENT, P_CONTEXT, P_HISTORY, P_IN, P_OUT,
     P_REL, RelValue, decode_history, encode_history, fingerprint, history_key, key,
 };
-use crate::tree::{Entries, decode_leaf, encode_leaf, prefix_range};
+use crate::tree::{self, Cursor, Node, NodeSink, NodeSource, TreeTxn};
 
 /// Content streaming buffer. Payloads of any length stream through a buffer of this size.
 pub(crate) const CONTENT_CHUNK: usize = 64 * 1024;
-/// Decoded tree nodes kept in memory, keyed by location *and* incarnation.
-const CACHE_NODES: usize = 64;
+/// Default number of decoded tree nodes kept in memory.
+pub(crate) const DEFAULT_CACHE_NODES: usize = 256;
 
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// Engine tuning that does not affect stored bytes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Options {
+    pub cache_nodes: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            cache_nodes: DEFAULT_CACHE_NODES,
+        }
+    }
+}
+
+/// Counters for instrumentation; they never influence engine decisions.
+#[derive(Default)]
+pub(crate) struct Counters {
+    pub pages_written: AtomicU64,
+    pub page_bytes_written: AtomicU64,
+    pub content_bytes_written: AtomicU64,
+    pub cache_misses: AtomicU64,
+    pub cache_evictions: AtomicU64,
+}
 
 /// The committed state a view reads.
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +82,13 @@ struct State {
     fenced: Option<String>,
 }
 
+/// Bounded node cache keyed by location *and* incarnation, evicting in insertion order.
+struct NodeCache {
+    map: HashMap<PageRef, Arc<Node>>,
+    order: VecDeque<PageRef>,
+    capacity: usize,
+}
+
 pub(crate) struct Inner {
     io: Box<dyn Io>,
     store: StoreId,
@@ -66,7 +98,8 @@ pub(crate) struct Inner {
     writer: Mutex<()>,
     /// Content-file allocation cursor; held while streaming an allocation.
     alloc: Mutex<u64>,
-    cache: Mutex<HashMap<PageRef, Arc<Entries>>>,
+    cache: Mutex<NodeCache>,
+    pub counters: Counters,
     /// Recovery diagnostics from open (for example an ignored damaged slot).
     pub diagnostics: Vec<String>,
 }
@@ -83,8 +116,91 @@ fn rejected(e: StorageError) -> CommitError {
     CommitError::Rejected(e)
 }
 
+/// Writes new tree nodes at fresh pages for one generation.
+struct PageWriter<'a> {
+    inner: &'a Inner,
+    next_page: u64,
+    generation: u64,
+}
+
+impl NodeSink for PageWriter<'_> {
+    fn write(&mut self, node: &Node) -> Result<PageRef, StorageError> {
+        let at = PageRef {
+            page: self.next_page,
+            incarnation: self.generation,
+        };
+        let next = self
+            .next_page
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidRequest("page counter exhausted".into()))?;
+        let page = encode_page(self.inner.store, PageKind::Node, at, &node.encode())?;
+        self.inner
+            .io
+            .write_at(FileId::Meta, at.page * PAGE_SIZE as u64, &page)?;
+        self.next_page = next;
+        self.inner
+            .counters
+            .pages_written
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .counters
+            .page_bytes_written
+            .fetch_add(page.len() as u64, Ordering::Relaxed);
+        Ok(at)
+    }
+}
+
+impl NodeSource for Inner {
+    fn load(&self, at: PageRef) -> Result<Arc<Node>, StorageError> {
+        let cur = lock(&self.state).current;
+        let offset = at.page.checked_mul(PAGE_SIZE as u64);
+        if at.page < FIRST_NODE_PAGE
+            || at.page >= cur.next_page
+            || at.incarnation == 0
+            || at.incarnation > cur.generation
+            || offset.is_none()
+        {
+            return Err(corrupt(format!(
+                "node reference {}@{} is not committed metadata (pages below {}, generations up to {})",
+                at.page, at.incarnation, cur.next_page, cur.generation
+            )));
+        }
+        if let Some(n) = lock(&self.cache).map.get(&at) {
+            return Ok(n.clone());
+        }
+        self.counters.cache_misses.fetch_add(1, Ordering::Relaxed);
+        let mut buf = vec![0; PAGE_SIZE];
+        self.io
+            .read_at(FileId::Meta, offset.unwrap_or_default(), &mut buf)?;
+        let node = Arc::new(Node::decode(&decode_page(
+            self.store,
+            PageKind::Node,
+            at,
+            &buf,
+        )?)?);
+        let mut c = lock(&self.cache);
+        if c.capacity > 0 && c.map.insert(at, node.clone()).is_none() {
+            c.order.push_back(at);
+            while c.map.len() > c.capacity {
+                let Some(old) = c.order.pop_front() else {
+                    break;
+                };
+                c.map.remove(&old);
+                self.counters
+                    .cache_evictions
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(node)
+    }
+}
+
 impl Inner {
-    pub fn create(io: Box<dyn Io>, store: StoreId) -> Result<Arc<Self>, StorageError> {
+    pub fn create(
+        io: Box<dyn Io>,
+        store: StoreId,
+        opts: Options,
+    ) -> Result<Arc<Self>, StorageError> {
         io.create()?;
         // Make the new directory entries durable before anything refers to them.
         io.sync_dir()?;
@@ -93,10 +209,11 @@ impl Inner {
             incarnation: 1,
         };
         // Slot 0 stays empty (a file hole reads as zeros); generation 1 is published in slot 1.
+        let empty = Node::Leaf(tree::Entries::new()).encode();
         io.write_at(
             FileId::Meta,
             root.page * PAGE_SIZE as u64,
-            &encode_page(store, PageKind::Leaf, root, &encode_leaf(&Entries::new()))?,
+            &encode_page(store, PageKind::Node, root, &empty)?,
         )?;
         io.sync(FileId::Content)?;
         io.sync(FileId::Meta)?;
@@ -114,10 +231,10 @@ impl Inner {
             &desc.encode(),
         )?;
         io.sync(FileId::Meta)?;
-        Ok(Arc::new(Self::new(io, desc, Vec::new())))
+        Ok(Arc::new(Self::new(io, desc, Vec::new(), opts)))
     }
 
-    pub fn open(io: Box<dyn Io>) -> Result<Arc<Self>, StorageError> {
+    pub fn open(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
         io.open()?;
         let len = io.len(FileId::Meta)?;
         if len < 2 * PAGE_SIZE as u64 {
@@ -138,10 +255,10 @@ impl Inner {
         // any receipt or new commit can rely on them.
         io.sync(FileId::Content)?;
         io.sync(FileId::Meta)?;
-        Ok(Arc::new(Self::new(io, desc, diagnostics)))
+        Ok(Arc::new(Self::new(io, desc, diagnostics, opts)))
     }
 
-    fn new(io: Box<dyn Io>, desc: Descriptor, diagnostics: Vec<String>) -> Self {
+    fn new(io: Box<dyn Io>, desc: Descriptor, diagnostics: Vec<String>, opts: Options) -> Self {
         Self {
             io,
             store: desc.store,
@@ -154,7 +271,12 @@ impl Inner {
                 fenced: None,
             }),
             writer: Mutex::new(()),
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(NodeCache {
+                map: HashMap::new(),
+                order: VecDeque::new(),
+                capacity: opts.cache_nodes,
+            }),
+            counters: Counters::default(),
             diagnostics,
         }
     }
@@ -165,25 +287,13 @@ impl Inner {
         })
     }
 
-    pub(crate) fn node(&self, at: PageRef) -> Result<Arc<Entries>, StorageError> {
-        if let Some(e) = lock(&self.cache).get(&at) {
-            return Ok(e.clone());
-        }
-        let mut buf = vec![0; PAGE_SIZE];
-        self.io
-            .read_at(FileId::Meta, at.page * PAGE_SIZE as u64, &mut buf)?;
-        let entries = Arc::new(decode_leaf(&decode_page(
-            self.store,
-            PageKind::Leaf,
-            at,
-            &buf,
-        )?)?);
-        let mut cache = lock(&self.cache);
-        if cache.len() >= CACHE_NODES {
-            cache.clear();
-        }
-        cache.insert(at, entries.clone());
-        Ok(entries)
+    pub fn height(&self) -> Result<usize, StorageError> {
+        let root = lock(&self.state).current.root;
+        tree::height(self, root)
+    }
+
+    pub fn cache_capacity(&self) -> usize {
+        lock(&self.cache).capacity
     }
 
     pub(crate) fn read_extent(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
@@ -228,6 +338,9 @@ impl Inner {
                 Err(e) => return Err(StorageError::Io(format!("staging source: {e}"))),
             };
             self.io.write_at(FileId::Content, offset + len, &buf[..n])?;
+            self.counters
+                .content_bytes_written
+                .fetch_add(n as u64, Ordering::Relaxed);
             hasher.update(&buf[..n]);
             len += n as u64;
         }
@@ -315,7 +428,7 @@ impl Inner {
             }
             st.current
         };
-        let mut entries: Entries = (*self.node(cur.root).map_err(rejected)?).clone();
+        let mut txn = TreeTxn::new(self, cur.root);
 
         // Every content index must name a binding before the request is fingerprinted.
         for c in &cs.changes {
@@ -334,8 +447,8 @@ impl Inner {
         // Attempt identity: an identical retry returns the original receipt.
         let fp = fingerprint(&attempt, &cs);
         let akey = key(P_ATTEMPT, &[attempt.as_bytes()]);
-        if let Some(v) = entries.get(&akey) {
-            let prior = AttemptValue::decode(v).map_err(rejected)?;
+        if let Some(v) = txn.get(&akey).map_err(rejected)? {
+            let prior = AttemptValue::decode(&v).map_err(rejected)?;
             return if prior.fingerprint == fp {
                 Ok(CommitReceipt {
                     attempt,
@@ -353,9 +466,9 @@ impl Inner {
         })?;
         let bound = self.resolve_content(&cs)?;
         let extents: Vec<ExtentRef> = bound.iter().map(|(_, x)| *x).collect();
-        apply(&mut entries, &cs, &extents, pos)?;
+        apply(&mut txn, &cs, &extents, pos)?;
 
-        // History entry → content file; then the new tree node → a fresh metadata page.
+        // History entry → content file; then touched tree nodes → fresh metadata pages.
         let hist = encode_history(pos, &attempt, &cs);
         let hist_ref = {
             let mut cursor = lock(&self.alloc);
@@ -367,35 +480,36 @@ impl Inner {
             self.io
                 .write_at(FileId::Content, x.offset, &hist)
                 .map_err(rejected)?;
+            self.counters
+                .content_bytes_written
+                .fetch_add(x.len, Ordering::Relaxed);
             *cursor += x.len;
             x
         };
-        entries.insert(history_key(pos), hist_ref.encode());
-        entries.insert(
+        txn.put(history_key(pos), hist_ref.encode())
+            .map_err(rejected)?;
+        txn.put(
             akey,
             AttemptValue {
                 position: pos,
                 fingerprint: fp,
             }
             .encode(),
-        );
+        )
+        .map_err(rejected)?;
 
-        let (Some(generation), Some(next_page)) =
-            (cur.generation.checked_add(1), cur.next_page.checked_add(1))
-        else {
+        let Some(generation) = cur.generation.checked_add(1) else {
             return Err(rejected(StorageError::InvalidRequest(
-                "generation or page counter exhausted".into(),
+                "generation counter exhausted".into(),
             )));
         };
-        let root = PageRef {
-            page: cur.next_page,
-            incarnation: generation,
+        let mut sink = PageWriter {
+            inner: self,
+            next_page: cur.next_page,
+            generation,
         };
-        let page = encode_page(self.store, PageKind::Leaf, root, &encode_leaf(&entries))
-            .map_err(rejected)?;
-        self.io
-            .write_at(FileId::Meta, root.page * PAGE_SIZE as u64, &page)
-            .map_err(rejected)?;
+        let root = txn.finish(&mut sink).map_err(rejected)?;
+        let next_page = sink.next_page;
 
         // Data barrier: every byte the new generation references must be durable first. Capture
         // the allocation boundary before it: staging may append past it concurrently, and only
@@ -452,14 +566,15 @@ impl Inner {
         }
         let cur = st.current;
         drop(st);
-        let entries = self.node(cur.root)?;
-        Ok(match entries.get(&key(P_ATTEMPT, &[attempt.as_bytes()])) {
-            Some(v) => AttemptOutcome::Committed(CommitReceipt {
-                attempt: attempt.clone(),
-                position: HistoryPosition(AttemptValue::decode(v)?.position),
-            }),
-            None => AttemptOutcome::Absent,
-        })
+        Ok(
+            match tree::get(self, cur.root, &key(P_ATTEMPT, &[attempt.as_bytes()]))? {
+                Some(v) => AttemptOutcome::Committed(CommitReceipt {
+                    attempt: attempt.clone(),
+                    position: HistoryPosition(AttemptValue::decode(&v)?.position),
+                }),
+                None => AttemptOutcome::Absent,
+            },
+        )
     }
 
     pub fn close(&self) -> Result<(), StorageError> {
@@ -474,11 +589,10 @@ impl Inner {
         s: &Snapshot,
         id: &ContextId,
     ) -> Result<Option<ContextRecord>, StorageError> {
-        let entries = self.node(s.desc.root)?;
-        let Some(v) = entries.get(&key(P_CONTEXT, &[id.as_bytes()])) else {
+        let Some(v) = tree::get(self, s.desc.root, &key(P_CONTEXT, &[id.as_bytes()]))? else {
             return Ok(None);
         };
-        let v = ContextValue::decode(v)?;
+        let v = ContextValue::decode(&v)?;
         Ok(Some(ContextRecord {
             id: id.clone(),
             revision: Revision(v.revision),
@@ -487,12 +601,12 @@ impl Inner {
         }))
     }
 
-    pub fn relationships(
-        &self,
+    /// Lazily yields relationships from one direction's index, one leaf at a time.
+    pub fn relationships<'a>(
+        &'a self,
         s: &Snapshot,
         q: &RelationshipQuery,
-    ) -> Result<Vec<Relationship>, StorageError> {
-        let entries = self.node(s.desc.root)?;
+    ) -> Result<impl Iterator<Item = Result<Relationship, StorageError>> + 'a, StorageError> {
         let p = match q.direction {
             Direction::Outgoing => P_OUT,
             Direction::Incoming => P_IN,
@@ -502,44 +616,65 @@ impl Inner {
         if let Some(k) = &q.kind {
             key_component(&mut prefix, k.as_bytes());
         }
-        let mut out = Vec::new();
-        for (k, _) in prefix_range(&entries, &prefix, None) {
+        let start = match &q.after {
+            None => None,
+            Some(a) => {
+                if q.kind.as_ref().is_some_and(|k| *k != a.kind) {
+                    return Err(StorageError::InvalidRequest(
+                        "resume position has a different kind than the query".into(),
+                    ));
+                }
+                let mut k = vec![p];
+                key_component(&mut k, q.from.as_bytes());
+                key_component(&mut k, a.kind.as_bytes());
+                key_component(&mut k, a.other.as_bytes());
+                key_component(&mut k, a.id.as_bytes());
+                // Strictly after the position: the next possible key.
+                k.push(0);
+                Some(k)
+            }
+        };
+        let root = s.desc.root;
+        let cursor = Cursor::new(self, root, &prefix, start.as_deref(), s.desc.next_page)?;
+        Ok(cursor.map(move |entry| {
+            let (k, _) = entry?;
             let parts = key_components(&k[1..])?;
             let [_, _, _, id] = parts.as_slice() else {
                 return Err(corrupt("relationship index key arity"));
             };
-            let rv = entries
-                .get(&key(P_REL, &[id]))
+            let rv = tree::get(self, root, &key(P_REL, &[id]))?
                 .ok_or_else(|| corrupt("relationship index entry without its record"))?;
-            let rv = RelValue::decode(rv)?;
+            let rv = RelValue::decode(&rv)?;
             let ident =
                 |b: &[u8]| corrupt(format!("stored identifier {}", String::from_utf8_lossy(b)));
-            out.push(Relationship {
+            Ok(Relationship {
                 id: RelationshipId::new(id.clone()).map_err(|_| ident(id))?,
                 kind: RelationshipKind::new(rv.kind.clone()).map_err(|_| ident(&rv.kind))?,
                 source: ContextId::new(rv.source.clone()).map_err(|_| ident(&rv.source))?,
                 target: ContextId::new(rv.target.clone()).map_err(|_| ident(&rv.target))?,
                 revision: Revision(rv.revision),
-            });
-        }
-        Ok(out)
+            })
+        }))
     }
 
-    pub fn history(
-        self: &Arc<Self>,
+    /// Lazily yields retained history from `start`.
+    pub fn history<'a>(
+        &'a self,
         s: &Snapshot,
         start: HistoryPosition,
-    ) -> Result<impl Iterator<Item = Result<HistoryEntry, StorageError>> + use<>, StorageError>
-    {
-        let entries = self.node(s.desc.root)?;
+    ) -> Result<impl Iterator<Item = Result<HistoryEntry, StorageError>> + 'a, StorageError> {
         let from = history_key(start.0.max(1));
-        let refs: Vec<ExtentRef> = prefix_range(&entries, &[P_HISTORY], Some(&from))
-            .map(|(_, v)| ExtentRef::decode(v))
-            .collect::<Result<_, _>>()?;
-        let me = self.clone();
-        Ok(refs
-            .into_iter()
-            .map(move |x| decode_history(&me.read_extent(&x)?)))
+        let cursor = Cursor::new(
+            self,
+            s.desc.root,
+            &[P_HISTORY],
+            Some(&from),
+            s.desc.next_page,
+        )?;
+        Ok(cursor.map(move |entry| {
+            let (_, v) = entry?;
+            decode_history(&self.read_extent(&ExtentRef::decode(&v)?)?)
+        }))
     }
 
     pub fn content(
@@ -547,13 +682,11 @@ impl Inner {
         s: &Snapshot,
         c: &ContentRef,
     ) -> Result<ExtentReader, StorageError> {
-        let entries = self.node(s.desc.root)?;
-        let x = entries
-            .get(&key(P_CONTENT, &[&c.digest.0]))
-            .ok_or_else(|| {
+        let x =
+            tree::get(&**self, s.desc.root, &key(P_CONTENT, &[&c.digest.0]))?.ok_or_else(|| {
                 StorageError::InvalidRequest("content is not committed in this view".into())
             })?;
-        let x = ExtentRef::decode(x)?;
+        let x = ExtentRef::decode(&x)?;
         if x.len != c.len || x.digest != c.digest.0 {
             return Err(corrupt(
                 "content record does not match the requested digest and length",
@@ -587,8 +720,7 @@ fn validate_cursors(io: &dyn Io, d: &Descriptor) -> Result<(), StorageError> {
         && d.content_len <= content;
     if !ok {
         return Err(corrupt(format!(
-            "publication record generation {} contradicts the store files (root page {}, next page {}, \
-             content {} of {content} bytes, metadata {meta} bytes)",
+            "publication record generation {} contradicts the store files (root page {}, next page {}, content {} of {content} bytes, metadata {meta} bytes)",
             d.generation, d.root.page, d.next_page, d.content_len
         )));
     }
@@ -629,24 +761,11 @@ fn select(slots: &[Slot]) -> Result<(Descriptor, Vec<String>), StorageError> {
     Ok((best, diags))
 }
 
-/// Applies a change set to the latest entries, checking preconditions.
-/// Largest key + value of one metadata record. Larger bodies belong in content.
-pub(crate) const MAX_ENTRY: usize = 1800;
-
-fn check_entry(k: &[u8], v: &[u8]) -> Result<(), CommitError> {
-    if k.len() + v.len() > MAX_ENTRY {
-        return Err(rejected(StorageError::InvalidRequest(format!(
-            "record too large for metadata: {} bytes (limit {MAX_ENTRY}); store large data as content",
-            k.len() + v.len()
-        ))));
-    }
-    Ok(())
-}
-
+/// Applies a change set to the newest tree, checking preconditions.
 /// Each changed record's revision becomes `pos`, the history position of this commit, so a
 /// revision is never reused for an identity, even after removal and recreation.
 fn apply(
-    entries: &mut Entries,
+    t: &mut TreeTxn,
     cs: &ChangeSet,
     bound: &[ExtentRef],
     pos: u64,
@@ -694,9 +813,10 @@ fn apply(
                 content,
             } => {
                 let k = key(P_CONTEXT, &[id.as_bytes()]);
-                let prev = entries
+                let prev = t
                     .get(&k)
-                    .map(|v| ContextValue::decode(v))
+                    .map_err(rejected)?
+                    .map(|v| ContextValue::decode(&v))
                     .transpose()
                     .map_err(rejected)?;
                 check(
@@ -713,24 +833,29 @@ fn apply(
                     ),
                 };
                 if let Some(x) = content {
-                    entries
-                        .entry(key(P_CONTENT, &[&x.digest]))
-                        .or_insert_with(|| x.encode());
+                    let ck = key(P_CONTENT, &[&x.digest]);
+                    if t.get(&ck).map_err(rejected)?.is_none() {
+                        t.put(ck, x.encode()).map_err(rejected)?;
+                    }
                 }
-                let v = ContextValue {
-                    revision: pos,
-                    body: body.clone(),
-                    content,
-                }
-                .encode();
-                check_entry(&k, &v)?;
-                entries.insert(k, v);
+                let revision = pos;
+                t.put(
+                    k,
+                    ContextValue {
+                        revision,
+                        body: body.clone(),
+                        content,
+                    }
+                    .encode(),
+                )
+                .map_err(rejected)?;
             }
             Change::RemoveContext { id, expect } => {
                 let k = key(P_CONTEXT, &[id.as_bytes()]);
-                let prev = entries
+                let prev = t
                     .get(&k)
-                    .map(|v| ContextValue::decode(v))
+                    .map_err(rejected)?
+                    .map(|v| ContextValue::decode(&v))
                     .transpose()
                     .map_err(rejected)?;
                 check(
@@ -741,7 +866,7 @@ fn apply(
                 if prev.is_none() {
                     return Err(invalid(format!("remove of absent {id:?}")));
                 }
-                entries.remove(&k);
+                t.delete(&k).map_err(rejected)?;
             }
             Change::PutRelationship {
                 id,
@@ -751,9 +876,10 @@ fn apply(
                 target,
             } => {
                 let k = key(P_REL, &[id.as_bytes()]);
-                let prev = entries
+                let prev = t
                     .get(&k)
-                    .map(|v| RelValue::decode(v))
+                    .map_err(rejected)?
+                    .map(|v| RelValue::decode(&v))
                     .transpose()
                     .map_err(rejected)?;
                 check(
@@ -762,8 +888,8 @@ fn apply(
                     expect,
                 )?;
                 if let Some(p) = &prev {
-                    entries.remove(&p.out_key(id.as_bytes()));
-                    entries.remove(&p.in_key(id.as_bytes()));
+                    t.delete(&p.out_key(id.as_bytes())).map_err(rejected)?;
+                    t.delete(&p.in_key(id.as_bytes())).map_err(rejected)?;
                 }
                 let v = RelValue {
                     revision: pos,
@@ -771,17 +897,18 @@ fn apply(
                     source: source.as_bytes().to_vec(),
                     target: target.as_bytes().to_vec(),
                 };
-                entries.insert(v.out_key(id.as_bytes()), Vec::new());
-                entries.insert(v.in_key(id.as_bytes()), Vec::new());
-                let v = v.encode();
-                check_entry(&k, &v)?;
-                entries.insert(k, v);
+                t.put(v.out_key(id.as_bytes()), Vec::new())
+                    .map_err(rejected)?;
+                t.put(v.in_key(id.as_bytes()), Vec::new())
+                    .map_err(rejected)?;
+                t.put(k, v.encode()).map_err(rejected)?;
             }
             Change::RemoveRelationship { id, expect } => {
                 let k = key(P_REL, &[id.as_bytes()]);
-                let prev = entries
+                let prev = t
                     .get(&k)
-                    .map(|v| RelValue::decode(v))
+                    .map_err(rejected)?
+                    .map(|v| RelValue::decode(&v))
                     .transpose()
                     .map_err(rejected)?;
                 check(
@@ -792,9 +919,9 @@ fn apply(
                 let Some(p) = prev else {
                     return Err(invalid(format!("remove of absent {id:?}")));
                 };
-                entries.remove(&p.out_key(id.as_bytes()));
-                entries.remove(&p.in_key(id.as_bytes()));
-                entries.remove(&k);
+                t.delete(&p.out_key(id.as_bytes())).map_err(rejected)?;
+                t.delete(&p.in_key(id.as_bytes())).map_err(rejected)?;
+                t.delete(&k).map_err(rejected)?;
             }
         }
     }

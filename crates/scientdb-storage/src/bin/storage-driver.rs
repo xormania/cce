@@ -8,7 +8,8 @@
 //!
 //! ```text
 //! probe ok|fail|hang                      harness self-check; does not touch storage
-//! create <dir> | open <dir>
+//! create <dir> | open <dir> [<cache-nodes>]
+//! stats                                   prints instrumentation counters and tree height
 //! stage <name> hex <bytes>                stage literal bytes
 //! stage <name> gen <len> <seed>           stage a generated stream (see `gen_byte`)
 //! put-context <id> <expect> <body> <content-name|->
@@ -19,6 +20,7 @@
 //! commit <attempt>                        submits the changes accumulated since the last commit
 //! outcome <attempt>
 //! dump <id>[,<id>...]                     prints the committed state reachable from those ids
+//! rels <id> out|in <kind|-> <limit> [<after-kind> <after-other> <after-id>]  paged query
 //! read-content <digest> <len>             reads content by logical reference through a new view
 //! hold                                    prints `holding` and blocks until killed
 //! close
@@ -34,9 +36,10 @@ use std::process::ExitCode;
 use scientdb_kernel::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, ContentBinding, ContentDigest, ContentRef,
     ContextId, Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId,
-    RelationshipKind, RelationshipQuery, Revision, StagedContent, StorageEngine,
+    RelationshipKind, RelationshipPosition, RelationshipQuery, Revision, StagedContent,
+    StorageEngine,
 };
-use scientdb_storage::NativeStore;
+use scientdb_storage::{NativeStore, StoreOptions};
 
 /// Deterministic store identity for a path: an explicit, reproducible input to `create`.
 fn store_id(dir: &str) -> [u8; 16] {
@@ -198,6 +201,22 @@ impl Driver {
                 self.store = Some(NativeStore::open(Path::new(dir)).map_err(|e| e.to_string())?);
                 self.say("ok opened");
             }
+            ["open", dir, cache] => {
+                let opts = StoreOptions {
+                    cache_nodes: cache.parse().map_err(|_| "bad cache size")?,
+                };
+                self.store =
+                    Some(NativeStore::open_with(Path::new(dir), opts).map_err(|e| e.to_string())?);
+                self.say("ok opened");
+            }
+            ["stats"] => {
+                let s = self.store()?.stats().map_err(|e| e.to_string())?;
+                self.say(&format!(
+                    "stats height={} pages_written={} page_bytes={} content_bytes={} misses={} evictions={} cache={}",
+                    s.tree_height, s.pages_written, s.page_bytes_written, s.content_bytes_written,
+                    s.node_cache_misses, s.node_cache_evictions, s.node_cache_capacity
+                ));
+            }
             ["stage", name, "hex", bytes] => {
                 let bytes = unhex(bytes)?;
                 let s = self
@@ -290,6 +309,59 @@ impl Driver {
                 }
             }
             ["dump", ids] => self.dump(ids)?,
+            ["rels", node, dir, kind, limit, after @ ..] => {
+                let direction = match *dir {
+                    "out" => Direction::Outgoing,
+                    "in" => Direction::Incoming,
+                    _ => return Err("direction must be out or in".into()),
+                };
+                let ident = |s: &str| s.as_bytes().to_vec();
+                let kind = if *kind == "-" {
+                    None
+                } else {
+                    Some(RelationshipKind::new(ident(kind)).map_err(|e| e.to_string())?)
+                };
+                let after = match after {
+                    [] => None,
+                    [k, o, i] => Some(RelationshipPosition {
+                        kind: RelationshipKind::new(ident(k)).map_err(|e| e.to_string())?,
+                        other: ContextId::new(ident(o)).map_err(|e| e.to_string())?,
+                        id: RelationshipId::new(ident(i)).map_err(|e| e.to_string())?,
+                    }),
+                    _ => return Err("after needs kind, other, id".into()),
+                };
+                let limit: usize = limit.parse().map_err(|_| "bad limit")?;
+                let q = RelationshipQuery {
+                    from: ContextId::new(ident(node)).map_err(|e| e.to_string())?,
+                    direction,
+                    kind,
+                    after,
+                };
+                let mut view = self.store()?.begin().map_err(|e| e.to_string())?;
+                let mut lines = Vec::new();
+                match view.relationships(&q) {
+                    Err(e) => lines.push(format!("query-error {e:?}")),
+                    Ok(it) => {
+                        for r in it.take(limit) {
+                            let r = r.map_err(|e| e.to_string())?;
+                            let other = if direction == Direction::Outgoing {
+                                &r.target
+                            } else {
+                                &r.source
+                            };
+                            lines.push(format!(
+                                "page {} {} {}",
+                                String::from_utf8_lossy(r.kind.as_bytes()),
+                                String::from_utf8_lossy(other.as_bytes()),
+                                String::from_utf8_lossy(r.id.as_bytes())
+                            ));
+                        }
+                    }
+                }
+                for l in lines {
+                    self.say(&l);
+                }
+            }
             ["read-content", digest, len] => {
                 let d: [u8; 32] = unhex(digest)?
                     .try_into()
@@ -353,6 +425,7 @@ impl Driver {
                     from: cid.clone(),
                     direction: dir,
                     kind: None,
+                    after: None,
                 };
                 for rel in view.relationships(&q).map_err(|e| e.to_string())? {
                     let rel = rel.map_err(|e| e.to_string())?;

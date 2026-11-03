@@ -37,11 +37,22 @@ A page is accepted only if magic, version, checksum, store identity, page number
 kind all match what the referring structure expects. A page written to a reused location by a later
 generation therefore cannot be mistaken for its predecessor.
 
-Leaf payload: `count: u32`, then `count` entries of `key_len: u16, key, value_len: u16, value`,
-with keys strictly increasing.
+Node payload (page kind 1), first byte is the node tag:
 
-**Current limitation:** a tree is one leaf. A commit whose resulting leaf exceeds the page payload
-(4048 bytes) is rejected with an explicit capacity error and changes nothing.
+- **Leaf (tag 1):** `count: u32`, then `count` entries of `key_len: u16, key, value_len: u16, value`,
+  keys strictly increasing.
+- **Branch (tag 2):** `children: u32` (at least 2), child 0 as `page: u64, incarnation: u64`, then for
+  each further child `sep_len: u16, separator, page: u64, incarnation: u64`. Separators are strictly
+  increasing; child `i` holds keys `k` with `sep[i-1] <= k < sep[i]`.
+
+The metadata tree is a copy-on-write B+tree. A commit copies only the nodes on the paths it touches,
+writes each of them to a fresh page (children before parents) and shares every untouched subtree
+with the previous generation. Nodes split by encoded size; the root grows when it splits. Deletion
+removes empty nodes, merges a leaf under a quarter full into an adjacent sibling when the merged leaf
+fits, and collapses a root branch with one child; there is no other minimum-occupancy rule. A key is
+at most 1024 bytes and a key plus value at most 1800 bytes, so every leaf holds at least two
+entries. Readers walk from the root with a cursor that keeps one root-to-leaf path and loads leaves
+as it reaches them; trees deeper than 32 levels are rejected as damaged.
 
 ## Publication records (slots 0 and 1)
 
