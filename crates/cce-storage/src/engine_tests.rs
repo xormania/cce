@@ -891,3 +891,73 @@ fn a_failed_data_barrier_fences_writes() {
     assert!(s.stage_content(&mut &b"x"[..]).is_err());
     assert!(revision(&s, "A").is_some());
 }
+
+#[test]
+fn request_fields_beyond_the_encodable_limit_are_refused_and_the_store_keeps_committing() {
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(SimIo::new()),
+            StoreId([3; 16]),
+            crate::engine::Options {
+                max_request_field: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    };
+    let evidence = |label: &[u8], bytes: &[u8]| ChangeSet {
+        changes: vec![put("E", Precondition::Any, b"e", None)],
+        evidence: vec![cce_core::storage::Evidence {
+            label: label.to_vec(),
+            bytes: bytes.to_vec(),
+        }],
+        ..ChangeSet::default()
+    };
+    let too_long = [
+        (
+            "body",
+            changes(vec![put("A", Precondition::Absent, &[1; 9], None)]),
+        ),
+        ("label", evidence(&[1; 9], b"ok")),
+        ("evidence bytes", evidence(b"ok", &[1; 9])),
+    ];
+    for (what, cs) in too_long {
+        let r = commit(&s, what, cs);
+        assert!(
+            matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.contains("limit")),
+            "{what}: {r:?}"
+        );
+    }
+    assert!(revision(&s, "A").is_none() && revision(&s, "E").is_none());
+    // Fields at the limit commit, so the commit path is still serving requests.
+    assert_eq!(commit(&s, "fits", evidence(&[1; 8], &[2; 8])).unwrap(), 1);
+}
+
+#[test]
+fn request_lists_beyond_the_limit_are_refused_before_encoding() {
+    use crate::records::check_request_bounds;
+    let ev = || cce_core::storage::Evidence {
+        label: b"l".to_vec(),
+        bytes: b"b".to_vec(),
+    };
+    let three_changes = changes(vec![
+        put("A", Precondition::Any, b"a", None),
+        put("B", Precondition::Any, b"b", None),
+        put("C", Precondition::Any, b"c", None),
+    ]);
+    let three_evidence = ChangeSet {
+        evidence: vec![ev(), ev(), ev()],
+        ..ChangeSet::default()
+    };
+    for (what, cs) in [
+        ("change list", three_changes),
+        ("evidence list", three_evidence),
+    ] {
+        let r = check_request_bounds(&cs, 2);
+        assert!(
+            matches!(&r, Err(StorageError::InvalidRequest(m)) if m.starts_with(what)),
+            "{what}: {r:?}"
+        );
+        assert!(check_request_bounds(&cs, 3).is_ok(), "{what} at the limit");
+    }
+}
