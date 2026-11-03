@@ -8,7 +8,8 @@
 //!
 //! ```text
 //! probe ok|fail|hang                      harness self-check; does not touch storage
-//! create <dir> | open <dir>
+//! create <dir> | open <dir> [<cache-nodes>]
+//! stats                                   prints instrumentation counters and tree height
 //! stage <name> hex <bytes>                stage literal bytes
 //! stage <name> gen <len> <seed>           stage a generated stream (see `gen_byte`)
 //! put-context <id> <expect> <body> <content-name|->
@@ -36,7 +37,7 @@ use scientdb_kernel::storage::{
     ContextId, Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId,
     RelationshipKind, RelationshipQuery, Revision, StagedContent, StorageEngine,
 };
-use scientdb_storage::NativeStore;
+use scientdb_storage::{NativeStore, StoreOptions};
 
 /// Deterministic store identity for a path: an explicit, reproducible input to `create`.
 fn store_id(dir: &str) -> [u8; 16] {
@@ -197,6 +198,22 @@ impl Driver {
             ["open", dir] => {
                 self.store = Some(NativeStore::open(Path::new(dir)).map_err(|e| e.to_string())?);
                 self.say("ok opened");
+            }
+            ["open", dir, cache] => {
+                let opts = StoreOptions {
+                    cache_nodes: cache.parse().map_err(|_| "bad cache size")?,
+                };
+                self.store =
+                    Some(NativeStore::open_with(Path::new(dir), opts).map_err(|e| e.to_string())?);
+                self.say("ok opened");
+            }
+            ["stats"] => {
+                let s = self.store()?.stats().map_err(|e| e.to_string())?;
+                self.say(&format!(
+                    "stats height={} pages_written={} page_bytes={} content_bytes={} misses={} evictions={} cache={}",
+                    s.tree_height, s.pages_written, s.page_bytes_written, s.content_bytes_written,
+                    s.node_cache_misses, s.node_cache_evictions, s.node_cache_capacity
+                ));
             }
             ["stage", name, "hex", bytes] => {
                 let bytes = unhex(bytes)?;

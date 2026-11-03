@@ -117,7 +117,10 @@ fn driver_violations(source: &str) -> Vec<String> {
     let mut v = Vec::new();
     for line in source.lines().map(str::trim) {
         if let Some(rest) = line.strip_prefix("use scientdb_storage::")
-            && rest.trim_end_matches(';') != "NativeStore"
+            && !matches!(
+                rest.trim_end_matches(';'),
+                "NativeStore" | "{NativeStore, StoreOptions}"
+            )
         {
             v.push(format!("driver imports storage internals: {line}"));
         }
