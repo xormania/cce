@@ -94,7 +94,8 @@ structural validation of hostile stores is not implemented yet.
 A view records what it reads: each context read (including one that finds nothing) protects that
 record, and each relationship query protects its whole queried range: one node, one direction and,
 if given, one kind. The protection covers the whole range however much of it the caller consumed, and
-it is registered before the first result is produced.
+it is registered before the first result is produced. Reads of retained history register no
+protection: history is append-only, so a commit never changes an entry a view has read.
 
 A commit from a view is validated against every logical write committed after the view began. If any
 of them touched a protected record or range, the commit returns `Conflict`, naming the record, and
@@ -103,7 +104,8 @@ prepared from the same basis both commit, and the later one is applied to the ne
 nothing the first commit wrote is lost. Preconditions on revisions and absence are
 checked against the newest state as well.
 
-The write sets of the most recent commits (4096 by default) are kept in memory for validation. A view
+The write sets of the most recent commits (4096 by default) are kept in memory for validation; the
+window is bounded by number of commits, so its memory grows with the size of those commits' write sets. A view
 older than that window is refused with an explicit `Conflict` saying the basis is too old; it is never
 validated against incomplete history. Physical maintenance writes no logical keys and so never causes
 a conflict.
