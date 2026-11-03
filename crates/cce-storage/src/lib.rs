@@ -18,6 +18,8 @@ mod format;
 mod io;
 mod records;
 #[cfg(test)]
+mod recovery_tests;
+#[cfg(test)]
 mod sim;
 mod tree;
 #[cfg(test)]
