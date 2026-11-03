@@ -137,6 +137,9 @@ struct Files {
 pub(crate) struct FsIo {
     dir: PathBuf,
     files: Mutex<Option<Arc<Files>>>,
+    /// Directories this adapter synced, in order (test observation only).
+    #[cfg(test)]
+    synced_dirs: Mutex<Vec<PathBuf>>,
 }
 
 impl FsIo {
@@ -144,6 +147,8 @@ impl FsIo {
         Self {
             dir: dir.to_path_buf(),
             files: Mutex::new(None),
+            #[cfg(test)]
+            synced_dirs: Mutex::new(Vec::new()),
         }
     }
 
@@ -178,6 +183,20 @@ impl FsIo {
     }
 }
 
+impl FsIo {
+    /// Syncs a directory so its entries are durable.
+    fn sync_path(&self, dir: &Path) -> Result<(), StorageError> {
+        #[cfg(test)]
+        self.synced_dirs
+            .lock()
+            .expect("synced")
+            .push(dir.to_path_buf());
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| io_err(&format!("sync directory {}", dir.display()), e))
+    }
+}
+
 fn pick(files: &Files, f: FileId) -> &File {
     match f {
         FileId::Meta => &files.meta,
@@ -187,7 +206,26 @@ fn pick(files: &Files, f: FileId) -> &File {
 
 impl Io for FsIo {
     fn create(&self) -> Result<(), StorageError> {
+        // Directories this call creates, outermost first. Each new entry lives in its parent, so
+        // every such parent must be synced or a crash can lose the whole store directory.
+        let mut new_dirs = Vec::new();
+        let mut p = self.dir.as_path();
+        while !p.exists() {
+            new_dirs.push(p.to_path_buf());
+            match p.parent() {
+                Some(q) if !q.as_os_str().is_empty() => p = q,
+                _ => break,
+            }
+        }
+        new_dirs.reverse();
         fs::create_dir_all(&self.dir).map_err(|e| io_err("create store directory", e))?;
+        for d in &new_dirs {
+            let parent = d
+                .parent()
+                .filter(|q| !q.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            self.sync_path(parent)?;
+        }
         let lock = self.take_lock()?;
         for name in [META_FILE, CONTENT_FILE] {
             if self.dir.join(name).exists() {
@@ -280,8 +318,38 @@ impl Io for FsIo {
     }
 
     fn sync_dir(&self) -> Result<(), StorageError> {
-        File::open(&self.dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|e| io_err("sync store directory", e))
+        self.sync_path(&self.dir.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creating_a_store_makes_every_new_directory_entry_durable() {
+        let base = std::env::temp_dir().join(format!("scientdb-dirsync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let store = base.join("a").join("b").join("store");
+        let io = FsIo::new(&store);
+        io.create().unwrap();
+        io.sync_dir().unwrap();
+        let synced = io.synced_dirs.lock().unwrap().clone();
+        // The entries for a, a/b and a/b/store live in their parents; each parent must be synced.
+        for parent in [
+            base.clone(),
+            base.join("a"),
+            base.join("a").join("b"),
+            store.clone(),
+        ] {
+            assert!(
+                synced.contains(&parent),
+                "{} not synced; synced: {synced:?}",
+                parent.display()
+            );
+        }
+        // Positive neighbour: an existing directory's parent is not required to change.
+        let _ = fs::remove_dir_all(&base);
     }
 }

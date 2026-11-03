@@ -49,8 +49,10 @@ pub(crate) struct Snapshot {
 
 struct State {
     current: Descriptor,
-    /// Staged, not yet committed extents of this open instance: offset → (len, digest).
-    staged: HashMap<u64, (u64, [u8; 32])>,
+    /// Staged, not yet committed extents of this open instance: serial → extent.
+    staged: HashMap<u64, ExtentRef>,
+    /// Next staging serial; each staging gets a distinct handle even for zero-length content.
+    next_stage: u64,
     /// Set when a publication outcome is uncertain; further writes are refused.
     fenced: Option<String>,
 }
@@ -142,6 +144,7 @@ impl Inner {
             state: Mutex::new(State {
                 current: desc,
                 staged: HashMap::new(),
+                next_stage: 1,
                 fenced: None,
             }),
             writer: Mutex::new(()),
@@ -214,11 +217,24 @@ impl Inner {
         }
         *cursor = offset + len;
         let digest: [u8; 32] = hasher.finalize().into();
-        lock(&self.state).staged.insert(offset, (len, digest));
+        let serial = {
+            let mut st = lock(&self.state);
+            let serial = st.next_stage;
+            st.next_stage += 1;
+            st.staged.insert(
+                serial,
+                ExtentRef {
+                    offset,
+                    len,
+                    digest,
+                },
+            );
+            serial
+        };
         let mut t = Enc::default();
         t.raw(&self.store.0)
             .u64(self.instance)
-            .u64(offset)
+            .u64(serial)
             .u64(len)
             .raw(&digest);
         Ok(StagedContent {
@@ -235,32 +251,31 @@ impl Inner {
         &self,
         token: &StagingToken,
         content: &ContentRef,
-    ) -> Result<ExtentRef, StorageError> {
+    ) -> Result<(u64, ExtentRef), StorageError> {
         let mut d = Dec::new(&token.0, "staging token");
         let parsed = (|| -> Result<_, StorageError> {
             let s: [u8; 16] = d.array()?;
             let inst = d.u64()?;
-            let off = d.u64()?;
+            let serial = d.u64()?;
             let len = d.u64()?;
             let dig: [u8; 32] = d.array()?;
-            Ok((s, inst, off, len, dig))
+            Ok((s, inst, serial, len, dig))
         })();
-        let Ok((s, inst, off, len, dig)) = parsed else {
+        let Ok((s, inst, serial, len, dig)) = parsed else {
             return Err(StorageError::ForeignHandle);
         };
         if s != self.store.0 || inst != self.instance {
             return Err(StorageError::ForeignHandle);
         }
-        let staged = lock(&self.state).staged.get(&off).copied();
+        let staged = lock(&self.state).staged.get(&serial).copied();
         match staged {
-            Some((l, g))
-                if l == len && g == dig && content.len == len && content.digest.0 == dig =>
+            Some(x)
+                if x.len == len
+                    && x.digest == dig
+                    && content.len == len
+                    && content.digest.0 == dig =>
             {
-                Ok(ExtentRef {
-                    offset: off,
-                    len,
-                    digest: dig,
-                })
+                Ok((serial, x))
             }
             _ => Err(StorageError::ForeignHandle),
         }
@@ -286,6 +301,20 @@ impl Inner {
         };
         let mut entries: Entries = (*self.node(cur.root).map_err(rejected)?).clone();
 
+        // Every content index must name a binding before the request is fingerprinted.
+        for c in &cs.changes {
+            if let Change::PutContext {
+                content: Some(i), ..
+            } = c
+                && *i >= cs.content.len()
+            {
+                return Err(rejected(StorageError::InvalidRequest(format!(
+                    "content index {i} out of range ({} bindings)",
+                    cs.content.len()
+                ))));
+            }
+        }
+
         // Attempt identity: an identical retry returns the original receipt.
         let fp = fingerprint(&attempt, &cs);
         let akey = key(P_ATTEMPT, &[attempt.as_bytes()]);
@@ -301,15 +330,16 @@ impl Inner {
             };
         }
 
-        let bound = self.resolve_content(&cs)?;
-        apply(&mut entries, &cs, &bound)?;
-
-        // History entry → content file; then the new tree node → a fresh metadata page.
         let pos = cur.history_pos.checked_add(1).ok_or_else(|| {
             rejected(StorageError::InvalidRequest(
                 "history position overflow".into(),
             ))
         })?;
+        let bound = self.resolve_content(&cs)?;
+        let extents: Vec<ExtentRef> = bound.iter().map(|(_, x)| *x).collect();
+        apply(&mut entries, &cs, &extents, pos)?;
+
+        // History entry → content file; then the new tree node → a fresh metadata page.
         let hist = encode_history(pos, &attempt, &cs);
         let hist_ref = {
             let mut cursor = lock(&self.alloc);
@@ -374,8 +404,8 @@ impl Inner {
 
         let mut st = lock(&self.state);
         st.current = desc;
-        for b in &bound {
-            st.staged.remove(&b.offset);
+        for (serial, _) in &bound {
+            st.staged.remove(serial);
         }
         Ok(CommitReceipt {
             attempt,
@@ -383,7 +413,7 @@ impl Inner {
         })
     }
 
-    fn resolve_content(&self, cs: &ChangeSet) -> Result<Vec<ExtentRef>, CommitError> {
+    fn resolve_content(&self, cs: &ChangeSet) -> Result<Vec<(u64, ExtentRef)>, CommitError> {
         cs.content
             .iter()
             .map(|b| self.staged_extent(&b.token, &b.content).map_err(rejected))
@@ -547,7 +577,27 @@ fn select(slots: &[Slot]) -> Result<(Descriptor, Vec<String>), StorageError> {
 }
 
 /// Applies a change set to the latest entries, checking preconditions.
-fn apply(entries: &mut Entries, cs: &ChangeSet, bound: &[ExtentRef]) -> Result<(), CommitError> {
+/// Largest key + value of one metadata record. Larger bodies belong in content.
+pub(crate) const MAX_ENTRY: usize = 1800;
+
+fn check_entry(k: &[u8], v: &[u8]) -> Result<(), CommitError> {
+    if k.len() + v.len() > MAX_ENTRY {
+        return Err(rejected(StorageError::InvalidRequest(format!(
+            "record too large for metadata: {} bytes (limit {MAX_ENTRY}); store large data as content",
+            k.len() + v.len()
+        ))));
+    }
+    Ok(())
+}
+
+/// Each changed record's revision becomes `pos`, the history position of this commit, so a
+/// revision is never reused for an identity, even after removal and recreation.
+fn apply(
+    entries: &mut Entries,
+    cs: &ChangeSet,
+    bound: &[ExtentRef],
+    pos: u64,
+) -> Result<(), CommitError> {
     let invalid = |m: String| CommitError::Rejected(StorageError::InvalidRequest(m));
     // Each logical identity may appear at most once per change set.
     let mut seen = BTreeSet::new();
@@ -614,16 +664,14 @@ fn apply(entries: &mut Entries, cs: &ChangeSet, bound: &[ExtentRef]) -> Result<(
                         .entry(key(P_CONTENT, &[&x.digest]))
                         .or_insert_with(|| x.encode());
                 }
-                let revision = prev.map_or(1, |p| p.revision + 1);
-                entries.insert(
-                    k,
-                    ContextValue {
-                        revision,
-                        body: body.clone(),
-                        content,
-                    }
-                    .encode(),
-                );
+                let v = ContextValue {
+                    revision: pos,
+                    body: body.clone(),
+                    content,
+                }
+                .encode();
+                check_entry(&k, &v)?;
+                entries.insert(k, v);
             }
             Change::RemoveContext { id, expect } => {
                 let k = key(P_CONTEXT, &[id.as_bytes()]);
@@ -665,14 +713,16 @@ fn apply(entries: &mut Entries, cs: &ChangeSet, bound: &[ExtentRef]) -> Result<(
                     entries.remove(&p.in_key(id.as_bytes()));
                 }
                 let v = RelValue {
-                    revision: prev.map_or(1, |p| p.revision + 1),
+                    revision: pos,
                     kind: kind.as_bytes().to_vec(),
                     source: source.as_bytes().to_vec(),
                     target: target.as_bytes().to_vec(),
                 };
                 entries.insert(v.out_key(id.as_bytes()), Vec::new());
                 entries.insert(v.in_key(id.as_bytes()), Vec::new());
-                entries.insert(k, v.encode());
+                let v = v.encode();
+                check_entry(&k, &v)?;
+                entries.insert(k, v);
             }
             Change::RemoveRelationship { id, expect } => {
                 let k = key(P_REL, &[id.as_bytes()]);

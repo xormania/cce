@@ -231,7 +231,7 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
                 e.bytes(body);
                 match content {
                     None => e.u8(0),
-                    Some(i) => e.u8(1).u32(*i as u32),
+                    Some(i) => e.u8(1).u64(*i as u64),
                 };
             }
             Change::RemoveContext { id, expect } => {
@@ -307,7 +307,7 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
                 let body = d.bytes()?.to_vec();
                 let content = match d.u8()? {
                     0 => None,
-                    1 => Some(d.u32()? as usize),
+                    1 => Some(usize::try_from(d.u64()?).map_err(|_| corrupt("content index"))?),
                     t => return Err(corrupt(format!("history content tag {t}"))),
                 };
                 Change::PutContext {
@@ -336,8 +336,20 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
         });
     }
     let nc = d.count(40)?;
+    let mut content = Vec::with_capacity(nc);
     for _ in 0..nc {
-        d.raw(40)?;
+        content.push(ContentRef {
+            digest: ContentDigest(d.array()?),
+            len: d.u64()?,
+        });
+    }
+    if changes
+        .iter()
+        .any(|c| matches!(c, Change::PutContext { content: Some(i), .. } if *i >= nc))
+    {
+        return Err(corrupt(
+            "history change refers to a missing content binding",
+        ));
     }
     let ne = d.count(8)?;
     let mut evidence = Vec::with_capacity(ne);
@@ -353,6 +365,7 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
         attempt,
         evidence,
         changes,
+        content,
     })
 }
 

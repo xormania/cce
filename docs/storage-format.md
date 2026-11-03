@@ -78,12 +78,18 @@ tuple order of the raw components.
 
 An extent is `offset: u64, length: u64, sha256: [u8; 32]` into `content.sdb`.
 
+A record's revision is the history position of the commit that last changed it. Revisions therefore
+strictly increase for an identity and are never reused, even after the record is removed and created
+again. A record's key plus value is limited to 1800 bytes; larger data belongs in content.
+
 ## History entries and attempt fingerprints
 
 A history entry is `position: u64`, attempt id, and the canonical request encoding: a version byte
-(1), the changes in submitted order (tagged; identities, preconditions, bodies, content indexes), the
+(1), the changes in submitted order (tagged; identities, preconditions, bodies, content indexes as `u64`), the
 bound content as `(sha256, length)` pairs, and the supplied evidence as `(label, bytes)` pairs.
-Staging tokens and physical locations are not part of it.
+Staging tokens and physical locations are not part of it. Every content index must refer to a
+binding of the same request; a request with an out-of-range index is rejected before it is
+fingerprinted. History entries return the bound content references with the changes.
 
 The attempt fingerprint is SHA-256 over `"scientdb.attempt.v1\0"`, the attempt id (length-prefixed),
 and that canonical encoding. Retrying an attempt with an identical logical request returns the

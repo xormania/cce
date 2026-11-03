@@ -8,6 +8,8 @@ mod codec;
 #[cfg(test)]
 mod crash_tests;
 mod engine;
+#[cfg(test)]
+mod engine_tests;
 mod format;
 mod io;
 mod records;

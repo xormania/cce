@@ -222,6 +222,8 @@ pub struct HistoryEntry {
     pub attempt: AttemptId,
     pub evidence: Vec<Evidence>,
     pub changes: Vec<Change>,
+    /// Content bound by this commit; [`Change::PutContext::content`] indexes into it.
+    pub content: Vec<ContentRef>,
 }
 
 /// Historical receipt of a committed attempt.

@@ -22,7 +22,8 @@ What the `scientdb-storage` engine promises today, under which assumptions, and 
 5. Sync `meta.sdb`.
 6. Make the generation visible to new views and acknowledge the commit.
 
-Store creation syncs the directory after creating the files and publishes generation 1 the same way.
+Store creation syncs the parent of every directory it had to create, then the store directory after
+creating the files, and publishes generation 1 the same way.
 
 ## What an acknowledgment means
 
