@@ -213,6 +213,18 @@ pub struct RelationshipQuery {
     pub direction: Direction,
     /// Restrict to one kind; `None` means all kinds.
     pub kind: Option<RelationshipKind>,
+    /// Resume strictly after this position (exclusive); `None` starts at the beginning.
+    pub after: Option<RelationshipPosition>,
+}
+
+/// A position in a relationship range, in result order: (kind, other endpoint, relationship id).
+/// Use the last relationship returned to resume a partially consumed query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelationshipPosition {
+    pub kind: RelationshipKind,
+    /// The endpoint that is not `RelationshipQuery::from`.
+    pub other: ContextId,
+    pub id: RelationshipId,
 }
 
 /// One retained logical history entry: the record of one committed attempt.

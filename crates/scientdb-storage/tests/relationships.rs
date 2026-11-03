@@ -223,3 +223,96 @@ fn metadata_grows_past_one_branch_and_traverses_with_a_tiny_cache() {
     assert_eq!(field("cache"), 4);
     assert!(field("evictions") > 0, "a tiny cache must evict: {stats}");
 }
+
+/// Pages through a query with the exclusive resume position, as a caller consuming a bounded cursor.
+fn page_all(d: &mut Driver, node: &str, dir: &str, kind: &str, size: usize) -> Vec<String> {
+    let mut got: Vec<String> = Vec::new();
+    loop {
+        let after = got
+            .last()
+            .map(|l| format!(" {}", l.trim_start_matches("page ")))
+            .unwrap_or_default();
+        let page = answered(
+            d.step(&format!("rels {node} {dir} {kind} {size}{after}")),
+            "rels",
+        );
+        assert!(page.len() <= size);
+        let done = page.len() < size;
+        got.extend(page);
+        if done {
+            return got;
+        }
+    }
+}
+
+#[test]
+fn partially_consumed_ranges_resume_exactly_after_their_boundary() {
+    let dir = test_dir("rels-paging");
+    let store = dir.join("store");
+    let mut model = Model::default();
+    let cmds = populate(&mut model);
+    let mut d = Driver::spawn();
+    answered(d.step(&format!("create {}", store.display())), "create");
+    commit_all(&mut d, &cmds, 300, "fill");
+
+    // Expected page lines from the model, in result order.
+    let expect = |dir: &str, kind: Option<&str>| -> Vec<String> {
+        let mut sel = BTreeMap::new();
+        for (id, (k, src, dst, _)) in &model.rels {
+            let (me, other) = if dir == "out" { (src, dst) } else { (dst, src) };
+            if me == "HUB" && kind.is_none_or(|want| want == k) {
+                sel.insert(
+                    (k.clone(), other.clone(), id.clone()),
+                    format!("page {k} {other} {id}"),
+                );
+            }
+        }
+        sel.into_values().collect()
+    };
+
+    for size in [1, 37, 900] {
+        assert_eq!(
+            page_all(&mut d, "HUB", "out", "-", size),
+            expect("out", None),
+            "out pages of {size}"
+        );
+    }
+    assert_eq!(
+        page_all(&mut d, "HUB", "out", "cites", 50),
+        expect("out", Some("cites"))
+    );
+    assert_eq!(page_all(&mut d, "HUB", "in", "-", 64), expect("in", None));
+
+    // Boundaries: after the last element is empty; after an element is exclusive.
+    let all = expect("out", None);
+    let last = all.last().unwrap().trim_start_matches("page ").to_string();
+    assert!(answered(d.step(&format!("rels HUB out - 10 {last}")), "after last").is_empty());
+    let third = all[2].trim_start_matches("page ").to_string();
+    assert_eq!(
+        answered(d.step(&format!("rels HUB out - 2 {third}")), "after third"),
+        all[3..5].to_vec()
+    );
+    // A position that is not itself present still resumes at the next larger entry.
+    let gap = answered(
+        d.step("rels HUB out - 1 cites N00000 hub-out-00000-zz"),
+        "gap",
+    );
+    assert_eq!(
+        gap,
+        all.iter()
+            .filter(|l| l.as_str() > "page cites N00000 hub-out-00000-zz")
+            .take(1)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+
+    // Empty ranges and a contradictory resume position.
+    assert!(answered(d.step("rels nobody out - 10"), "empty").is_empty());
+    assert!(answered(d.step("rels HUB in depends 10"), "no such kind").is_empty());
+    let bad = answered(
+        d.step("rels HUB out cites 10 depends N00001 hub-out-00001"),
+        "bad after",
+    );
+    assert_eq!(bad.len(), 1);
+    assert!(bad[0].starts_with("query-error InvalidRequest"), "{bad:?}");
+}

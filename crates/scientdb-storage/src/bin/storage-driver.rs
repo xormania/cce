@@ -20,6 +20,7 @@
 //! commit <attempt>                        submits the changes accumulated since the last commit
 //! outcome <attempt>
 //! dump <id>[,<id>...]                     prints the committed state reachable from those ids
+//! rels <id> out|in <kind|-> <limit> [<after-kind> <after-other> <after-id>]  paged query
 //! read-content <digest> <len>             reads content by logical reference through a new view
 //! hold                                    prints `holding` and blocks until killed
 //! close
@@ -35,7 +36,8 @@ use std::process::ExitCode;
 use scientdb_kernel::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, ContentBinding, ContentDigest, ContentRef,
     ContextId, Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId,
-    RelationshipKind, RelationshipQuery, Revision, StagedContent, StorageEngine,
+    RelationshipKind, RelationshipPosition, RelationshipQuery, Revision, StagedContent,
+    StorageEngine,
 };
 use scientdb_storage::{NativeStore, StoreOptions};
 
@@ -307,6 +309,59 @@ impl Driver {
                 }
             }
             ["dump", ids] => self.dump(ids)?,
+            ["rels", node, dir, kind, limit, after @ ..] => {
+                let direction = match *dir {
+                    "out" => Direction::Outgoing,
+                    "in" => Direction::Incoming,
+                    _ => return Err("direction must be out or in".into()),
+                };
+                let ident = |s: &str| s.as_bytes().to_vec();
+                let kind = if *kind == "-" {
+                    None
+                } else {
+                    Some(RelationshipKind::new(ident(kind)).map_err(|e| e.to_string())?)
+                };
+                let after = match after {
+                    [] => None,
+                    [k, o, i] => Some(RelationshipPosition {
+                        kind: RelationshipKind::new(ident(k)).map_err(|e| e.to_string())?,
+                        other: ContextId::new(ident(o)).map_err(|e| e.to_string())?,
+                        id: RelationshipId::new(ident(i)).map_err(|e| e.to_string())?,
+                    }),
+                    _ => return Err("after needs kind, other, id".into()),
+                };
+                let limit: usize = limit.parse().map_err(|_| "bad limit")?;
+                let q = RelationshipQuery {
+                    from: ContextId::new(ident(node)).map_err(|e| e.to_string())?,
+                    direction,
+                    kind,
+                    after,
+                };
+                let mut view = self.store()?.begin().map_err(|e| e.to_string())?;
+                let mut lines = Vec::new();
+                match view.relationships(&q) {
+                    Err(e) => lines.push(format!("query-error {e:?}")),
+                    Ok(it) => {
+                        for r in it.take(limit) {
+                            let r = r.map_err(|e| e.to_string())?;
+                            let other = if direction == Direction::Outgoing {
+                                &r.target
+                            } else {
+                                &r.source
+                            };
+                            lines.push(format!(
+                                "page {} {} {}",
+                                String::from_utf8_lossy(r.kind.as_bytes()),
+                                String::from_utf8_lossy(other.as_bytes()),
+                                String::from_utf8_lossy(r.id.as_bytes())
+                            ));
+                        }
+                    }
+                }
+                for l in lines {
+                    self.say(&l);
+                }
+            }
             ["read-content", digest, len] => {
                 let d: [u8; 32] = unhex(digest)?
                     .try_into()
@@ -370,6 +425,7 @@ impl Driver {
                     from: cid.clone(),
                     direction: dir,
                     kind: None,
+                    after: None,
                 };
                 for rel in view.relationships(&q).map_err(|e| e.to_string())? {
                     let rel = rel.map_err(|e| e.to_string())?;

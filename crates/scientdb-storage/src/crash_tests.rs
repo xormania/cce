@@ -116,6 +116,7 @@ fn logical_state(store: &NativeStore) -> Vec<String> {
                 from: id.clone(),
                 direction: d,
                 kind: None,
+                after: None,
             };
             for r in v.relationships(&q).expect("rels") {
                 out.push(format!("{id:?} {d:?} {:?}", r.expect("rel")));

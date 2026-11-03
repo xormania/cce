@@ -599,8 +599,26 @@ impl Inner {
         if let Some(k) = &q.kind {
             key_component(&mut prefix, k.as_bytes());
         }
+        let start = match &q.after {
+            None => None,
+            Some(a) => {
+                if q.kind.as_ref().is_some_and(|k| *k != a.kind) {
+                    return Err(StorageError::InvalidRequest(
+                        "resume position has a different kind than the query".into(),
+                    ));
+                }
+                let mut k = vec![p];
+                key_component(&mut k, q.from.as_bytes());
+                key_component(&mut k, a.kind.as_bytes());
+                key_component(&mut k, a.other.as_bytes());
+                key_component(&mut k, a.id.as_bytes());
+                // Strictly after the position: the next possible key.
+                k.push(0);
+                Some(k)
+            }
+        };
         let root = s.desc.root;
-        let cursor = Cursor::new(self, root, &prefix, None)?;
+        let cursor = Cursor::new(self, root, &prefix, start.as_deref())?;
         Ok(cursor.map(move |entry| {
             let (k, _) = entry?;
             let parts = key_components(&k[1..])?;
