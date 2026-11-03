@@ -213,3 +213,183 @@ fn staging_against_a_declared_length_and_digest_rejects_any_mismatch() {
         );
     }
 }
+
+use crate::io::{FileId, Io};
+use crate::sim::Persist;
+
+fn reopen(sim: &SimIo) -> NativeStore {
+    sim.release();
+    NativeStore {
+        inner: Inner::open(Box::new(sim.clone()), Default::default()).expect("open"),
+    }
+}
+
+#[test]
+fn a_damaged_segment_is_reported_before_any_of_its_bytes_are_delivered() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    let payload = bytes(6 * CONTENT_CHUNK, 5);
+    let c = bind(&s, "A", &payload, "a1");
+    let segs = s
+        .inner
+        .content_segments(&s.inner.snapshot().unwrap(), &c)
+        .unwrap();
+    drop(s);
+    // Flip one byte inside segment 3 on disk.
+    let target = segs[3].offset + 100;
+    let mut b = [0u8];
+    sim.read_at(FileId::Content, target, &mut b).unwrap();
+    sim.write_at(FileId::Content, target, &[b[0] ^ 0xff])
+        .unwrap();
+    sim.sync(FileId::Content).unwrap();
+
+    let s = reopen(&sim);
+    let mut r = s.begin().unwrap().content(&c).unwrap();
+    let mut delivered = Vec::new();
+    let mut buf = vec![0; 1000];
+    let err = loop {
+        match r.read(&mut buf) {
+            Ok(0) => panic!("a damaged stream reported a complete read"),
+            Ok(n) => delivered.extend_from_slice(&buf[..n]),
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(
+        delivered,
+        payload[..3 * CONTENT_CHUNK],
+        "bytes beyond the verified segments were delivered"
+    );
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("segment 3"),
+        "error must name the failed segment: {err}"
+    );
+    assert!(
+        r.read(&mut buf).is_err(),
+        "reads after a failed check must keep failing"
+    );
+}
+
+#[test]
+fn a_cancelled_stage_leaves_nothing_accepted_and_survives_restart() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    let kept = bind(&s, "K", &bytes(2 * CONTENT_CHUNK, 2), "keep");
+    struct FailsMidway(usize);
+    impl Read for FailsMidway {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0 == 0 {
+                return Err(io::Error::other("caller cancelled"));
+            }
+            self.0 -= 1;
+            buf.fill(7);
+            Ok(buf.len())
+        }
+    }
+    assert!(s.stage_content(&mut FailsMidway(3)).is_err());
+    // The next staging may reuse the abandoned space; committed content is untouched.
+    let next = bind(&s, "N", &bytes(CONTENT_CHUNK + 9, 4), "next");
+    drop(s);
+    let s = reopen(&sim.after_crash(Persist::None));
+    let mut v = s.begin().unwrap();
+    for (c, want) in [
+        (kept, bytes(2 * CONTENT_CHUNK, 2)),
+        (next, bytes(CONTENT_CHUNK + 9, 4)),
+    ] {
+        let mut got = Vec::new();
+        v.content(&c).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, want);
+    }
+}
+
+#[test]
+fn staging_handles_are_bound_to_their_store_and_open_instance() {
+    use scientdb_kernel::storage::{CommitError, StorageError};
+    let a = SimIo::new();
+    let store_a = sim_store(&a);
+    let b = SimIo::new();
+    let store_b = NativeStore {
+        inner: Inner::create(Box::new(b.clone()), StoreId([5; 16]), Default::default()).unwrap(),
+    };
+    let payload = b"payload".to_vec();
+    let from_a = store_a.stage_content(&mut &payload[..]).unwrap();
+    let put = |id: &str| Change::PutContext {
+        id: ContextId::new(id.as_bytes().to_vec()).unwrap(),
+        expect: Precondition::Any,
+        body: b"b".to_vec(),
+        content: Some(0),
+    };
+    let cs = |staged: &scientdb_kernel::storage::StagedContent| ChangeSet {
+        changes: vec![put("X")],
+        content: vec![ContentBinding::from(staged)],
+        ..ChangeSet::default()
+    };
+    let foreign = store_b.commit(
+        AttemptId::new(*b"x").unwrap(),
+        store_b.begin().unwrap(),
+        cs(&from_a),
+    );
+    assert_eq!(
+        foreign,
+        Err(CommitError::Rejected(StorageError::ForeignHandle))
+    );
+
+    // A handle from before a reopen is stale; restaging the same bytes gives the same reference.
+    drop(store_a);
+    let store_a = reopen(&a);
+    let stale = store_a.commit(
+        AttemptId::new(*b"y").unwrap(),
+        store_a.begin().unwrap(),
+        cs(&from_a),
+    );
+    assert_eq!(
+        stale,
+        Err(CommitError::Rejected(StorageError::ForeignHandle))
+    );
+    let again = store_a.stage_content(&mut &payload[..]).unwrap();
+    assert_eq!(again.content, from_a.content);
+    store_a
+        .commit(
+            AttemptId::new(*b"y").unwrap(),
+            store_a.begin().unwrap(),
+            cs(&again),
+        )
+        .expect("restaged bytes commit");
+}
+
+#[test]
+fn an_acknowledged_create_survives_power_loss() {
+    let sim = SimIo::new();
+    drop(sim_store(&sim));
+    let after = sim.after_crash(Persist::None);
+    let s = NativeStore {
+        inner: Inner::open(Box::new(after), Default::default()).expect("created store lost"),
+    };
+    assert!(s.begin().is_ok());
+}
+
+#[test]
+fn updating_metadata_does_not_rewrite_a_large_payload() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    let payload = bytes(16 * CONTENT_CHUNK, 8);
+    bind(&s, "A", &payload, "a1");
+    let before = s.stats().unwrap().content_bytes_written;
+    let cs = ChangeSet {
+        changes: vec![Change::PutContext {
+            id: ContextId::new(*b"A").unwrap(),
+            expect: Precondition::Any,
+            body: b"new body".to_vec(),
+            content: None,
+        }],
+        ..ChangeSet::default()
+    };
+    s.commit(AttemptId::new(*b"a2").unwrap(), s.begin().unwrap(), cs)
+        .unwrap();
+    let written = s.stats().unwrap().content_bytes_written - before;
+    assert!(
+        written < 4096,
+        "a metadata-only update wrote {written} content bytes for a {} byte payload",
+        payload.len()
+    );
+}
