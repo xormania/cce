@@ -120,23 +120,25 @@ impl SimIo {
             let mut survivors: Vec<Pending> = match persist {
                 Persist::None => Vec::new(),
                 Persist::All => f.pending.clone(),
-                Persist::Seeded(_) => f
-                    .pending
-                    .iter()
-                    .filter(|_| xorshift(&mut rng) % 2 == 0)
-                    .map(|p| {
+                Persist::Seeded(_) => {
+                    let mut out = Vec::new();
+                    for p in &f.pending {
+                        if xorshift(&mut rng) % 2 != 0 {
+                            continue;
+                        }
                         let sectors = p.data.len().div_ceil(SECTOR) as u64;
                         let keep = if sectors > 1 && xorshift(&mut rng) % 3 == 0 {
                             (xorshift(&mut rng) % sectors) as usize * SECTOR
                         } else {
                             p.data.len()
                         };
-                        Pending {
+                        out.push(Pending {
                             offset: p.offset,
                             data: p.data[..keep].to_vec(),
-                        }
-                    })
-                    .collect(),
+                        });
+                    }
+                    out
+                }
             };
             if let Persist::Seeded(_) = persist {
                 for i in (1..survivors.len()).rev() {
