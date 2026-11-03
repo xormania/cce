@@ -5,6 +5,8 @@
 //! recovery chose.
 
 use std::io::Read;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -164,6 +166,57 @@ fn logical_state(store: &NativeStore) -> Vec<String> {
     out
 }
 
+/// Runs one case of a cut loop. If it fails, the durable images of `images` and the operation
+/// trace are written to a new directory under the system temporary directory and the failure is
+/// re-raised naming that directory, so the failing case can be reproduced offline. Nothing is
+/// written when the case passes.
+fn with_repro(label: &str, images: &[(&str, &SimIo)], trace: &[Op], case: impl FnOnce()) {
+    let Err(panic) = catch_unwind(AssertUnwindSafe(case)) else {
+        return;
+    };
+    let why = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "non-string panic".into());
+    match save_repro(label, images, trace) {
+        Ok(dir) => panic!(
+            "{label}: {why}\nreproduction images and trace: {}",
+            dir.display()
+        ),
+        Err(e) => {
+            eprintln!("{label}: could not save reproduction images: {e}");
+            resume_unwind(panic)
+        }
+    }
+}
+
+fn save_repro(label: &str, images: &[(&str, &SimIo)], trace: &[Op]) -> std::io::Result<PathBuf> {
+    let safe: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let dir = std::env::temp_dir().join(format!(
+        "cce-repro-{}-{safe}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    std::fs::create_dir_all(&dir)?;
+    for (name, sim) in images {
+        for file in [FileId::Meta, FileId::Content] {
+            if let Some((durable, _)) = sim.file_images_for_test(file) {
+                std::fs::write(dir.join(format!("{name}.{}.durable", file.name())), durable)?;
+            }
+        }
+    }
+    let ops: String = trace.iter().map(|op| format!("{op:?}\n")).collect();
+    std::fs::write(dir.join("trace.txt"), ops)?;
+    std::fs::write(dir.join("case.txt"), format!("{label}\n"))?;
+    Ok(dir)
+}
+
 /// Independent expected states after each committed step, from an uninterrupted run.
 fn reference_states(steps: u32) -> Vec<Vec<String>> {
     let s = create(Box::new(SimIo::new()));
@@ -265,38 +318,51 @@ fn every_cut_of_store_creation_opens_the_empty_store_or_refuses_to_initialize() 
     for cut in 0..=total {
         let sim = SimIo::new();
         sim.crash_after(cut);
-        let created = Inner::create(Box::new(sim.clone()), STORE, Default::default());
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let created = Inner::create(
+            Box::new(Traced {
+                inner: sim.clone(),
+                trace: trace.clone(),
+            }),
+            STORE,
+            Default::default(),
+        );
         assert_eq!(created.is_ok(), cut == total, "cut {cut}: creation result");
         drop(created);
         for p in [Persist::None, Persist::All] {
             let img = sim.after_crash(p);
             let before = images(&img);
-            match try_open(Box::new(img.clone())) {
-                Ok(s) => {
-                    assert_eq!(logical_state(&s), empty, "cut {cut} {p:?}");
-                    assert_eq!(history_len(&s), 0, "cut {cut} {p:?}");
-                    assert_eq!(generation(&s), 1, "cut {cut} {p:?}");
-                    opened += 1;
+            let label = format!("create cut {cut} {p:?}");
+            let pristine = img.after_process_exit();
+            let ops = trace.lock().unwrap().clone();
+            with_repro(&label, &[("image", &pristine)], &ops, || {
+                match try_open(Box::new(img.clone())) {
+                    Ok(s) => {
+                        assert_eq!(logical_state(&s), empty, "cut {cut} {p:?}");
+                        assert_eq!(history_len(&s), 0, "cut {cut} {p:?}");
+                        assert_eq!(generation(&s), 1, "cut {cut} {p:?}");
+                        opened += 1;
+                    }
+                    // Before the directory barrier no store file survives: there is no store.
+                    Err(StorageError::StoreState(m))
+                        if before.iter().all(Option::is_none) && m.contains("missing") =>
+                    {
+                        refused += 1;
+                    }
+                    Err(StorageError::Integrity(m))
+                        if m.contains("initialization never completed")
+                            || m.contains("no valid publication record") =>
+                    {
+                        assert_eq!(
+                            images(&img),
+                            before,
+                            "cut {cut} {p:?}: a refused open wrote to the store"
+                        );
+                        refused += 1;
+                    }
+                    Err(e) => panic!("cut {cut} {p:?}: unexpected open result {e:?}"),
                 }
-                // Before the directory barrier no store file survives: there is no store.
-                Err(StorageError::StoreState(m))
-                    if before.iter().all(Option::is_none) && m.contains("missing") =>
-                {
-                    refused += 1;
-                }
-                Err(StorageError::Integrity(m))
-                    if m.contains("initialization never completed")
-                        || m.contains("no valid publication record") =>
-                {
-                    assert_eq!(
-                        images(&img),
-                        before,
-                        "cut {cut} {p:?}: a refused open wrote to the store"
-                    );
-                    refused += 1;
-                }
-                Err(e) => panic!("cut {cut} {p:?}: unexpected open result {e:?}"),
-            }
+            });
         }
     }
     // The completed creation always opens; some interrupted creation is always refused.
@@ -460,17 +526,61 @@ fn is_fenced_refusal(r: &Result<impl std::fmt::Debug, CommitError>) -> bool {
     matches!(r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.contains("writes fenced"))
 }
 
-/// Commit 1 succeeds; commit 2 hits a lossy failure of `barrier`. Returns the store, its
-/// simulator, the commit error, and both staged contents.
-fn lossy_failure_of(
-    barrier: Barrier,
-) -> (
-    NativeStore,
-    SimIo,
-    CommitError,
-    StagedContent,
-    StagedContent,
-) {
+/// A store after a lossy barrier failure of its second commit, with the results of the writes
+/// attempted afterwards (checked by the caller, after reopening, so that a missing fence is
+/// also observed by its effect on what reopening finds).
+struct LossyRun {
+    store: NativeStore,
+    sim: SimIo,
+    err: CommitError,
+    x: StagedContent,
+    y: StagedContent,
+    /// (what was attempted, refused as fenced, the result).
+    later: Vec<(&'static str, bool, String)>,
+}
+
+fn assert_later_writes_fenced(barrier: Barrier, later: &[(&'static str, bool, String)]) {
+    for (what, fenced, result) in later {
+        assert!(fenced, "{barrier:?}: {what} after the failure: {result}");
+    }
+}
+
+/// After reopening: every attempt reported committed has its history entry, and every content
+/// that entry binds reads back completely, as the bytes its request staged.
+fn assert_committed_content_readable(barrier: Barrier, s: &NativeStore) {
+    let mut v = s.begin().unwrap();
+    let history: Vec<_> = v
+        .history(HistoryPosition(0))
+        .unwrap()
+        .map(|h| h.unwrap())
+        .collect();
+    for step in 1..=4 {
+        let AttemptOutcome::Committed(r) = s.outcome(&attempt(step)).unwrap() else {
+            continue;
+        };
+        let entry = history
+            .iter()
+            .find(|h| h.position == r.position)
+            .unwrap_or_else(|| panic!("{barrier:?}: committed attempt {step} has no history"));
+        assert_eq!(entry.attempt, attempt(step), "{barrier:?}");
+        for c in &entry.content {
+            let mut bytes = Vec::new();
+            let read = v.content(c).and_then(|mut r| {
+                r.read_to_end(&mut bytes)
+                    .map_err(|e| StorageError::Io(e.to_string()))
+            });
+            assert!(
+                read.is_ok(),
+                "{barrier:?}: attempt {step} is committed but its content is unreadable: {read:?}"
+            );
+            assert_eq!(bytes, payload(step), "{barrier:?}: attempt {step} content");
+        }
+    }
+}
+
+/// Commit 1 succeeds; commit 2 hits a lossy failure of `barrier`; then a commit of content staged
+/// before the failure, a commit without content, and new staging are attempted.
+fn lossy_failure_of(barrier: Barrier) -> LossyRun {
     let n = barrier_op(barrier);
     let sim = SimIo::new();
     sim.lossy_sync_failures();
@@ -481,14 +591,16 @@ fn lossy_failure_of(
     let (a, cs) = request_with(&x, 2);
     let err = s.commit(a, s.begin().unwrap(), cs).unwrap_err();
 
-    // Writes stay fenced: neither the content staged before the failure nor anything new may be
-    // committed, and nothing new may be staged.
+    // Writes must stay fenced: neither the content staged before the failure nor anything new
+    // may be committed, and nothing new may be staged.
+    let mut later = Vec::new();
     let (a3, cs3) = request_with(&y, 3);
     let late = s.commit(a3, s.begin().unwrap(), cs3);
-    assert!(
+    later.push((
+        "commit of content staged before the failed barrier",
         is_fenced_refusal(&late),
-        "{barrier:?}: commit of content staged before the failed barrier: {late:?}"
-    );
+        format!("{late:?}"),
+    ));
     let unbound = ChangeSet {
         changes: vec![Change::PutContext {
             id: cid("D"),
@@ -499,13 +611,35 @@ fn lossy_failure_of(
         ..ChangeSet::default()
     };
     let late = s.commit(attempt(4), s.begin().unwrap(), unbound);
-    assert!(is_fenced_refusal(&late), "{barrier:?}: {late:?}");
+    later.push((
+        "commit without content",
+        is_fenced_refusal(&late),
+        format!("{late:?}"),
+    ));
     let staged = s.stage_content(&mut &b"more"[..]);
-    assert!(
+    later.push((
+        "staging",
         matches!(&staged, Err(StorageError::StoreState(m)) if m.contains("writes fenced")),
-        "{barrier:?}: staging after the failure: {staged:?}"
-    );
-    (s, sim, err, x, y)
+        format!("{staged:?}"),
+    ));
+    LossyRun {
+        store: s,
+        sim,
+        err,
+        x,
+        y,
+        later,
+    }
+}
+
+/// Opens each image once for the semantic check, leaving it reusable.
+fn check_content_after_reopen(barrier: Barrier, images: &[SimIo]) {
+    for img in images {
+        let s = open(Box::new(img.clone()));
+        assert_committed_content_readable(barrier, &s);
+        drop(s);
+        img.release();
+    }
 }
 
 /// Opens each image after a failed second commit: the store must show exactly the state after
@@ -564,30 +698,47 @@ fn a_lossy_failure_of_the_metadata_data_barrier_fences_and_recovers_the_old_stat
 }
 
 fn data_barrier_case(barrier: Barrier) {
-    let states = reference_states(1);
-    let (s, sim, err, x, y) = lossy_failure_of(barrier);
+    let LossyRun {
+        store,
+        sim,
+        err,
+        x,
+        y,
+        later,
+    } = lossy_failure_of(barrier);
     assert!(
         matches!(&err, CommitError::Rejected(StorageError::Io(m)) if m.contains("simulated I/O error")),
         "{barrier:?}: {err:?}"
     );
-    assert_eq!(s.outcome(&attempt(2)).unwrap(), AttemptOutcome::Absent);
-    assert_eq!(logical_state(&s), states[1], "{barrier:?}");
-    drop(s);
+    assert_eq!(store.outcome(&attempt(2)).unwrap(), AttemptOutcome::Absent);
     let power_loss = sim.after_crash(Persist::None);
+    drop(store);
     sim.release();
-    assert_recovers_pre_failure_state(barrier, vec![sim, power_loss], &x, &y);
+    let images = vec![sim, power_loss];
+    // Semantic check first: whatever was acknowledged must be readable after reopening.
+    check_content_after_reopen(barrier, &images);
+    assert_later_writes_fenced(barrier, &later);
+    assert_recovers_pre_failure_state(barrier, images, &x, &y);
 }
 
 #[test]
 fn a_lossy_failure_of_the_publication_barrier_is_indeterminate_and_recovers_a_whole_state() {
     let barrier = Barrier::Publication;
     let states = reference_states(1);
-    let (s, sim, err, x, y) = lossy_failure_of(barrier);
+    let LossyRun {
+        store: s,
+        sim,
+        err,
+        x,
+        y,
+        later,
+    } = lossy_failure_of(barrier);
     assert!(
         matches!(&err, CommitError::Indeterminate(m) if m.contains("uncertain")),
         "{err:?}"
     );
     assert_eq!(s.outcome(&attempt(2)).unwrap(), AttemptOutcome::Unknown);
+    assert_later_writes_fenced(barrier, &later);
     assert_eq!(logical_state(&s), states[1]);
     drop(s);
     let images = vec![
@@ -597,5 +748,158 @@ fn a_lossy_failure_of_the_publication_barrier_is_indeterminate_and_recovers_a_wh
     ];
     // The failed barrier dropped the unsynced publication record, so every image holds the old
     // generation; recovery must present it whole, with outcomes that agree with it.
+    check_content_after_reopen(barrier, &images);
     assert_recovers_pre_failure_state(barrier, images, &x, &y);
+}
+
+/// A fault injected while opening a crashed image.
+#[derive(Clone, Copy, Debug)]
+enum OpenFault {
+    /// The n-th mutating operation of open fails with an I/O error.
+    FailOp(u64),
+    /// The first read of open fails.
+    FailRead,
+    /// The process crashes after n mutating operations of open.
+    CrashAfter(u64),
+}
+
+fn durable(sim: &SimIo) -> Vec<Option<Vec<u8>>> {
+    images(sim).into_iter().map(|f| f.map(|(d, _)| d)).collect()
+}
+
+/// What the outcomes of the two commits must be in a recovered state.
+fn assert_outcomes_agree(s: &NativeStore, got: &[String], states: &[Vec<String>]) {
+    assert!(
+        matches!(s.outcome(&attempt(1)).unwrap(), AttemptOutcome::Committed(r) if r.position == HistoryPosition(1)),
+        "acknowledged commit 1 lost"
+    );
+    let second = s.outcome(&attempt(2)).unwrap();
+    if got == states[2].as_slice() {
+        assert!(
+            matches!(&second, AttemptOutcome::Committed(r) if r.position == HistoryPosition(2)),
+            "state has commit 2 but its outcome is {second:?}"
+        );
+    } else {
+        assert_eq!(second, AttemptOutcome::Absent, "state lacks commit 2");
+    }
+}
+
+#[test]
+fn a_fault_during_recovery_of_any_crashed_commit_leaves_the_image_recoverable() {
+    let states = reference_states(2);
+    let (old, new) = (&states[1], &states[2]);
+
+    // Operations of the second commit (staging included), and of opening a store.
+    let probe = SimIo::new();
+    let s = create(Box::new(probe.clone()));
+    assert!(commit_step(&s, 1));
+    let before = probe.ops();
+    assert!(commit_step(&s, 2));
+    let total = probe.ops() - before;
+    drop(s);
+    let reopened = probe.after_process_exit();
+    let before = reopened.ops();
+    drop(open(Box::new(reopened.clone())));
+    let open_ops = reopened.ops() - before;
+    assert_eq!(open_ops, 2, "open is expected to issue its two barriers");
+    let faults: Vec<OpenFault> = (1..=open_ops)
+        .map(OpenFault::FailOp)
+        .chain([OpenFault::FailRead])
+        .chain((0..open_ops).map(OpenFault::CrashAfter))
+        .collect();
+
+    let mut checked = 0;
+    for cut in 0..=total {
+        let sim = SimIo::new();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let s = create(Box::new(Traced {
+            inner: sim.clone(),
+            trace: trace.clone(),
+        }));
+        assert!(commit_step(&s, 1));
+        trace.lock().unwrap().clear();
+        sim.crash_after(cut);
+        let _ = commit_step(&s, 2);
+        drop(s);
+        let trace = trace.lock().unwrap().clone();
+        let persists = [Persist::None, Persist::All]
+            .into_iter()
+            .chain((1..=12).map(Persist::Seeded));
+        for p in persists {
+            let img = sim.after_crash(p);
+            // What an uninterrupted recovery of this image gives.
+            let expected = logical_state(&open(Box::new(img.after_process_exit())));
+            assert!(
+                &expected == old || &expected == new,
+                "cut {cut} {p:?}: uninterrupted recovery gave a partial state"
+            );
+            for fault in &faults {
+                let label = format!("commit cut {cut} {p:?} open fault {fault:?}");
+                with_repro(&label, &[("image", &img)], &trace, || {
+                    let work = img.after_process_exit();
+                    let before = durable(&work);
+                    let (err, recover) = match *fault {
+                        OpenFault::FailOp(n) => {
+                            work.fail_nth_op(n);
+                            let e = try_open(Box::new(work.clone()))
+                                .err()
+                                .expect("open must fail");
+                            assert!(
+                                matches!(&e, StorageError::Io(m) if m.contains("simulated I/O error")),
+                                "{e:?}"
+                            );
+                            work.release();
+                            (e, work.clone())
+                        }
+                        OpenFault::FailRead => {
+                            work.fail_next_read();
+                            let e = try_open(Box::new(work.clone()))
+                                .err()
+                                .expect("open must fail");
+                            assert!(
+                                matches!(&e, StorageError::Io(m) if m.contains("simulated read error")),
+                                "{e:?}"
+                            );
+                            work.release();
+                            (e, work.clone())
+                        }
+                        OpenFault::CrashAfter(n) => {
+                            work.crash_after(n);
+                            let e = try_open(Box::new(work.clone()))
+                                .err()
+                                .expect("open must fail");
+                            assert!(
+                                matches!(&e, StorageError::Io(m) if m.contains("simulated crash")),
+                                "{e:?}"
+                            );
+                            // A power loss right after the crash: only durable bytes remain.
+                            (e, work.after_crash(Persist::None))
+                        }
+                    };
+                    assert_eq!(
+                        durable(&work),
+                        before,
+                        "the faulty open ({err:?}) changed durable bytes"
+                    );
+
+                    let s = open(Box::new(recover.clone()));
+                    let got = logical_state(&s);
+                    assert_eq!(got, expected, "recovery after a faulty open differs");
+                    assert_outcomes_agree(&s, &got, &states);
+                    let first = images(&recover);
+                    drop(s);
+                    recover.release();
+                    let s = open(Box::new(recover.clone()));
+                    assert_eq!(logical_state(&s), expected);
+                    assert_eq!(
+                        images(&recover),
+                        first,
+                        "a second clean open changed the files"
+                    );
+                });
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, (total + 1) * 14 * faults.len() as u64);
 }

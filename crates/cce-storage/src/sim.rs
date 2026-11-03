@@ -214,9 +214,10 @@ impl SimIo {
     }
 
     /// A file's durable and volatile images, or `None` if the file does not exist (test checks
-    /// that an operation left the store bytes unchanged).
+    /// that an operation left the store bytes unchanged, and saving images of a failed test,
+    /// which may run after a panic poisoned the lock).
     pub fn file_images_for_test(&self, file: FileId) -> Option<(Vec<u8>, Vec<u8>)> {
-        let st = self.st.lock().expect("sim");
+        let st = self.st.lock().unwrap_or_else(|e| e.into_inner());
         st.files
             .get(&file)
             .map(|f| (f.durable.clone(), f.volatile.clone()))
