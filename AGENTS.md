@@ -14,7 +14,7 @@
 
 ## Local environment and tools
 
-- Target `ubuntu-dev`. Native setup is the default; Docker is not a prerequisite.
+- Target a local Linux development machine. Native setup is the default; Docker is not a prerequisite.
 - Inspect and reuse the established local agent configuration. Preserve unrelated
   files, settings, credentials, and other projects' toolchain selections.
 - During setup or an explicitly requested update, resolve current upstream

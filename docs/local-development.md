@@ -2,7 +2,7 @@
 
 ## Goal and completion
 
-Prepare `https://github.com/xormania/cce` on `ubuntu-dev` so xor can begin the
+Prepare `https://github.com/xormania/cce` on a local Linux machine so xor can begin the
 Rust kernel work with Serena and the standard local agent environment ready.
 Native installation is the default. Docker is optional, not a prerequisite.
 
@@ -20,7 +20,7 @@ independent work. Kernel design and implementation remain the subsequent task.
 1. Read `AGENTS.md` and the applicable local/user agent instructions.
 2. Locate or clone `xormania/cce` using xor's existing directory conventions.
    Verify the remote, branch, working tree, resolved path, ownership, and mount.
-   Prefer the WSL Linux filesystem for the working copy. Do not relocate existing
+   Prefer a native Linux filesystem for the working copy. Do not relocate existing
    work or assume a pathname establishes filesystem durability.
 3. Inspect the installed harnesses, MCP registrations, relevant hooks, permission
    settings, and existing Rust/Python tooling. Record versions and executable
@@ -194,7 +194,7 @@ kernel or making nightly the user's default as part of environment setup.
 
 Produce a concise setup record with:
 
-- The resolved checkout path, branch, remote, host/WSL facts, and relevant mount.
+- The resolved checkout path, branch, remote, host facts, and relevant mount.
 - Tool versions, installation methods, executable paths, release sources, and
   the date checked; any compatibility exception with its actual failure evidence.
 - Configuration files changed and the effective MCP launch settings for each
@@ -206,6 +206,6 @@ Produce a concise setup record with:
 
 Commit portable project configuration and a redacted setup summary through a
 feature branch/PR. Keep private machine details and raw local logs untracked.
-Do not substitute cloud tests or written instructions for results on `ubuntu-dev`.
+Do not substitute cloud tests or written instructions for local results.
 The environment is ready when required tools and connections work locally and
 the applicable checks above have actually passed.
