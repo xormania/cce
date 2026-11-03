@@ -444,3 +444,75 @@ fn content_is_served_only_for_the_requested_digest() {
         .unwrap();
     assert_eq!(out, b"bytes of B");
 }
+
+#[test]
+fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock, Weak};
+
+    use crate::io::{FileId, Io};
+
+    // Stages more content right after the commit's content barrier, as a concurrent staging
+    // call could: those bytes are not durable and must not be published.
+    struct StageAfterContentSync {
+        sim: SimIo,
+        store: Arc<OnceLock<Weak<Inner>>>,
+        fired: AtomicBool,
+    }
+    impl Io for StageAfterContentSync {
+        fn create(&self) -> Result<(), StorageError> {
+            self.sim.create()
+        }
+        fn open(&self) -> Result<(), StorageError> {
+            self.sim.open()
+        }
+        fn read_at(&self, file: FileId, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+            self.sim.read_at(file, offset, buf)
+        }
+        fn write_at(&self, file: FileId, offset: u64, data: &[u8]) -> Result<(), StorageError> {
+            self.sim.write_at(file, offset, data)
+        }
+        fn len(&self, file: FileId) -> Result<u64, StorageError> {
+            self.sim.len(file)
+        }
+        fn sync(&self, file: FileId) -> Result<(), StorageError> {
+            self.sim.sync(file)?;
+            if file == FileId::Content
+                && let Some(inner) = self.store.get().and_then(Weak::upgrade)
+                && !self.fired.swap(true, Ordering::SeqCst)
+            {
+                inner.stage(&mut &[9u8; 100][..])?;
+            }
+            Ok(())
+        }
+        fn sync_dir(&self) -> Result<(), StorageError> {
+            self.sim.sync_dir()
+        }
+    }
+
+    let sim = SimIo::new();
+    let hook = Arc::new(OnceLock::new());
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(StageAfterContentSync {
+                sim: sim.clone(),
+                store: hook.clone(),
+                fired: AtomicBool::new(false),
+            }),
+            StoreId([3; 16]),
+        )
+        .unwrap(),
+    };
+    hook.set(Arc::downgrade(&s.inner)).unwrap();
+    commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .expect("commit acknowledged");
+    drop(s);
+    // Power is lost: unsynced writes vanish. The acknowledged commit must still open.
+    let after_power_loss = sim.after_crash(Persist::None);
+    let s = reopen(&after_power_loss);
+    assert!(revision(&s, "A").is_some());
+}
