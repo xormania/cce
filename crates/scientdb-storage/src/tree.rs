@@ -195,6 +195,9 @@ pub(crate) struct Cursor<'a> {
     next: Vec<u8>,
     prefix: Vec<u8>,
     done: bool,
+    /// Nodes this cursor may still load. A valid tree never loads a page twice, so the store's
+    /// page count bounds the work; a shared or cyclic subtree exhausts it.
+    budget: u64,
 }
 
 impl<'a> Cursor<'a> {
@@ -204,6 +207,7 @@ impl<'a> Cursor<'a> {
         root: PageRef,
         prefix: &[u8],
         start: Option<&[u8]>,
+        budget: u64,
     ) -> Result<Self, StorageError> {
         let next = start.unwrap_or(prefix).to_vec();
         let mut c = Cursor {
@@ -213,9 +217,17 @@ impl<'a> Cursor<'a> {
             next,
             prefix: prefix.to_vec(),
             done: false,
+            budget,
         };
         c.descend(root)?;
         Ok(c)
+    }
+
+    fn load(&mut self, at: PageRef) -> Result<Arc<Node>, StorageError> {
+        self.budget = self.budget.checked_sub(1).ok_or_else(|| {
+            corrupt("tree traversal exceeded the store's page count (shared or cyclic subtree)")
+        })?;
+        self.src.load(at)
     }
 
     fn descend(&mut self, mut at: PageRef) -> Result<(), StorageError> {
@@ -223,7 +235,7 @@ impl<'a> Cursor<'a> {
             if self.stack.len() >= MAX_HEIGHT {
                 return Err(corrupt("tree deeper than the supported maximum"));
             }
-            let node = self.src.load(at)?;
+            let node = self.load(at)?;
             match &*node {
                 Node::Leaf(_) => {
                     self.leaf = Some(node);
@@ -252,7 +264,7 @@ impl<'a> Cursor<'a> {
                     if self.stack.len() >= MAX_HEIGHT {
                         return Err(corrupt("tree deeper than the supported maximum"));
                     }
-                    let n = self.src.load(at)?;
+                    let n = self.load(at)?;
                     match &*n {
                         Node::Leaf(_) => {
                             self.leaf = Some(n);
@@ -698,7 +710,7 @@ mod tests {
     }
 
     fn all(m: &Mem, root: PageRef) -> Vec<(Vec<u8>, Vec<u8>)> {
-        Cursor::new(m, root, b"", None)
+        Cursor::new(m, root, b"", None, u64::MAX)
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
@@ -742,7 +754,7 @@ mod tests {
                 t.put(key, vec![1; 40]).unwrap();
             }
         });
-        let b: Vec<_> = Cursor::new(&m, root, b"b", None)
+        let b: Vec<_> = Cursor::new(&m, root, b"b", None, u64::MAX)
             .unwrap()
             .map(|r| r.unwrap().0)
             .collect();
@@ -750,14 +762,22 @@ mod tests {
         assert!(b.windows(2).all(|w| w[0] < w[1]));
         let mut start = b"b".to_vec();
         start.extend(k(2001));
-        let tail: Vec<_> = Cursor::new(&m, root, b"b", Some(&start))
+        let tail: Vec<_> = Cursor::new(&m, root, b"b", Some(&start), u64::MAX)
             .unwrap()
             .map(|r| r.unwrap().0)
             .collect();
         assert_eq!(tail.first(), Some(&start));
         assert_eq!(tail.len(), 500);
-        assert_eq!(Cursor::new(&m, root, b"c", None).unwrap().count(), 0);
-        assert_eq!(Cursor::new(&m, root, b"a\xff", None).unwrap().count(), 0);
+        assert_eq!(
+            Cursor::new(&m, root, b"c", None, u64::MAX).unwrap().count(),
+            0
+        );
+        assert_eq!(
+            Cursor::new(&m, root, b"a\xff", None, u64::MAX)
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -998,6 +1018,33 @@ mod tests {
             );
             assert!(children.len() >= 2 && seps.len() == children.len() - 1);
         }
+    }
+
+    #[test]
+    fn a_shared_subtree_graph_cannot_make_a_cursor_unbounded() {
+        let m = Mem::default();
+        // A crafted graph: 24 branches, each referring to the next one twice, over one leaf.
+        let leaf = Sink(&m, 1)
+            .write(&Node::Leaf(
+                [(b"k".to_vec(), Vec::new())].into_iter().collect(),
+            ))
+            .unwrap();
+        let mut top = leaf;
+        for _ in 0..24 {
+            top = Sink(&m, 1)
+                .write(&Node::Branch {
+                    seps: vec![b"k".to_vec()],
+                    children: vec![top, top],
+                })
+                .unwrap();
+        }
+        let pages = *m.next.borrow();
+        let r: Result<Vec<_>, _> = Cursor::new(&m, top, b"", None, pages).unwrap().collect();
+        assert!(
+            matches!(&r, Err(StorageError::Integrity(_))),
+            "cursor walked a shared subtree: {:?}",
+            r.map(|v| v.len())
+        );
     }
 
     #[test]

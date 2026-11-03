@@ -83,8 +83,11 @@ Reads stay within the committed content length and require a content record to m
 digest and length. Commits refuse to continue when the generation or page counter would overflow.
 
 **Limitation:** checksums detect accidental damage, not deliberate forgery. A store crafted with
-valid checksums but inconsistent structures is only partly validated today (cursor bounds, extent
-bounds, digest matching); full structural validation of hostile stores is not implemented yet.
+valid checksums but inconsistent structures is only partly validated today: publication cursors,
+extent bounds and content digests are checked; every node reference must lie inside committed
+metadata with an incarnation no newer than the current generation; and a traversal may load at most
+as many nodes as the store has pages, so a shared or cyclic subtree fails instead of looping. Full
+structural validation of hostile stores is not implemented yet.
 
 ## Ownership
 

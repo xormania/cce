@@ -483,3 +483,45 @@ fn a_store_in_the_previous_format_version_is_refused_without_modification() {
     sim.read_at(FileId::Meta, 0, &mut after).unwrap();
     assert_eq!(before, after, "refusing the store modified it");
 }
+
+#[test]
+fn node_references_outside_committed_metadata_are_refused_before_reading() {
+    use crate::tree::NodeSource;
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let d = s.inner.snapshot().unwrap().desc;
+    let bad = [
+        PageRef {
+            page: d.next_page,
+            incarnation: d.generation + 1,
+        },
+        PageRef {
+            page: d.root.page,
+            incarnation: d.generation + 1,
+        },
+        PageRef {
+            page: 0,
+            incarnation: 1,
+        },
+        PageRef {
+            page: u64::MAX / 2,
+            incarnation: 1,
+        },
+    ];
+    for at in bad {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.inner.load(at)));
+        let r = r.unwrap_or_else(|_| panic!("loading {at:?} panicked"));
+        assert!(
+            matches!(&r, Err(StorageError::Integrity(m)) if m.contains("not committed")),
+            "{at:?}: {r:?}"
+        );
+    }
+    // Positive neighbour: the committed root loads.
+    assert!(s.inner.load(d.root).is_ok());
+}
