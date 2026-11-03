@@ -2,16 +2,20 @@
 //! request or is refused as a mismatch, without changing state, across concurrency and reopen.
 
 use std::io::Read;
-use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+use std::time::{Duration, Instant};
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentBinding,
-    ContextId, Evidence, HistoryPosition, Precondition, ReadView, StorageEngine,
+    ContextId, Evidence, HistoryEntry, HistoryPosition, Precondition, ReadView, StorageEngine,
+    StorageError,
 };
 
 use crate::NativeStore;
 use crate::engine::Inner;
 use crate::format::{Descriptor, StoreId};
+use crate::io::{FileId, Io};
 use crate::sim::{Persist, SimIo};
 
 const STORE: StoreId = StoreId(*b"attempt-id-store");
@@ -386,4 +390,214 @@ fn an_uncertain_publication_resolves_on_reopen_by_what_survived() {
     assert_eq!(s.outcome(&step_attempt(2)).unwrap(), AttemptOutcome::Absent);
     assert_eq!(logical_state(&s), old);
     assert_eq!(s.outcome(&step_attempt(1)).unwrap(), committed(1));
+}
+
+// ----- racing submissions and outcome ordering -------------------------------------------------
+
+/// The request `variant` submits in `round`: one record per round; variants differ in body and
+/// evidence.
+fn race_request(round: u32, variant: usize) -> ChangeSet {
+    ChangeSet {
+        changes: vec![Change::PutContext {
+            id: cid(&format!("R{round}")),
+            expect: Precondition::Any,
+            body: format!("variant {variant}").into_bytes(),
+            content: None,
+        }],
+        evidence: vec![Evidence {
+            label: b"variant".to_vec(),
+            bytes: vec![variant as u8],
+        }],
+        ..ChangeSet::default()
+    }
+}
+
+#[test]
+fn racing_different_requests_under_one_attempt_id_commit_exactly_one() {
+    const THREADS: usize = 8;
+    let s = sim_store(&SimIo::new());
+    // Rounds with pairwise different requests, then rounds where half the threads submit one
+    // request and half another.
+    let rounds = [8, 8, 8, 8, 8, 2, 2, 2, 2, 2];
+    for (round, distinct) in (1u32..).zip(rounds) {
+        let id = attempt(&format!("race-{round}"));
+        let start = Barrier::new(THREADS);
+        let results: Vec<(usize, Result<CommitReceipt, CommitError>)> = std::thread::scope(|sc| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let (s, id, start) = (&s, id.clone(), &start);
+                    sc.spawn(move || {
+                        let variant = t % distinct;
+                        let view = s.begin().unwrap();
+                        start.wait();
+                        (variant, s.commit(id, view, race_request(round, variant)))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // The winner is whichever request retained history recorded for the attempt.
+        let entries: Vec<HistoryEntry> = s
+            .begin()
+            .unwrap()
+            .history(HistoryPosition(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|h| h.attempt == id)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "round {round}: history entries for the attempt"
+        );
+        let entry = &entries[0];
+        assert_eq!(
+            entry.position,
+            HistoryPosition(round as u64),
+            "round {round}"
+        );
+        let winner = entry.evidence[0].bytes[0] as usize;
+        let request = race_request(round, winner);
+        assert_eq!(
+            entry.changes, request.changes,
+            "round {round}: recorded changes"
+        );
+        assert_eq!(
+            entry.evidence, request.evidence,
+            "round {round}: recorded evidence"
+        );
+
+        let receipt = CommitReceipt {
+            attempt: id.clone(),
+            position: entry.position,
+        };
+        for (t, (variant, r)) in results.iter().enumerate() {
+            if *variant == winner {
+                assert_eq!(r, &Ok(receipt.clone()), "round {round} thread {t}");
+            } else {
+                assert_eq!(
+                    r,
+                    &Err(CommitError::AttemptMismatch),
+                    "round {round} thread {t}"
+                );
+            }
+        }
+        assert_eq!(
+            results.iter().filter(|(_, r)| r.is_ok()).count(),
+            THREADS / distinct,
+            "round {round}: acknowledged submissions"
+        );
+        assert_eq!(
+            body_of(&s, &format!("R{round}")),
+            Some(format!("variant {winner}").into_bytes()),
+            "round {round}: stored state is the winner's request"
+        );
+        assert_eq!(s.outcome(&id).unwrap(), AttemptOutcome::Committed(receipt));
+    }
+    assert_eq!(history_len(&s), rounds.len());
+}
+
+/// Simulated I/O that, while armed, holds the next content barrier until the test releases the
+/// gate: the commit is then in flight, its effects written but not yet published.
+struct GatedIo {
+    inner: SimIo,
+    armed: Arc<AtomicBool>,
+    reached: Arc<AtomicBool>,
+    gate: Arc<Mutex<()>>,
+}
+
+impl Io for GatedIo {
+    fn create(&self) -> Result<(), StorageError> {
+        self.inner.create()
+    }
+    fn open(&self) -> Result<(), StorageError> {
+        self.inner.open()
+    }
+    fn read_at(&self, file: FileId, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+        self.inner.read_at(file, offset, buf)
+    }
+    fn write_at(&self, file: FileId, offset: u64, data: &[u8]) -> Result<(), StorageError> {
+        self.inner.write_at(file, offset, data)
+    }
+    fn len(&self, file: FileId) -> Result<u64, StorageError> {
+        self.inner.len(file)
+    }
+    fn sync(&self, file: FileId) -> Result<(), StorageError> {
+        if file == FileId::Content && self.armed.load(Ordering::SeqCst) {
+            self.reached.store(true, Ordering::SeqCst);
+            drop(self.gate.lock().unwrap());
+        }
+        self.inner.sync(file)
+    }
+    fn sync_dir(&self) -> Result<(), StorageError> {
+        self.inner.sync_dir()
+    }
+}
+
+#[test]
+fn outcome_moves_from_pending_to_committed_without_passing_through_absent() {
+    let armed = Arc::new(AtomicBool::new(false));
+    let reached = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(Mutex::new(()));
+    let io = GatedIo {
+        inner: SimIo::new(),
+        armed: armed.clone(),
+        reached: reached.clone(),
+        gate: gate.clone(),
+    };
+    let s = NativeStore {
+        inner: Inner::create(Box::new(io), STORE, Default::default()).unwrap(),
+    };
+    seed(&s);
+    let a = attempt("x");
+    assert_eq!(s.outcome(&a).unwrap(), AttemptOutcome::Absent);
+    let cs = request(&s, Variant::Identical);
+
+    let held = gate.lock().unwrap();
+    armed.store(true, Ordering::SeqCst);
+    let ticket = s.submit(a.clone(), s.begin().unwrap(), cs).unwrap();
+    let polled = AtomicBool::new(false);
+    let observed = std::thread::scope(|sc| {
+        // Records every change of the answer until the commit resolves.
+        let poller = sc.spawn(|| {
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut seen: Vec<AttemptOutcome> = Vec::new();
+            loop {
+                let o = s.outcome(&a).unwrap();
+                polled.store(true, Ordering::SeqCst);
+                if seen.last() != Some(&o) {
+                    seen.push(o.clone());
+                }
+                if matches!(o, AttemptOutcome::Committed(_)) || Instant::now() > until {
+                    return seen;
+                }
+            }
+        });
+        let until = Instant::now() + Duration::from_secs(10);
+        // Release only once the commit is held at its barrier and the poller has answered.
+        while !reached.load(Ordering::SeqCst) || !polled.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < until,
+                "commit never reached its data barrier, or the poller never ran"
+            );
+            std::thread::yield_now();
+        }
+        // In flight: written, not published. The answer must still be pending.
+        assert_eq!(
+            s.outcome(&a).unwrap(),
+            AttemptOutcome::Pending,
+            "in-flight commit"
+        );
+        armed.store(false, Ordering::SeqCst);
+        drop(held);
+        poller.join().unwrap()
+    });
+    let receipt = ticket.wait().unwrap();
+    assert_eq!(receipt.position, HistoryPosition(2));
+    assert_eq!(
+        observed,
+        [AttemptOutcome::Pending, AttemptOutcome::Committed(receipt)],
+        "outcome sequence while the commit resolved"
+    );
 }
