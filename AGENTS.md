@@ -58,6 +58,9 @@ comments, and committed files must stand on their own:
   prompts, or reference documents supplied outside the repository, and do not
   describe future work the change does not implement.
 - Do not commit files supplied as instructions or reference material.
+- Do not include personal or machine-specific details: local paths, hostnames,
+  OS or machine setup, local tool or agent configuration, or other projects.
+  Write generic guidance instead.
 - If unsure whether something belongs, leave it out and ask xor.
 - The `leak-guard` check scans PR text, commit messages, and added lines. If it
   fails, rewrite the text; do not work around the check.
