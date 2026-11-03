@@ -25,6 +25,10 @@ mod recovery_tests;
 mod sim;
 mod tree;
 #[cfg(test)]
+mod tree_reopen_tests;
+#[cfg(test)]
+mod view_gap_tests;
+#[cfg(test)]
 mod view_tests;
 
 use std::io::Read;
