@@ -15,7 +15,7 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use scientdb_kernel::storage::{
+use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
     ContentReader, ContentRef, ContextId, ContextRecord, Direction, HistoryEntry, HistoryPosition,
     Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery, Revision,

@@ -12,6 +12,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cce-core"
+version = "0.1.0"
+
+[[package]]
+name = "cce-storage"
+version = "0.1.0"
+dependencies = [
+ "cce-core",
+ "crc32fast",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -104,20 +118,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
-]
-
-[[package]]
-name = "scientdb-kernel"
-version = "0.1.0"
-
-[[package]]
-name = "scientdb-storage"
-version = "0.1.0"
-dependencies = [
- "crc32fast",
- "scientdb-kernel",
- "serde_json",
- "sha2",
 ]
 
 [[package]]

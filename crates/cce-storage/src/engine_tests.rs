@@ -2,7 +2,7 @@
 
 use std::io::Read;
 
-use scientdb_kernel::storage::{
+use cce_core::storage::{
     AttemptId, Change, ChangeSet, CommitError, ContentBinding, ContextId, HistoryPosition,
     Precondition, ReadView, Revision, StorageEngine, StorageError,
 };
@@ -430,8 +430,8 @@ fn content_is_served_only_for_the_requested_digest() {
     sim.release();
     let s = reopen(&sim);
     let mut v = s.begin().unwrap();
-    let want = scientdb_kernel::storage::ContentRef {
-        digest: scientdb_kernel::storage::ContentDigest(forged),
+    let want = cce_core::storage::ContentRef {
+        digest: cce_core::storage::ContentDigest(forged),
         len: b.content.len,
     };
     let served = v.content(&want).map(|mut r| {

@@ -3,17 +3,18 @@
 //! The metadata file is a sequence of `PAGE_SIZE` pages. Pages 0 and 1 are the two publication
 //! slots; pages from 2 hold tree nodes. All integers are little-endian.
 
-use scientdb_kernel::storage::StorageError;
+use cce_core::storage::StorageError;
 
 use crate::codec::{Dec, Enc, corrupt};
 
 pub(crate) const PAGE_SIZE: usize = 4096;
-/// Version 3: content stored as verified segments with manifests, and context records holding logical
-/// content references (version 2 had single-extent content; version 1 single-leaf trees). Older
-/// versions are refused, never reinterpreted.
-pub(crate) const FORMAT_VERSION: u16 = 3;
-pub(crate) const PAGE_MAGIC: [u8; 4] = *b"SDBP";
-pub(crate) const DESC_MAGIC: [u8; 4] = *b"SDBD";
+/// Version 4: page and record magic `CCEP`/`CCED` and the `cce.attempt.v1` fingerprint domain. Version 3 introduced content stored
+/// as verified segments with manifests and context records holding logical content references
+/// (version 2 had single-extent content; version 1 single-leaf trees). Older versions are refused,
+/// never reinterpreted.
+pub(crate) const FORMAT_VERSION: u16 = 4;
+pub(crate) const PAGE_MAGIC: [u8; 4] = *b"CCEP";
+pub(crate) const DESC_MAGIC: [u8; 4] = *b"CCED";
 /// Pages 0 and 1 are publication slots.
 pub(crate) const FIRST_NODE_PAGE: u64 = 2;
 /// magic 4 + version 2 + kind 1 + reserved 1 + store 16 + page 8 + incarnation 8 + len 4 + crc 4.

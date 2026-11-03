@@ -1,7 +1,7 @@
-//! Native storage engine for ScientDB.
+//! Native storage engine for CCE.
 //!
 //! Physical structures are private. The public surface is the logical port from
-//! `scientdb-kernel` plus constructors for a native store. See `docs/storage-format.md`
+//! `cce-core` plus constructors for a native store. See `docs/storage-format.md`
 //! and `docs/storage-failure-model.md` for the implemented format and guarantees.
 
 mod codec;
@@ -23,7 +23,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use scientdb_kernel::storage::{
+use cce_core::storage::{
     AttemptId, AttemptOutcome, ChangeSet, CommitError, CommitReceipt, ContentReader, ContentRef,
     ContextId, ContextRecord, HistoryEntry, HistoryPosition, ReadView, Relationship,
     RelationshipQuery, StagedContent, StorageEngine, StorageError,

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/scientdb-kernel", "crates/scientdb-storage"]
+members = ["crates/cce-core", "crates/cce-storage"]
 
 [workspace.package]
 edition = "2024"

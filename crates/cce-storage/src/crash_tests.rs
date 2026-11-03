@@ -6,7 +6,7 @@
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
-use scientdb_kernel::storage::{
+use cce_core::storage::{
     AttemptId, Change, ChangeSet, ContentBinding, ContextId, Direction, Evidence, HistoryPosition,
     Precondition, ReadView, RelationshipId, RelationshipKind, RelationshipQuery, StorageEngine,
 };
@@ -239,7 +239,7 @@ fn filesystem_and_simulator_run_the_same_protocol() {
     });
 
     let fs_trace = Arc::new(Mutex::new(Vec::new()));
-    let dir = std::env::temp_dir().join(format!("scientdb-parity-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("cce-parity-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let fs_state = scenario(&mut |_| traced(FsIo::new(&dir), &fs_trace));
     let _ = std::fs::remove_dir_all(&dir);
@@ -305,12 +305,12 @@ fn failed_publication_barrier_is_indeterminate_and_fences_writes() {
         .commit(attempt.clone(), s.begin().unwrap(), cs)
         .unwrap_err();
     assert!(
-        matches!(err, scientdb_kernel::storage::CommitError::Indeterminate(_)),
+        matches!(err, cce_core::storage::CommitError::Indeterminate(_)),
         "{err:?}"
     );
     assert_eq!(
         s.outcome(&attempt).unwrap(),
-        scientdb_kernel::storage::AttemptOutcome::Unknown
+        cce_core::storage::AttemptOutcome::Unknown
     );
     // Writes stay fenced: no further commit may proceed on unknown state.
     assert!(

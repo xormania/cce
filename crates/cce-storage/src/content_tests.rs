@@ -2,7 +2,7 @@
 
 use std::io::{self, Read};
 
-use scientdb_kernel::storage::{
+use cce_core::storage::{
     AttemptId, Change, ChangeSet, ContentBinding, ContextId, Precondition, ReadView, StorageEngine,
 };
 
@@ -28,7 +28,7 @@ pub(crate) fn bind(
     id: &str,
     payload: &[u8],
     attempt: &str,
-) -> scientdb_kernel::storage::ContentRef {
+) -> cce_core::storage::ContentRef {
     let staged = s.stage_content(&mut &payload[..]).unwrap();
     let cs = ChangeSet {
         changes: vec![Change::PutContext {
@@ -159,14 +159,14 @@ fn staging_tolerates_short_and_interrupted_reads_and_reports_permanent_failure()
     }
     let err = s.stage_content(&mut Broken(5)).unwrap_err();
     assert!(
-        matches!(err, scientdb_kernel::storage::StorageError::Io(_)),
+        matches!(err, cce_core::storage::StorageError::Io(_)),
         "{err:?}"
     );
 }
 
 #[test]
 fn staging_against_a_declared_length_and_digest_rejects_any_mismatch() {
-    use scientdb_kernel::storage::{ContentDigest, ContentRef, StorageError};
+    use cce_core::storage::{ContentDigest, ContentRef, StorageError};
     use sha2::{Digest, Sha256};
     let sim = SimIo::new();
     let s = sim_store(&sim);
@@ -304,7 +304,7 @@ fn a_cancelled_stage_leaves_nothing_accepted_and_survives_restart() {
 
 #[test]
 fn staging_handles_are_bound_to_their_store_and_open_instance() {
-    use scientdb_kernel::storage::{CommitError, StorageError};
+    use cce_core::storage::{CommitError, StorageError};
     let a = SimIo::new();
     let store_a = sim_store(&a);
     let b = SimIo::new();
@@ -319,7 +319,7 @@ fn staging_handles_are_bound_to_their_store_and_open_instance() {
         body: b"b".to_vec(),
         content: Some(0),
     };
-    let cs = |staged: &scientdb_kernel::storage::StagedContent| ChangeSet {
+    let cs = |staged: &cce_core::storage::StagedContent| ChangeSet {
         changes: vec![put("X")],
         content: vec![ContentBinding::from(staged)],
         ..ChangeSet::default()
@@ -433,7 +433,7 @@ fn a_failed_segment_read_never_lets_unverified_bytes_through() {
 
 #[test]
 fn declared_staging_rejects_an_overrun_without_waiting_for_more_input() {
-    use scientdb_kernel::storage::{ContentDigest, ContentRef, StorageError};
+    use cce_core::storage::{ContentDigest, ContentRef, StorageError};
     let sim = SimIo::new();
     let s = sim_store(&sim);
     // Two bytes, then a source that would block forever if asked again.
@@ -461,7 +461,7 @@ fn declared_staging_rejects_an_overrun_without_waiting_for_more_input() {
 
 #[test]
 fn staging_beyond_the_segment_quota_is_refused() {
-    use scientdb_kernel::storage::StorageError;
+    use cce_core::storage::StorageError;
     let sim = SimIo::new();
     let s = NativeStore {
         inner: Inner::create(
