@@ -10,8 +10,7 @@ use crate::codec::{Dec, Enc, corrupt};
 pub(crate) const PAGE_SIZE: usize = 4096;
 /// Version 3: content stored as verified segments with manifests, and context records holding logical
 /// content references (version 2 had single-extent content; version 1 single-leaf trees). Older
-/// versions are
-/// refused, never reinterpreted.
+/// versions are refused, never reinterpreted.
 pub(crate) const FORMAT_VERSION: u16 = 3;
 pub(crate) const PAGE_MAGIC: [u8; 4] = *b"SDBP";
 pub(crate) const DESC_MAGIC: [u8; 4] = *b"SDBD";
