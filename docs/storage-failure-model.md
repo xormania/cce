@@ -97,9 +97,16 @@ the store handle and every view and content reader derived from it are dropped. 
 
 ## Readers and content integrity
 
-A view reads the generation that was current when it began. Content is streamed in 64 KiB chunks;
-its SHA-256 is checked when the stream ends. Bytes delivered before a mismatch are not verified, and
-a mismatch fails the read instead of reporting a complete stream.
+A view reads the generation that was current when it began. Content streams one segment at a time
+through a buffer of one segment. Each segment is read whole and checked against its SHA-256 before
+any of its bytes are delivered, and the SHA-256 of the whole stream is checked before end of stream
+is reported. After a failed check the reader returns an error naming the segment, and every later
+read fails too; it never reports a complete stream.
+
+Staging with a declared length and digest stops as soon as the stream exceeds the declared length
+and compares length and digest at the end; a mismatch, a short stream or a source error produces no
+staged content. Space written by a failed or abandoned staging lies beyond the committed content
+length and is reused by later staging or after a restart.
 
 ## Not implemented yet
 

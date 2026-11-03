@@ -339,6 +339,14 @@ pub trait StorageEngine: Send + Sync {
     /// Streams content into staging. Staged content is not accepted context.
     fn stage_content(&self, bytes: &mut dyn Read) -> Result<StagedContent, StorageError>;
 
+    /// Streams content into staging and checks it against the caller's declared length and digest.
+    /// A stream that is longer, shorter or different fails without producing staged content.
+    fn stage_content_expecting(
+        &self,
+        bytes: &mut dyn Read,
+        expected: &ContentRef,
+    ) -> Result<StagedContent, StorageError>;
+
     /// Atomically commits one complete change against the given basis.
     fn commit(
         &self,

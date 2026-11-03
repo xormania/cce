@@ -6,6 +6,8 @@
 
 mod codec;
 #[cfg(test)]
+mod content_tests;
+#[cfg(test)]
 mod crash_tests;
 mod engine;
 #[cfg(test)]
@@ -112,6 +114,7 @@ impl From<StoreOptions> for Options {
     fn from(o: StoreOptions) -> Self {
         Options {
             cache_nodes: o.cache_nodes,
+            ..Options::default()
         }
     }
 }
@@ -173,6 +176,14 @@ impl StorageEngine for NativeStore {
 
     fn stage_content(&self, bytes: &mut dyn Read) -> Result<StagedContent, StorageError> {
         self.inner.stage(bytes)
+    }
+
+    fn stage_content_expecting(
+        &self,
+        bytes: &mut dyn Read,
+        expected: &ContentRef,
+    ) -> Result<StagedContent, StorageError> {
+        self.inner.stage_checked(bytes, Some(expected))
     }
 
     fn commit(

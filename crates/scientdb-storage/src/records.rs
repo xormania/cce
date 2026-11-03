@@ -10,7 +10,7 @@
 //! | `0x04` | target, kind, source, relationship id    | empty (incoming index)    |
 //! | `0x05` | history position (u64 big-endian)        | [`ExtentRef`] of entry    |
 //! | `0x06` | attempt id                               | [`AttemptValue`]          |
-//! | `0x07` | content digest                           | [`ExtentRef`] of bytes    |
+//! | `0x07` | content digest                           | [`ExtentRef`] of its [`Manifest`] |
 //!
 //! Components use the order-preserving encoding in `codec::key_component`.
 
@@ -77,19 +77,14 @@ impl ExtentRef {
         d.finish()?;
         Ok(r)
     }
-    pub fn content_ref(&self) -> ContentRef {
-        ContentRef {
-            digest: ContentDigest(self.digest),
-            len: self.len,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContextValue {
     pub revision: u64,
     pub body: Vec<u8>,
-    pub content: Option<ExtentRef>,
+    /// Logical reference to the bound content; its physical layout lives under `P_CONTENT`.
+    pub content: Option<ContentRef>,
 }
 
 impl ContextValue {
@@ -100,9 +95,8 @@ impl ContextValue {
             None => {
                 e.u8(0);
             }
-            Some(x) => {
-                e.u8(1);
-                x.enc(&mut e);
+            Some(c) => {
+                e.u8(1).raw(&c.digest.0).u64(c.len);
             }
         }
         e.buf
@@ -113,7 +107,10 @@ impl ContextValue {
         let body = d.bytes()?.to_vec();
         let content = match d.u8()? {
             0 => None,
-            1 => Some(ExtentRef::dec(&mut d)?),
+            1 => Some(ContentRef {
+                digest: ContentDigest(d.array()?),
+                len: d.u64()?,
+            }),
             t => return Err(corrupt(format!("context record: content tag {t}"))),
         };
         d.finish()?;
@@ -429,5 +426,73 @@ mod tests {
         assert_eq!(h.attempt, a);
         assert_eq!(h.changes, cs.changes);
         assert_eq!(h.evidence, cs.evidence);
+    }
+}
+
+/// Largest segment of stored content; one segment is read and verified at a time.
+pub(crate) const SEGMENT_MAX: u64 = 64 * 1024;
+const MANIFEST_V1: u8 = 1;
+
+/// Physical layout of one content stream: its logical identity and its segments in order. Stored
+/// as an extent of the content file; each segment carries its own digest so a reader can verify it
+/// before delivering any of its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Manifest {
+    pub content: ContentRef,
+    pub segments: Vec<ExtentRef>,
+}
+
+impl Manifest {
+    /// Encoded size of a manifest with `segments` segments.
+    pub fn encoded_len(segments: usize) -> u64 {
+        1 + 32 + 8 + 4 + 48 * segments as u64
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::default();
+        e.u8(MANIFEST_V1)
+            .raw(&self.content.digest.0)
+            .u64(self.content.len)
+            .u32(self.segments.len() as u32);
+        for x in &self.segments {
+            x.enc(&mut e);
+        }
+        debug_assert_eq!(e.buf.len() as u64, Self::encoded_len(self.segments.len()));
+        e.buf
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, StorageError> {
+        let mut d = Dec::new(b, "content manifest");
+        if d.u8()? != MANIFEST_V1 {
+            return Err(StorageError::Unsupported("content manifest version".into()));
+        }
+        let content = ContentRef {
+            digest: ContentDigest(d.array()?),
+            len: d.u64()?,
+        };
+        let n = d.count(48)?;
+        let mut segments = Vec::with_capacity(n);
+        let mut total: u64 = 0;
+        for _ in 0..n {
+            let x = ExtentRef::dec(&mut d)?;
+            if x.len == 0 || x.len > SEGMENT_MAX {
+                return Err(corrupt(format!(
+                    "content manifest: segment length {}",
+                    x.len
+                )));
+            }
+            total = total
+                .checked_add(x.len)
+                .ok_or_else(|| corrupt("content manifest: length overflow"))?;
+            segments.push(x);
+        }
+        d.finish()?;
+        if total != content.len {
+            return Err(corrupt(format!(
+                "content manifest: segments hold {total} bytes, content is {}",
+                content.len
+            )));
+        }
+        Ok(Self { content, segments })
     }
 }

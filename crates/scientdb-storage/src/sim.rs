@@ -62,6 +62,8 @@ struct State {
     ops: u64,
     /// Fail this mutating operation number with an I/O error, without crashing.
     fail_op: Option<u64>,
+    /// Fail the next read with an I/O error.
+    fail_next_read: bool,
 }
 
 /// A simulated store directory. Clones share the same state.
@@ -91,6 +93,11 @@ impl SimIo {
     pub fn fail_nth_op(&self, n: u64) {
         let mut st = self.st.lock().expect("sim");
         st.fail_op = Some(st.ops + n);
+    }
+
+    /// Makes the next read fail with an I/O error (once).
+    pub fn fail_next_read(&self) {
+        self.st.lock().expect("sim").fail_next_read = true;
     }
 
     pub fn ops(&self) -> u64 {
@@ -248,7 +255,11 @@ impl Io for SimIo {
     }
 
     fn read_at(&self, file: FileId, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
-        let st = self.st.lock().expect("sim");
+        let mut st = self.st.lock().expect("sim");
+        if std::mem::take(&mut st.fail_next_read) {
+            buf.fill(0);
+            return Err(StorageError::Io("simulated read error".into()));
+        }
         let f = st
             .files
             .get(&file)
