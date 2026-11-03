@@ -456,3 +456,33 @@ fn a_panicking_commit_leaves_no_attempt_pending_and_fences_writes() {
         "{r:?}"
     );
 }
+
+#[test]
+fn after_a_panicking_commit_only_its_attempt_is_uncertain() {
+    use cce_core::storage::{AttemptOutcome, CommitReceipt, HistoryPosition};
+    let s = store();
+    let [a, p, q] = ["a", "p", "q"].map(|x| AttemptId::new(x.as_bytes().to_vec()).unwrap());
+    let receipt = s
+        .commit(a.clone(), s.begin().unwrap(), cs(vec![put("A")]))
+        .unwrap();
+    s.inner.panic_next_commit_for_test();
+    let r = s.commit(p.clone(), s.begin().unwrap(), cs(vec![put("P")]));
+    assert!(matches!(r, Err(CommitError::Indeterminate(_))), "{r:?}");
+    // A retry of the panicked attempt is still uncertain, never a definitive refusal.
+    let r = s.commit(p.clone(), s.begin().unwrap(), cs(vec![put("P")]));
+    assert!(matches!(r, Err(CommitError::Indeterminate(_))), "{r:?}");
+    assert_eq!(s.outcome(&p).unwrap(), AttemptOutcome::Unknown);
+    // Other attempts keep definitive answers.
+    assert_eq!(
+        s.outcome(&a).unwrap(),
+        AttemptOutcome::Committed(CommitReceipt {
+            attempt: a.clone(),
+            position: HistoryPosition(1)
+        })
+    );
+    assert_eq!(
+        s.commit(a, s.begin().unwrap(), cs(vec![put("A")])).unwrap(),
+        receipt
+    );
+    assert_eq!(s.outcome(&q).unwrap(), AttemptOutcome::Absent);
+}
