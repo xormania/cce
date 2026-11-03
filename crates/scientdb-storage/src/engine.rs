@@ -13,7 +13,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 
 use scientdb_kernel::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
@@ -51,16 +51,21 @@ pub(crate) struct Options {
     pub cache_nodes: usize,
     /// Commits whose write sets are retained for validating older read bases.
     pub conflict_window: usize,
+    /// Admitted commits that may wait for the commit worker before admission is refused.
+    pub commit_queue: usize,
 }
 
 /// Default number of recent commits whose write sets are kept for conflict validation.
 pub(crate) const DEFAULT_CONFLICT_WINDOW: usize = 4096;
+/// Default number of admitted commits that may wait for the commit worker.
+pub(crate) const DEFAULT_COMMIT_QUEUE: usize = 64;
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             cache_nodes: DEFAULT_CACHE_NODES,
             conflict_window: DEFAULT_CONFLICT_WINDOW,
+            commit_queue: DEFAULT_COMMIT_QUEUE,
         }
     }
 }
@@ -110,6 +115,12 @@ pub(crate) struct Inner {
     cache: Mutex<NodeCache>,
     /// Logical write sets of recent commits, for validating older read bases.
     conflicts: Mutex<ConflictLog>,
+    /// Sender to the commit worker.
+    worker: Mutex<Option<mpsc::SyncSender<Job>>>,
+    /// Attempts admitted to the worker and not yet resolved.
+    pending: Mutex<HashMap<AttemptId, u32>>,
+    #[cfg(test)]
+    gate: Mutex<()>,
     pub counters: Counters,
     /// Recovery diagnostics from open (for example an ignored damaged slot).
     pub diagnostics: Vec<String>,
@@ -242,7 +253,9 @@ impl Inner {
             &desc.encode(),
         )?;
         io.sync(FileId::Meta)?;
-        Ok(Arc::new(Self::new(io, desc, Vec::new(), opts)))
+        let inner = Arc::new(Self::new(io, desc, Vec::new(), opts));
+        inner.start_worker(opts.commit_queue)?;
+        Ok(inner)
     }
 
     pub fn open(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
@@ -266,7 +279,9 @@ impl Inner {
         // any receipt or new commit can rely on them.
         io.sync(FileId::Content)?;
         io.sync(FileId::Meta)?;
-        Ok(Arc::new(Self::new(io, desc, diagnostics, opts)))
+        let inner = Arc::new(Self::new(io, desc, diagnostics, opts));
+        inner.start_worker(opts.commit_queue)?;
+        Ok(inner)
     }
 
     fn new(io: Box<dyn Io>, desc: Descriptor, diagnostics: Vec<String>, opts: Options) -> Self {
@@ -287,6 +302,10 @@ impl Inner {
                 order: VecDeque::new(),
                 capacity: opts.cache_nodes,
             }),
+            worker: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            gate: Mutex::new(()),
             conflicts: Mutex::new(ConflictLog {
                 floor: desc.history_pos,
                 entries: VecDeque::new(),
@@ -294,6 +313,84 @@ impl Inner {
             }),
             counters: Counters::default(),
             diagnostics,
+        }
+    }
+
+    /// Test hook: holds the commit worker before its next job until the guard is dropped.
+    #[cfg(test)]
+    pub(crate) fn pause_worker_for_test(&self) -> MutexGuard<'_, ()> {
+        lock(&self.gate)
+    }
+
+    /// Starts the store's commit worker: the single thread that orders publications. The worker
+    /// holds no reference to the engine; each queued job holds a strong one, so admitted work
+    /// completes even if every caller handle is dropped, and an idle worker never keeps the store
+    /// owned. The worker exits when the engine (and with it the queue's sender) is dropped.
+    fn start_worker(self: &Arc<Self>, capacity: usize) -> Result<(), StorageError> {
+        let (tx, rx) = mpsc::sync_channel::<Job>(capacity.max(1));
+        *lock(&self.worker) = Some(tx);
+        std::thread::Builder::new()
+            .name("scientdb-commit".into())
+            .spawn(move || {
+                for job in rx {
+                    let inner = job.inner.clone();
+                    #[cfg(test)]
+                    drop(lock(&inner.gate));
+                    let r =
+                        inner.commit(job.attempt.clone(), job.basis, &job.observed, job.changes);
+                    inner.finish_pending(&job.attempt);
+                    // The caller may have gone away; the commit stands either way.
+                    let _ = job.reply.send(r);
+                }
+            })
+            .map_err(|e| StorageError::Io(format!("start commit worker: {e}")))?;
+        Ok(())
+    }
+
+    /// Admits a commit to the worker's queue, or refuses it explicitly when the queue is full.
+    pub fn submit(
+        self: &Arc<Self>,
+        attempt: AttemptId,
+        basis: Snapshot,
+        observed: Vec<Observation>,
+        changes: ChangeSet,
+    ) -> Result<mpsc::Receiver<Result<CommitReceipt, CommitError>>, CommitError> {
+        let (reply, rx) = mpsc::channel();
+        let tx = lock(&self.worker).clone().ok_or_else(|| {
+            rejected(StorageError::StoreState("commit worker not running".into()))
+        })?;
+        *lock(&self.pending).entry(attempt.clone()).or_default() += 1;
+        let job = Job {
+            inner: self.clone(),
+            attempt: attempt.clone(),
+            basis,
+            observed,
+            changes,
+            reply,
+        };
+        match tx.try_send(job) {
+            Ok(()) => Ok(rx),
+            Err(e) => {
+                self.finish_pending(&attempt);
+                Err(rejected(match e {
+                    mpsc::TrySendError::Full(_) => {
+                        StorageError::Busy("commit queue is full; retry later".into())
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        StorageError::StoreState("commit worker stopped".into())
+                    }
+                }))
+            }
+        }
+    }
+
+    fn finish_pending(&self, attempt: &AttemptId) {
+        let mut p = lock(&self.pending);
+        if let Some(n) = p.get_mut(attempt) {
+            *n -= 1;
+            if *n == 0 {
+                p.remove(attempt);
+            }
         }
     }
 
@@ -628,6 +725,9 @@ impl Inner {
     }
 
     pub fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
+        if lock(&self.pending).contains_key(attempt) {
+            return Ok(AttemptOutcome::Pending);
+        }
         let st = lock(&self.state);
         if st.fenced.is_some() {
             return Ok(AttemptOutcome::Unknown);
@@ -791,6 +891,16 @@ impl Inner {
             failed: None,
         })
     }
+}
+
+/// One admitted commit waiting for the worker.
+pub(crate) struct Job {
+    inner: Arc<Inner>,
+    attempt: AttemptId,
+    basis: Snapshot,
+    observed: Vec<Observation>,
+    changes: ChangeSet,
+    reply: mpsc::Sender<Result<CommitReceipt, CommitError>>,
 }
 
 /// A logical read a view made, protected until the view's commit is validated.

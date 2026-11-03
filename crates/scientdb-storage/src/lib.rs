@@ -55,19 +55,20 @@ impl NativeStore {
         store_id: [u8; 16],
         options: StoreOptions,
     ) -> Result<Self, StorageError> {
+        let opts: Options = options.into();
         let inner = Inner::create(
             Box::new(io::FsIo::new(dir)),
             format::StoreId(store_id),
-            options.into(),
+            opts,
         )?;
         Ok(Self { inner })
     }
 
     /// Like [`NativeStore::open`], with explicit tuning options.
     pub fn open_with(dir: &Path, options: StoreOptions) -> Result<Self, StorageError> {
-        Ok(Self {
-            inner: Inner::open(Box::new(io::FsIo::new(dir)), options.into())?,
-        })
+        let opts: Options = options.into();
+        let inner = Inner::open(Box::new(io::FsIo::new(dir)), opts)?;
+        Ok(Self { inner })
     }
 
     /// Instrumentation counters and current tree shape. Counters never affect engine behavior.
@@ -85,6 +86,23 @@ impl NativeStore {
         })
     }
 
+    /// Admits a commit without waiting for it. The commit proceeds even if the ticket is dropped.
+    pub fn submit(
+        &self,
+        attempt: AttemptId,
+        basis: NativeView,
+        changes: ChangeSet,
+    ) -> Result<CommitTicket, CommitError> {
+        if !Arc::ptr_eq(&basis.inner, &self.inner) {
+            return Err(CommitError::Rejected(StorageError::ForeignHandle));
+        }
+        Ok(CommitTicket {
+            rx: self
+                .inner
+                .submit(attempt, basis.snap, basis.observed, changes)?,
+        })
+    }
+
     /// Recovery diagnostics from opening this store, such as an ignored damaged publication slot.
     pub fn recovery_diagnostics(&self) -> &[String] {
         &self.inner.diagnostics
@@ -93,6 +111,23 @@ impl NativeStore {
     /// Opens an existing store in `dir`. Never initializes a new store in its place.
     pub fn open(dir: &Path) -> Result<Self, StorageError> {
         Self::open_with(dir, StoreOptions::default())
+    }
+}
+
+/// An admitted commit. Dropping the ticket does not cancel the commit; reconcile its outcome with
+/// [`StorageEngine::outcome`] using the attempt identity.
+pub struct CommitTicket {
+    rx: std::sync::mpsc::Receiver<Result<CommitReceipt, CommitError>>,
+}
+
+impl CommitTicket {
+    /// Waits for the commit's result.
+    pub fn wait(self) -> Result<CommitReceipt, CommitError> {
+        self.rx.recv().unwrap_or_else(|_| {
+            Err(CommitError::Indeterminate(
+                "commit worker stopped before answering; reconcile with outcome".into(),
+            ))
+        })
     }
 }
 
@@ -202,11 +237,7 @@ impl StorageEngine for NativeStore {
         basis: NativeView,
         changes: ChangeSet,
     ) -> Result<CommitReceipt, CommitError> {
-        if !Arc::ptr_eq(&basis.inner, &self.inner) {
-            return Err(CommitError::Rejected(StorageError::ForeignHandle));
-        }
-        self.inner
-            .commit(attempt, basis.snap, &basis.observed, changes)
+        self.submit(attempt, basis, changes)?.wait()
     }
 
     fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {

@@ -328,3 +328,91 @@ fn a_basis_from_another_store_is_rejected() {
     assert_eq!(r, Err(CommitError::Rejected(StorageError::ForeignHandle)));
     commit_now(&a, "own", vec![put("A")]);
 }
+
+fn store_with(opts: crate::engine::Options) -> NativeStore {
+    NativeStore {
+        inner: Inner::create(Box::new(SimIo::new()), StoreId([7; 16]), opts).unwrap(),
+    }
+}
+
+fn wait_resolved(s: &NativeStore, a: &AttemptId) -> scientdb_kernel::storage::AttemptOutcome {
+    use scientdb_kernel::storage::AttemptOutcome;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match s.outcome(a).unwrap() {
+            AttemptOutcome::Pending if std::time::Instant::now() < until => {
+                std::thread::yield_now()
+            }
+            other => return other,
+        }
+    }
+}
+
+#[test]
+fn an_admitted_commit_completes_after_its_caller_goes_away() {
+    use scientdb_kernel::storage::{AttemptOutcome, HistoryPosition};
+    let s = store();
+    let gate = s.inner.pause_worker_for_test();
+    let a = AttemptId::new(*b"abandoned").unwrap();
+    let ticket = s
+        .submit(a.clone(), s.begin().unwrap(), cs(vec![put("A")]))
+        .unwrap();
+    // Admitted but not yet published: the outcome is pending, not absent.
+    assert_eq!(s.outcome(&a).unwrap(), AttemptOutcome::Pending);
+    drop(ticket);
+    drop(gate);
+    match wait_resolved(&s, &a) {
+        AttemptOutcome::Committed(r) => assert_eq!(r.position, HistoryPosition(1)),
+        other => panic!("abandoned commit was lost: {other:?}"),
+    }
+    let mut v = s.begin().unwrap();
+    assert_eq!(
+        v.history(HistoryPosition(0)).unwrap().count(),
+        1,
+        "the commit must apply exactly once"
+    );
+}
+
+#[test]
+fn a_full_commit_queue_refuses_admission_explicitly_and_reads_continue() {
+    use scientdb_kernel::storage::StorageError;
+    let s = store_with(crate::engine::Options {
+        commit_queue: 1,
+        ..Default::default()
+    });
+    commit_now(&s, "seed", vec![put("S")]);
+    let gate = s.inner.pause_worker_for_test();
+    let first = s
+        .submit(
+            AttemptId::new(*b"q1").unwrap(),
+            s.begin().unwrap(),
+            cs(vec![put("A")]),
+        )
+        .unwrap();
+    let mut queued = Vec::new();
+    let mut refused = None;
+    for i in 0..4 {
+        match s.submit(
+            AttemptId::new(format!("q{}", i + 2).into_bytes()).unwrap(),
+            s.begin().unwrap(),
+            cs(vec![put(&format!("B{i}"))]),
+        ) {
+            Ok(t) => queued.push(t),
+            Err(e) => {
+                refused = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(
+        matches!(refused, Some(CommitError::Rejected(StorageError::Busy(_)))),
+        "no backpressure: {refused:?}"
+    );
+    // Committed state stays readable while writes are backed up.
+    assert!(s.begin().unwrap().context(&cid("S")).unwrap().is_some());
+    drop(gate);
+    first.wait().unwrap();
+    for t in queued {
+        t.wait().unwrap();
+    }
+}
