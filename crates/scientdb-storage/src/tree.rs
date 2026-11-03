@@ -790,6 +790,67 @@ mod tests {
         );
     }
 
+    /// Deterministic workloads against an independent `BTreeMap` model, checking every committed
+    /// generation (old roots stay readable and unchanged).
+    #[test]
+    fn workloads_match_an_independent_model_in_every_generation() {
+        fn rng(s: &mut u64) -> u64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        }
+        let workloads: Vec<(&str, Vec<u32>)> = vec![
+            ("ascending", (0..6000).collect()),
+            ("descending", (0..6000).rev().collect()),
+            ("random", {
+                let mut s = 0x2545_f491_4f6c_dd1d;
+                (0..6000).map(|_| (rng(&mut s) % 4000) as u32).collect()
+            }),
+            ("duplicates", (0..6000).map(|i| i % 37).collect()),
+        ];
+        for (name, keys) in workloads {
+            let m = Mem::default();
+            let mut root = empty(&m);
+            let mut model = Entries::new();
+            let mut generations = Vec::new();
+            let mut s = 99u64;
+            for (g, chunk) in keys.chunks(700).enumerate() {
+                root = commit(&m, root, g as u64 + 1, |t| {
+                    for &i in chunk {
+                        // Mix inserts, replacements (same key, new value) and deletions.
+                        match rng(&mut s) % 10 {
+                            0 | 1 => {
+                                let present = model.remove(&k(i)).is_some();
+                                assert_eq!(t.delete(&k(i)).unwrap(), present, "{name}: delete {i}");
+                            }
+                            _ => {
+                                let v = format!("{name}-{i}-{g}").into_bytes();
+                                t.put(k(i), v.clone()).unwrap();
+                                model.insert(k(i), v);
+                            }
+                        }
+                    }
+                });
+                generations.push((root, model.clone()));
+            }
+            for (gen_root, gen_model) in &generations {
+                assert_eq!(
+                    all(&m, *gen_root),
+                    gen_model.clone().into_iter().collect::<Vec<_>>(),
+                    "{name}"
+                );
+                for key in gen_model.keys().step_by(97) {
+                    assert_eq!(
+                        get(&m, *gen_root, key).unwrap().as_ref(),
+                        gen_model.get(key),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn oversized_records_are_refused_explicitly() {
         let m = Mem::default();
