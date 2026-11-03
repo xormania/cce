@@ -525,3 +525,45 @@ fn node_references_outside_committed_metadata_are_refused_before_reading() {
     // Positive neighbour: the committed root loads.
     assert!(s.inner.load(d.root).is_ok());
 }
+
+#[test]
+fn history_position_exhaustion_is_rejected_without_wrapping() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let mut d = s.inner.snapshot().unwrap().desc;
+    drop(s);
+    // The next generation's record claims the last representable history position.
+    d.generation += 1;
+    d.history_pos = u64::MAX;
+    sim.write_at(
+        FileId::Meta,
+        Descriptor::slot(d.generation) * PAGE_SIZE as u64,
+        &d.encode(),
+    )
+    .unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    sim.release();
+    let s = reopen(&sim);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        commit(
+            &s,
+            "y",
+            changes(vec![put("B", Precondition::Absent, b"b", None)]),
+        )
+    }))
+    .expect("commit panicked at history exhaustion");
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.contains("overflow")),
+        "{r:?}"
+    );
+    assert!(
+        revision(&s, "A").is_some(),
+        "existing state must stay readable"
+    );
+}
