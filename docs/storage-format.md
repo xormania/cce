@@ -85,9 +85,26 @@ tuple order of the raw components.
 | `04` | target, kind, source, relationship id | empty — incoming index |
 | `05` | history position (`u64` big-endian) | extent of the history entry |
 | `06` | attempt id | history position `u64`, request fingerprint (32 bytes) |
-| `07` | content SHA-256 | extent of the content bytes |
+| `07` | content SHA-256 | extent of the content's manifest |
 
 An extent is `offset: u64, length: u64, sha256: [u8; 32]` into `content.sdb`.
+
+## Content
+
+Content is stored as segments of at most 65536 bytes, each written to its own allocation in
+`content.sdb`, followed by a manifest:
+
+| Field | Size |
+|---|---|
+| version (1) | 1 |
+| SHA-256 of the whole stream | 32 |
+| stream length | 8 |
+| segment count | 4 |
+| per segment: offset, length, SHA-256 | 8 + 8 + 32 |
+
+The manifest is valid only if every segment is 1..65536 bytes and the lengths add up to the stream
+length. Context records hold only the logical reference (SHA-256 and length); the physical layout is
+found through the `07` record.
 
 A record's revision is the history position of the commit that last changed it. Revisions therefore
 strictly increase for an identity and are never reused, even after the record is removed and created
