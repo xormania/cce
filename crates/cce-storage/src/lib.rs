@@ -4,6 +4,8 @@
 //! `cce-core` plus constructors for a native store. See `docs/storage-format.md`
 //! and `docs/storage-failure-model.md` for the implemented format and guarantees.
 
+#[cfg(test)]
+mod attempt_tests;
 mod codec;
 #[cfg(test)]
 mod content_tests;
