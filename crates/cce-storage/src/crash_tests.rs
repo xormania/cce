@@ -7,8 +7,9 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, ContentBinding, ContextId, Direction, Evidence, HistoryPosition,
-    Precondition, ReadView, RelationshipId, RelationshipKind, RelationshipQuery, StorageEngine,
+    AttemptId, AttemptOutcome, Change, ChangeSet, CommitReceipt, ContentBinding, ContextId,
+    Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
+    RelationshipQuery, StorageEngine,
 };
 
 use crate::NativeStore;
@@ -43,11 +44,16 @@ fn open(io: Box<dyn Io>) -> NativeStore {
     }
 }
 
+/// The content bytes bound by `step`.
+fn payload(step: u32) -> Vec<u8> {
+    (0..(150_000 + step as usize * 7))
+        .map(|i| (i * 31 + step as usize) as u8)
+        .collect()
+}
+
 /// A complete logical request: records, both relationship directions, content, evidence.
 fn request(store: &NativeStore, step: u32) -> Option<(AttemptId, ChangeSet)> {
-    let payload: Vec<u8> = (0..(150_000 + step as usize * 7))
-        .map(|i| (i * 31 + step as usize) as u8)
-        .collect();
+    let payload = payload(step);
     let staged = store.stage_content(&mut &payload[..]).ok()?;
     let mut cs = ChangeSet {
         content: vec![ContentBinding::from(&staged)],
@@ -222,13 +228,48 @@ fn every_cut_of_a_commit_recovers_a_whole_old_or_new_state() {
 
 #[test]
 fn filesystem_and_simulator_run_the_same_protocol() {
-    fn scenario(io_for: &mut dyn FnMut(bool) -> Box<dyn Io>) -> Vec<String> {
+    /// Logical state, receipts, outcomes after reopen, and every record's content bytes.
+    type Observed = (
+        Vec<String>,
+        Vec<CommitReceipt>,
+        Vec<AttemptOutcome>,
+        Vec<(&'static str, Vec<u8>)>,
+    );
+    fn scenario(io_for: &mut dyn FnMut(bool) -> Box<dyn Io>) -> Observed {
         let s = create(io_for(true));
-        assert!(commit_step(&s, 1));
-        assert!(commit_step(&s, 2));
+        let mut receipts = Vec::new();
+        let mut attempts = Vec::new();
+        for step in 1..=2 {
+            let (attempt, cs) = request(&s, step).expect("stage");
+            receipts.push(
+                s.commit(attempt.clone(), s.begin().expect("begin"), cs)
+                    .expect("commit"),
+            );
+            attempts.push(attempt);
+        }
         s.close().expect("close");
         let s = open(io_for(false));
-        logical_state(&s)
+        let outcomes = attempts
+            .iter()
+            .map(|a| s.outcome(a).expect("outcome"))
+            .collect();
+        let mut v = s.begin().expect("begin");
+        let mut contents = Vec::new();
+        for id in IDS {
+            if let Some(c) = v
+                .context(&cid(id))
+                .expect("context")
+                .and_then(|r| r.content)
+            {
+                let mut bytes = Vec::new();
+                v.content(&c)
+                    .expect("content")
+                    .read_to_end(&mut bytes)
+                    .expect("read content");
+                contents.push((id, bytes));
+            }
+        }
+        (logical_state(&s), receipts, outcomes, contents)
     }
 
     let sim_trace = Arc::new(Mutex::new(Vec::new()));
@@ -244,10 +285,49 @@ fn filesystem_and_simulator_run_the_same_protocol() {
     let fs_state = scenario(&mut |_| traced(FsIo::new(&dir), &fs_trace));
     let _ = std::fs::remove_dir_all(&dir);
 
+    let (sim_logical, sim_receipts, sim_outcomes, sim_contents) = &sim_state;
+    let (fs_logical, fs_receipts, fs_outcomes, fs_contents) = &fs_state;
     assert_eq!(
-        sim_state, fs_state,
+        sim_logical, fs_logical,
         "logical results differ between adapters"
     );
+    assert_eq!(
+        sim_receipts, fs_receipts,
+        "receipts differ between adapters"
+    );
+    assert_eq!(
+        sim_outcomes, fs_outcomes,
+        "outcomes differ between adapters"
+    );
+    // Independent expectation: steps 1 and 2 committed at positions 1 and 2, and each step's
+    // record holds exactly that step's payload.
+    let positions: Vec<u64> = sim_receipts.iter().map(|r| r.position.0).collect();
+    assert_eq!(positions, [1, 2]);
+    assert_eq!(
+        *sim_outcomes,
+        sim_receipts
+            .iter()
+            .cloned()
+            .map(AttemptOutcome::Committed)
+            .collect::<Vec<_>>()
+    );
+    let expected: Vec<(&str, Vec<u8>)> = (1..=2u32)
+        .map(|step| (IDS[step as usize % 4], payload(step)))
+        .collect();
+    for (adapter, contents) in [("simulator", sim_contents), ("filesystem", fs_contents)] {
+        let ids: Vec<&str> = contents.iter().map(|(id, _)| *id).collect();
+        let want: Vec<&str> = expected.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, want, "{adapter}: records with content");
+        for ((id, got), (_, want)) in contents.iter().zip(&expected) {
+            assert!(
+                got == want,
+                "{adapter}: content of {id} differs ({} bytes, expected {}, first difference at {:?})",
+                got.len(),
+                want.len(),
+                got.iter().zip(want).position(|(a, b)| a != b)
+            );
+        }
+    }
     let (a, b) = (
         sim_trace.lock().unwrap().clone(),
         fs_trace.lock().unwrap().clone(),
@@ -282,7 +362,10 @@ fn filesystem_and_simulator_run_the_same_protocol() {
         sim2.release();
         traced(sim2.clone(), &again)
     });
-    assert_eq!(state2, sim_state);
+    assert!(
+        state2 == sim_state,
+        "a repeated simulated run observed different results"
+    );
     assert_eq!(*again.lock().unwrap(), a);
 }
 
