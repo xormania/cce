@@ -1,0 +1,56 @@
+name: rust
+
+# Every push to a branch runs the checks, so a branch is green before its PR opens; pull_request
+# runs only for forks, whose pushes do not reach this repository. Superseded runs are cancelled.
+# Actions are pinned by commit.
+on:
+  push:
+    branches: ['**']
+    paths-ignore: ['**.md']
+  pull_request:
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: '0'
+  # Keep the registry inside the workspace so it can be cached by a relative path.
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rust-toolchain.toml selects the pinned toolchain and components.
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cargo-home/registry/index
+            .cargo-home/registry/cache
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- --deny warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
