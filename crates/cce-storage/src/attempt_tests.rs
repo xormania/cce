@@ -3,7 +3,7 @@
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use cce_core::storage::{
@@ -498,13 +498,52 @@ fn racing_different_requests_under_one_attempt_id_commit_exactly_one() {
     assert_eq!(history_len(&s), rounds.len());
 }
 
-/// Simulated I/O that, while armed, holds the next content barrier until the test releases the
-/// gate: the commit is then in flight, its effects written but not yet published.
+/// Holds a commit at its next content barrier while armed, until released: the commit is then in
+/// flight, its effects written but not yet published.
+#[derive(Clone, Default)]
+struct Gate(Arc<GateState>);
+
+#[derive(Default)]
+struct GateState {
+    armed: AtomicBool,
+    reached: AtomicBool,
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl Gate {
+    fn arm(&self) {
+        *self.0.open.lock().unwrap() = false;
+        self.0.reached.store(false, Ordering::SeqCst);
+        self.0.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        self.0.armed.store(false, Ordering::SeqCst);
+        *self.0.open.lock().unwrap() = true;
+        self.0.opened.notify_all();
+    }
+
+    fn reached(&self) -> bool {
+        self.0.reached.load(Ordering::SeqCst)
+    }
+
+    /// Called at a content barrier: blocks while the gate is armed and closed.
+    fn pass(&self) {
+        if self.0.armed.load(Ordering::SeqCst) {
+            self.0.reached.store(true, Ordering::SeqCst);
+            let mut open = self.0.open.lock().unwrap();
+            while !*open {
+                open = self.0.opened.wait(open).unwrap();
+            }
+        }
+    }
+}
+
+/// Simulated I/O whose content barriers pass through a [`Gate`].
 struct GatedIo {
     inner: SimIo,
-    armed: Arc<AtomicBool>,
-    reached: Arc<AtomicBool>,
-    gate: Arc<Mutex<()>>,
+    gate: Gate,
 }
 
 impl Io for GatedIo {
@@ -524,9 +563,8 @@ impl Io for GatedIo {
         self.inner.len(file)
     }
     fn sync(&self, file: FileId) -> Result<(), StorageError> {
-        if file == FileId::Content && self.armed.load(Ordering::SeqCst) {
-            self.reached.store(true, Ordering::SeqCst);
-            drop(self.gate.lock().unwrap());
+        if file == FileId::Content {
+            self.gate.pass();
         }
         self.inner.sync(file)
     }
@@ -535,27 +573,36 @@ impl Io for GatedIo {
     }
 }
 
-#[test]
-fn outcome_moves_from_pending_to_committed_without_passing_through_absent() {
-    let armed = Arc::new(AtomicBool::new(false));
-    let reached = Arc::new(AtomicBool::new(false));
-    let gate = Arc::new(Mutex::new(()));
+/// A seeded store (attempt "seed" committed at position 1) over gated simulated I/O.
+fn gated_store() -> (NativeStore, Gate) {
+    let gate = Gate::default();
     let io = GatedIo {
         inner: SimIo::new(),
-        armed: armed.clone(),
-        reached: reached.clone(),
         gate: gate.clone(),
     };
     let s = NativeStore {
         inner: Inner::create(Box::new(io), STORE, Default::default()).unwrap(),
     };
     seed(&s);
+    (s, gate)
+}
+
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < until, "timed out waiting: {what}");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn outcome_moves_from_pending_to_committed_without_passing_through_absent() {
+    let (s, gate) = gated_store();
     let a = attempt("x");
     assert_eq!(s.outcome(&a).unwrap(), AttemptOutcome::Absent);
     let cs = request(&s, Variant::Identical);
 
-    let held = gate.lock().unwrap();
-    armed.store(true, Ordering::SeqCst);
+    gate.arm();
     let ticket = s.submit(a.clone(), s.begin().unwrap(), cs).unwrap();
     let polled = AtomicBool::new(false);
     let observed = std::thread::scope(|sc| {
@@ -574,23 +621,17 @@ fn outcome_moves_from_pending_to_committed_without_passing_through_absent() {
                 }
             }
         });
-        let until = Instant::now() + Duration::from_secs(10);
         // Release only once the commit is held at its barrier and the poller has answered.
-        while !reached.load(Ordering::SeqCst) || !polled.load(Ordering::SeqCst) {
-            assert!(
-                Instant::now() < until,
-                "commit never reached its data barrier, or the poller never ran"
-            );
-            std::thread::yield_now();
-        }
+        wait_until("commit at its data barrier, poller running", || {
+            gate.reached() && polled.load(Ordering::SeqCst)
+        });
         // In flight: written, not published. The answer must still be pending.
         assert_eq!(
             s.outcome(&a).unwrap(),
             AttemptOutcome::Pending,
             "in-flight commit"
         );
-        armed.store(false, Ordering::SeqCst);
-        drop(held);
+        gate.release();
         poller.join().unwrap()
     });
     let receipt = ticket.wait().unwrap();
@@ -600,4 +641,78 @@ fn outcome_moves_from_pending_to_committed_without_passing_through_absent() {
         [AttemptOutcome::Pending, AttemptOutcome::Committed(receipt)],
         "outcome sequence while the commit resolved"
     );
+}
+
+#[test]
+fn outcome_racing_a_publication_never_answers_from_the_state_before_it() {
+    let (s, gate) = gated_store();
+    let a = attempt("x");
+    let cs = request(&s, Variant::Identical);
+    gate.arm();
+    let ticket = s.submit(a.clone(), s.begin().unwrap(), cs).unwrap();
+    wait_until("commit at its data barrier", || gate.reached());
+
+    // Should outcome() get between its two looks at the engine while this commit is in flight,
+    // the hook lets the commit finish completely (published, no longer pending) right there.
+    let (tx, rx) = mpsc::channel();
+    let finish = {
+        let gate = gate.clone();
+        move || {
+            gate.release();
+            tx.send(ticket.wait()).unwrap();
+        }
+    };
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let ran = hook_ran.clone();
+    assert!(
+        s.inner
+            .set_outcome_hook_for_test(Some(Box::new(move || {
+                ran.store(true, Ordering::SeqCst);
+                finish();
+            })))
+            .is_none()
+    );
+    let answer = s.outcome(&a).unwrap();
+    assert!(
+        matches!(
+            answer,
+            AttemptOutcome::Pending | AttemptOutcome::Committed(_)
+        ),
+        "an in-flight commit answered {answer:?} (hook ran: {})",
+        hook_ran.load(Ordering::SeqCst)
+    );
+    // If the pending check answered first, the hook was not reached: finish the commit here.
+    if let Some(unused) = s.inner.set_outcome_hook_for_test(None) {
+        unused();
+    }
+    let receipt = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("commit finished")
+        .unwrap();
+    assert_eq!(receipt.position, HistoryPosition(2));
+    if let AttemptOutcome::Committed(r) = &answer {
+        assert_eq!(r, &receipt);
+    }
+    assert_eq!(s.outcome(&a).unwrap(), AttemptOutcome::Committed(receipt));
+}
+
+#[test]
+fn outcome_reaches_its_hook_when_no_commit_is_in_flight() {
+    let (s, _gate) = gated_store();
+    let seed_receipt = CommitReceipt {
+        attempt: attempt("seed"),
+        position: HistoryPosition(1),
+    };
+    for (a, want) in [
+        ("unknown", AttemptOutcome::Absent),
+        ("seed", AttemptOutcome::Committed(seed_receipt)),
+    ] {
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        s.inner
+            .set_outcome_hook_for_test(Some(Box::new(move || r.store(true, Ordering::SeqCst))));
+        assert_eq!(s.outcome(&attempt(a)).unwrap(), want, "{a}");
+        assert!(ran.load(Ordering::SeqCst), "{a}: hook not reached");
+        assert!(s.inner.set_outcome_hook_for_test(None).is_none(), "{a}");
+    }
 }
