@@ -114,6 +114,7 @@ impl From<StoreOptions> for Options {
     fn from(o: StoreOptions) -> Self {
         Options {
             cache_nodes: o.cache_nodes,
+            ..Options::default()
         }
     }
 }

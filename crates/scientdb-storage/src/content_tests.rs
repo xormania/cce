@@ -393,3 +393,91 @@ fn updating_metadata_does_not_rewrite_a_large_payload() {
         payload.len()
     );
 }
+
+#[test]
+fn a_failed_segment_read_never_lets_unverified_bytes_through() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    let payload = bytes(3 * CONTENT_CHUNK + 10, 6);
+    let c = bind(&s, "A", &payload, "a1");
+    let mut r = s.begin().unwrap().content(&c).unwrap();
+    sim.fail_next_read();
+    let mut buf = vec![0; 1000];
+    assert!(
+        r.read(&mut buf).is_err(),
+        "the injected read error must surface"
+    );
+    // Retrying must never return bytes that were not read and verified.
+    let mut delivered = Vec::new();
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => delivered.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        payload.starts_with(&delivered),
+        "unverified bytes delivered after a read error"
+    );
+    // A fresh reader still streams everything.
+    let mut all = Vec::new();
+    s.begin()
+        .unwrap()
+        .content(&c)
+        .unwrap()
+        .read_to_end(&mut all)
+        .unwrap();
+    assert_eq!(all, payload);
+}
+
+#[test]
+fn declared_staging_rejects_an_overrun_without_waiting_for_more_input() {
+    use scientdb_kernel::storage::{ContentDigest, ContentRef, StorageError};
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    // Two bytes, then a source that would block forever if asked again.
+    struct ThenBlocks(u8);
+    impl Read for ThenBlocks {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0 >= 2 {
+                panic!("staging asked for more input after the declared length was exceeded");
+            }
+            let n = buf.len().min(2 - self.0 as usize);
+            buf[..n].fill(1);
+            self.0 += n as u8;
+            Ok(n)
+        }
+    }
+    let declared = ContentRef {
+        digest: ContentDigest([0; 32]),
+        len: 1,
+    };
+    let err = s
+        .stage_content_expecting(&mut ThenBlocks(0), &declared)
+        .unwrap_err();
+    assert!(matches!(err, StorageError::InvalidRequest(_)), "{err:?}");
+}
+
+#[test]
+fn staging_beyond_the_segment_quota_is_refused() {
+    use scientdb_kernel::storage::StorageError;
+    let sim = SimIo::new();
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(sim.clone()),
+            StoreId([4; 16]),
+            crate::engine::Options {
+                max_content_segments: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    };
+    let fits = bytes(4 * CONTENT_CHUNK, 1);
+    s.stage_content(&mut &fits[..])
+        .expect("content within the quota stages");
+    let over = bytes(4 * CONTENT_CHUNK + 1, 1);
+    let err = s.stage_content(&mut &over[..]).unwrap_err();
+    assert!(matches!(err, StorageError::InvalidRequest(_)), "{err:?}");
+}

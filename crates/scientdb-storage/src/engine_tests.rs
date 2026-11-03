@@ -525,3 +525,81 @@ fn node_references_outside_committed_metadata_are_refused_before_reading() {
     // Positive neighbour: the committed root loads.
     assert!(s.inner.load(d.root).is_ok());
 }
+
+#[test]
+fn an_oversized_manifest_reference_is_refused_before_allocation() {
+    // A small segment quota keeps the largest valid manifest small, so a crafted reference only a
+    // little beyond it (backed by real bytes, within committed content) shows the size bound.
+    let opts = crate::engine::Options {
+        max_content_segments: 4,
+        ..Default::default()
+    };
+    let sim = SimIo::new();
+    let s = NativeStore {
+        inner: Inner::create(Box::new(sim.clone()), StoreId([3; 16]), opts).unwrap(),
+    };
+    let staged = s.stage_content(&mut &b"bytes"[..]).unwrap();
+    let cs = ChangeSet {
+        changes: vec![put("B", Precondition::Absent, b"b", Some(0))],
+        content: vec![ContentBinding::from(&staged)],
+        ..ChangeSet::default()
+    };
+    commit(&s, "x", cs).unwrap();
+    let cur = s.inner.snapshot().unwrap().desc;
+    // Crafted metadata: the content record points at a manifest far larger than any valid one.
+    let filler = vec![7u8; 1 << 20];
+    sim.write_at(FileId::Content, cur.content_len, &filler)
+        .unwrap();
+    sim.sync(FileId::Content).unwrap();
+    let huge = ExtentRef {
+        offset: 0,
+        len: filler.len() as u64,
+        digest: [0; 32],
+    };
+    let mut t = TreeTxn::new(&*s.inner, cur.root);
+    t.put(key(P_CONTENT, &[&staged.content.digest.0]), huge.encode())
+        .unwrap();
+    struct Sink<'a>(&'a SimIo, u64, u64);
+    impl NodeSink for Sink<'_> {
+        fn write(&mut self, n: &Node) -> Result<PageRef, StorageError> {
+            let at = PageRef {
+                page: self.1,
+                incarnation: self.2,
+            };
+            self.0.write_at(
+                FileId::Meta,
+                at.page * PAGE_SIZE as u64,
+                &encode_page(StoreId([3; 16]), PageKind::Node, at, &n.encode())?,
+            )?;
+            self.1 += 1;
+            Ok(at)
+        }
+    }
+    let mut sink = Sink(&sim, cur.next_page, cur.generation + 1);
+    let root = t.finish(&mut sink).unwrap();
+    // Enough committed content that the bounds check alone would not stop the read.
+    let d = Descriptor {
+        generation: cur.generation + 1,
+        root,
+        next_page: sink.1,
+        content_len: cur.content_len + filler.len() as u64,
+        ..cur
+    };
+    sim.write_at(
+        FileId::Meta,
+        Descriptor::slot(d.generation) * PAGE_SIZE as u64,
+        &d.encode(),
+    )
+    .unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    drop(s);
+    sim.release();
+    let s = NativeStore {
+        inner: Inner::open(Box::new(sim.clone()), opts).expect("open"),
+    };
+    let r = s.begin().unwrap().content(&staged.content).map(|_| ());
+    assert!(
+        matches!(&r, Err(StorageError::Integrity(m)) if m.contains("manifest") && m.contains("limit")),
+        "{r:?}"
+    );
+}
