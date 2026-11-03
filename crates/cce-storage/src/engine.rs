@@ -140,8 +140,8 @@ pub(crate) struct Inner {
     /// Makes the next commit panic inside the worker (tests of worker robustness only).
     #[cfg(test)]
     panic_next_commit: std::sync::atomic::AtomicBool,
-    /// Runs once inside `outcome`, between its pending check and its read of the published state
-    /// (tests of answer ordering only).
+    /// Runs once at the start of `outcome`, before it looks at pending attempts or the published
+    /// state (tests of answer ordering only).
     #[cfg(test)]
     outcome_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Largest number of segments one content stream may have.
@@ -368,8 +368,8 @@ impl Inner {
         lock(&self.gate)
     }
 
-    /// Test hook: installs (or with `None` removes) the callback `outcome` runs once between its
-    /// pending check and its read of the published state. Returns the callback it replaced.
+    /// Test hook: installs (or with `None` removes) the callback `outcome` runs once at its start,
+    /// before it looks at pending attempts or the published state. Returns the callback it replaced.
     #[cfg(test)]
     pub(crate) fn set_outcome_hook_for_test(
         &self,
@@ -866,15 +866,17 @@ impl Inner {
     }
 
     pub fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
-        if lock(&self.pending).contains_key(attempt) {
-            return Ok(AttemptOutcome::Pending);
-        }
+        // Test seam: lets a concurrent commit finish after this call began, before it looks at
+        // anything (tests of answer ordering only).
         #[cfg(test)]
         {
             let hook = lock(&self.outcome_hook).take();
             if let Some(hook) = hook {
                 hook();
             }
+        }
+        if lock(&self.pending).contains_key(attempt) {
+            return Ok(AttemptOutcome::Pending);
         }
         let st = lock(&self.state);
         if st

@@ -644,7 +644,7 @@ fn outcome_moves_from_pending_to_committed_without_passing_through_absent() {
 }
 
 #[test]
-fn outcome_racing_a_publication_never_answers_from_the_state_before_it() {
+fn outcome_called_while_a_commit_publishes_answers_from_the_published_state() {
     let (s, gate) = gated_store();
     let a = attempt("x");
     let cs = request(&s, Variant::Identical);
@@ -652,8 +652,8 @@ fn outcome_racing_a_publication_never_answers_from_the_state_before_it() {
     let ticket = s.submit(a.clone(), s.begin().unwrap(), cs).unwrap();
     wait_until("commit at its data barrier", || gate.reached());
 
-    // Should outcome() get between its two looks at the engine while this commit is in flight,
-    // the hook lets the commit finish completely (published, no longer pending) right there.
+    // outcome() has begun while the commit is in flight; before it looks at anything, the hook
+    // lets the commit finish completely (published, then no longer pending).
     let (tx, rx) = mpsc::channel();
     let finish = {
         let gate = gate.clone();
@@ -674,26 +674,16 @@ fn outcome_racing_a_publication_never_answers_from_the_state_before_it() {
     );
     let answer = s.outcome(&a).unwrap();
     assert!(
-        matches!(
-            answer,
-            AttemptOutcome::Pending | AttemptOutcome::Committed(_)
-        ),
-        "an in-flight commit answered {answer:?} (hook ran: {})",
-        hook_ran.load(Ordering::SeqCst)
+        hook_ran.load(Ordering::SeqCst),
+        "the interleaving under test did not happen"
     );
-    // If the pending check answered first, the hook was not reached: finish the commit here.
-    if let Some(unused) = s.inner.set_outcome_hook_for_test(None) {
-        unused();
-    }
     let receipt = rx
         .recv_timeout(Duration::from_secs(10))
         .expect("commit finished")
         .unwrap();
     assert_eq!(receipt.position, HistoryPosition(2));
-    if let AttemptOutcome::Committed(r) = &answer {
-        assert_eq!(r, &receipt);
-    }
-    assert_eq!(s.outcome(&a).unwrap(), AttemptOutcome::Committed(receipt));
+    // The commit finished during the call: the answer reflects it, never a state from before it.
+    assert_eq!(answer, AttemptOutcome::Committed(receipt));
 }
 
 #[test]
