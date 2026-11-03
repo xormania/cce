@@ -141,6 +141,11 @@ fn sha256(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
 }
 
+/// The content file cannot grow further without wrapping its byte offsets.
+fn content_space_exhausted() -> StorageError {
+    StorageError::InvalidRequest("content space exhausted".into())
+}
+
 fn rejected(e: StorageError) -> CommitError {
     CommitError::Rejected(e)
 }
@@ -162,10 +167,12 @@ impl NodeSink for PageWriter<'_> {
             .next_page
             .checked_add(1)
             .ok_or_else(|| StorageError::InvalidRequest("page counter exhausted".into()))?;
+        let offset = at
+            .page
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| StorageError::InvalidRequest("page counter exhausted".into()))?;
         let page = encode_page(self.inner.store, PageKind::Node, at, &node.encode())?;
-        self.inner
-            .io
-            .write_at(FileId::Meta, at.page * PAGE_SIZE as u64, &page)?;
+        self.inner.io.write_at(FileId::Meta, offset, &page)?;
         self.next_page = next;
         self.inner
             .counters
@@ -408,6 +415,17 @@ impl Inner {
         })
     }
 
+    /// Moves the page and content allocation cursors (boundary tests only).
+    #[cfg(test)]
+    pub(crate) fn set_cursors_for_test(&self, next_page: Option<u64>, content: Option<u64>) {
+        if let Some(p) = next_page {
+            lock(&self.state).current.next_page = p;
+        }
+        if let Some(c) = content {
+            *lock(&self.alloc) = c;
+        }
+    }
+
     pub fn height(&self) -> Result<usize, StorageError> {
         let root = lock(&self.state).current.root;
         tree::height(self, root)
@@ -503,6 +521,9 @@ impl Inner {
                 )));
             }
             let seg = &buf[..filled];
+            let end = at
+                .checked_add(filled as u64)
+                .ok_or_else(content_space_exhausted)?;
             self.io.write_at(FileId::Content, at, seg)?;
             self.counters
                 .content_bytes_written
@@ -513,7 +534,7 @@ impl Inner {
                 digest: sha256(seg),
             });
             total.update(seg);
-            at += filled as u64;
+            at = end;
             len += filled as u64;
             if filled < buf.len() {
                 break;
@@ -532,6 +553,9 @@ impl Inner {
             )));
         }
         let manifest = Manifest { content, segments }.encode();
+        let end = at
+            .checked_add(manifest.len() as u64)
+            .ok_or_else(content_space_exhausted)?;
         self.io.write_at(FileId::Content, at, &manifest)?;
         self.counters
             .content_bytes_written
@@ -541,7 +565,7 @@ impl Inner {
             len: manifest.len() as u64,
             digest: sha256(&manifest),
         };
-        *cursor = at + mref.len;
+        *cursor = end;
         let serial = {
             let mut st = lock(&self.state);
             let serial = st.next_stage;
@@ -668,13 +692,18 @@ impl Inner {
                 len: hist.len() as u64,
                 digest: sha256(&hist),
             };
+            let end = x
+                .offset
+                .checked_add(x.len)
+                .ok_or_else(content_space_exhausted)
+                .map_err(rejected)?;
             self.io
                 .write_at(FileId::Content, x.offset, &hist)
                 .map_err(rejected)?;
             self.counters
                 .content_bytes_written
                 .fetch_add(x.len, Ordering::Relaxed);
-            *cursor += x.len;
+            *cursor = end;
             x
         };
         txn.put(history_key(pos), hist_ref.encode())
