@@ -416,3 +416,43 @@ fn a_full_commit_queue_refuses_admission_explicitly_and_reads_continue() {
         t.wait().unwrap();
     }
 }
+
+#[test]
+fn a_panicking_commit_leaves_no_attempt_pending_and_fences_writes() {
+    use cce_core::storage::AttemptOutcome;
+    let s = store();
+    let gate = s.inner.pause_worker_for_test();
+    let [a, b, c] = ["a", "b", "c"].map(|x| AttemptId::new(x.as_bytes().to_vec()).unwrap());
+    s.inner.panic_next_commit_for_test();
+    let ta = s
+        .submit(a.clone(), s.begin().unwrap(), cs(vec![put("A")]))
+        .unwrap();
+    let tb = s
+        .submit(b.clone(), s.begin().unwrap(), cs(vec![put("B")]))
+        .unwrap();
+    let tc = s
+        .submit(c.clone(), s.begin().unwrap(), cs(vec![put("C")]))
+        .unwrap();
+    drop(gate);
+
+    // The attempt whose commit panicked is uncertain, never left pending.
+    let r = ta.wait();
+    assert!(matches!(r, Err(CommitError::Indeterminate(_))), "{r:?}");
+    assert_eq!(wait_resolved(&s, &a), AttemptOutcome::Unknown);
+    // Queued attempts are answered and resolved too; none of them commits behind the fence.
+    for (t, x) in [(tb, &b), (tc, &c)] {
+        let r = t.wait();
+        assert!(matches!(r, Err(CommitError::Rejected(_))), "{r:?}");
+        assert_ne!(wait_resolved(&s, x), AttemptOutcome::Pending);
+    }
+    for id in ["A", "B", "C"] {
+        assert!(s.begin().unwrap().context(&cid(id)).unwrap().is_none());
+    }
+    // The worker is still serving: a new request gets an explicit fenced refusal, not a hang.
+    let d = AttemptId::new(b"d".to_vec()).unwrap();
+    let r = s.commit(d, s.begin().unwrap(), cs(vec![put("D")]));
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(cce_core::storage::StorageError::StoreState(m))) if m.contains("fenced")),
+        "{r:?}"
+    );
+}

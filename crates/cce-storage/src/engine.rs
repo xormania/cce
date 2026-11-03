@@ -126,6 +126,9 @@ pub(crate) struct Inner {
     pending: Mutex<HashMap<AttemptId, u32>>,
     #[cfg(test)]
     gate: Mutex<()>,
+    /// Makes the next commit panic inside the worker (tests of worker robustness only).
+    #[cfg(test)]
+    panic_next_commit: std::sync::atomic::AtomicBool,
     /// Largest number of segments one content stream may have.
     max_segments: usize,
     pub counters: Counters,
@@ -313,6 +316,8 @@ impl Inner {
             pending: Mutex::new(HashMap::new()),
             #[cfg(test)]
             gate: Mutex::new(()),
+            #[cfg(test)]
+            panic_next_commit: std::sync::atomic::AtomicBool::new(false),
             conflicts: Mutex::new(ConflictLog {
                 floor: desc.history_pos,
                 entries: VecDeque::new(),
@@ -322,6 +327,12 @@ impl Inner {
             counters: Counters::default(),
             diagnostics,
         }
+    }
+
+    /// Test hook: makes the next commit panic inside the worker.
+    #[cfg(test)]
+    pub(crate) fn panic_next_commit_for_test(&self) {
+        self.panic_next_commit.store(true, Ordering::SeqCst);
     }
 
     /// Test hook: holds the commit worker before its next job until the guard is dropped.
@@ -344,8 +355,18 @@ impl Inner {
                     let inner = job.inner.clone();
                     #[cfg(test)]
                     drop(lock(&inner.gate));
-                    let r =
-                        inner.commit(job.attempt.clone(), job.basis, &job.observed, job.changes);
+                    let attempt = job.attempt.clone();
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        inner.commit(attempt.clone(), job.basis, &job.observed, job.changes)
+                    }))
+                    .unwrap_or_else(|_| {
+                        // A commit that panicked may have written anything up to its
+                        // publication: its outcome is unknown, and writes stay fenced until
+                        // reopen. Queued jobs keep being answered (refused behind the fence).
+                        let why = format!("commit of attempt {attempt:?} failed unexpectedly");
+                        lock(&inner.state).fenced = Some(why.clone());
+                        Err(CommitError::Indeterminate(why))
+                    });
                     inner.finish_pending(&job.attempt);
                     // The caller may have gone away; the commit stands either way.
                     let _ = job.reply.send(r);
@@ -601,6 +622,10 @@ impl Inner {
         cs: ChangeSet,
     ) -> Result<CommitReceipt, CommitError> {
         let _w = lock(&self.writer);
+        #[cfg(test)]
+        if self.panic_next_commit.swap(false, Ordering::SeqCst) {
+            panic!("injected commit panic");
+        }
         let cur = {
             let st = lock(&self.state);
             if let Some(f) = &st.fenced {
