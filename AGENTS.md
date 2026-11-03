@@ -44,3 +44,21 @@
 - Follow the repository's actual merge rules; do not import rules from another project.
 - Use the established human or neutral automation Git identity. Do not add
   assistant/model co-authorship or generated-by signatures.
+- Do parallel work in git worktrees outside the checkout, one branch per
+  worktree: `git worktree add ~/worktrees/cce/<branch> -b <branch> origin/master`.
+  Remove the worktree after its PR merges.
+
+## Public text
+
+This repository is public. Commit messages, PR titles and bodies, issue and PR
+comments, and committed files must stand on their own:
+
+- Describe the change in the diff: what changed, why in terms of the code, and
+  how it was checked.
+- Do not include, quote, summarize, link, or name planning material, task
+  prompts, or reference documents supplied outside the repository, and do not
+  describe future work the change does not implement.
+- Do not commit files supplied as instructions or reference material.
+- If unsure whether something belongs, leave it out and ask xor.
+- The `leak-guard` check scans PR text, commit messages, and added lines. If it
+  fails, rewrite the text; do not work around the check.
