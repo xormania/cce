@@ -194,6 +194,66 @@ fn designated_history_is_removed_exactly_and_the_removal_survives_reopen() {
 }
 
 #[test]
+fn every_cut_of_a_removal_commit_recovers_the_state_before_or_after_it() {
+    use crate::repro_tests::{PROCESS_EXIT, survival};
+    use crate::sim::Persist;
+    let build = |sim: &SimIo| {
+        let s = create(sim);
+        let reqs = three_commits(&s);
+        (s, reqs)
+    };
+    let probe = SimIo::new();
+    let (s, _) = build(&probe);
+    let start = probe.ops();
+    committed(&s, "remove-b", remove_history(&[2]));
+    let total = probe.ops() - start;
+    drop(s);
+    let (old, new) = (vec![1, 2, 3], vec![1, 3, 4]);
+    for cut in 0..=total {
+        let sim = SimIo::new();
+        let (s, reqs) = build(&sim);
+        sim.crash_after(cut);
+        let acked = commit(&s, "remove-b", remove_history(&[2])).is_ok();
+        assert_eq!(acked, cut == total, "cut {cut}");
+        drop(s);
+        let images = [Persist::None, Persist::All]
+            .into_iter()
+            .chain((1..=6).map(Persist::Seeded))
+            .map(|p| (survival(p), sim.after_crash(p)))
+            .chain(std::iter::once((
+                PROCESS_EXIT.to_string(),
+                sim.after_process_exit(),
+            )));
+        for (survived, img) in images {
+            let what = format!("cut {cut}, {survived}");
+            let rec = open_on(Box::new(img.clone()), Default::default())
+                .unwrap_or_else(|e| panic!("{what}: recovery must open the store: {e:?}"));
+            crate::audit::check_retirement(&img)
+                .unwrap_or_else(|e| panic!("{what}: after recovery: {e}"));
+            let got = positions(&history(&rec));
+            assert!(got == old || got == new, "{what}: partial removal {got:?}");
+            if acked {
+                assert_eq!(got, new, "{what}: acknowledged removal lost");
+            }
+            // B's receipt holds either way; retrying the removal ends removed, at position 4.
+            assert_eq!(
+                commit(&rec, "b", reqs[1].clone()).map(|r| r.position.0),
+                Ok(2),
+                "{what}: retry of B"
+            );
+            assert_eq!(
+                commit(&rec, "remove-b", remove_history(&[2])).map(|r| r.position.0),
+                Ok(4),
+                "{what}: retry of the removal"
+            );
+            assert_eq!(positions(&history(&rec)), new, "{what}: after the retries");
+            crate::audit::check_retirement(&img)
+                .unwrap_or_else(|e| panic!("{what}: after the retries: {e}"));
+        }
+    }
+}
+
+#[test]
 fn a_retry_after_removal_restores_no_content_relationship_or_history() {
     let sim = SimIo::new();
     let s = create(&sim);
