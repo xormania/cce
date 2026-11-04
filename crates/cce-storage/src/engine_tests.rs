@@ -1004,3 +1004,78 @@ fn a_request_whose_fields_fit_but_whose_whole_encoding_does_not_is_refused() {
     // Positive neighbour: one such field keeps the whole request within the limit.
     assert_eq!(commit(&s, "one", with_evidence(1)).unwrap(), 1);
 }
+
+#[test]
+fn the_computed_request_length_matches_the_encoding_for_every_change_shape() {
+    use crate::records::{encode_request, encoded_request_len};
+    use cce_core::storage::{
+        ContentBinding, ContentDigest, ContentRef, Evidence, Revision, StagingToken,
+    };
+    let id = |n: usize| ContextId::new(vec![b'c'; n]).unwrap();
+    let rid = |n: usize| cce_core::storage::RelationshipId::new(vec![b'r'; n]).unwrap();
+    let kind = cce_core::storage::RelationshipKind::new(b"k".to_vec()).unwrap();
+    let preconditions = [
+        Precondition::Any,
+        Precondition::Absent,
+        Precondition::AtRevision(Revision(u64::MAX)),
+    ];
+    let mut checked = 0;
+    for p in &preconditions {
+        for content in [None, Some(0), Some(usize::MAX)] {
+            for n in [1, 255] {
+                let changes = [
+                    Change::PutContext {
+                        id: id(n),
+                        expect: *p,
+                        body: vec![1; n],
+                        content,
+                    },
+                    Change::RemoveContext {
+                        id: id(n),
+                        expect: *p,
+                    },
+                    Change::PutRelationship {
+                        id: rid(n),
+                        expect: *p,
+                        kind: kind.clone(),
+                        source: id(n),
+                        target: id(1),
+                    },
+                    Change::RemoveRelationship {
+                        id: rid(n),
+                        expect: *p,
+                    },
+                ];
+                for take in 0..=changes.len() {
+                    for evidence in 0..=2 {
+                        let cs = ChangeSet {
+                            changes: changes[..take].to_vec(),
+                            content: (0..evidence)
+                                .map(|i| ContentBinding {
+                                    token: StagingToken(vec![i as u8]),
+                                    content: ContentRef {
+                                        digest: ContentDigest([i as u8; 32]),
+                                        len: i as u64,
+                                    },
+                                })
+                                .collect(),
+                            evidence: (0..evidence)
+                                .map(|i| Evidence {
+                                    label: vec![2; i],
+                                    bytes: vec![3; n],
+                                })
+                                .collect(),
+                        };
+                        assert_eq!(
+                            encoded_request_len(&cs),
+                            encode_request(&cs).len() as u64,
+                            "{cs:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 3 * 3 * 2 * 5 * 3);
+}
