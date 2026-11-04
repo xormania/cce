@@ -467,7 +467,8 @@ impl Inner {
     /// Starts the store's commit worker: the single thread that orders publications. The worker
     /// holds no reference to the engine; each queued job holds a strong one, so admitted work
     /// completes even if every caller handle is dropped, and an idle worker never keeps the store
-    /// owned A job's reference is released before its attempt stops being pending. The worker exits when the engine (and with it the queue's sender) is dropped.
+    /// owned. A job's engine reference is released before its attempt stops being pending. The
+    /// worker exits when the engine (and with it the queue's sender) is dropped.
     fn start_worker(self: &Arc<Self>, capacity: usize) -> Result<(), StorageError> {
         let (tx, rx) = mpsc::sync_channel::<Job>(capacity.max(1));
         *lock(&self.worker) = Some(tx);
