@@ -19,6 +19,8 @@ MAX_STATUS_GROUPS = 40
 MAX_MUTATIONS = 12
 MAX_MUTATION_LOGS = 8
 MAX_BYTES = 1_000_000
+MAX_DOCUMENTS = 24
+MAX_DECISION_PACKETS = 12
 
 
 def _path(value):
@@ -142,6 +144,73 @@ def _inventory(mapping):
     return enriched
 
 
+def _answer_record(row):
+    """The minimized answer fields sent for comparison: no free-form private notes."""
+    return json.dumps({key: row.get(key) for key in ("answer", "question", "authority", "outcome", "given",
+                                                     "summary", "forbids", "supersedes", "source")
+                       if row.get(key) not in (None, [], "")}, ensure_ascii=False)
+
+
+def decision_packets(api, ref, ledger_path, documents):
+    """Join each disputed claim with its applicable answer and any supersession in one packet.
+
+    Deterministic findings come from drift_ledger; the packet asks Jev only whether the claim is
+    reconciled (advisory). Returns (semantic rows, limitations). Nothing here can fail a candidate.
+    """
+    from drift_ledger import LedgerError, load, resolve, scan
+    limits = []
+    try:
+        model = load(_read(api, ledger_path, ref))
+    except LedgerError:
+        return [], ["decision_ledger_invalid"]
+    except (ValueError, KeyError, TypeError, OSError, urllib.error.URLError):
+        return [], ["decision_ledger_unavailable"]
+    texts = {}
+    for path in documents:
+        try:
+            texts[path] = _read(api, path, ref)
+        except (ValueError, KeyError, TypeError, OSError, urllib.error.URLError):
+            limits.append("decision_document_unavailable")
+    if not documents:
+        limits.append("decision_documents_not_configured")
+    view, findings = resolve(model)
+    findings += scan(model, view, texts)
+    if findings:
+        limits.append("decision_record_findings")
+    rows = {row["question"]: row for row in view["decisions"] + view["required"]}
+    historical = {row["answer"]: row for row in view["historical"]}
+    packets = []
+    for finding in findings:
+        if len(packets) >= MAX_DECISION_PACKETS:
+            limits.append("decision_packet_inventory_truncated")
+            break
+        excerpts = []
+        if "path" in finding:
+            lines = texts[finding["path"]].splitlines()
+            at = finding["line"] - 1
+            excerpts.append(_excerpt("\n".join(lines[max(0, at - 2):at + 6])))
+        question = finding.get("question")
+        if question in rows:
+            excerpts.append(_excerpt(_answer_record(rows[question])))
+            for old in rows[question].get("supersedes", []):
+                if old in historical:
+                    excerpts.append(_excerpt(json.dumps(historical[old], ensure_ascii=False)))
+        for key in ("proposal", "work"):
+            if key in finding:
+                table = model["proposals" if key == "proposal" else "work"]
+                excerpts.append(_excerpt(json.dumps({k: v for k, v in table[finding[key]].items()
+                                                     if k in ("id", "questions", "answer", "summary", "state",
+                                                              "restricts")}, ensure_ascii=False)))
+        if "answer" in finding and not question:
+            excerpts.append(_excerpt(_answer_record(dict(model["answers"][finding["answer"]],
+                                                         answer=finding["answer"]))))
+        excerpts.append(_excerpt(json.dumps(finding, sort_keys=True)))
+        packets.append({"id": "decision:" + finding["code"] + ":" + ":".join(
+                            str(finding.get(k, "")) for k in ("question", "answer", "proposal", "work", "path", "line")),
+                        "excerpts": excerpts[:6], "questions": ["resolution", "deferral"]})
+    return packets, limits
+
+
 def _runs(raw):
     """Normalize fields, keeping aborts distinct from an assertion witness."""
     if not isinstance(raw, list) or len(raw) > 256:
@@ -173,7 +242,7 @@ def data_evidence(source, env, api_factory, normalized_mutations=None, public_ap
     paths = env.get("DRIFT_DATA_FILES", "")
     required = env.get("DRIFT_DATA_REQUIRED", "false").lower() == "true"
     if not repository and not paths:
-        return [], [], ["data_not_configured"], required
+        return [], [], ["data_not_configured", "decision_data_not_configured"], required
     if not token:
         return [], [], ["data_credentials_missing"], required
     limits = []
@@ -181,9 +250,14 @@ def data_evidence(source, env, api_factory, normalized_mutations=None, public_ap
         files = json.loads(paths)
         if (not REPOSITORY.fullmatch(repository) or not isinstance(files, dict)
                 or not {"requirements", "summary"} <= files.keys()
-                or files.keys() - {"requirements", "summary", "records"}
-                or not _path(files["requirements"]) or not _path(files["summary"])):
+                or files.keys() - {"requirements", "summary", "records", "ledger", "documents"}
+                or not _path(files["requirements"]) or not _path(files["summary"])
+                or ("ledger" in files and not _path(files["ledger"]))):
             raise ValueError("invalid_data_configuration")
+        documents = files.get("documents", [])
+        if (not isinstance(documents, list) or len(documents) > MAX_DOCUMENTS
+                or any(not _path(path) for path in documents) or len(set(documents)) != len(documents)):
+            raise ValueError("invalid_document_inventory")
         records = files.get("records", [])
         if (not isinstance(records, list) or len(records) > MAX_RECORDS
                 or any(not _path(path) for path in records) or len(set(records)) != len(records)):
@@ -321,6 +395,12 @@ def data_evidence(source, env, api_factory, normalized_mutations=None, public_ap
             semantic.append({"id": "mutation:" + mutation["id"],
                              "excerpts": excerpts,
                              "questions": ["witness", "proof", "resolution"]})
+        if "ledger" in files:
+            decided, more = decision_packets(api, ref, files["ledger"], documents)
+            semantic.extend(decided)
+            limits.extend(more)
+        else:
+            limits.append("decision_data_not_configured")
         for row in semantic:
             row.pop("public_path", None)
             row.pop("public_line", None)

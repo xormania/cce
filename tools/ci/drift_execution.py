@@ -19,6 +19,8 @@ MAX_JOBS = 50
 MAX_LOG_BYTES = 1_000_000
 MAX_COMPARE_FILES = 300
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_DEFINITION_REASONS = frozenset({"producer_definition_unaccepted", "unsupported_producer_definition",
+                                 "producer_acceptance_unavailable"})
 _KINDS = {
     "drift-input": {"unittest": r"python3?\s+-m\s+unittest\s+discover\b"},
     "rust": {"format": r"cargo\s+fmt\b", "clippy": r"cargo\s+clippy\b",
@@ -54,12 +56,43 @@ def _steps(text, producer):
     return found
 
 
+def _owner_acceptance(api, source):
+    """Return the repository owner's approving review of exactly this head, if any.
+
+    Candidate output can never certify a changed producer. Only the repository owner's latest
+    review of the candidate's own head commit can accept it; a later push needs a new review.
+    """
+    owner = api.repository.split("/", 1)[0]
+    for number in source.get("pulls", []):
+        reviews = api.api("/pulls/" + str(int(number)) + "/reviews?per_page=100")
+        if not isinstance(reviews, list):
+            raise ValueError("producer_acceptance_unavailable")
+        latest = None
+        for review in reviews:
+            if (isinstance(review, dict) and (review.get("user") or {}).get("login") == owner
+                    and review.get("commit_id") == source["head_sha"]
+                    and review.get("state") in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}):
+                latest = review
+        if latest is not None and latest["state"] == "APPROVED":
+            return {"pull": int(number), "review": latest.get("id")}
+    return None
+
+
 def _definition(api, source, producer, root):
+    """Return (path, accepted definition, expected steps, acceptance).
+
+    Distinct failures: ``producer_definition_unaccepted`` (changed, no owner acceptance),
+    ``unsupported_producer_definition`` (steps not recognizable).
+    """
     path = ".github/workflows/" + producer + ".yml"
     trusted = (root / path).read_text()
-    if api.file(path, source["head_sha"]) != trusted:
-        raise ValueError("producer_definition_mismatch")
-    return path, trusted, _steps(trusted, producer)
+    candidate = api.file(path, source["head_sha"])
+    if candidate == trusted:
+        return path, trusted, _steps(trusted, producer), None
+    acceptance = _owner_acceptance(api, source)
+    if acceptance is None:
+        raise ValueError("producer_definition_unaccepted")
+    return path, candidate, _steps(candidate, producer), acceptance
 
 
 def _markdown_filtered(text, event):
@@ -190,11 +223,14 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
         producers.append("leak-guard")
     for producer in producers:
         try:
-            path, trusted, expected = _definition(api, source, producer, root)
-        except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError):
-            checks.append(_row(producer + ":trusted-definition", source_sha=source["head_sha"]))
-            limits.append("producer_definition_unverified")
+            path, trusted, expected, acceptance = _definition(api, source, producer, root)
+        except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError) as error:
+            reason = str(error) if str(error) in _DEFINITION_REASONS else "producer_definition_unavailable"
+            checks.append(_row(producer + ":trusted-definition", source_sha=source["head_sha"], reason=reason))
+            limits += ["producer_definition_unverified", reason]
             continue
+        if acceptance is not None:
+            limits.append("producer_definition_owner_accepted")
         candidates = [r for r in runs if _candidate_run(r, source, api, producer)
                       and (r.get("event") == "pull_request"
                            if producer == "leak-guard" or producer == "rust" and rust_pr_required else True)]
@@ -249,9 +285,18 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
         logs = "\n".join(job_logs.values())
         try:
             workflow_ref = _workflow_ref(api, source, run, path, trusted, logs)
-        except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError):
-            checks.append(_row(producer + ":trusted-definition", source_sha=source["head_sha"]))
-            limits.append("producer_definition_unverified")
+        except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError) as error:
+            if str(error) == "producer_merge_identity_unavailable":
+                # The run happened; its merge commit cannot be identified (for example the PR now
+                # conflicts with its base). Remedy: update the branch so a current merge run exists.
+                checks.append(_row(producer + ":merge-identity", source_sha=source["head_sha"],
+                                   reason="producer_merge_identity_unavailable"))
+                limits.append("producer_merge_identity_unavailable")
+            else:
+                reason = ("producer_definition_unaccepted" if str(error) == "producer_definition_mismatch"
+                          else "producer_definition_unavailable")
+                checks.append(_row(producer + ":trusted-definition", source_sha=source["head_sha"], reason=reason))
+                limits += ["producer_definition_unverified", reason]
             continue
         if observations is not None and logs:
             excerpt = _excerpt(logs)
@@ -273,5 +318,6 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
                     ran = ran and not _scan_skipped(witness)
             checks.append(_row(title, "pass" if status == "success" else "fail" if status == "failure" else "skipped",
                 ran, run["head_sha"], equivalent=equivalent, run_id=run["id"], job_id=job_id, attempt=run.get("run_attempt", 1),
-                workflow_ref=workflow_ref, workflow_sha256=hashlib.sha256(trusted.encode("utf-8")).hexdigest()))
+                workflow_ref=workflow_ref, workflow_sha256=hashlib.sha256(trusted.encode("utf-8")).hexdigest(),
+                producer_acceptance=acceptance))
     return checks, sorted(set(limits)), waiting

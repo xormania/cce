@@ -35,8 +35,21 @@ run, attempt and workflow hash remain attached. An applicable newer failure is
 preserved. An unfiltered PR producer still requires its current merge-candidate run.
 
 Changing a producer definition cannot certify that definition through its own
-output. A mismatch with the trusted definition fails validation; such changes need
-execution through an existing trusted producer before its results can be accepted.
+output. A changed definition is accepted only when the repository owner's latest
+review of the pull request's exact head commit approves it; a later push needs a
+new review, and an approval from any other account, of an older head, or followed
+by a change request does not count. Accepted rows record the review. After the
+change merges, the default branch's copy is the trusted definition again.
+
+Execution findings are reported separately, each with its remedy:
+
+| Code | Meaning | Remedy |
+|---|---|---|
+| `required_check_failed` | The producer ran and the step failed. | Fix the failure. |
+| `required_execution_unavailable` | No applicable run exists yet. | Wait for or start the run. |
+| `producer_merge_identity_unavailable` | The run happened, but its merge commit cannot be identified (for example the PR conflicts with its base). | Update the branch from its base. |
+| `producer_definition_unaccepted` | The candidate changes a producer definition and the owner has not approved this head. | Owner review of this head, or drop the workflow change. |
+| `unsupported_producer_definition` | The steps cannot be recognized. | Keep the named direct-command steps. |
 
 Jev answers independent typed questions about proof, guarantees, witnesses,
 deferrals and resolutions. These answers are advisory. They never change test
@@ -179,3 +192,30 @@ defect/healthy replays, actual isolated CLI execution, provider rejection and
 non-execution, private marker handling, bounded artifacts, deduplication and
 candidate check lifecycle. Synthetic provider replies validate integration behavior;
 they are not measurements of the model's diagnostic accuracy.
+
+## Owner decisions and claims (optional data)
+
+With versioned data configured (`DRIFT_DATA_REPOSITORY`, `DRIFT_DATA_TOKEN`,
+`DRIFT_DATA_FILES`), the observer also reads a decision ledger and selected status
+documents at one pinned data revision. Configure them in `DRIFT_DATA_FILES` as
+`"ledger": "<path>"` and `"documents": ["<path>", ...]` (at most 24). Use a token
+that can only read that repository's contents.
+
+The ledger links each question to the answers that settle it, the work they
+authorize and agent proposals. `tools/ci/drift_ledger.py` resolves it
+deterministically: an answer is replaced only by one that names it in
+`supersedes` (never by date), two unordered answers are a conflict, a proposal is
+never an answer, a proposal that would impose a restriction a deferral excludes
+is flagged, and an unanswered question must name the operation it blocks. The
+same module prints the current view for agents (`drift_ledger.py view`).
+
+Each finding (for example a document line presenting a settled question as still
+waiting for the owner) becomes one private packet that contains only the claim's
+surrounding lines, the applicable answer's fields (identity, outcome, summary,
+date given, source path, excluded restrictions) and any answer it superseded.
+Jev's answer is advisory; findings never fail a candidate. Public output keeps
+only opaque codes such as `decision_record_findings`.
+
+Without decision data the summary states that private owner-decision consistency
+was not checked. A data-only correction is evaluated by the next run (or a
+dispatched run with `force`), which reads the data repository's current revision.
