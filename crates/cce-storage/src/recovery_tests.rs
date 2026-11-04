@@ -772,10 +772,6 @@ enum OpenFault {
     CrashAfter(u64),
 }
 
-fn durable(sim: &SimIo) -> Vec<Option<Vec<u8>>> {
-    images(sim).into_iter().map(|f| f.map(|(d, _)| d)).collect()
-}
-
 /// What the outcomes of the two commits must be in a recovered state.
 fn assert_outcomes_agree(s: &NativeStore, got: &[String], states: &[Vec<String>]) {
     assert!(
@@ -810,14 +806,44 @@ fn a_fault_during_recovery_of_any_crashed_commit_leaves_the_image_recoverable() 
     let before = reopened.ops();
     drop(open(Box::new(reopened.clone())));
     let open_ops = reopened.ops() - before;
-    assert_eq!(open_ops, 2, "open is expected to issue its two barriers");
+    assert!(open_ops > 0, "open is expected to issue barriers");
     let faults: Vec<OpenFault> = (1..=open_ops)
         .map(OpenFault::FailOp)
         .chain([OpenFault::FailRead])
         .chain((0..open_ops).map(OpenFault::CrashAfter))
         .collect();
 
+    // Opens `img` cleanly, checks outcomes and that a second open leaves the files unchanged, and
+    // returns the recovered state. Reporting attempt 2 as committed acknowledges it, so from then
+    // on it must survive a power loss.
+    let recover = |img: &SimIo| -> Vec<String> {
+        let s = open(Box::new(img.clone()));
+        let got = logical_state(&s);
+        assert!(&got == old || &got == new, "recovered a partial state");
+        assert_outcomes_agree(&s, &got, &states);
+        if &got == new {
+            let lost = img.after_crash(Persist::None);
+            assert_eq!(
+                &logical_state(&open(Box::new(lost))),
+                new,
+                "a commit that recovery reported as committed was lost on power loss"
+            );
+        }
+        let first = images(img);
+        drop(s);
+        img.release();
+        let s = open(Box::new(img.clone()));
+        assert_eq!(logical_state(&s), got);
+        assert_eq!(images(img), first, "a second clean open changed the files");
+        got
+    };
+
     let mut checked = 0;
+    // Evidence that the process-exit cases exercise what they are meant to: a faulty open that
+    // made cached bytes durable, and a power loss after it that recovered a different whole state
+    // than a fresh process would have.
+    let made_durable = std::cell::Cell::new(0u64);
+    let diverged = std::cell::Cell::new(0u64);
     for cut in 0..=total {
         let sim = SimIo::new();
         let trace = Arc::new(Mutex::new(Vec::new()));
@@ -828,89 +854,95 @@ fn a_fault_during_recovery_of_any_crashed_commit_leaves_the_image_recoverable() 
         assert!(commit_step(&s, 1));
         trace.lock().unwrap().clear();
         sim.crash_after(cut);
-        let _ = commit_step(&s, 2);
+        let acknowledged = commit_step(&s, 2);
         drop(s);
         let trace = trace.lock().unwrap().clone();
-        let persists = [Persist::None, Persist::All]
+        // Power-loss images (only what survived), and the process-exit image (the commit's
+        // unsynced writes are still in the operating system's cache).
+        let mut crashed: Vec<(String, SimIo)> = [Persist::None, Persist::All]
             .into_iter()
-            .chain((1..=12).map(Persist::Seeded));
-        for p in persists {
-            let img = sim.after_crash(p);
+            .chain((1..=12).map(Persist::Seeded))
+            .map(|p| (format!("{p:?}"), sim.after_crash(p)))
+            .collect();
+        crashed.push(("process exit".into(), sim.after_process_exit()));
+        for (what, img) in &crashed {
             // What an uninterrupted recovery of this image gives.
             let expected = logical_state(&open(Box::new(img.after_process_exit())));
             assert!(
                 &expected == old || &expected == new,
-                "cut {cut} {p:?}: uninterrupted recovery gave a partial state"
+                "cut {cut} {what}: uninterrupted recovery gave a partial state"
             );
+            if acknowledged {
+                assert_eq!(&expected, new, "cut {cut} {what}: acknowledged commit lost");
+            }
             for fault in &faults {
-                let label = format!("commit cut {cut} {p:?} open fault {fault:?}");
-                with_repro(&label, &[("image", &img)], &trace, || {
+                let label = format!("commit cut {cut} {what} open fault {fault:?}");
+                with_repro(&label, &[("image", img)], &trace, || {
                     let work = img.after_process_exit();
-                    let before = durable(&work);
-                    let (err, recover) = match *fault {
-                        OpenFault::FailOp(n) => {
-                            work.fail_nth_op(n);
-                            let e = try_open(Box::new(work.clone()))
-                                .err()
-                                .expect("open must fail");
-                            assert!(
-                                matches!(&e, StorageError::Io(m) if m.contains("simulated I/O error")),
-                                "{e:?}"
-                            );
-                            work.release();
-                            (e, work.clone())
-                        }
-                        OpenFault::FailRead => {
-                            work.fail_next_read();
-                            let e = try_open(Box::new(work.clone()))
-                                .err()
-                                .expect("open must fail");
-                            assert!(
-                                matches!(&e, StorageError::Io(m) if m.contains("simulated read error")),
-                                "{e:?}"
-                            );
-                            work.release();
-                            (e, work.clone())
-                        }
-                        OpenFault::CrashAfter(n) => {
-                            work.crash_after(n);
-                            let e = try_open(Box::new(work.clone()))
-                                .err()
-                                .expect("open must fail");
-                            assert!(
-                                matches!(&e, StorageError::Io(m) if m.contains("simulated crash")),
-                                "{e:?}"
-                            );
-                            // A power loss right after the crash: only durable bytes remain.
-                            (e, work.after_crash(Persist::None))
-                        }
+                    let before = images(&work);
+                    match *fault {
+                        OpenFault::FailOp(n) => work.fail_nth_op(n),
+                        OpenFault::FailRead => work.fail_next_read(),
+                        OpenFault::CrashAfter(n) => work.crash_after(n),
+                    }
+                    let e = try_open(Box::new(work.clone()))
+                        .err()
+                        .expect("open must fail");
+                    let injected = match fault {
+                        OpenFault::FailOp(_) => "simulated I/O error",
+                        OpenFault::FailRead => "simulated read error",
+                        OpenFault::CrashAfter(_) => "simulated crash",
                     };
-                    assert_eq!(
-                        durable(&work),
-                        before,
-                        "the faulty open ({err:?}) changed durable bytes"
+                    assert!(
+                        matches!(&e, StorageError::Io(m) if m.contains(injected)),
+                        "{e:?}"
                     );
+                    // The faulty open wrote nothing: each file's bytes are unchanged and its
+                    // durable image is unchanged or its existing bytes made durable.
+                    for (b, a) in before.iter().zip(images(&work)) {
+                        let ((bd, bv), (ad, av)) = (b.clone().unwrap(), a.unwrap());
+                        assert!(av == bv, "the faulty open ({e:?}) wrote to a file");
+                        assert!(
+                            ad == bd || ad == bv,
+                            "the faulty open ({e:?}) made bytes durable that it did not hold"
+                        );
+                        if ad != bd {
+                            made_durable.set(made_durable.get() + 1);
+                        }
+                    }
 
-                    let s = open(Box::new(recover.clone()));
-                    let got = logical_state(&s);
+                    // A fresh process after the faulty one: the same as an uninterrupted
+                    // recovery of the image.
+                    let got = recover(&work.after_process_exit());
                     assert_eq!(got, expected, "recovery after a faulty open differs");
-                    assert_outcomes_agree(&s, &got, &states);
-                    let first = images(&recover);
-                    drop(s);
-                    recover.release();
-                    let s = open(Box::new(recover.clone()));
-                    assert_eq!(logical_state(&s), expected);
-                    assert_eq!(
-                        images(&recover),
-                        first,
-                        "a second clean open changed the files"
-                    );
+                    // Power lost right after the faulty open: a whole state, and an acknowledged
+                    // commit survives.
+                    let got = recover(&work.after_crash(Persist::None));
+                    if got != expected {
+                        diverged.set(diverged.get() + 1);
+                    }
+                    if acknowledged {
+                        assert_eq!(&got, new, "acknowledged commit lost after power loss");
+                    }
                 });
                 checked += 1;
             }
         }
     }
-    assert_eq!(checked, (total + 1) * 14 * faults.len() as u64);
+    assert_eq!(checked, (total + 1) * 15 * faults.len() as u64);
+    assert!(
+        made_durable.get() > 0,
+        "no faulty open made cached bytes durable"
+    );
+    assert!(
+        diverged.get() > 0,
+        "power loss after a faulty open never changed the outcome"
+    );
+    eprintln!(
+        "faults during recovery: {checked} cases, {} made cached bytes durable, {} diverged after power loss",
+        made_durable.get(),
+        diverged.get()
+    );
 }
 
 #[test]
