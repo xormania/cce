@@ -34,8 +34,13 @@ mod guard_tests;
 mod io;
 #[cfg(test)]
 mod key_bounds_tests;
+mod ledger;
+#[cfg(test)]
+mod ledger_tests;
 #[cfg(test)]
 mod maintain_tests;
+#[cfg(test)]
+mod merge_skip_tests;
 #[cfg(test)]
 mod oracle_tests;
 #[cfg(test)]
@@ -53,6 +58,8 @@ mod repro_tests;
 mod resource_tests;
 #[cfg(test)]
 mod reuse_tests;
+#[cfg(test)]
+mod seal_tests;
 #[cfg(any(test, feature = "fuzz-api"))]
 mod sim;
 #[cfg(test)]
@@ -65,6 +72,8 @@ mod tree_reopen_tests;
 mod verify;
 #[cfg(test)]
 mod verify_tests;
+#[cfg(test)]
+mod uncertain_publication_tests;
 #[cfg(test)]
 mod view_gap_tests;
 #[cfg(test)]

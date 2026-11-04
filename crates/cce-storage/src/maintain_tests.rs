@@ -14,7 +14,7 @@ use crate::engine::{Inner, Options};
 use crate::format::StoreId;
 use crate::records::Manifest;
 use crate::sim::SimIo;
-use crate::test_support::{cid, create_on, open_on, put_context};
+use crate::test_support::{changes, cid, create_on, open_on, put_context};
 use crate::{MaintenanceBudget, MaintenanceTask, NativeStore};
 
 const STORE: StoreId = StoreId(*b"maintenance-test");
@@ -244,7 +244,7 @@ fn reclaiming_content_holes_retires_exactly_the_leaked_bytes_and_changes_no_reco
                 MaintenanceTask::ReclaimContentHoles,
                 MaintenanceBudget::default(),
             )
-            .unwrap();
+            .unwrap_or_else(|e| panic!("reclaiming the leaked holes must succeed: {e:?}"));
         assert_eq!(r.content_bytes_reclaimed, leak, "discard {discard}");
         assert!(r.complete);
         assert_eq!(
@@ -348,7 +348,9 @@ fn a_pending_staging_of_this_process_is_not_reclaimed() {
             MaintenanceTask::ReclaimContentHoles,
             MaintenanceBudget::default(),
         )
-        .unwrap();
+        .unwrap_or_else(|e| {
+            panic!("reclaim must succeed and leave the pending staging alone: {e:?}")
+        });
     assert_eq!(
         r.content_bytes_reclaimed, 0,
         "pending staged bytes were reclaimed"
@@ -1015,6 +1017,533 @@ fn streams_left_for_lack_of_remaining_budget_move_on_the_next_call() {
     audit(&sim);
 }
 
+/// Test I/O over a simulator: runs `on_record` when a publication record is written, and then fails
+/// the metadata sync that would make that record durable, so the record may or may not survive.
+struct UncertainRecord {
+    sim: SimIo,
+    state: std::sync::Arc<UncertainState>,
+}
+
+#[derive(Default)]
+struct UncertainState {
+    on_record: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    fail_meta_sync: std::sync::atomic::AtomicBool,
+    /// Fail the next content-file sync (the data barrier).
+    fail_content_sync: std::sync::atomic::AtomicBool,
+}
+
+impl crate::io::Io for UncertainRecord {
+    fn create(&self) -> Result<(), StorageError> {
+        self.sim.create()
+    }
+    fn open(&self) -> Result<(), StorageError> {
+        self.sim.open()
+    }
+    fn read_at(
+        &self,
+        file: crate::io::FileId,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<(), StorageError> {
+        self.sim.read_at(file, offset, buf)
+    }
+    fn write_at(
+        &self,
+        file: crate::io::FileId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), StorageError> {
+        if file == crate::io::FileId::Meta && offset < 2 * crate::format::PAGE_SIZE as u64 {
+            let hook = self.state.on_record.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+                self.state
+                    .fail_meta_sync
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.sim.write_at(file, offset, data)
+    }
+    fn len(&self, file: crate::io::FileId) -> Result<u64, StorageError> {
+        self.sim.len(file)
+    }
+    fn sync(&self, file: crate::io::FileId) -> Result<(), StorageError> {
+        if file == crate::io::FileId::Meta
+            && self
+                .state
+                .fail_meta_sync
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::Io(
+                "injected: publication record sync failed".into(),
+            ));
+        }
+        if file == crate::io::FileId::Content
+            && self
+                .state
+                .fail_content_sync
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::Io("injected: data barrier failed".into()));
+        }
+        self.sim.sync(file)
+    }
+    fn sync_dir(&self) -> Result<(), StorageError> {
+        self.sim.sync_dir()
+    }
+}
+
+/// A reader that signals its first read, then waits to be released before serving `data`.
+struct GatedReader {
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    release: std::sync::mpsc::Receiver<()>,
+    data: Vec<u8>,
+    at: usize,
+}
+
+impl Read for GatedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(tx) = self.entered.take() {
+            tx.send(()).unwrap();
+            self.release.recv().unwrap();
+        }
+        let n = buf.len().min(self.data.len() - self.at);
+        buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+/// A relocation whose publication record may be durable keeps the space its moves took: owned by
+/// that uncertain publication, never offered for reuse, so a staging that passed its fence check
+/// while the relocation was publishing cannot take and overwrite the relocated content.
+#[test]
+fn a_staging_never_takes_space_an_uncertain_relocation_references() {
+    use std::sync::mpsc::channel;
+    let base = fragmented();
+    let sim = base.after_process_exit();
+    sim.release();
+    let state = std::sync::Arc::new(UncertainState::default());
+    let s = open_on(
+        Box::new(UncertainRecord {
+            sim: sim.clone(),
+            state: state.clone(),
+        }),
+        Options::default(),
+    )
+    .unwrap();
+    let (go_tx, go_rx) = channel::<()>();
+    let (entered_tx, entered_rx) = channel::<()>();
+    let (release_tx, release_rx) = channel::<()>();
+    // Once the relocation writes its publication record (after capturing the content boundary),
+    // a staging starts, passes its fence check and waits inside its reader.
+    *state.on_record.lock().unwrap() = Some(Box::new(move || {
+        go_tx.send(()).unwrap();
+        entered_rx.recv().unwrap();
+    }));
+    // All of A's retired space, which B's move takes exactly.
+    let free_before = s.inner.reusable_content_bytes();
+    let staged_bytes = bytes_of(9, 100_000);
+    let (relocated, staged) = std::thread::scope(|t| {
+        let (store, data) = (&s, staged_bytes.clone());
+        let stager = t.spawn(move || {
+            go_rx.recv().unwrap();
+            let mut reader = GatedReader {
+                entered: Some(entered_tx),
+                release: release_rx,
+                data,
+                at: 0,
+            };
+            store.stage_content(&mut reader)
+        });
+        // Content only: the page part would wait for the paused staging's allocation lock.
+        let r = s.maintain(
+            MaintenanceTask::Relocate,
+            MaintenanceBudget {
+                max_pages: 0,
+                max_content_bytes: 64 << 20,
+            },
+        );
+        release_tx.send(()).unwrap();
+        (r, stager.join().unwrap())
+    });
+    eprintln!("relocation: {relocated:?}");
+    eprintln!("staging: {:?}", staged.as_ref().map(|_| "staged"));
+    assert!(
+        matches!(relocated, Err(CommitError::Indeterminate(_))),
+        "the schedule must make the relocation's publication uncertain: {relocated:?}"
+    );
+    // The publication may be durable and reference the copies: the reservations stay owned by it.
+    assert_eq!(
+        s.inner.reserved_bytes_for_test().1,
+        free_before,
+        "the uncertain relocation must keep owning the space its moves took"
+    );
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        0,
+        "space the uncertain relocation may reference was offered for reuse"
+    );
+    drop(s);
+    // Whichever record survives, B must read back exactly.
+    let images = [("process exit".to_string(), sim.after_process_exit())]
+        .into_iter()
+        .chain(
+            [crate::sim::Persist::None, crate::sim::Persist::All]
+                .into_iter()
+                .chain((1..=4).map(crate::sim::Persist::Seeded))
+                .map(|p| (format!("{p:?}"), sim.after_crash(p))),
+        );
+    let mut lost = Vec::new();
+    for (how, img) in images {
+        let recovered = open(&img);
+        let generation = recovered.inner.snapshot().unwrap().desc.generation;
+        let got = read_bound(&mut recovered.begin().unwrap(), "B");
+        eprintln!(
+            "{how}: generation {generation}: B {}",
+            if got.as_ref().ok() == Some(&bytes_of(2, 100_000)) {
+                "intact".to_string()
+            } else {
+                format!("{got:?}").chars().take(120).collect()
+            }
+        );
+        if got != Ok(bytes_of(2, 100_000)) {
+            lost.push(format!("{how} (generation {generation}): {got:?}"));
+        }
+    }
+    assert!(lost.is_empty(), "relocated content overwritten: {lost:?}");
+}
+
+/// A relocation that fails definitely before publication (here its data barrier) returns the space
+/// its moves took to the pool, at the generations it was retired at; nothing stays owned.
+#[test]
+fn a_relocation_rejected_before_publication_returns_its_space() {
+    let base = fragmented();
+    let sim = base.after_process_exit();
+    sim.release();
+    let state = std::sync::Arc::new(UncertainState::default());
+    let s = open_on(
+        Box::new(UncertainRecord {
+            sim: sim.clone(),
+            state: state.clone(),
+        }),
+        Options::default(),
+    )
+    .unwrap();
+    let free_before = s.inner.reusable_content_bytes();
+    assert!(free_before > 0, "A's retired space is offered for reuse");
+    // After the copy, before publication: the next content sync (the data barrier) fails.
+    let arm = state.clone();
+    s.inner.set_relocate_hook_for_test(Some(Box::new(move || {
+        arm.fail_content_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    })));
+    let r = s.maintain(
+        MaintenanceTask::Relocate,
+        MaintenanceBudget {
+            max_pages: 0,
+            max_content_bytes: 64 << 20,
+        },
+    );
+    assert!(
+        matches!(r, Err(CommitError::Rejected(_))),
+        "a failed data barrier is a definite rejection: {r:?}"
+    );
+    assert_eq!(
+        s.inner.reserved_bytes_for_test(),
+        (0, 0),
+        "a definitely rejected relocation keeps no reservations"
+    );
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free_before,
+        "the space the moves took must be offered for reuse again"
+    );
+    drop(s);
+    let recovered = open(&sim.after_process_exit());
+    assert_eq!(
+        read_bound(&mut recovered.begin().unwrap(), "B"),
+        Ok(bytes_of(2, 100_000))
+    );
+}
+
+/// Expects a maintenance step refused by the space check, with nothing published.
+fn refused_by_space_check(
+    s: &NativeStore,
+    r: Result<crate::MaintenanceReport, CommitError>,
+    generation: u64,
+    what: &str,
+) {
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.contains("space check failed")),
+        "{what}: the space check must refuse the step: {r:?}"
+    );
+    assert_eq!(
+        s.inner.snapshot().unwrap().desc.generation,
+        generation,
+        "{what}: a refused step published"
+    );
+    assert_eq!(
+        s.inner.reserved_bytes_for_test(),
+        (0, 0),
+        "{what}: a refused step keeps no reservations"
+    );
+}
+
+const CONTENT_ONLY: MaintenanceBudget = MaintenanceBudget {
+    max_pages: 0,
+    max_content_bytes: 64 << 20,
+};
+
+#[test]
+fn a_relocation_retiring_its_own_copy_is_refused_by_the_space_check() {
+    let sim = fragmented();
+    let s = open(&sim);
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let free_before = s.inner.reusable_content_bytes();
+    let mut v = s.begin().unwrap();
+    let digest = v
+        .context(&cid("B"))
+        .unwrap()
+        .unwrap()
+        .content
+        .unwrap()
+        .digest;
+    drop(v);
+    let k = crate::records::key(crate::records::P_CONTENT, &[&digest.0]);
+    let files = sim.clone();
+    // The journal retires the first new segment, found from the rewritten entry's new manifest,
+    // with its record.
+    s.inner.set_journal_hook_for_test(Box::new(move |j, txn| {
+        let Ok(crate::records::ContentEntry::Live { manifest, .. }) =
+            crate::records::ContentEntry::decode(&txn.get(&k).unwrap().unwrap())
+        else {
+            panic!("B's entry is live");
+        };
+        let mut b = vec![0; manifest.len as usize];
+        crate::io::Io::read_at(&files, crate::io::FileId::Content, manifest.offset, &mut b)
+            .unwrap();
+        let first = Manifest::decode(&b).unwrap().segments[0];
+        let x = (first.offset, first.len);
+        j.retired_extents.push(x);
+        txn.put(
+            crate::records::retired_extent_key(j.generation, x.0),
+            x.1.to_le_bytes().to_vec(),
+        )
+        .unwrap();
+    }));
+    let r = s.maintain(MaintenanceTask::Relocate, CONTENT_ONLY);
+    refused_by_space_check(&s, r, generation, "retired copy");
+    assert_eq!(s.inner.reusable_content_bytes(), free_before);
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "B"),
+        Ok(bytes_of(2, 100_000))
+    );
+}
+
+#[test]
+fn a_relocation_whose_entry_does_not_name_the_copy_is_refused() {
+    use crate::records::{ContentEntry, P_CONTENT, key};
+    let sim = fragmented();
+    let s = open(&sim);
+    let cur = s.inner.snapshot().unwrap().desc;
+    let mut v = s.begin().unwrap();
+    let digest = v
+        .context(&cid("B"))
+        .unwrap()
+        .unwrap()
+        .content
+        .unwrap()
+        .digest;
+    drop(v);
+    let k = key(P_CONTENT, &[&digest.0]);
+    let before = crate::tree::get(&*s.inner, cur.root, &k).unwrap().unwrap();
+    assert!(matches!(
+        ContentEntry::decode(&before),
+        Ok(ContentEntry::Live { .. })
+    ));
+    // The entry is put back as it was, naming the old manifest.
+    s.inner.set_journal_hook_for_test(Box::new(move |_, txn| {
+        txn.put(k, before).unwrap();
+    }));
+    let r = s.maintain(MaintenanceTask::Relocate, CONTENT_ONLY);
+    refused_by_space_check(&s, r, cur.generation, "entry naming the old manifest");
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "B"),
+        Ok(bytes_of(2, 100_000))
+    );
+}
+
+#[test]
+fn a_hole_over_reachable_content_is_refused_by_the_full_reach() {
+    let (sim, s, _) = leaked(100_000, false);
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let before = logical(&s);
+    let live = {
+        let d = crate::audit::published(&sim).unwrap().pop().unwrap();
+        *crate::audit::reach(&sim, &d)
+            .unwrap()
+            .content_segments
+            .iter()
+            .next()
+            .unwrap()
+    };
+    // The journal claims a live segment as one more hole, with its record.
+    s.inner.set_journal_hook_for_test(Box::new(move |j, txn| {
+        j.retired_extents.push(live);
+        txn.put(
+            crate::records::retired_extent_key(j.generation, live.0),
+            live.1.to_le_bytes().to_vec(),
+        )
+        .unwrap();
+    }));
+    let r = s.maintain(MaintenanceTask::ReclaimContentHoles, FULL);
+    refused_by_space_check(&s, r, generation, "hole over live content");
+    assert_eq!(logical(&s), before, "a refused reclaim changed records");
+}
+
+/// A hole claimed over a staging of this process that a later commit's content length covers is
+/// refused by the space check before anything is written: the staging's space is in use.
+#[test]
+fn a_hole_over_a_pending_staging_is_refused_by_the_space_check() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    // Q is abandoned across a restart once a commit covers it: a real hole.
+    let abandoned = s.stage_content(&mut &bytes_of(5, 30_000)[..]).unwrap();
+    commit(&s, "cover-q", changes(vec![put("B", "b", None)]));
+    drop(abandoned);
+    drop(s);
+    let s = open(&sim);
+    // P stays registered while a later commit covers its bytes.
+    let staged = s.stage_content(&mut &bytes_of(6, 30_000)[..]).unwrap();
+    commit(&s, "cover-p", changes(vec![put("C", "c", None)]));
+    let pending = s.inner.staged_extents_for_test(&staged).unwrap();
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let x = *pending
+        .iter()
+        .find(|x| x.1 > 1000)
+        .expect("a staged segment");
+    // The journal claims P's segment as one more hole, with its record.
+    s.inner.set_journal_hook_for_test(Box::new(move |j, txn| {
+        j.retired_extents.push(x);
+        txn.put(
+            crate::records::retired_extent_key(j.generation, x.0),
+            x.1.to_le_bytes().to_vec(),
+        )
+        .unwrap();
+    }));
+    let r = s.maintain(MaintenanceTask::ReclaimContentHoles, FULL);
+    refused_by_space_check(&s, r, generation, "hole over a pending staging");
+    // P can still be committed and reads back exactly.
+    commit(
+        &s,
+        "bind",
+        ChangeSet {
+            changes: vec![put("A", "a", Some(0))],
+            content: vec![ContentBinding::from(&staged)],
+            ..ChangeSet::default()
+        },
+    );
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "A"),
+        Ok(bytes_of(6, 30_000))
+    );
+}
+
+#[test]
+fn a_page_relocation_reusing_a_referenced_page_is_refused() {
+    let sim = scattered_small();
+    let s = open(&sim);
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let before = logical(&s);
+    // The journal claims to reuse a page the new tree still refers to.
+    s.inner.set_journal_hook_for_test(Box::new(|j, txn| {
+        let referenced = txn.frontier()[0].page;
+        j.reused_pages.push(referenced);
+    }));
+    let r = s.maintain(MaintenanceTask::Relocate, FULL);
+    refused_by_space_check(&s, r, generation, "reused referenced page");
+    assert_eq!(logical(&s), before);
+}
+
+/// Hole reclaim whose publication is uncertain, with a staging paused past its fence check
+/// meanwhile: reclaim holds no reservations and frees nothing before it is published, so every
+/// recovered image holds the same records as before the step.
+#[test]
+fn an_uncertain_hole_reclaim_leaves_no_space_a_staging_can_take() {
+    use std::sync::mpsc::channel;
+    let (base, s, _) = leaked(100_000, false);
+    let before = logical(&s);
+    drop(s);
+    let sim = base.after_process_exit();
+    sim.release();
+    let state = std::sync::Arc::new(UncertainState::default());
+    let s = open_on(
+        Box::new(UncertainRecord {
+            sim: sim.clone(),
+            state: state.clone(),
+        }),
+        Options::default(),
+    )
+    .unwrap();
+    let (go_tx, go_rx) = channel::<()>();
+    let (entered_tx, entered_rx) = channel::<()>();
+    let (release_tx, release_rx) = channel::<()>();
+    *state.on_record.lock().unwrap() = Some(Box::new(move || {
+        go_tx.send(()).unwrap();
+        entered_rx.recv().unwrap();
+    }));
+    let (reclaimed, later) = std::thread::scope(|t| {
+        let (store, data) = (&s, bytes_of(9, 100_000));
+        let stager = t.spawn(move || {
+            go_rx.recv().unwrap();
+            let mut reader = GatedReader {
+                entered: Some(entered_tx),
+                release: release_rx,
+                data,
+                at: 0,
+            };
+            store.stage_content(&mut reader)
+        });
+        let r = s.maintain(
+            MaintenanceTask::ReclaimContentHoles,
+            MaintenanceBudget::default(),
+        );
+        release_tx.send(()).unwrap();
+        (r, stager.join().unwrap())
+    });
+    eprintln!("reclaim: {reclaimed:?}");
+    eprintln!("later staging: {:?}", later.as_ref().map(|_| "staged"));
+    assert!(
+        matches!(reclaimed, Err(CommitError::Indeterminate(_))),
+        "the schedule must make the reclaim's publication uncertain: {reclaimed:?}"
+    );
+    drop(s);
+    let images = [("process exit".to_string(), sim.after_process_exit())]
+        .into_iter()
+        .chain(
+            [crate::sim::Persist::None, crate::sim::Persist::All]
+                .into_iter()
+                .chain((1..=4).map(crate::sim::Persist::Seeded))
+                .map(|p| (format!("{p:?}"), sim.after_crash(p))),
+        );
+    let mut changed = Vec::new();
+    for (how, img) in images {
+        let recovered = open(&img);
+        let generation = recovered.inner.snapshot().unwrap().desc.generation;
+        let same = logical(&recovered) == before;
+        eprintln!(
+            "{how}: generation {generation}: records {}",
+            if same { "unchanged" } else { "CHANGED" }
+        );
+        audit(&img);
+        if !same {
+            changed.push(format!("{how} (generation {generation})"));
+        }
+    }
+    assert!(changed.is_empty(), "records changed: {changed:?}");
+}
+
 #[test]
 fn relocation_takes_lower_space_when_a_tighter_fit_lies_above() {
     let sim = SimIo::new();
@@ -1060,6 +1589,15 @@ fn relocation_takes_lower_space_when_a_tighter_fit_lies_above() {
 /// Runs `maintain(Relocate)` on another thread and `between` on this one once the copy is done
 /// and before the step publishes.
 fn relocate_around(s: &NativeStore, between: impl FnOnce()) -> crate::MaintenanceReport {
+    relocate_around_result(s, between)
+        .unwrap_or_else(|e| panic!("the relocation must publish: {e:?}"))
+}
+
+/// [`relocate_around`], returning the step's result.
+fn relocate_around_result(
+    s: &NativeStore,
+    between: impl FnOnce(),
+) -> Result<crate::MaintenanceReport, CommitError> {
     let (copied_tx, copied_rx) = std::sync::mpsc::channel();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     s.inner.set_relocate_hook_for_test(Some(Box::new(move || {
@@ -1080,7 +1618,7 @@ fn relocate_around(s: &NativeStore, between: impl FnOnce()) -> crate::Maintenanc
         }
         between();
         go_tx.send(()).unwrap();
-        worker.join().unwrap().unwrap()
+        worker.join().unwrap()
     })
 }
 
@@ -1202,6 +1740,132 @@ fn a_move_whose_content_was_committed_again_during_relocation_is_dropped() {
         logical(&s).contexts.get("D").and_then(|c| c.2.as_deref()),
         Some(&bytes_of(2, 100_000)[..])
     );
+}
+
+/// A relocation that applied a move of a superseded manifest (here: revalidation switched off
+/// for one step) is refused by the space check before it writes anything: no page, no record,
+/// the generation unchanged, no fence, its reservations returned, and the store keeps working.
+#[test]
+fn a_move_of_a_superseded_manifest_is_refused_before_anything_is_written() {
+    let sim = fragmented();
+    let s = open(&sim);
+    s.inner.skip_relocation_revalidation_for_test();
+    let image = |sim: &SimIo| {
+        [crate::io::FileId::Meta, crate::io::FileId::Content].map(|f| {
+            let mut b = vec![0; crate::io::Io::len(sim, f).unwrap() as usize];
+            crate::io::Io::read_at(sim, f, 0, &mut b).unwrap();
+            b
+        })
+    };
+    let at_publication = std::sync::Mutex::new(None);
+    let r = relocate_around_result(&s, || {
+        // B gives up its content, then D binds the same bytes again under another manifest.
+        commit(
+            &s,
+            "release",
+            ChangeSet {
+                changes: vec![put("B", "B", None)],
+                ..ChangeSet::default()
+            },
+        );
+        let staged = s.stage_content(&mut &bytes_of(2, 100_000)[..]).unwrap();
+        commit(
+            &s,
+            "again",
+            ChangeSet {
+                changes: vec![put("D", "d", Some(0))],
+                content: vec![ContentBinding::from(&staged)],
+                ..ChangeSet::default()
+            },
+        );
+        *at_publication.lock().unwrap() =
+            Some((s.inner.snapshot().unwrap().desc.generation, image(&sim)));
+    });
+    let (generation, files) = at_publication.lock().unwrap().take().unwrap();
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.starts_with("space check failed")),
+        "the move itself must be refused before publication (not a later step behind a fence): {r:?}"
+    );
+    assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
+    assert!(
+        image(&sim) == files,
+        "a refused relocation wrote to the store"
+    );
+    assert_eq!(
+        s.inner.fence_reason(),
+        None,
+        "a refused relocation fenced writes"
+    );
+    assert_eq!(s.inner.reserved_bytes_for_test(), (0, 0));
+    commit(
+        &s,
+        "afterwards",
+        ChangeSet {
+            changes: vec![put("E", "e", None)],
+            ..ChangeSet::default()
+        },
+    );
+    assert_eq!(
+        logical(&s).contexts.get("D").and_then(|c| c.2.as_deref()),
+        Some(&bytes_of(2, 100_000)[..])
+    );
+    audit(&sim);
+}
+
+/// A maintenance step that panics after its publication record is durable, before it is applied,
+/// is reported as uncertain, fences writes and keeps the space its moves took; reopening recovers
+/// the published state.
+#[test]
+fn a_maintenance_step_that_panics_after_publishing_is_uncertain_and_keeps_its_space() {
+    let sim = fragmented();
+    let s = open(&sim);
+    let free_before = s.inner.reusable_content_bytes();
+    s.inner.panic_next_maintenance_for_test();
+    // On its own thread: the step's panic stays there, caught by the step.
+    let r = std::thread::scope(|t| {
+        t.spawn(|| s.maintain(MaintenanceTask::Relocate, CONTENT_ONLY))
+            .join()
+            .unwrap_or_else(|_| panic!("a maintenance panic must not reach the caller"))
+    });
+    assert!(
+        matches!(&r, Err(CommitError::Indeterminate(m)) if m.contains("failed unexpectedly")),
+        "a panicking step must be reported as uncertain: {r:?}"
+    );
+    assert!(
+        s.inner
+            .fence_reason()
+            .is_some_and(|why| why.contains("failed unexpectedly")),
+        "a panicking step must fence writes"
+    );
+    assert_eq!(
+        s.inner.reserved_bytes_for_test().1,
+        free_before,
+        "the space the moves took stays owned by the uncertain publication"
+    );
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        0,
+        "space was offered for reuse"
+    );
+    assert!(
+        s.maintain(MaintenanceTask::Relocate, CONTENT_ONLY).is_err(),
+        "a fenced store must refuse further maintenance"
+    );
+    drop(s);
+    let s = open(&sim);
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "B"),
+        Ok(bytes_of(2, 100_000))
+    );
+    commit(
+        &s,
+        "after reopen",
+        ChangeSet {
+            changes: vec![put("E", "e", None)],
+            ..ChangeSet::default()
+        },
+    );
+    audit(&sim);
 }
 
 #[test]
@@ -1805,8 +2469,10 @@ fn maintenance_steps_hold_one_page_or_segment_and_read_only_what_they_need() {
             "{name}: held {read} / {written} bytes at once"
         );
         match task {
+            // Each manifest twice: once to choose the holes, once for the independent reach
+            // the step is sealed against.
             MaintenanceTask::ReclaimContentHoles => assert!(
-                content.1 <= manifests,
+                content.1 <= 2 * manifests,
                 "{name}: read {} content bytes, the manifests are {manifests}",
                 content.1
             ),

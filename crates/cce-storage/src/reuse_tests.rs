@@ -209,12 +209,12 @@ fn put_body(s: &NativeStore, attempt: &str, id: &str, body: &str) {
         }],
         ..ChangeSet::default()
     };
-    s.commit(
+    let r = s.commit(
         AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
         s.begin().unwrap(),
         cs,
-    )
-    .unwrap();
+    );
+    assert!(r.is_ok(), "commit {attempt} was refused: {r:?}");
 }
 
 /// Commits `range` of the churn: commit `i` sets record `K{i % LIVE}` to `v{i}`. Every commit is
@@ -1918,6 +1918,300 @@ fn a_staging_bound_twice_in_a_refused_commit_can_still_be_discarded() {
     );
     // Both bindings' admissions are released: nothing still holds the staging.
     assert_eq!(s.discard_staged(staged), Ok(()));
+}
+
+/// A store whose next staging of `len` bytes reuses retired space: content committed, removed
+/// and two generations further on.
+fn with_retired_space(sim: &SimIo, len: usize) -> NativeStore {
+    let s = sim_create(sim);
+    committed_then_removed(&s, sim, "X", &payload(1, len));
+    put_body(&s, "advance-2", "advance", "2");
+    s
+}
+
+/// Commits `staged` as record `Y`.
+fn commit_y(s: &NativeStore, staged: &cce_core::storage::StagedContent) -> Result<(), CommitError> {
+    s.commit(
+        AttemptId::new(*b"y").unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![Change::PutContext {
+                id: cid("Y"),
+                expect: Precondition::Any,
+                body: b"Y".to_vec(),
+                content: Some(0),
+            }],
+            content: vec![ContentBinding::from(staged)],
+            ..ChangeSet::default()
+        },
+    )
+    .map(|_| ())
+}
+
+/// A commit whose publication record may or may not be durable keeps the reused space its
+/// staging holds: discarding that staging is refused and the space is not offered for reuse,
+/// whichever publication the store reopens with.
+#[test]
+fn an_uncertain_publication_keeps_the_reused_space_of_its_staging() {
+    let len = CONTENT_CHUNK + 300;
+    let y = payload(2, len);
+
+    // Probe: the operations a reusing commit of Y takes; its last one is the record's sync.
+    let probe = SimIo::new();
+    let p = with_retired_space(&probe, len);
+    let sp = p.stage_content(&mut &y[..]).unwrap();
+    let before = probe.ops();
+    assert_eq!(commit_y(&p, &sp), Ok(()));
+    let per_commit = probe.ops() - before;
+
+    let sim = SimIo::new();
+    let s = with_retired_space(&sim, len);
+    let free_before = s.inner.reusable_content_bytes();
+    let sy = s.stage_content(&mut &y[..]).unwrap();
+    let held = staged_extents(&s, &sy);
+    assert!(
+        s.inner.reusable_content_bytes() < free_before,
+        "the staging did not reuse retired space"
+    );
+    let free_staged = s.inner.reusable_content_bytes();
+    sim.fail_nth_op(per_commit);
+    let r = commit_y(&s, &sy);
+    assert!(
+        matches!(r, Err(CommitError::Indeterminate(_))),
+        "the publication did not become uncertain: {r:?}"
+    );
+
+    let d = s.discard_staged(sy);
+    assert!(
+        d.is_err(),
+        "discarding a staging an uncertain publication may have consumed was accepted"
+    );
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free_staged,
+        "the uncertain publication's reused space was offered for reuse"
+    );
+    drop(s);
+
+    // Whichever record survives, the reopened store is consistent and Y, if committed, reads
+    // back exactly.
+    for (what, img) in [
+        ("record durable", sim.after_process_exit()),
+        ("record lost", sim.after_crash(crate::sim::Persist::None)),
+    ] {
+        let rec = NativeStore {
+            inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
+        };
+        assert_eq!(crate::audit::check_retirement(&img), Ok(()), "{what}");
+        let y_record = rec.begin().unwrap().context(&cid("Y")).unwrap();
+        if let Some(r) = y_record {
+            let c = r.content.expect("Y has content");
+            assert_eq!(
+                read_all(&mut rec.begin().unwrap(), &c),
+                Ok(y.clone()),
+                "{what}"
+            );
+            assert!(
+                overlaps(&content_extents(&reach(&img, &desc(&rec)).unwrap()), &held),
+                "{what}: Y is not in the space its staging reused"
+            );
+        }
+    }
+}
+
+/// A staging that passed its entry check while writes were not fenced takes no reusable space
+/// once they are: the fence is re-checked at every take.
+#[test]
+fn a_staging_takes_no_reusable_space_once_writes_are_fenced() {
+    let len = CONTENT_CHUNK + 300;
+    let sim = SimIo::new();
+    let s = with_retired_space(&sim, len);
+    let free_before = s.inner.reusable_content_bytes();
+    assert!(free_before > 0, "no retired space to reuse");
+
+    /// Yields the first segment, then fences the store before yielding the rest.
+    struct FenceAfterFirst<'a> {
+        bytes: &'a [u8],
+        at: usize,
+        s: &'a NativeStore,
+    }
+    impl Read for FenceAfterFirst<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.at == CONTENT_CHUNK {
+                self.s.inner.fence_for_test("fenced while a staging runs");
+            }
+            let end = self
+                .bytes
+                .len()
+                .min(self.at + out.len())
+                .min(if self.at < CONTENT_CHUNK {
+                    CONTENT_CHUNK
+                } else {
+                    usize::MAX
+                });
+            let n = end - self.at;
+            out[..n].copy_from_slice(&self.bytes[self.at..end]);
+            self.at = end;
+            Ok(n)
+        }
+    }
+    let y = payload(3, 3 * CONTENT_CHUNK);
+    let r = s.stage_content(&mut FenceAfterFirst {
+        bytes: &y,
+        at: 0,
+        s: &s,
+    });
+    assert!(r.is_err(), "the staging completed after writes were fenced");
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free_before,
+        "the fenced staging kept reusable space"
+    );
+}
+
+fn content_file_len(sim: &SimIo) -> u64 {
+    use crate::io::{FileId, Io};
+    sim.len(FileId::Content).unwrap()
+}
+
+/// A commit rejected after writing its history entry leaves those bytes unreferenced. They are
+/// not offered for reuse directly (no record covers them yet); the next publication retires
+/// them with a record, so no space is lost and nothing free lacks a record.
+#[test]
+fn a_rejected_commits_written_history_is_retired_by_the_next_publication() {
+    let attempt_after = |s: &NativeStore, n: u64, sim: &SimIo| -> Result<(), CommitError> {
+        sim.fail_nth_op(n);
+        s.commit(
+            AttemptId::new(*b"rejected").unwrap(),
+            s.begin().unwrap(),
+            ChangeSet {
+                changes: vec![Change::PutContext {
+                    id: cid("R"),
+                    expect: Precondition::Any,
+                    body: b"R".to_vec(),
+                    content: None,
+                }],
+                ..ChangeSet::default()
+            },
+        )
+        .map(|_| ())
+    };
+    // The first failing operation that rejects the commit after its history entry is written.
+    let found = (1..64u64).find_map(|n| {
+        let sim = SimIo::new();
+        let s = with_retired_space(&sim, CONTENT_CHUNK + 300);
+        let before = content_file_len(&sim);
+        let free_before = s.inner.reusable_content_bytes();
+        let r = attempt_after(&s, n, &sim);
+        let grown = content_file_len(&sim) - before;
+        matches!(r, Err(CommitError::Rejected(_)))
+            .then_some(())
+            .filter(|()| grown > 0 && lock_fenced(&s).is_none())
+            .map(|()| (n, sim, s, before, grown, free_before))
+    });
+    let Some((n, sim, s, before, grown, free_before)) = found else {
+        panic!("no failing operation rejects a commit after its history write");
+    };
+    let label = format!("failing operation {n}");
+    let hole = (before, grown);
+    // Not free before a record covers them: the free space is what it was before the attempt.
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free_before,
+        "{label}: the rejected commit's bytes were offered for reuse without a record"
+    );
+    assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "{label}: queued bytes and records"
+    );
+    put_body(&s, "next", "N", "next");
+    assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "{label}: after the next publication"
+    );
+    let retired = retired_content(&sim, &s);
+    let covered: u64 = retired
+        .iter()
+        .map(|(o, l)| {
+            let lo = (*o).max(hole.0);
+            let hi = (o + l).min(hole.0 + hole.1);
+            hi.saturating_sub(lo)
+        })
+        .sum();
+    assert_eq!(
+        covered, hole.1,
+        "{label}: the rejected commit's history bytes {hole:?} are not retired by the next \
+         publication (retired: {retired:?})"
+    );
+    assert_eq!(crate::audit::check_retirement(&sim), Ok(()), "{label}");
+}
+
+fn lock_fenced(s: &NativeStore) -> Option<String> {
+    s.inner.fence_reason()
+}
+
+/// A commit binding a staging is rejected (its basis conflicts); the same staging then commits:
+/// its reservations are consumed exactly once and its content reads back exactly.
+#[test]
+fn a_staging_whose_commit_was_rejected_commits_later_exactly_once() {
+    let len = CONTENT_CHUNK + 300;
+    let sim = SimIo::new();
+    let s = with_retired_space(&sim, len);
+    let y = payload(4, len);
+    let sy = s.stage_content(&mut &y[..]).unwrap();
+    let (held, _) = s.inner.reserved_bytes_for_test();
+    assert!(held > 0, "the staging holds no reserved space");
+    let free = s.inner.reusable_content_bytes();
+
+    let mut basis = s.begin().unwrap();
+    assert_eq!(basis.context(&cid("Y")).map(|r| r.is_none()), Ok(true));
+    put_body(&s, "y-first", "Y", "someone else");
+    let refused = s.commit(
+        AttemptId::new(*b"y-stale").unwrap(),
+        basis,
+        ChangeSet {
+            changes: vec![Change::PutContext {
+                id: cid("Y"),
+                expect: Precondition::Any,
+                body: b"Y".to_vec(),
+                content: Some(0),
+            }],
+            content: vec![ContentBinding::from(&sy)],
+            ..ChangeSet::default()
+        },
+    );
+    assert!(
+        matches!(refused, Err(CommitError::Conflict(_))),
+        "the commit did not conflict: {refused:?}"
+    );
+    assert_eq!(
+        s.inner.reserved_bytes_for_test().0,
+        held,
+        "the rejected commit changed what the staging holds"
+    );
+
+    assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "after the rejection"
+    );
+    assert_eq!(commit_y(&s, &sy), Ok(()));
+    assert_eq!(
+        s.inner.reserved_bytes_for_test(),
+        (0, 0),
+        "the staging's reservations were not consumed"
+    );
+    assert_eq!(s.inner.ledger_check_for_test(), Ok(()), "after the commit");
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free,
+        "reserved space returned to the pool after being consumed"
+    );
+    assert_eq!(crate::audit::check_retirement(&sim), Ok(()));
+    let c = content_of(&s, "Y");
+    assert_eq!(read_all(&mut s.begin().unwrap(), &c), Ok(y));
 }
 
 #[test]

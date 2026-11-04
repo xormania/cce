@@ -22,7 +22,13 @@ stores or drivers so they close before it is dropped.
 
 Directories are removed after successful tests. Unwinding retains them and
 prints the path. If a failure is captured rather than unwound, call `retain()`
-before dropping the owner. Cleanup errors are reported without replacing the
+before dropping the owner. Runs that fail on purpose in high volume (for example
+fault-injection campaigns) can set `CCE_KEEP_FAILED_TEST_DIRS=0` so that an
+unwinding test removes its directory instead; a test that expects its own
+failure can call `discard_on_unwind()`, and a test that must keep its directory under any
+setting can call `keep_on_unwind()`. Tests create every directory they use
+through this owner rather than removing a fixed path at the end, which a
+failing assertion would skip. Cleanup errors are reported without replacing the
 test's original outcome. CI collects retained directories after a failed run.
 
 Integration fixtures in `tests/common/story.rs` compute expected values from
@@ -61,6 +67,15 @@ toolchain observations, inventories, commands, timing, logs and assertion
 locations. `results.json` and `comparison.md` are written incrementally; retained
 test images are under `temporary/`. The summary supplies a fresh-output rerun
 command. The operator checkout is never reset or patched.
+
+The runner builds and runs the healthy workspace suite for both revisions and then
+builds and runs once per selected defect, each at Cargo's default parallelism (one
+job and one test thread per available core). On a shared or constrained machine,
+bound it explicitly, for example:
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 python3 tools/testkit/sidebyside.py --original origin/master --candidate HEAD --output /tmp/cce-comparison-1
+```
 
 `tools/testkit/faults.json` defines each literal edit, expected anchor count,
 named test and witness file. Anchors must match before the edit is applied.

@@ -2,14 +2,15 @@
 //! a new physical generation without any logical change. The writer lock orders each step with
 //! commits, so a step always works on the newest published state.
 
-use cce_core::storage::{CommitError, StorageError};
+use cce_core::storage::{AttemptId, CommitError, StorageError};
 
-use std::sync::{Arc, Mutex};
+use std::cell::Cell;
+use std::sync::Arc;
 
-use super::{ContentPool, Inner, Reuse, Taken, lock, rejected, sha256};
+use super::{Fence, Inner, MaintenanceSpace, Reuse, Taken, lock, rejected, sha256};
 use crate::codec::{corrupt, key_components};
-use crate::format::Descriptor;
 use crate::format::PageRef;
+use crate::format::{Descriptor, PAGE_SIZE, PageKind, decode_page};
 use crate::io::FileId;
 use crate::records::{
     ContentEntry, ExtentRef, Manifest, P_CONTENT, P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED,
@@ -32,8 +33,36 @@ impl Inner {
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceReport, CommitError> {
         self.refuse_if_read_only("maintenance").map_err(rejected)?;
+        // A step that panics may have written a durable publication record before it made it
+        // current: its outcome is unknown, as for a commit that panics. Writes are fenced, and
+        // space a relocation reserved stays owned by that uncertain publication.
+        let reserved: Cell<Option<(u64, u64)>> = Cell::new(None);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.maintain_step(task, budget, &reserved)
+        }))
+        .unwrap_or_else(|_| {
+            let why = format!("maintenance step {task:?} failed unexpectedly");
+            self.fence(Fence {
+                why: why.clone(),
+                uncertain: None,
+            });
+            if let Some((serial, generation)) = reserved.get() {
+                self.hold_for_uncertain(&relocation_owner(), generation, &[serial]);
+            }
+            Err(CommitError::Indeterminate(why))
+        })
+    }
+
+    /// One maintenance step; `reserved` names the reservations a relocation holds while their
+    /// outcome is not settled, as `(serial, generation)`.
+    fn maintain_step(
+        self: &Arc<Self>,
+        task: MaintenanceTask,
+        budget: MaintenanceBudget,
+        reserved: &Cell<Option<(u64, u64)>>,
+    ) -> Result<MaintenanceReport, CommitError> {
         if task == MaintenanceTask::Relocate {
-            return self.relocate(budget);
+            return self.relocate(budget, reserved);
         }
         let _w = lock(&self.writer);
         let (cur, fence) = {
@@ -53,6 +82,91 @@ impl Inner {
                 "maintenance task {other:?} is not implemented yet"
             )))),
         }
+    }
+
+    /// Every content extent the published state `cur` reaches: each live entry's manifest and its
+    /// segments, and each history entry. Found from the raw image, as an independent audit would:
+    /// pages are read straight from the files (no cache, no cursor) and followed from the root,
+    /// and manifests are read raw and checked against their digest. It shares nothing with how
+    /// hole reclaim chooses its holes ([`Inner::content_in_use`]), so a hole that choice got wrong
+    /// is still found reachable here.
+    fn full_reach(&self, cur: &Descriptor) -> Result<Vec<(u64, u64)>, StorageError> {
+        let mut reach = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![cur.root];
+        while let Some(at) = stack.pop() {
+            if !seen.insert(at.page) || at.page >= cur.next_page || at.incarnation > cur.generation
+            {
+                return Err(corrupt(format!(
+                    "page {}@{} reached twice or outside generation {}",
+                    at.page, at.incarnation, cur.generation
+                )));
+            }
+            let mut page = vec![0; PAGE_SIZE];
+            self.io
+                .read_at(FileId::Meta, at.page * PAGE_SIZE as u64, &mut page)?;
+            match Node::decode(&decode_page(cur.store, PageKind::Node, at, &page)?)? {
+                Node::Branch { children, .. } => stack.extend(children),
+                Node::Leaf(entries) => {
+                    for (k, v) in entries {
+                        match k.first() {
+                            Some(&P_CONTENT) => {
+                                if let ContentEntry::Live { manifest: x, .. } =
+                                    ContentEntry::decode(&v)?
+                                {
+                                    if x.offset
+                                        .checked_add(x.len)
+                                        .is_none_or(|e| e > cur.content_len)
+                                    {
+                                        return Err(corrupt(format!(
+                                            "manifest {}+{} beyond committed content",
+                                            x.offset, x.len
+                                        )));
+                                    }
+                                    reach.push((x.offset, x.len));
+                                    let m = Manifest::decode(&self.read_raw(&x)?)?;
+                                    reach.extend(m.segments.iter().map(|s| (s.offset, s.len)));
+                                }
+                            }
+                            Some(&P_HISTORY) => {
+                                let x = ExtentRef::decode(&v)?;
+                                reach.push((x.offset, x.len));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        Ok(reach)
+    }
+
+    /// Every extent of the stagings this process has registered and not yet committed or
+    /// discarded: their manifests and segments, read from this process's own writes. Their bytes
+    /// can lie below the committed length once a later commit covers them.
+    fn staged_reach(&self) -> Result<Vec<(u64, u64)>, StorageError> {
+        let staged: Vec<ExtentRef> = lock(&self.state).staged.values().map(|(m, _)| *m).collect();
+        let mut reach = Vec::new();
+        for x in staged {
+            reach.push((x.offset, x.len));
+            let m = Manifest::decode(&self.read_raw(&x)?)?;
+            reach.extend(m.segments.iter().map(|s| (s.offset, s.len)));
+        }
+        Ok(reach)
+    }
+
+    /// Reads extent `x` straight from the content file and checks it against its digest.
+    fn read_raw(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+        let len = usize::try_from(x.len).map_err(|_| corrupt("extent too large"))?;
+        let mut buf = vec![0; len];
+        self.io.read_at(FileId::Content, x.offset, &mut buf)?;
+        if sha256(&buf) != x.digest {
+            return Err(corrupt(format!(
+                "content extent at {}: digest mismatch",
+                x.offset
+            )));
+        }
+        Ok(buf)
     }
 
     /// Content-file space below the committed length that is in use: reachable from the published
@@ -106,7 +220,7 @@ impl Inner {
                 used.push((s.offset, s.len));
             }
         }
-        used.extend(lock(&self.pool).discarded.iter().copied());
+        used.extend(lock(&self.pool).discarded().iter().copied());
         used.sort_unstable();
         Ok(used)
     }
@@ -157,8 +271,20 @@ impl Inner {
             )
             .map_err(rejected)?;
         }
+        // Sealed against everything the published state reaches, read from the raw image, and
+        // every registered staging, found independently of how the holes were chosen: a hole over
+        // either is refused.
+        let space = MaintenanceSpace {
+            retired: taken.clone(),
+            still_reachable: {
+                let mut reach = self.full_reach(cur).map_err(rejected)?;
+                reach.extend(self.staged_reach().map_err(rejected)?);
+                reach
+            },
+            ..MaintenanceSpace::default()
+        };
         // A physical generation: the history position does not move.
-        let (desc, discarded) = self.publish(cur, txn, generation, cur.history_pos, None)?;
+        let (desc, discarded) = self.publish(cur, txn, generation, cur.history_pos, space)?;
         self.adopt(desc, &taken, &discarded);
         Ok(report(generation, bytes, complete))
     }
@@ -198,7 +324,13 @@ impl Inner {
         for k in &fresh {
             txn.put(k.clone(), Vec::new()).map_err(rejected)?;
         }
-        let (desc, discarded) = self.publish(cur, txn, generation, cur.history_pos, None)?;
+        let (desc, discarded) = self.publish(
+            cur,
+            txn,
+            generation,
+            cur.history_pos,
+            MaintenanceSpace::default(),
+        )?;
         self.adopt(desc, &[], &discarded);
         Ok(MaintenanceReport {
             index_entries_written: fresh.len() as u64,
@@ -216,6 +348,7 @@ impl Inner {
     fn relocate_content(
         self: &Arc<Self>,
         budget: MaintenanceBudget,
+        reserved: &Cell<Option<(u64, u64)>>,
     ) -> Result<MaintenanceReport, CommitError> {
         // A fenced store cannot publish: refuse before copying anything (checked again under the
         // writer lock before publishing).
@@ -257,8 +390,12 @@ impl Inner {
         }
         candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
 
+        // This step's own taker id: the pool accepts back, or reserves, only what it took.
         let mut taken = Taken {
-            pool: &self.pool,
+            inner: self,
+            owner: self
+                .next_taker
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             taken: Vec::new(),
         };
         let mut moves = Vec::new();
@@ -272,26 +409,34 @@ impl Inner {
             // stream with nowhere lower to go is not work left to do.
             let mut placed = Vec::new();
             for s in m.segments.iter().chain(std::iter::once(&old)) {
-                match self.take_retired(s.len, bound, Some(s.offset), &mut taken) {
-                    Some(at) => placed.push(at),
+                // A checked take, refused once writes are fenced (then nothing moves).
+                let got = lock(&self.pool)
+                    .take(taken.owner, s.len, bound, Some(s.offset))
+                    .ok()
+                    .flatten();
+                match got {
+                    Some(r) => {
+                        taken.taken.push(r);
+                        placed.push(r.offset);
+                    }
                     None => break,
                 }
             }
             if placed.len() != m.segments.len() + 1 {
-                give_back(&self.pool, &mut taken, mark);
+                give_back(&mut taken, mark);
                 continue;
             }
             // A movable stream that does not fit is skipped, never a reason to stop: smaller
             // streams below it may still fit. One larger than the whole budget can only move with
             // a larger one; one that only exceeds what remains moves on a later call.
             if total > budget.max_content_bytes {
-                give_back(&self.pool, &mut taken, mark);
+                give_back(&mut taken, mark);
                 over_budget += 1;
                 complete = false;
                 continue;
             }
             if bytes + total > budget.max_content_bytes {
-                give_back(&self.pool, &mut taken, mark);
+                give_back(&mut taken, mark);
                 complete = false;
                 continue;
             }
@@ -308,9 +453,10 @@ impl Inner {
             }
             let encoded = Manifest {
                 content: m.content,
-                segments,
+                segments: segments.clone(),
             }
             .encode();
+            let new_segments = segments;
             let at = placed[placed.len() - 1];
             self.io
                 .write_at(FileId::Content, at, &encoded)
@@ -325,6 +471,7 @@ impl Inner {
                 old,
                 old_segments: m.segments,
                 new,
+                new_segments,
                 takes: mark..taken.taken.len(),
                 bytes: total,
             });
@@ -352,10 +499,18 @@ impl Inner {
         let mut txn = TreeTxn::new(&**self, cur.root);
         let mut applied = Vec::new();
         let mut dropped = Vec::new();
+        #[cfg(test)]
+        let skip = self
+            .skip_relocation_revalidation
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let skip = false;
         for mv in moves {
             let still = match txn.get(&mv.key).map_err(rejected)? {
                 Some(v) => match ContentEntry::decode(&v).map_err(rejected)? {
-                    ContentEntry::Live { manifest, refs } if manifest == mv.old => Some(refs),
+                    ContentEntry::Live { manifest, refs } if manifest == mv.old || skip => {
+                        Some(refs)
+                    }
                     _ => None,
                 },
                 None => None,
@@ -378,10 +533,10 @@ impl Inner {
         }
         // Reservations of dropped moves go back to the pool; their copies stay in retired space.
         for mv in dropped.iter().rev() {
-            for r in taken.taken.drain(mv.takes.clone()) {
-                lock(&self.pool)
-                    .free
-                    .insert(r.offset, (r.record_len, r.retired_at));
+            let back: Vec<Reuse> = taken.taken.drain(mv.takes.clone()).collect();
+            let given = lock(&self.pool).give_back(taken.owner, &back);
+            if let Err(why) = given {
+                self.fault(&why);
             }
         }
         if applied.is_empty() {
@@ -414,7 +569,15 @@ impl Inner {
             s
         };
         let held: Vec<Reuse> = std::mem::take(&mut taken.taken);
-        lock(&self.pool).held.insert(serial, held);
+        let held_now = lock(&self.pool).hold(taken.owner, serial, held);
+        if let Err(back) = held_now {
+            // Not this step's to reserve: give it back and refuse the step.
+            taken.taken = back;
+            return Err(rejected(StorageError::StoreState(format!(
+                "space check failed: relocation could not reserve its space as {serial}"
+            ))));
+        }
+        reserved.set(Some((serial, generation)));
         let unbound = (
             ExtentRef {
                 offset: 0,
@@ -426,30 +589,66 @@ impl Inner {
                 len: 0,
             },
         );
-        let remainders = self.consume_reuse(&mut txn, &[(serial, unbound)]);
-        let published = remainders.and_then(|rem| {
-            self.publish(&cur, txn, generation, cur.history_pos, None)
+        let consumed = self.consume_reuse(&mut txn, &[(serial, unbound)]);
+        let published = consumed.and_then(|(rem, consumed)| {
+            // Old manifests and segments are retired; the copies must stay reachable, so the
+            // seal's overlap check compares the two, and each entry must name its new manifest.
+            let space = MaintenanceSpace {
+                retired: retired.clone(),
+                remainders: rem.clone(),
+                consumed,
+                still_reachable: applied
+                    .iter()
+                    .flat_map(|mv| std::iter::once(mv.new).chain(mv.new_segments.iter().copied()))
+                    .map(|x| (x.offset, x.len))
+                    .collect(),
+                bound: vec![serial],
+                entries: applied.iter().map(|mv| (mv.key.clone(), mv.new)).collect(),
+            };
+            self.publish(&cur, txn, generation, cur.history_pos, space)
                 .map(|p| (p, rem))
         });
         let ((desc, discarded), remainders) = match published {
             Ok(p) => p,
+            Err(e @ CommitError::Indeterminate(_)) => {
+                // The record may be durable and reference the copies: the reservations stay
+                // owned by this uncertain publication until reopen decides, never offered for
+                // reuse (the publication already fenced writes).
+                self.hold_for_uncertain(&relocation_owner(), generation, &[serial]);
+                reserved.set(None);
+                return Err(e);
+            }
             Err(e) => {
-                // Nothing was published: the reservations return to the pool.
-                let mut pool = lock(&self.pool);
-                for r in pool.held.remove(&serial).unwrap_or_default() {
-                    pool.free.insert(r.offset, (r.record_len, r.retired_at));
+                // Definitely not published: the reservations return to the pool at their
+                // original generation.
+                reserved.set(None);
+                let released = lock(&self.pool).release(serial);
+                if let Err(why) = released {
+                    self.fault(&why);
                 }
                 return Err(e);
             }
         };
-        self.adopt(desc, &retired, &discarded);
-        let mut pool = lock(&self.pool);
-        let held = pool.held.remove(&serial).unwrap_or_default();
-        self.count_reused(&held);
-        for (offset, len, retired_at) in remainders {
-            pool.free.insert(offset, (len, retired_at));
+        #[cfg(test)]
+        if self
+            .panic_next_maintenance
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("injected: maintenance step panicked after its publication");
         }
-        drop(pool);
+        self.adopt(desc, &retired, &discarded);
+        // The reservations are consumed; the unused parts of their records stay free at their
+        // original generation.
+        let freed = {
+            let mut pool = lock(&self.pool);
+            reserved.set(None);
+            let held = pool.consume(serial);
+            self.count_reused(&held);
+            pool.insert_free(&remainders)
+        };
+        if let Err(why) = freed {
+            self.fault(&why);
+        }
         let moved = applied.iter().map(|m| m.bytes).sum();
         Ok(MaintenanceReport {
             content_bytes_moved: moved,
@@ -462,8 +661,9 @@ impl Inner {
     fn relocate(
         self: &Arc<Self>,
         budget: MaintenanceBudget,
+        reserved: &Cell<Option<(u64, u64)>>,
     ) -> Result<MaintenanceReport, CommitError> {
-        let content = self.relocate_content(budget)?;
+        let content = self.relocate_content(budget, reserved)?;
         let pages = self.relocate_pages(budget)?;
         Ok(MaintenanceReport {
             generation: pages.generation.max(content.generation),
@@ -512,9 +712,14 @@ impl Inner {
                     .ok_or_else(|| rejected(corrupt("a tree page's first key is missing")))?;
                 txn.put(key.clone(), value).map_err(rejected)?;
             }
-            if let Some((desc, discarded)) =
-                self.publish_below(&cur, txn, generation, cur.history_pos, None, Some(below))?
-            {
+            if let Some((desc, discarded)) = self.publish_below(
+                &cur,
+                txn,
+                generation,
+                cur.history_pos,
+                MaintenanceSpace::default(),
+                Some(below),
+            )? {
                 self.adopt(desc, &[], &discarded);
                 return Ok(MaintenanceReport {
                     pages_moved: n as u64,
@@ -536,11 +741,21 @@ impl Inner {
     fn adopt(&self, desc: Descriptor, retired: &[(u64, u64)], discarded: &[(u64, u64)]) {
         let generation = desc.generation;
         lock(&self.state).current = desc;
-        let mut pool = lock(&self.pool);
-        for &(offset, len) in retired.iter().chain(discarded) {
-            pool.free.insert(offset, (len, generation));
+        let freed: Vec<(u64, u64, u64)> = retired
+            .iter()
+            .chain(discarded)
+            .map(|&(offset, len)| (offset, len, generation))
+            .collect();
+        let inserted = {
+            let mut pool = lock(&self.pool);
+            pool.trim_discarded(discarded);
+            pool.insert_free(&freed)
+        };
+        // Sealed before publication, so this cannot fail; if it does, the record is durable and
+        // nothing can be rejected any more: record the fault and fence writes.
+        if let Err(why) = inserted {
+            self.fault(&why);
         }
-        pool.discarded.retain(|x| !discarded.contains(x));
     }
 
     /// Installs a callback run once by the next relocation step between its copy and its
@@ -548,6 +763,20 @@ impl Inner {
     #[cfg(test)]
     pub(crate) fn set_relocate_hook_for_test(&self, hook: Option<Box<dyn FnOnce() + Send>>) {
         *lock(&self.relocate_hook) = hook;
+    }
+
+    /// Makes the next relocation step panic right after its publication, before it is applied.
+    #[cfg(test)]
+    pub(crate) fn panic_next_maintenance_for_test(&self) {
+        self.panic_next_maintenance
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the next relocation step skip revalidating its moves.
+    #[cfg(test)]
+    pub(crate) fn skip_relocation_revalidation_for_test(&self) {
+        self.skip_relocation_revalidation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Publishes the current tree with `edit` applied, as a physical generation (tests that craft
@@ -561,8 +790,13 @@ impl Inner {
         let cur = lock(&self.state).current;
         let mut txn = TreeTxn::new(self, cur.root);
         edit(&mut txn);
-        let (desc, discarded) =
-            self.publish(&cur, txn, cur.generation + 1, cur.history_pos, None)?;
+        let (desc, discarded) = self.publish(
+            &cur,
+            txn,
+            cur.generation + 1,
+            cur.history_pos,
+            MaintenanceSpace::default(),
+        )?;
         self.adopt(desc, &[], &discarded);
         Ok(())
     }
@@ -574,6 +808,7 @@ struct Move {
     old: ExtentRef,
     old_segments: Vec<ExtentRef>,
     new: ExtentRef,
+    new_segments: Vec<ExtentRef>,
     /// Its reservations, as positions in the step's reservation list.
     takes: std::ops::Range<usize>,
     bytes: u64,
@@ -608,10 +843,17 @@ fn first_key_under(
 }
 
 /// Returns reservations taken since `mark` to the pool.
-fn give_back(pool: &Mutex<ContentPool>, taken: &mut Taken, mark: usize) {
-    let mut pool = lock(pool);
-    for r in taken.taken.drain(mark..) {
-        pool.free.insert(r.offset, (r.record_len, r.retired_at));
+/// The owner an uncertain relocation's reservations are recorded under.
+fn relocation_owner() -> AttemptId {
+    AttemptId::new(*b"maintenance: relocation").expect("a valid attempt identifier")
+}
+
+/// Gives back what `taken` took since `mark` (a stream that will not move).
+fn give_back(taken: &mut Taken, mark: usize) {
+    let back: Vec<Reuse> = taken.taken.drain(mark..).collect();
+    let given = lock(&taken.inner.pool).give_back(taken.owner, &back);
+    if let Err(why) = given {
+        taken.inner.fault(&why);
     }
 }
 
