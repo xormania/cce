@@ -6,6 +6,8 @@
 
 #[cfg(test)]
 mod attempt_tests;
+#[cfg(test)]
+mod bundle_tests;
 mod codec;
 #[cfg(test)]
 mod content_tests;
