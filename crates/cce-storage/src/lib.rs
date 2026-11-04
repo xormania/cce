@@ -379,7 +379,8 @@ pub struct StoreStats {
     /// publication consumes those extents (space a staging or relocation took and gave back again
     /// does not count).
     pub content_bytes_reused: u64,
-    /// Retired content bytes currently available for reuse (not held by a staging).
+    /// Retired content bytes currently available for reuse (not held by a staging or a
+    /// maintenance step).
     pub reusable_content_bytes: u64,
     /// Metadata pages read from the metadata file, the publication records included.
     pub pages_read: u64,
@@ -387,7 +388,8 @@ pub struct StoreStats {
     pub pages_read_at_open: u64,
     /// Index entries visited: one per point lookup, plus one per entry a range scan yields.
     pub entries_visited: u64,
-    /// Bytes held right now in content stream buffers (content readers and stagings).
+    /// Bytes held right now in content stream buffers (content readers, stagings and the segment
+    /// copies of a relocation step).
     pub content_buffer_bytes: u64,
     /// The most `content_buffer_bytes` has been since the store was opened.
     pub content_buffer_bytes_peak: u64,
@@ -417,8 +419,9 @@ pub struct SpaceReport {
     pub retired_pages_protected: u64,
     pub retired_pages_reusable: u64,
     /// Retired content-file bytes, by whether the reuse rule allows taking them now. The split is by
-    /// rule only: "reusable" also counts retired space a staging currently holds or is taking, which
-    /// is not free to take until that staging is committed or discarded (see `reusable_content_bytes`
+    /// rule only: "reusable" also counts retired space a staging or a maintenance step currently holds
+    /// or is taking, which is not free to take until that staging is committed or discarded or that
+    /// step ends (see `reusable_content_bytes`
     /// in `StoreStats` for what is free now).
     pub retired_content_bytes_protected: u64,
     pub retired_content_bytes_reusable: u64,
