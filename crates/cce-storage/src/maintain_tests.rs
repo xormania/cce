@@ -222,7 +222,7 @@ fn reclaiming_content_holes_retires_exactly_the_leaked_bytes_and_changes_no_reco
                 MaintenanceTask::ReclaimContentHoles,
                 MaintenanceBudget::default(),
             )
-            .unwrap();
+            .unwrap_or_else(|e| panic!("reclaiming the leaked holes must succeed: {e:?}"));
         assert_eq!(r.content_bytes_reclaimed, leak, "discard {discard}");
         assert!(r.complete);
         assert_eq!(
@@ -1269,9 +1269,30 @@ fn a_relocation_retiring_its_own_copy_is_refused_by_the_space_check() {
     let s = open(&sim);
     let generation = s.inner.snapshot().unwrap().desc.generation;
     let free_before = s.inner.reusable_content_bytes();
-    // The journal retires one of the new segments, with its record.
-    s.inner.set_journal_hook_for_test(Box::new(|j, txn| {
-        let x = j.still_reachable[1];
+    let mut v = s.begin().unwrap();
+    let digest = v
+        .context(&cid("B"))
+        .unwrap()
+        .unwrap()
+        .content
+        .unwrap()
+        .digest;
+    drop(v);
+    let k = crate::records::key(crate::records::P_CONTENT, &[&digest.0]);
+    let files = sim.clone();
+    // The journal retires the first new segment, found from the rewritten entry's new manifest,
+    // with its record.
+    s.inner.set_journal_hook_for_test(Box::new(move |j, txn| {
+        let Ok(crate::records::ContentEntry::Live { manifest, .. }) =
+            crate::records::ContentEntry::decode(&txn.get(&k).unwrap().unwrap())
+        else {
+            panic!("B's entry is live");
+        };
+        let mut b = vec![0; manifest.len as usize];
+        crate::io::Io::read_at(&files, crate::io::FileId::Content, manifest.offset, &mut b)
+            .unwrap();
+        let first = Manifest::decode(&b).unwrap().segments[0];
+        let x = (first.offset, first.len);
         j.retired_extents.push(x);
         txn.put(
             crate::records::retired_extent_key(j.generation, x.0),
