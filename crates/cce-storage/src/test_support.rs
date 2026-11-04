@@ -1,6 +1,6 @@
 //! Test composition for the private storage adapters. Scenario assertions stay in their suites.
 
-use cce_core::storage::{AttemptId, ContextId, StorageError};
+use cce_core::storage::{AttemptId, Change, ChangeSet, ContextId, Precondition, StorageError};
 
 use crate::NativeStore;
 use crate::engine::{Inner, Options};
@@ -28,4 +28,25 @@ pub(crate) fn cid(s: &str) -> ContextId {
 
 pub(crate) fn attempt(s: &str) -> AttemptId {
     AttemptId::new(s.as_bytes().to_vec()).unwrap()
+}
+
+pub(crate) fn put_context(
+    id: &str,
+    expect: Precondition,
+    body: &[u8],
+    content: Option<usize>,
+) -> Change {
+    Change::PutContext {
+        id: cid(id),
+        expect,
+        body: body.to_vec(),
+        content,
+    }
+}
+
+pub(crate) fn changes(changes: Vec<Change>) -> ChangeSet {
+    ChangeSet {
+        changes,
+        ..ChangeSet::default()
+    }
 }

@@ -1,6 +1,6 @@
 //! Engine behavior tests through the logical port (simulated I/O unless stated).
 
-use crate::test_support::{attempt, create_on, open_on};
+use crate::test_support::{attempt, changes, create_on, open_on, put_context as put};
 
 use std::io::Read;
 
@@ -18,25 +18,9 @@ fn store() -> NativeStore {
     create_on(Box::new(SimIo::new()), StoreId([3; 16]), Default::default()).unwrap()
 }
 
-fn put(id: &str, expect: Precondition, body: &[u8], content: Option<usize>) -> Change {
-    Change::PutContext {
-        id: ContextId::new(id.as_bytes().to_vec()).unwrap(),
-        expect,
-        body: body.to_vec(),
-        content,
-    }
-}
-
 fn commit(s: &NativeStore, a: &str, cs: ChangeSet) -> Result<u64, CommitError> {
     s.commit(attempt(a), s.begin().unwrap(), cs)
         .map(|r| r.position.0)
-}
-
-fn changes(c: Vec<Change>) -> ChangeSet {
-    ChangeSet {
-        changes: c,
-        ..ChangeSet::default()
-    }
 }
 
 fn revision(s: &NativeStore, id: &str) -> Option<Revision> {

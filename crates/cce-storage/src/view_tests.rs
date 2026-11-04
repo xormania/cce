@@ -1,7 +1,7 @@
 //! Concurrent views and logical conflict validation. Schedules are explicit: the test decides the
 //! order of view creation, intervening commits and the final commit.
 
-use crate::test_support::{cid, create_on};
+use crate::test_support::{changes as cs, cid, create_on};
 
 use cce_core::storage::{
     AttemptId, Change, ChangeSet, CommitError, Direction, Precondition, ReadView, RelationshipId,
@@ -33,13 +33,6 @@ fn rel(id: &str, kind: &str, src: &str, dst: &str) -> Change {
         kind: RelationshipKind::new(kind.as_bytes().to_vec()).unwrap(),
         source: cid(src),
         target: cid(dst),
-    }
-}
-
-fn cs(changes: Vec<Change>) -> ChangeSet {
-    ChangeSet {
-        changes,
-        ..ChangeSet::default()
     }
 }
 

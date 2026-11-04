@@ -2,7 +2,7 @@
 //! relationship directions, history, the attempt's outcome and bound content all stay as they
 //! were, also for a fresh process, and the same attempt can then commit a valid request.
 
-use crate::test_support::{cid, create_on, open_on};
+use crate::test_support::{cid, create_on, open_on, put_context as put};
 
 use std::io::Read;
 
@@ -17,15 +17,6 @@ use crate::format::StoreId;
 use crate::sim::SimIo;
 
 const STORE: StoreId = StoreId(*b"bundle-atomicity");
-
-fn put(id: &str, expect: Precondition, body: &[u8], content: Option<usize>) -> Change {
-    Change::PutContext {
-        id: cid(id),
-        expect,
-        body: body.to_vec(),
-        content,
-    }
-}
 
 /// A store holding records A and B and nothing else.
 fn seeded(sim: &SimIo) -> NativeStore {
