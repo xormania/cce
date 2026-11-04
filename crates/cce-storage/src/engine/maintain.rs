@@ -2,7 +2,7 @@
 //! a new physical generation without any logical change. The writer lock orders each step with
 //! commits, so a step always works on the newest published state.
 
-use cce_core::storage::{CommitError, StorageError};
+use cce_core::storage::{AttemptId, CommitError, StorageError};
 
 use std::sync::{Arc, Mutex};
 
@@ -428,8 +428,16 @@ impl Inner {
         });
         let ((desc, discarded), remainders) = match published {
             Ok(p) => p,
+            Err(e @ CommitError::Indeterminate(_)) => {
+                // The record may be durable and reference the copies: the reservations stay
+                // owned by this uncertain publication until reopen decides, never offered for
+                // reuse (the publication already fenced writes).
+                self.hold_for_uncertain(&relocation_owner(), generation, &[serial]);
+                return Err(e);
+            }
             Err(e) => {
-                // Nothing was published: the reservations return to the pool.
+                // Definitely not published: the reservations return to the pool at their
+                // original generation.
                 let mut pool = lock(&self.pool);
                 for r in pool.held.remove(&serial).unwrap_or_default() {
                     pool.free.insert(r.offset, (r.record_len, r.retired_at));
@@ -603,6 +611,11 @@ fn first_key_under(
 }
 
 /// Returns reservations taken since `mark` to the pool.
+/// The owner an uncertain relocation's reservations are recorded under.
+fn relocation_owner() -> AttemptId {
+    AttemptId::new(*b"maintenance: relocation").expect("a valid attempt identifier")
+}
+
 fn give_back(pool: &Mutex<ContentPool>, taken: &mut Taken, mark: usize) {
     let mut pool = lock(pool);
     for r in taken.taken.drain(mark..) {

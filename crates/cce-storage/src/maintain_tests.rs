@@ -985,6 +985,334 @@ fn streams_left_for_lack_of_remaining_budget_move_on_the_next_call() {
     audit(&sim);
 }
 
+/// Test I/O over a simulator: runs `on_record` when a publication record is written, and then fails
+/// the metadata sync that would make that record durable, so the record may or may not survive.
+struct UncertainRecord {
+    sim: SimIo,
+    state: std::sync::Arc<UncertainState>,
+}
+
+#[derive(Default)]
+struct UncertainState {
+    on_record: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    fail_meta_sync: std::sync::atomic::AtomicBool,
+    /// Fail the next content-file sync (the data barrier).
+    fail_content_sync: std::sync::atomic::AtomicBool,
+}
+
+impl crate::io::Io for UncertainRecord {
+    fn create(&self) -> Result<(), StorageError> {
+        self.sim.create()
+    }
+    fn open(&self) -> Result<(), StorageError> {
+        self.sim.open()
+    }
+    fn read_at(
+        &self,
+        file: crate::io::FileId,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<(), StorageError> {
+        self.sim.read_at(file, offset, buf)
+    }
+    fn write_at(
+        &self,
+        file: crate::io::FileId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), StorageError> {
+        if file == crate::io::FileId::Meta && offset < 2 * crate::format::PAGE_SIZE as u64 {
+            let hook = self.state.on_record.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+                self.state
+                    .fail_meta_sync
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.sim.write_at(file, offset, data)
+    }
+    fn len(&self, file: crate::io::FileId) -> Result<u64, StorageError> {
+        self.sim.len(file)
+    }
+    fn sync(&self, file: crate::io::FileId) -> Result<(), StorageError> {
+        if file == crate::io::FileId::Meta
+            && self
+                .state
+                .fail_meta_sync
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::Io(
+                "injected: publication record sync failed".into(),
+            ));
+        }
+        if file == crate::io::FileId::Content
+            && self
+                .state
+                .fail_content_sync
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::Io("injected: data barrier failed".into()));
+        }
+        self.sim.sync(file)
+    }
+    fn sync_dir(&self) -> Result<(), StorageError> {
+        self.sim.sync_dir()
+    }
+}
+
+/// A reader that signals its first read, then waits to be released before serving `data`.
+struct GatedReader {
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    release: std::sync::mpsc::Receiver<()>,
+    data: Vec<u8>,
+    at: usize,
+}
+
+impl Read for GatedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(tx) = self.entered.take() {
+            tx.send(()).unwrap();
+            self.release.recv().unwrap();
+        }
+        let n = buf.len().min(self.data.len() - self.at);
+        buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+/// A relocation whose publication record may be durable keeps the space its moves took: owned by
+/// that uncertain publication, never offered for reuse, so a staging that passed its fence check
+/// while the relocation was publishing cannot take and overwrite the relocated content.
+#[test]
+fn a_staging_never_takes_space_an_uncertain_relocation_references() {
+    use std::sync::mpsc::channel;
+    let base = fragmented();
+    let sim = base.after_process_exit();
+    sim.release();
+    let state = std::sync::Arc::new(UncertainState::default());
+    let s = open_on(
+        Box::new(UncertainRecord {
+            sim: sim.clone(),
+            state: state.clone(),
+        }),
+        Options::default(),
+    )
+    .unwrap();
+    let (go_tx, go_rx) = channel::<()>();
+    let (entered_tx, entered_rx) = channel::<()>();
+    let (release_tx, release_rx) = channel::<()>();
+    // Once the relocation writes its publication record (after capturing the content boundary),
+    // a staging starts, passes its fence check and waits inside its reader.
+    *state.on_record.lock().unwrap() = Some(Box::new(move || {
+        go_tx.send(()).unwrap();
+        entered_rx.recv().unwrap();
+    }));
+    // All of A's retired space, which B's move takes exactly.
+    let free_before = s.inner.reusable_content_bytes();
+    let staged_bytes = bytes_of(9, 100_000);
+    let (relocated, staged) = std::thread::scope(|t| {
+        let (store, data) = (&s, staged_bytes.clone());
+        let stager = t.spawn(move || {
+            go_rx.recv().unwrap();
+            let mut reader = GatedReader {
+                entered: Some(entered_tx),
+                release: release_rx,
+                data,
+                at: 0,
+            };
+            store.stage_content(&mut reader)
+        });
+        // Content only: the page part would wait for the paused staging's allocation lock.
+        let r = s.maintain(
+            MaintenanceTask::Relocate,
+            MaintenanceBudget {
+                max_pages: 0,
+                max_content_bytes: 64 << 20,
+            },
+        );
+        release_tx.send(()).unwrap();
+        (r, stager.join().unwrap())
+    });
+    eprintln!("relocation: {relocated:?}");
+    eprintln!("staging: {:?}", staged.as_ref().map(|_| "staged"));
+    assert!(
+        matches!(relocated, Err(CommitError::Indeterminate(_))),
+        "the schedule must make the relocation's publication uncertain: {relocated:?}"
+    );
+    // The publication may be durable and reference the copies: the reservations stay owned by it.
+    assert_eq!(
+        s.inner.reserved_bytes_for_test().1,
+        free_before,
+        "the uncertain relocation must keep owning the space its moves took"
+    );
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        0,
+        "space the uncertain relocation may reference was offered for reuse"
+    );
+    drop(s);
+    // Whichever record survives, B must read back exactly.
+    let images = [("process exit".to_string(), sim.after_process_exit())]
+        .into_iter()
+        .chain(
+            [crate::sim::Persist::None, crate::sim::Persist::All]
+                .into_iter()
+                .chain((1..=4).map(crate::sim::Persist::Seeded))
+                .map(|p| (format!("{p:?}"), sim.after_crash(p))),
+        );
+    let mut lost = Vec::new();
+    for (how, img) in images {
+        let recovered = open(&img);
+        let generation = recovered.inner.snapshot().unwrap().desc.generation;
+        let got = read_bound(&mut recovered.begin().unwrap(), "B");
+        eprintln!(
+            "{how}: generation {generation}: B {}",
+            if got.as_ref().ok() == Some(&bytes_of(2, 100_000)) {
+                "intact".to_string()
+            } else {
+                format!("{got:?}").chars().take(120).collect()
+            }
+        );
+        if got != Ok(bytes_of(2, 100_000)) {
+            lost.push(format!("{how} (generation {generation}): {got:?}"));
+        }
+    }
+    assert!(lost.is_empty(), "relocated content overwritten: {lost:?}");
+}
+
+/// A relocation that fails definitely before publication (here its data barrier) returns the space
+/// its moves took to the pool, at the generations it was retired at; nothing stays owned.
+#[test]
+fn a_relocation_rejected_before_publication_returns_its_space() {
+    let base = fragmented();
+    let sim = base.after_process_exit();
+    sim.release();
+    let state = std::sync::Arc::new(UncertainState::default());
+    let s = open_on(
+        Box::new(UncertainRecord {
+            sim: sim.clone(),
+            state: state.clone(),
+        }),
+        Options::default(),
+    )
+    .unwrap();
+    let free_before = s.inner.reusable_content_bytes();
+    assert!(free_before > 0, "A's retired space is offered for reuse");
+    // After the copy, before publication: the next content sync (the data barrier) fails.
+    let arm = state.clone();
+    s.inner.set_relocate_hook_for_test(Some(Box::new(move || {
+        arm.fail_content_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    })));
+    let r = s.maintain(
+        MaintenanceTask::Relocate,
+        MaintenanceBudget {
+            max_pages: 0,
+            max_content_bytes: 64 << 20,
+        },
+    );
+    assert!(
+        matches!(r, Err(CommitError::Rejected(_))),
+        "a failed data barrier is a definite rejection: {r:?}"
+    );
+    assert_eq!(
+        s.inner.reserved_bytes_for_test(),
+        (0, 0),
+        "a definitely rejected relocation keeps no reservations"
+    );
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free_before,
+        "the space the moves took must be offered for reuse again"
+    );
+    drop(s);
+    let recovered = open(&sim.after_process_exit());
+    assert_eq!(
+        read_bound(&mut recovered.begin().unwrap(), "B"),
+        Ok(bytes_of(2, 100_000))
+    );
+}
+
+/// Hole reclaim whose publication is uncertain, with a staging paused past its fence check
+/// meanwhile: reclaim holds no reservations and frees nothing before it is published, so every
+/// recovered image holds the same records as before the step.
+#[test]
+fn an_uncertain_hole_reclaim_leaves_no_space_a_staging_can_take() {
+    use std::sync::mpsc::channel;
+    let (base, s, _) = leaked(100_000, false);
+    let before = logical(&s);
+    drop(s);
+    let sim = base.after_process_exit();
+    sim.release();
+    let state = std::sync::Arc::new(UncertainState::default());
+    let s = open_on(
+        Box::new(UncertainRecord {
+            sim: sim.clone(),
+            state: state.clone(),
+        }),
+        Options::default(),
+    )
+    .unwrap();
+    let (go_tx, go_rx) = channel::<()>();
+    let (entered_tx, entered_rx) = channel::<()>();
+    let (release_tx, release_rx) = channel::<()>();
+    *state.on_record.lock().unwrap() = Some(Box::new(move || {
+        go_tx.send(()).unwrap();
+        entered_rx.recv().unwrap();
+    }));
+    let (reclaimed, later) = std::thread::scope(|t| {
+        let (store, data) = (&s, bytes_of(9, 100_000));
+        let stager = t.spawn(move || {
+            go_rx.recv().unwrap();
+            let mut reader = GatedReader {
+                entered: Some(entered_tx),
+                release: release_rx,
+                data,
+                at: 0,
+            };
+            store.stage_content(&mut reader)
+        });
+        let r = s.maintain(
+            MaintenanceTask::ReclaimContentHoles,
+            MaintenanceBudget::default(),
+        );
+        release_tx.send(()).unwrap();
+        (r, stager.join().unwrap())
+    });
+    eprintln!("reclaim: {reclaimed:?}");
+    eprintln!("later staging: {:?}", later.as_ref().map(|_| "staged"));
+    assert!(
+        matches!(reclaimed, Err(CommitError::Indeterminate(_))),
+        "the schedule must make the reclaim's publication uncertain: {reclaimed:?}"
+    );
+    drop(s);
+    let images = [("process exit".to_string(), sim.after_process_exit())]
+        .into_iter()
+        .chain(
+            [crate::sim::Persist::None, crate::sim::Persist::All]
+                .into_iter()
+                .chain((1..=4).map(crate::sim::Persist::Seeded))
+                .map(|p| (format!("{p:?}"), sim.after_crash(p))),
+        );
+    let mut changed = Vec::new();
+    for (how, img) in images {
+        let recovered = open(&img);
+        let generation = recovered.inner.snapshot().unwrap().desc.generation;
+        let same = logical(&recovered) == before;
+        eprintln!(
+            "{how}: generation {generation}: records {}",
+            if same { "unchanged" } else { "CHANGED" }
+        );
+        audit(&img);
+        if !same {
+            changed.push(format!("{how} (generation {generation})"));
+        }
+    }
+    assert!(changed.is_empty(), "records changed: {changed:?}");
+}
+
 #[test]
 fn relocation_takes_lower_space_when_a_tighter_fit_lies_above() {
     let sim = SimIo::new();
