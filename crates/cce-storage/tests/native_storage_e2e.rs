@@ -416,6 +416,25 @@ fn a_failing_shell_setup_never_starts_the_driver() {
 }
 
 #[test]
+fn the_driver_reports_tokens_that_are_not_hex_as_errors() {
+    // A multibyte character splits a two-byte pair; a sign is accepted by integer parsing.
+    for token in ["a\u{e9}b", "+1"] {
+        let step = Driver::spawn().step(&format!("stage s hex {token}"));
+        assert!(
+            matches!(&step, Step::Answered(lines) if lines.iter().any(|l| l.starts_with("error not hex"))),
+            "{token:?}: expected a not-hex error line, got {step:?}"
+        );
+    }
+    // Neighbour: valid hex gets past parsing (and fails only for want of a store).
+    let step = Driver::spawn().step("stage s hex 0aFf");
+    assert!(
+        matches!(&step, Step::Answered(lines)
+            if lines.iter().any(|l| l.starts_with("error ") && !l.starts_with("error not hex"))),
+        "valid hex must parse: {step:?}"
+    );
+}
+
+#[test]
 fn a_store_has_one_owning_process_until_every_guard_is_gone() {
     let dir = test_dir("ownership");
     let store = dir.join("store");
