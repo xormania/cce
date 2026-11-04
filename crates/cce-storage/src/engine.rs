@@ -60,6 +60,8 @@ pub(crate) struct Options {
     /// Largest length of any variable-length request field (record body, evidence label or bytes)
     /// and of any request list; bounded by the 32-bit length prefixes of the encoding.
     pub max_request_field: u64,
+    /// Largest encoded size of a whole request, which history stores as one length-prefixed field.
+    pub max_request_len: u64,
 }
 
 /// Default number of recent commits whose write sets are kept for conflict validation.
@@ -75,6 +77,7 @@ impl Default for Options {
             commit_queue: DEFAULT_COMMIT_QUEUE,
             max_content_segments: DEFAULT_MAX_CONTENT_SEGMENTS,
             max_request_field: u32::MAX as u64,
+            max_request_len: u32::MAX as u64,
         }
     }
 }
@@ -150,6 +153,8 @@ pub(crate) struct Inner {
     max_segments: usize,
     /// Largest variable-length request field or list (see `Options::max_request_field`).
     max_request_field: u64,
+    /// Largest encoded request (see `Options::max_request_len`).
+    max_request_len: u64,
     /// Opened for inspection only: no commit worker, no staging, no commits, no syncs.
     read_only: bool,
     pub counters: Counters,
@@ -441,6 +446,7 @@ impl Inner {
             }),
             max_segments: opts.max_content_segments,
             max_request_field: opts.max_request_field,
+            max_request_len: opts.max_request_len,
             read_only: false,
             counters: Counters::default(),
             diagnostics,
@@ -794,7 +800,8 @@ impl Inner {
         self.refuse_if_read_only("commits are").map_err(rejected)?;
         let _w = lock(&self.writer);
         // Before anything is encoded: no field may overflow its length prefix.
-        crate::records::check_request_bounds(&cs, self.max_request_field).map_err(rejected)?;
+        crate::records::check_request_bounds(&cs, self.max_request_field, self.max_request_len)
+            .map_err(rejected)?;
         #[cfg(test)]
         if self.panic_next_commit.swap(false, Ordering::SeqCst) {
             panic!("injected commit panic");

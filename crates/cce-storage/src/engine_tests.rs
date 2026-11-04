@@ -958,11 +958,49 @@ fn request_lists_beyond_the_limit_are_refused_before_encoding() {
         ("change list", three_changes),
         ("evidence list", three_evidence),
     ] {
-        let r = check_request_bounds(&cs, 2);
+        let r = check_request_bounds(&cs, 2, u64::MAX);
         assert!(
             matches!(&r, Err(StorageError::InvalidRequest(m)) if m.starts_with(what)),
             "{what}: {r:?}"
         );
-        assert!(check_request_bounds(&cs, 3).is_ok(), "{what} at the limit");
+        assert!(
+            check_request_bounds(&cs, 3, u64::MAX).is_ok(),
+            "{what} at the limit"
+        );
     }
+}
+
+#[test]
+fn a_request_whose_fields_fit_but_whose_whole_encoding_does_not_is_refused() {
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(SimIo::new()),
+            StoreId([3; 16]),
+            crate::engine::Options {
+                max_request_len: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    };
+    let with_evidence = |n: usize| ChangeSet {
+        changes: vec![put("E", Precondition::Any, b"e", None)],
+        evidence: (0..n)
+            .map(|_| cce_core::storage::Evidence {
+                label: b"l".to_vec(),
+                bytes: vec![7; 100],
+            })
+            .collect(),
+        ..ChangeSet::default()
+    };
+    // Every field is within the limit, but the encoded request as a whole is not: it is stored
+    // as one length-prefixed field of the history entry.
+    let r = commit(&s, "two", with_evidence(2));
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.starts_with("encoded request")),
+        "{r:?}"
+    );
+    assert!(revision(&s, "E").is_none());
+    // Positive neighbour: one such field keeps the whole request within the limit.
+    assert_eq!(commit(&s, "one", with_evidence(1)).unwrap(), 1);
 }
