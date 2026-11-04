@@ -1,0 +1,52 @@
+name: leak-scan
+# Trusted producer of the required `scan` check for same-repository pull requests.
+# Runs the default branch's code after the leak-guard pull_request workflow completes, so a pull
+# request's own workflow code never runs where PRIVATE_MARKERS is available. The pull request's
+# title, body and commits are read as data (tools/ci/leak_scan_trusted.sh); nothing from it is
+# checked out or executed. A missing secret, an invalid pattern or any failure before a verdict
+# leaves `scan` failed or in progress, never passed.
+# Limits: pull requests from forks are not scanned here and get no `scan` check from this workflow;
+# PR comments and review comments are not scanned.
+
+on:
+  workflow_run:
+    workflows: [leak-guard]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+# One scan at a time per branch; a queued run replaces an older queued one, and each run reads the
+# pull request's current title, body and head when it starts.
+concurrency:
+  group: leak-scan-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Trusted leak scan
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted scan code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          sparse-checkout: |
+            tools/ci
+          persist-credentials: false
+      - name: Scan pull request text, commits and added lines as data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PULLS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
+          MARKERS: ${{ secrets.PRIVATE_MARKERS }}
+          SERVER: ${{ github.server_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash trusted/tools/ci/leak_scan_trusted.sh
