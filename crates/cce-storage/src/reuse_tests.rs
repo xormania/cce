@@ -2142,6 +2142,62 @@ fn lock_fenced(s: &NativeStore) -> Option<String> {
     s.inner.fence_reason()
 }
 
+/// A commit binding a staging is rejected (its basis conflicts); the same staging then commits:
+/// its reservations are consumed exactly once and its content reads back exactly.
+#[test]
+fn a_staging_whose_commit_was_rejected_commits_later_exactly_once() {
+    let len = CONTENT_CHUNK + 300;
+    let sim = SimIo::new();
+    let s = with_retired_space(&sim, len);
+    let y = payload(4, len);
+    let sy = s.stage_content(&mut &y[..]).unwrap();
+    let (held, _) = s.inner.reserved_bytes_for_test();
+    assert!(held > 0, "the staging holds no reserved space");
+    let free = s.inner.reusable_content_bytes();
+
+    let mut basis = s.begin().unwrap();
+    assert_eq!(basis.context(&cid("Y")).map(|r| r.is_none()), Ok(true));
+    put_body(&s, "y-first", "Y", "someone else");
+    let refused = s.commit(
+        AttemptId::new(*b"y-stale").unwrap(),
+        basis,
+        ChangeSet {
+            changes: vec![Change::PutContext {
+                id: cid("Y"),
+                expect: Precondition::Any,
+                body: b"Y".to_vec(),
+                content: Some(0),
+            }],
+            content: vec![ContentBinding::from(&sy)],
+            ..ChangeSet::default()
+        },
+    );
+    assert!(
+        matches!(refused, Err(CommitError::Conflict(_))),
+        "the commit did not conflict: {refused:?}"
+    );
+    assert_eq!(
+        s.inner.reserved_bytes_for_test().0,
+        held,
+        "the rejected commit changed what the staging holds"
+    );
+
+    assert_eq!(commit_y(&s, &sy), Ok(()));
+    assert_eq!(
+        s.inner.reserved_bytes_for_test(),
+        (0, 0),
+        "the staging's reservations were not consumed"
+    );
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free,
+        "reserved space returned to the pool after being consumed"
+    );
+    assert_eq!(crate::audit::check_retirement(&sim), Ok(()));
+    let c = content_of(&s, "Y");
+    assert_eq!(read_all(&mut s.begin().unwrap(), &c), Ok(y));
+}
+
 #[test]
 fn two_stagings_of_the_same_bytes_in_one_commit_keep_one_and_retire_the_other() {
     let len = CONTENT_CHUNK + 300;

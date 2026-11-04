@@ -1663,6 +1663,18 @@ impl Inner {
         lock(&self.pool).fenced = true;
     }
 
+    /// Test hook: total length of the retired extents stagings hold, and of those an uncertain
+    /// publication owns.
+    #[cfg(test)]
+    pub(crate) fn reserved_bytes_for_test(&self) -> (u64, u64) {
+        let pool = lock(&self.pool);
+        let sum = |rs: &[Reuse]| rs.iter().map(|r| r.record_len).sum::<u64>();
+        (
+            pool.held.values().map(|rs| sum(rs)).sum(),
+            pool.uncertain.values().map(|(_, _, rs)| sum(rs)).sum(),
+        )
+    }
+
     /// Test hook: why writes are fenced, if they are.
     #[cfg(test)]
     pub(crate) fn fence_reason(&self) -> Option<String> {
@@ -1685,10 +1697,15 @@ impl Inner {
     pub(crate) fn hold_for_uncertain(&self, attempt: &AttemptId, generation: u64, serials: &[u64]) {
         let mut pool = lock(&self.pool);
         pool.fenced = true;
+        // A serial may be listed more than once (a staging bound twice): its reservations are
+        // moved once and later listings add nothing, never replacing what was moved.
         for serial in serials {
             let held = pool.held.remove(serial).unwrap_or_default();
             pool.uncertain
-                .insert(*serial, (attempt.clone(), generation, held));
+                .entry(*serial)
+                .or_insert_with(|| (attempt.clone(), generation, Vec::new()))
+                .2
+                .extend(held);
         }
     }
 
