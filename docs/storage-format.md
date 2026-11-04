@@ -100,7 +100,7 @@ refused, and so are key plus value longer than 1800 bytes.
 - A relationship's outgoing and incoming index keys (`03`, `04`) hold its source, kind, target and
   id: 1 + Σ(length + zero bytes + 2). They fit while the four identifiers' lengths plus their zero
   bytes total at most 1791 bytes. Identifiers without zero bytes (at most 1020) always fit; only
-  identifiers with many zero bytes can exceed it (four all-zero identifiers reach 2036). Such a
+  identifiers with many zero bytes can exceed it (four all-zero 255-byte identifiers total 2040, a 2049-byte key). Such a
   relationship is refused before anything of its request is applied, with `InvalidRequest` naming
   the relationship, its key length and the key limit.
 - A context record's value holds its body, so the largest accepted body is 1800 bytes minus the key
