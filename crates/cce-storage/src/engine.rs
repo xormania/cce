@@ -174,6 +174,10 @@ pub(crate) struct Inner {
     /// takes any (tests forcing reader registration against that decision).
     #[cfg(test)]
     reuse_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once inside a relocation step, after its copy and before it publishes (tests that
+    /// commit in between).
+    #[cfg(test)]
+    relocate_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// View registrations currently waiting for a quiescent commit (tests of that interleaving).
     #[cfg(test)]
     waiting_registrations: std::sync::atomic::AtomicUsize,
@@ -203,6 +207,8 @@ pub(crate) struct Inner {
 
 /// Engine locks. `Recorded` keeps its mutex private to this module, so engine code can reach a
 /// recorded lock only through `lock()` (a bypass would not compile).
+mod maintain;
+
 mod locks {
     use std::sync::{Mutex, MutexGuard};
 
@@ -572,6 +578,8 @@ impl Inner {
             panic_next_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             reuse_hook: Mutex::new(None),
+            #[cfg(test)]
+            relocate_hook: Mutex::new(None),
             #[cfg(test)]
             waiting_registrations: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -1308,6 +1316,71 @@ impl Inner {
         };
         let retired_content = self.settle_content(&mut txn, &extents, content_refs, generation)?;
         let remainders = self.consume_reuse(&mut txn, &bound)?;
+        let (desc, discarded) = self.publish(&cur, txn, generation, pos, Some(&attempt))?;
+        lock(&self.conflicts).record(pos, written);
+        let mut st = lock(&self.state);
+        st.current = desc;
+        for (serial, _) in &bound {
+            st.staged.remove(serial);
+        }
+        drop(st);
+        // The published state's retired content, as this commit changed it: what it retired is
+        // reusable from the next generation on; what bound stagings held is consumed, apart from
+        // unused remainders.
+        let mut pool = lock(&self.pool);
+        for (serial, _) in &bound {
+            let held = pool.held.remove(serial).unwrap_or_default();
+            self.count_reused(&held);
+        }
+        for (offset, len) in retired_content {
+            pool.free.insert(offset, (len, generation));
+        }
+        for (offset, len, retired_at) in remainders {
+            pool.free.insert(offset, (len, retired_at));
+        }
+        for (offset, len) in &discarded {
+            pool.free.insert(*offset, (*len, generation));
+        }
+        pool.discarded.retain(|x| !discarded.contains(x));
+        drop(pool);
+        Ok(CommitReceipt {
+            attempt,
+            position: HistoryPosition(pos),
+        })
+    }
+
+    /// Publishes `txn` as generation `generation` at history position `pos`: retires the space of
+    /// discarded stagings, settles page retirement and reuse, writes the tree, and runs the data
+    /// and publication barriers. Returns the published record and the discarded extents it
+    /// retired; the caller makes the record current. `uncertain` names the attempt whose outcome a
+    /// failed publication barrier leaves unknown (none for maintenance).
+    fn publish(
+        &self,
+        cur: &Descriptor,
+        txn: TreeTxn<'_>,
+        generation: u64,
+        pos: u64,
+        uncertain: Option<&AttemptId>,
+    ) -> Result<Published, CommitError> {
+        self.publish_below(cur, txn, generation, pos, uncertain, None)?
+            .ok_or_else(|| {
+                rejected(StorageError::InvalidRequest(
+                    "an unrestricted publication found no pages to write".into(),
+                ))
+            })
+    }
+
+    /// [`Inner::publish`], but with `below` every tree page it writes must be a retired page
+    /// numbered below it: if there are too few, it writes and publishes nothing and returns `None`.
+    fn publish_below(
+        &self,
+        cur: &Descriptor,
+        mut txn: TreeTxn<'_>,
+        generation: u64,
+        pos: u64,
+        uncertain: Option<&AttemptId>,
+        below: Option<u64>,
+    ) -> Result<Option<Published>, CommitError> {
         // Discarded stagings' own space becomes retired with this commit.
         let discarded: Vec<(u64, u64)> = lock(&self.pool).discarded.clone();
         for (offset, len) in &discarded {
@@ -1329,8 +1402,11 @@ impl Inner {
                 hook();
             }
         }
-        let reuse = settle_allocation(&mut txn, self, &cur, generation, reusable_through)
+        let reuse = settle_allocation(&mut txn, self, cur, generation, reusable_through, below)
             .map_err(rejected)?;
+        if below.is_some() && reuse.len() < txn.dirty_pages() {
+            return Ok(None);
+        }
         let mut sink = PageWriter {
             inner: self,
             next_page: cur.next_page,
@@ -1385,40 +1461,12 @@ impl Inner {
             let why = format!("publication of generation {generation} uncertain: {e}");
             lock(&self.state).fenced = Some(Fence {
                 why: why.clone(),
-                uncertain: Some(attempt.clone()),
+                uncertain: uncertain.cloned(),
             });
             return Err(CommitError::Indeterminate(why));
         }
 
-        lock(&self.conflicts).record(pos, written);
-        let mut st = lock(&self.state);
-        st.current = desc;
-        for (serial, _) in &bound {
-            st.staged.remove(serial);
-        }
-        drop(st);
-        // The published state's retired content, as this commit changed it: what it retired is
-        // reusable from the next generation on; what bound stagings held is consumed, apart from
-        // unused remainders.
-        let mut pool = lock(&self.pool);
-        for (serial, _) in &bound {
-            pool.held.remove(serial);
-        }
-        for (offset, len) in retired_content {
-            pool.free.insert(offset, (len, generation));
-        }
-        for (offset, len, retired_at) in remainders {
-            pool.free.insert(offset, (len, retired_at));
-        }
-        for (offset, len) in &discarded {
-            pool.free.insert(*offset, (*len, generation));
-        }
-        pool.discarded.retain(|x| !discarded.contains(x));
-        drop(pool);
-        Ok(CommitReceipt {
-            attempt,
-            position: HistoryPosition(pos),
-        })
+        Ok(Some((desc, discarded)))
     }
 
     fn resolve_content(&self, cs: &ChangeSet) -> Result<Vec<(u64, BoundContent)>, CommitError> {
@@ -1568,31 +1616,34 @@ impl Inner {
         reusable_through: Option<u64>,
         taken: &mut Taken,
     ) -> Result<u64, StorageError> {
-        if let Some(bound) = reusable_through {
-            let mut pool = lock(&self.pool);
-            let best = pool
-                .free
-                .iter()
-                .filter(|(_, (len, retired_at))| *len >= need && *retired_at <= bound)
-                .min_by_key(|(offset, (len, _))| (*len, **offset))
-                .map(|(offset, (len, retired_at))| (*offset, *len, *retired_at));
-            if let Some((offset, record_len, retired_at)) = best {
-                pool.free.remove(&offset);
-                self.counters
-                    .content_bytes_reused
-                    .fetch_add(need, Ordering::Relaxed);
-                taken.taken.push(Reuse {
-                    offset,
-                    used: need,
-                    record_len,
-                    retired_at,
-                });
-                return Ok(offset);
-            }
+        if let Some(offset) =
+            reusable_through.and_then(|bound| self.take_retired(need, bound, taken))
+        {
+            return Ok(offset);
         }
         let offset = *at;
         *at = at.checked_add(need).ok_or_else(content_space_exhausted)?;
         Ok(offset)
+    }
+
+    /// Takes the smallest retired content extent of at least `need` bytes retired no later than
+    /// `bound` into `taken`, or `None` if there is none.
+    fn take_retired(&self, need: u64, bound: u64, taken: &mut Taken) -> Option<u64> {
+        let mut pool = lock(&self.pool);
+        let (offset, record_len, retired_at) = pool
+            .free
+            .iter()
+            .filter(|(_, (len, retired_at))| *len >= need && *retired_at <= bound)
+            .min_by_key(|(offset, (len, _))| (*len, **offset))
+            .map(|(offset, (len, retired_at))| (*offset, *len, *retired_at))?;
+        pool.free.remove(&offset);
+        taken.taken.push(Reuse {
+            offset,
+            used: need,
+            record_len,
+            retired_at,
+        });
+        Some(offset)
     }
 
     /// The newest retiring generation whose space may be overwritten by writes that become
@@ -1680,6 +1731,15 @@ impl Inner {
         let inst = d.u64().ok()?;
         let serial = d.u64().ok()?;
         (s == self.store.0 && inst == self.instance).then_some(serial)
+    }
+
+    /// Counts the retired space a publication consumed as reused (reservations returned to the pool
+    /// never count).
+    fn count_reused(&self, consumed: &[Reuse]) {
+        let bytes = consumed.iter().map(|r| r.used).sum::<u64>();
+        self.counters
+            .content_bytes_reused
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Total length of retired content extents no staging holds.
@@ -2056,6 +2116,9 @@ fn check_guard(d: &Descriptor, guard: Option<crate::ReceiptGuard>) -> Result<(),
 /// A retirement record taken from the committed tree: key, value and the retired page.
 type RetiredRecord = (Vec<u8>, Vec<u8>, u64);
 
+/// A published record and the discarded staging extents its publication retired.
+type Published = (Descriptor, Vec<(u64, u64)>);
+
 /// Upper bound on rounds of settling a commit's page allocation. Each round's edits touch pages
 /// already being rewritten (or split from them), so replaced pages and page demand stop changing
 /// within a few rounds; a commit that does not settle is rejected.
@@ -2063,15 +2126,17 @@ const ALLOCATION_ROUNDS: usize = 16;
 
 /// Records every committed page the transaction replaces as retired at `generation` and takes,
 /// for the pages the transaction will write, retired pages recorded no later than
-/// `reusable_through` (deleting their records). Recording, consuming and returning records all
-/// edit the tree, which can replace further pages and change how many pages it needs, so this
-/// repeats until a round changes nothing. Returns the pages to write first.
+/// `reusable_through` (deleting their records), and with `below` only pages numbered below it.
+/// Recording, consuming and returning records all edit the tree, which can replace further pages
+/// and change how many pages it needs, so this repeats until a round changes nothing. Returns the
+/// pages to write first.
 fn settle_allocation(
     txn: &mut TreeTxn,
     src: &dyn NodeSource,
     cur: &Descriptor,
     generation: u64,
     reusable_through: Option<u64>,
+    below: Option<u64>,
 ) -> Result<Vec<u64>, StorageError> {
     // Candidates in record order (oldest retirement first), from the committed tree.
     let mut candidates = match reusable_through {
@@ -2092,7 +2157,9 @@ fn settle_allocation(
                 Retired::Page {
                     generation, page, ..
                 } => {
-                    if reusable_through.is_some_and(|b| generation <= b) {
+                    if reusable_through.is_some_and(|b| generation <= b)
+                        && below.is_none_or(|b| page < b)
+                    {
                         return Ok(Some((k, v, page)));
                     }
                     generation
