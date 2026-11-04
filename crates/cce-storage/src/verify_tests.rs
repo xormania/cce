@@ -466,6 +466,34 @@ fn a_history_marker_naming_an_attempt_recorded_at_another_position_is_an_attempt
 }
 
 #[test]
+fn removing_history_whose_entry_records_another_position_is_refused_as_damage() {
+    // Uses this module's crafted publication: position 2's key names position 1's entry.
+    let sim = rich();
+    edit_tree(&sim, |t| {
+        let first = t.get(&history_key(1)).unwrap().unwrap();
+        t.put(history_key(2), first).unwrap();
+    });
+    let s = NativeStore {
+        inner: Inner::open(Box::new(sim.clone()), Options::default()).unwrap(),
+    };
+    let r = s.commit(
+        AttemptId::new(*b"forget").unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![Change::RemoveHistory {
+                position: cce_core::storage::HistoryPosition(2),
+            }],
+            ..ChangeSet::default()
+        },
+    );
+    assert!(
+        matches!(&r, Err(cce_core::storage::CommitError::Rejected(StorageError::Integrity(m)))
+            if m.contains("records position 1")),
+        "a removal must not trust a history key naming another position's entry: {r:?}"
+    );
+}
+
+#[test]
 fn a_position_both_retained_and_removed_is_a_history_finding() {
     let sim = rich();
     edit_tree(&sim, |t| {
