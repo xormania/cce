@@ -615,6 +615,14 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
     if version != REQUEST_ENCODING_V1 && d.u8()? > 1 {
         return Err(corrupt("history request removal mode"));
     }
+    // Version 3 is written only for a request that removes history.
+    if version == REQUEST_ENCODING_V3
+        && !changes
+            .iter()
+            .any(|c| matches!(c, Change::RemoveHistory { .. }))
+    {
+        return Err(corrupt("history request version 3 removes no history"));
+    }
     d.finish()?;
     Ok(HistoryEntry {
         position,
