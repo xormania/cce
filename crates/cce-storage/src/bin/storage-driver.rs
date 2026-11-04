@@ -43,7 +43,7 @@ use cce_core::storage::{
     RelationshipKind, RelationshipPosition, RelationshipQuery, Revision, StagedContent,
     StorageEngine,
 };
-use cce_storage::{NativeReadOnly, NativeStore, NativeView, StoreOptions};
+use cce_storage::{NativeReadOnly, NativeStore, StoreOptions};
 
 /// Deterministic store identity for a path: an explicit, reproducible input to `create`.
 fn store_id(dir: &str) -> [u8; 16] {
@@ -182,7 +182,7 @@ impl Driver {
     }
 
     /// A view from whichever handle is open, read-write or read-only.
-    fn begin(&self) -> Result<NativeView, String> {
+    fn begin(&self) -> Result<<NativeStore as StorageEngine>::View, String> {
         match (&self.store, &self.read_only) {
             (Some(s), _) => s.begin(),
             (None, Some(r)) => r.begin(),
