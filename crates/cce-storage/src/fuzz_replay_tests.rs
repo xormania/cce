@@ -244,48 +244,62 @@ fn seeds() -> BTreeMap<(&'static str, String), Vec<u8>> {
     add("image", "rich-store", image_of(&rich));
     add("image", "branching-store", image_of(&branching_store()));
 
+    for (name, run, ops) in ops_seed_sources() {
+        add("ops", name, ops_to_bytes(run, &ops));
+    }
+    out
+}
+
+/// The runs and sequences the `ops` seeds encode.
+fn ops_seed_sources() -> Vec<(&'static str, ByteRun, Vec<Op>)> {
     let merge_skip = merge_skip_sequence();
     let double = double_binding_sequence();
-    add(
-        "ops",
-        "merge-skip-regression",
-        ops_to_bytes(ByteRun::Complete, &merge_skip),
-    );
-    add(
-        "ops",
-        "double-binding-regression",
-        ops_to_bytes(ByteRun::Complete, &double),
-    );
-    add(
-        "ops",
-        "staging-lifecycle",
-        ops_to_bytes(ByteRun::Complete, &staging_lifecycle()),
-    );
-    add(
-        "ops",
-        "crash-in-merge-skip",
-        ops_to_bytes(ByteRun::Crash { cut: 37 }, &merge_skip),
-    );
-    let failure = ByteRun::Failure {
-        cut: 21,
-        lossy: false,
-        live: true,
-    };
-    add(
-        "ops",
-        "failure-in-merge-skip",
-        ops_to_bytes(failure, &merge_skip),
-    );
-    let after = ByteRun::AfterPublication {
-        pick: 0,
-        live: true,
-    };
-    add(
-        "ops",
-        "failure-after-publication",
-        ops_to_bytes(after, &double),
-    );
-    out
+    vec![
+        (
+            "merge-skip-regression",
+            ByteRun::Complete,
+            merge_skip.clone(),
+        ),
+        (
+            "double-binding-regression",
+            ByteRun::Complete,
+            double.clone(),
+        ),
+        ("staging-lifecycle", ByteRun::Complete, staging_lifecycle()),
+        (
+            "crash-in-merge-skip",
+            ByteRun::Crash { cut: 37 },
+            merge_skip.clone(),
+        ),
+        (
+            "failure-in-merge-skip",
+            ByteRun::Failure {
+                cut: 21,
+                lossy: false,
+                live: true,
+            },
+            merge_skip,
+        ),
+        (
+            "failure-after-publication",
+            ByteRun::AfterPublication {
+                pick: 0,
+                live: true,
+            },
+            double,
+        ),
+    ]
+}
+
+/// Each `ops` seed decodes to exactly the run and steps it was made from (an encoding that drops
+/// a step or a change would silently replay a different sequence).
+#[test]
+fn ops_seeds_decode_to_the_sequences_they_encode() {
+    for (name, run, ops) in ops_seed_sources() {
+        let (got_run, got) = ops_from_bytes(&ops_to_bytes(run, &ops));
+        assert_eq!(got_run, run, "{name}");
+        assert_eq!(format!("{got:?}"), format!("{ops:?}"), "{name}");
+    }
 }
 
 /// Stages, binds earlier stagings, holds and reads views, submits, retries, discards and

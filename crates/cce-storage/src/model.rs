@@ -2957,7 +2957,7 @@ impl ByteReader<'_> {
 
     fn request(&mut self) -> RequestSpec {
         RequestSpec {
-            changes: (0..1 + self.byte() as usize % 3)
+            changes: (0..1 + self.byte() as usize % MAX_CHANGES)
                 .map(|_| self.change())
                 .collect(),
             evidence: (0..self.byte() as usize % 3).map(|_| self.byte()).collect(),
@@ -3000,6 +3000,10 @@ impl ByteReader<'_> {
             .collect()
     }
 }
+
+/// Most changes in one request: the tree-reshaping generator's four puts or removals and one
+/// relationship change.
+const MAX_CHANGES: usize = 5;
 
 /// The sum of the step weights (the tag ranges in `ByteReader::op`).
 const OP_WEIGHTS: u8 = 36;
@@ -3141,8 +3145,8 @@ fn put_read(out: &mut Vec<u8>, r: &ReadSpec) {
 }
 
 fn put_request(out: &mut Vec<u8>, r: &RequestSpec) {
-    out.push(r.changes.len().clamp(1, 3) as u8 - 1);
-    for c in r.changes.iter().take(3) {
+    out.push(r.changes.len().clamp(1, MAX_CHANGES) as u8 - 1);
+    for c in r.changes.iter().take(MAX_CHANGES) {
         put_change(out, c);
     }
     out.push(r.evidence.len().min(2) as u8);
