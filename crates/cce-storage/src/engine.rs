@@ -1624,7 +1624,7 @@ impl Inner {
         taken: &mut Taken,
     ) -> Result<u64, StorageError> {
         if let Some(offset) =
-            reusable_through.and_then(|bound| self.take_retired(need, bound, taken))
+            reusable_through.and_then(|bound| self.take_retired(need, bound, None, taken))
         {
             return Ok(offset);
         }
@@ -1634,13 +1634,25 @@ impl Inner {
     }
 
     /// Takes the smallest retired content extent of at least `need` bytes retired no later than
-    /// `bound` into `taken`, or `None` if there is none.
-    fn take_retired(&self, need: u64, bound: u64, taken: &mut Taken) -> Option<u64> {
+    /// `bound` into `taken`, or `None` if there is none. With `below`, only an extent whose first
+    /// `need` bytes end at or before `below` qualifies, so what is written there lies entirely
+    /// below that offset (staging passes `None`).
+    fn take_retired(
+        &self,
+        need: u64,
+        bound: u64,
+        below: Option<u64>,
+        taken: &mut Taken,
+    ) -> Option<u64> {
         let mut pool = lock(&self.pool);
         let (offset, record_len, retired_at) = pool
             .free
             .iter()
-            .filter(|(_, (len, retired_at))| *len >= need && *retired_at <= bound)
+            .filter(|(offset, (len, retired_at))| {
+                *len >= need
+                    && *retired_at <= bound
+                    && below.is_none_or(|b| offset.checked_add(need).is_some_and(|end| end <= b))
+            })
             .min_by_key(|(offset, (len, _))| (*len, **offset))
             .map(|(offset, (len, retired_at))| (*offset, *len, *retired_at))?;
         pool.free.remove(&offset);
