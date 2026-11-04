@@ -44,7 +44,10 @@ fn occupied_paths_are_preserved_and_failure_evidence_is_retained() {
     assert_eq!(std::fs::read(existing.join("sentinel")).unwrap(), b"keep");
     let failed = root.join("failed-path");
     let result = std::panic::catch_unwind(|| {
-        let d = TestDir::in_root(&root, "unwind").unwrap();
+        // Retention on unwind is asked for explicitly, so the witness holds under any
+        // CCE_KEEP_FAILED_TEST_DIRS setting.
+        let mut d = TestDir::in_root(&root, "unwind").unwrap();
+        d.keep_on_unwind();
         std::fs::write(&failed, d.to_string_lossy().as_bytes()).unwrap();
         panic!("intentional resource witness");
     });

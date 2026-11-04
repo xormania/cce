@@ -34,6 +34,11 @@ impl TestDir {
     pub fn discard_on_unwind(&mut self) {
         self.keep_on_unwind = false;
     }
+
+    /// Keep the directory if this scope unwinds, whatever `CCE_KEEP_FAILED_TEST_DIRS` says.
+    pub fn keep_on_unwind(&mut self) {
+        self.keep_on_unwind = true;
+    }
 }
 
 /// Whether a directory is kept when its test unwinds: yes unless `CCE_KEEP_FAILED_TEST_DIRS=0`,
