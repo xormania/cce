@@ -210,6 +210,11 @@ class ExecutionTests(unittest.TestCase):
         self.api.responses["/pulls/9"]["base"]["sha"] = OLD
         self.assertNotIn("producer_definition_owner_accepted_rust", self.collect()[1])
 
+    def test_malformed_pull_response_is_recorded_as_unavailable(self):
+        self.change_rust()
+        self.api.responses["/pulls/9"] = ["not", "an", "object"]
+        self.assertIn("producer_acceptance_unavailable", self.collect()[1])
+
     def test_latest_review_is_ordered_by_time_not_list_position(self):
         self.change_rust()
         self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [

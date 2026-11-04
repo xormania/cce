@@ -70,6 +70,8 @@ def _owner_acceptance(api, source):
     owner = api.repository.split("/", 1)[0]
     for number in source.get("pulls", []):
         pull = api.api("/pulls/" + str(int(number)))
+        if not isinstance(pull, dict):
+            raise ValueError("producer_acceptance_unavailable")
         if (pull.get("state") != "open" or (pull.get("head") or {}).get("sha") != source["head_sha"]
                 or (pull.get("base") or {}).get("sha") != source["base_sha"]):
             continue
