@@ -233,6 +233,22 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
     }
 }
 
+/// The runner's own counts after a run: generated cases that passed, and cases it rejected
+/// (local and global rejects; the generator has no rejection path, so these are expected to be 0).
+/// `None` when the runner's summary cannot be read.
+fn case_counts(runner: &TestRunner) -> (Option<u64>, Option<u64>) {
+    let text = runner.to_string();
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|l| l.trim().strip_prefix(name)?.trim().parse::<u64>().ok())
+    };
+    let rejected = match (field("local rejects:"), field("global rejects:")) {
+        (Some(l), Some(g)) => Some(l + g),
+        _ => None,
+    };
+    (field("successes:"), rejected)
+}
+
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
@@ -276,6 +292,7 @@ fn run_profile<const FILES: bool>(backend: &str, profile: Profile, cases: u32, s
         },
     );
     let (sequences, ops) = *attempted.lock().unwrap();
+    let (accepted, rejected) = case_counts(&runner);
     let report = serde_json::json!({
         "backend": backend,
         "profile": match profile {
@@ -288,6 +305,8 @@ fn run_profile<const FILES: bool>(backend: &str, profile: Profile, cases: u32, s
         // Includes shrinking attempts when a case failed.
         "sequences_run": sequences,
         "attempted_operations": ops,
+        "accepted_cases": accepted,
+        "rejected_cases": rejected,
         "passed": result.is_ok(),
         "observed": STATS.with(|s| s.borrow().clone()),
     });
@@ -451,6 +470,7 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
         },
     );
     let [sequences, ops, cut_points, cuts, post_cuts] = *totals.lock().unwrap();
+    let (accepted, rejected) = case_counts(&runner);
     let observed = STATS.with(|s| s.borrow().clone());
     let report = serde_json::json!({
         "campaign": b.name,
@@ -470,6 +490,8 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
         "attempted_operations": ops,
         "cut_points_available": cut_points,
         "cuts_executed": cuts,
+        "accepted_cases": accepted,
+        "rejected_cases": rejected,
         "recovered_without_step": observed.get("recovered without the step").copied().unwrap_or(0),
         "recovered_with_step": observed.get("recovered with the step").copied().unwrap_or(0),
         "failures_after_publication": post_cuts,
