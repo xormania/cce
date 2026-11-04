@@ -255,6 +255,11 @@ impl CaseRuns {
     fn before_failure(&self) -> u64 {
         self.0.0.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Whether a case unwound.
+    fn panicked(&self) -> bool {
+        self.0.1.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 impl Drop for CaseRun {
@@ -268,10 +273,14 @@ impl Drop for CaseRun {
 /// What a run's report says about its cases. `accepted` and `rejected` come from the property
 /// runner's summary (new cases that passed; local and global rejects). `attempted` counts newly
 /// generated cases from the harness side: every case the harness ran before the first failure,
-/// minus the persisted failures the runner replayed first (loaded with the runner's own loader),
-/// plus the rejected ones, which never reach the harness. `failed` is 1 when a newly generated case
-/// failed. Shrinking steps are not cases. So `attempted == accepted + rejected + failed` on any
-/// run; a field is `None` when the runner's summary cannot be read.
+/// minus the persisted failures the runner replayed first, plus the rejected ones, which never
+/// reach the harness. `failed` is 1 when a newly generated case failed. Shrinking steps are not
+/// cases. So `attempted == accepted + rejected + failed` on any run; a field is `None` when the
+/// runner's summary cannot be read.
+///
+/// The count relies on two things, both checked: a failing case panics (one that returned an
+/// error instead would not stop the harness count, so shrink steps would count), and the result
+/// cache is the runner's no-op default (a cache hit would pass without running the harness).
 #[derive(Debug, PartialEq, Eq)]
 struct CaseCounts {
     attempted: Option<u64>,
@@ -281,7 +290,27 @@ struct CaseCounts {
     persisted_replayed: u64,
 }
 
-fn case_counts(runner: &TestRunner, config: &Config, runs: &CaseRuns, failed: bool) -> CaseCounts {
+/// Before a run: checks the counting assumptions for `config` and returns how many persisted
+/// failures the runner will replay first. It must run before the run, which saves a new
+/// failure's seed.
+fn counting_start(config: &Config) -> u64 {
+    let noop: fn() -> Box<dyn proptest::test_runner::ResultCache> =
+        proptest::test_runner::noop_result_cache;
+    assert!(
+        std::ptr::fn_addr_eq(config.result_cache, noop),
+        "case counting assumes the runner's no-op result cache"
+    );
+    config.failure_persistence.as_ref().map_or(0, |p| {
+        p.load_persisted_failures2(config.source_file).len() as u64
+    })
+}
+
+/// After a run whose `persisted` count `counting_start` returned.
+fn case_counts(runner: &TestRunner, persisted: u64, runs: &CaseRuns, failed: bool) -> CaseCounts {
+    assert!(
+        !failed || runs.panicked(),
+        "a case failed without panicking: the case count would include shrink steps"
+    );
     let text = runner.to_string();
     let field = |name: &str| {
         text.lines()
@@ -291,9 +320,6 @@ fn case_counts(runner: &TestRunner, config: &Config, runs: &CaseRuns, failed: bo
         (Some(l), Some(g)) => Some(l + g),
         _ => None,
     };
-    let persisted = config.failure_persistence.as_ref().map_or(0, |p| {
-        p.load_persisted_failures2(config.source_file).len() as u64
-    });
     let ran = runs.before_failure();
     let replayed = ran.min(persisted);
     let generated_failed = failed && ran > persisted;
@@ -339,6 +365,7 @@ fn run_profile<const FILES: bool>(backend: &str, profile: Profile, cases: u32, s
     let ran = CaseRuns::default();
     let runs = ran.clone();
     let case_config = config.clone();
+    let persisted = counting_start(&config);
     let result = runner.run(
         &ModelMachine::sequential_strategy(MIN_OPS..=MAX_OPS),
         move |(initial, transitions, seen)| {
@@ -354,7 +381,7 @@ fn run_profile<const FILES: bool>(backend: &str, profile: Profile, cases: u32, s
     );
     let (sequences, ops) = *attempted.lock().unwrap();
     let failed = matches!(result, Err(TestError::Fail(..)));
-    let counts = case_counts(&runner, &config, &ran, failed);
+    let counts = case_counts(&runner, persisted, &ran, failed);
     let report = serde_json::json!({
         "backend": backend,
         "profile": match profile {
@@ -496,6 +523,7 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
     let mut runner = TestRunner::new(config.clone());
     let ran = CaseRuns::default();
     let runs = ran.clone();
+    let persisted = counting_start(&config);
     let result = runner.run(
         &ModelMachine::sequential_strategy(b.ops.clone()),
         move |(_, transitions, _)| {
@@ -539,7 +567,7 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
     );
     let [sequences, ops, cut_points, cuts, post_cuts] = *totals.lock().unwrap();
     let failed = matches!(result, Err(TestError::Fail(..)));
-    let counts = case_counts(&runner, &config, &ran, failed);
+    let counts = case_counts(&runner, persisted, &ran, failed);
     let observed = STATS.with(|s| s.borrow().clone());
     let report = serde_json::json!({
         "campaign": b.name,
@@ -1415,18 +1443,15 @@ fn reported_case_counts_add_up_on_rejecting_failing_and_replaying_runs() {
         let mut runner = TestRunner::new(config.clone());
         let ran = CaseRuns::default();
         let runs = ran.clone();
+        let persisted = counting_start(&config);
         let result = runner.run(&even(), move |x| {
             let _case = runs.start();
             assert!(fail_at.is_none_or(|f| x < f), "planted failure at {x}");
             Ok(())
         });
         let failed = matches!(result, Err(TestError::Fail(..)));
-        let persisted = runner.config().failure_persistence.clone();
-        (
-            case_counts(&runner, &config, &ran, failed),
-            failed,
-            persisted,
-        )
+        let saved = runner.config().failure_persistence.clone();
+        (case_counts(&runner, persisted, &ran, failed), failed, saved)
     };
     let sums = |c: &CaseCounts| {
         c.attempted.expect("attempted")
@@ -1463,4 +1488,96 @@ fn reported_case_counts_add_up_on_rejecting_failing_and_replaying_runs() {
     assert!(!failed && c.persisted_replayed == 1, "{c:?}");
     assert_eq!(c.accepted, Some(40), "{c:?}");
     assert!(sums(&c), "replaying run: {c:?}");
+}
+
+/// With the file persistence the harness uses, a brand-new failure is a failed generated case,
+/// not a replay (the runner saves its seed during the run); on the next run it is a replay.
+#[test]
+fn a_new_failure_with_file_persistence_is_counted_as_failed_then_as_replayed() {
+    let dir = crate::test_support::resources::TestDir::new("cce-case-counts");
+    let file: &'static str = Box::leak(
+        dir.join("failures.txt")
+            .to_string_lossy()
+            .into_owned()
+            .into_boxed_str(),
+    );
+    let config = Config {
+        cases: 40,
+        rng_seed: RngSeed::Fixed(7),
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(file))),
+        source_file: Some(file!()),
+        ..Config::default()
+    };
+    let run = |fail_at: Option<u8>| {
+        let mut runner = TestRunner::new(config.clone());
+        let ran = CaseRuns::default();
+        let runs = ran.clone();
+        let persisted = counting_start(&config);
+        let result = runner.run(&(0u8..=255), move |x| {
+            let _case = runs.start();
+            assert!(fail_at.is_none_or(|f| x < f), "planted failure at {x}");
+            Ok(())
+        });
+        let failed = matches!(result, Err(TestError::Fail(..)));
+        (case_counts(&runner, persisted, &ran, failed), failed)
+    };
+    let (c, failed) = run(Some(100));
+    assert!(failed, "the planted failure did not fail the run");
+    assert_eq!(
+        (c.failed, c.persisted_replayed),
+        (1, 0),
+        "a new failure: {c:?}"
+    );
+    assert_eq!(
+        c.attempted,
+        Some(c.accepted.expect("accepted") + c.rejected.expect("rejected") + 1),
+        "{c:?}"
+    );
+    let (c, failed) = run(None);
+    assert!(!failed, "the saved failure fails again: {c:?}");
+    assert_eq!(
+        (c.failed, c.persisted_replayed, c.accepted),
+        (0, 1, Some(40)),
+        "{c:?}"
+    );
+    assert_eq!(
+        c.attempted,
+        Some(40 + c.rejected.expect("rejected")),
+        "{c:?}"
+    );
+}
+
+/// The counting refuses a run whose failing case returned an error instead of panicking.
+#[test]
+#[should_panic(expected = "a case failed without panicking")]
+fn case_counting_refuses_a_failure_that_did_not_panic() {
+    let config = Config {
+        cases: 8,
+        rng_seed: RngSeed::Fixed(7),
+        failure_persistence: None,
+        ..Config::default()
+    };
+    let mut runner = TestRunner::new(config.clone());
+    let ran = CaseRuns::default();
+    let runs = ran.clone();
+    let persisted = counting_start(&config);
+    let result = runner.run(&(0u8..=255), move |_| {
+        let _case = runs.start();
+        Err(proptest::test_runner::TestCaseError::fail(
+            "returned, not panicked",
+        ))
+    });
+    let failed = matches!(result, Err(TestError::Fail(..)));
+    let _ = case_counts(&runner, persisted, &ran, failed);
+}
+
+/// The counting refuses a runner configured with a result cache.
+#[test]
+#[should_panic(expected = "no-op result cache")]
+fn case_counting_refuses_a_result_cache() {
+    let config = Config {
+        result_cache: proptest::test_runner::basic_result_cache,
+        ..Config::default()
+    };
+    let _ = counting_start(&config);
 }
