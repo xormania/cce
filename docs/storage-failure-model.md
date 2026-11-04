@@ -295,6 +295,23 @@ space, which is proportional to the metadata (as for the integrity check).
   about what a commit writes; the content part copies up to the content budget of stream bytes,
   which is why it copies without the lock.
 
+What a step holds in memory, and what it reads:
+
+- Every step reads and writes at most one tree page or one content segment per operation, and in all
+  reads no more metadata than the file's tree pages once over.
+- `ReclaimContentHoles` reads no content but manifests. It scans the whole published state whatever
+  its budget, holding every extent in use (manifests, segments, history entries, retirement records,
+  stagings), so its memory grows with that count.
+- `RebuildRelationshipIndexes` reads no content. It holds every index key it removes and every entry
+  it writes, so its memory grows with the size of the indexes.
+- `Relocate` reads only the manifests and the content it moves. It holds the manifest of every
+  committed stream while it plans, and lists every tree page with one key below it for the page
+  part, so its memory grows with the number of streams and pages.
+
+The tests measure the per-operation bounds and the content read through the I/O the steps make;
+they do not see data a step keeps between operations, so the memory bounds above are stated, not
+measured.
+
 Every maintenance publication passes the same data barrier as a commit, so a crash at any point of a
 step, whether the process exits or power is lost, recovers either the state before the step or the
 state after it. A relocation that publishes both parts may also stop between them, with its content

@@ -405,7 +405,8 @@ impl Inner {
         };
         self.adopt(desc, &retired, &discarded);
         let mut pool = lock(&self.pool);
-        pool.held.remove(&serial);
+        let held = pool.held.remove(&serial).unwrap_or_default();
+        self.count_reused(&held);
         for (offset, len, retired_at) in remainders {
             pool.free.insert(offset, (len, retired_at));
         }

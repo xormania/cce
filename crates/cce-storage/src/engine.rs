@@ -1268,7 +1268,8 @@ impl Inner {
         // unused remainders.
         let mut pool = lock(&self.pool);
         for (serial, _) in &bound {
-            pool.held.remove(serial);
+            let held = pool.held.remove(serial).unwrap_or_default();
+            self.count_reused(&held);
         }
         for (offset, len) in retired_content {
             pool.free.insert(offset, (len, generation));
@@ -1575,9 +1576,6 @@ impl Inner {
             .min_by_key(|(offset, (len, _))| (*len, **offset))
             .map(|(offset, (len, retired_at))| (*offset, *len, *retired_at))?;
         pool.free.remove(&offset);
-        self.counters
-            .content_bytes_reused
-            .fetch_add(need, Ordering::Relaxed);
         taken.taken.push(Reuse {
             offset,
             used: need,
@@ -1672,6 +1670,15 @@ impl Inner {
         let inst = d.u64().ok()?;
         let serial = d.u64().ok()?;
         (s == self.store.0 && inst == self.instance).then_some(serial)
+    }
+
+    /// Counts the retired space a publication consumed as reused (reservations returned to the pool
+    /// never count).
+    fn count_reused(&self, consumed: &[Reuse]) {
+        let bytes = consumed.iter().map(|r| r.used).sum::<u64>();
+        self.counters
+            .content_bytes_reused
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Total length of retired content extents no staging holds.

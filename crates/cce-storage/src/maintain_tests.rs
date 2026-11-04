@@ -596,10 +596,12 @@ fn a_rebuild_causes_no_conflict_with_a_view_that_read_the_indexes() {
     .expect("a physical rebuild must not conflict with a logical read");
 }
 
-/// Records the largest single read and write of either file, to bound what a step holds.
+/// Records the largest single read and write of either file, to bound what a step holds, and per
+/// file the largest read and the bytes read in all.
 struct Sizes {
     sim: SimIo,
     largest: std::sync::Arc<std::sync::Mutex<(usize, usize)>>,
+    reads: std::sync::Arc<std::sync::Mutex<FileReads>>,
 }
 
 impl crate::io::Io for Sizes {
@@ -621,6 +623,11 @@ impl crate::io::Io for Sizes {
         let mut l = self.largest.lock().unwrap();
         l.0 = l.0.max(buf.len());
         drop(l);
+        let mut r = self.reads.lock().unwrap();
+        let f = &mut r[usize::from(file == crate::io::FileId::Content)];
+        f.0 = f.0.max(buf.len());
+        f.1 += buf.len() as u64;
+        drop(r);
         self.sim.read_at(file, offset, buf)
     }
     fn write_at(
@@ -710,6 +717,7 @@ fn relocation_moves_content_into_lower_retired_space_and_changes_no_record() {
             Box::new(Sizes {
                 sim: sim.clone(),
                 largest: largest.clone(),
+                reads: Default::default(),
             }),
             Options::default(),
         )
@@ -888,6 +896,49 @@ fn a_move_whose_content_was_committed_again_during_relocation_is_dropped() {
     assert_eq!(
         logical(&s).contexts["D"].2.as_deref(),
         Some(&bytes_of(2, 100_000)[..])
+    );
+}
+
+#[test]
+fn reuse_is_counted_only_for_space_a_publication_consumed() {
+    let sim = fragmented();
+    let s = open(&sim);
+    let start = s.stats().unwrap().content_bytes_reused;
+    let mut commits = 0;
+    let r = relocate_around(&s, || {
+        // B's content is replaced, so the copied move is dropped and its space returned.
+        let pre = s.stats().unwrap().content_bytes_reused;
+        let staged = s.stage_content(&mut &bytes_of(9, 20_000)[..]).unwrap();
+        commit(
+            &s,
+            "replace",
+            ChangeSet {
+                changes: vec![put("B", "B", Some(0))],
+                content: vec![ContentBinding::from(&staged)],
+                ..ChangeSet::default()
+            },
+        );
+        // What the replacing commit itself reused.
+        commits = s.stats().unwrap().content_bytes_reused - pre;
+    });
+    assert_eq!(r.content_bytes_moved, 0);
+    assert_eq!(
+        s.stats().unwrap().content_bytes_reused,
+        start + commits,
+        "a dropped move counted as reuse"
+    );
+    // A staging that takes retired space and is then discarded consumed nothing either.
+    let before = s.stats().unwrap();
+    let staged = s.stage_content(&mut &bytes_of(7, 10_000)[..]).unwrap();
+    assert!(
+        s.stats().unwrap().reusable_content_bytes < before.reusable_content_bytes,
+        "the staging took no retired space"
+    );
+    s.discard_staged(staged).unwrap();
+    assert_eq!(
+        s.stats().unwrap().content_bytes_reused,
+        before.content_bytes_reused,
+        "a discarded staging counted as reuse"
     );
 }
 
@@ -1378,4 +1429,78 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
     }
     // Every cut of every step, after a process exit and after six power losses.
     assert_eq!(checked, cases);
+}
+
+/// Per file (metadata, content): the largest single read and the bytes read in all.
+type FileReads = [(usize, u64); 2];
+
+/// What each maintenance step holds and reads, measured through the I/O it makes: no step reads
+/// or writes more than one tree page or one content segment at a time; hole reclaim reads no
+/// content but manifests, the index rebuild reads no content at all, relocation reads only the
+/// manifests and the content it moves; and no step reads more metadata than the file's tree pages
+/// once over. (The lists a step builds in memory, the rebuild's index keys and the reclaim's
+/// extents in use, grow with the metadata; the failure model states those bounds.)
+#[test]
+fn maintenance_steps_hold_one_page_or_segment_and_read_only_what_they_need() {
+    use crate::engine::CONTENT_CHUNK;
+    use crate::format::PAGE_SIZE;
+    use std::sync::{Arc, Mutex};
+    // The full-budget steps of the crash sweep.
+    for (name, image, task, _, partial) in SWEEPS {
+        if partial {
+            continue;
+        }
+        let sim = image();
+        let d = crate::audit::published(&sim).unwrap().pop().unwrap();
+        let reach = crate::audit::reach(&sim, &d).unwrap();
+        let manifests: u64 = reach.manifests.iter().map(|(_, l)| l).sum();
+        let largest = Arc::new(Mutex::new((0, 0)));
+        let reads: Arc<Mutex<FileReads>> = Arc::default();
+        let s = NativeStore {
+            inner: Inner::open(
+                Box::new(Sizes {
+                    sim: sim.clone(),
+                    largest: largest.clone(),
+                    reads: reads.clone(),
+                }),
+                Options::default(),
+            )
+            .unwrap(),
+        };
+        *largest.lock().unwrap() = (0, 0);
+        *reads.lock().unwrap() = FileReads::default();
+        let r = s.maintain(task, FULL).unwrap();
+        let (read, written) = *largest.lock().unwrap();
+        let [meta, content] = *reads.lock().unwrap();
+        assert!(
+            meta.1 <= d.next_page * PAGE_SIZE as u64,
+            "{name}: read {} metadata bytes of {} pages",
+            meta.1,
+            d.next_page
+        );
+        assert!(
+            meta.0 <= PAGE_SIZE,
+            "{name}: a metadata read of {} bytes",
+            meta.0
+        );
+        assert!(
+            read <= CONTENT_CHUNK && written <= CONTENT_CHUNK,
+            "{name}: held {read} / {written} bytes at once"
+        );
+        match task {
+            MaintenanceTask::ReclaimContentHoles => assert!(
+                content.1 <= manifests,
+                "{name}: read {} content bytes, the manifests are {manifests}",
+                content.1
+            ),
+            MaintenanceTask::RebuildRelationshipIndexes => {
+                assert_eq!(content.1, 0, "{name}: read content")
+            }
+            _ => assert!(
+                content.1 <= manifests + r.content_bytes_moved,
+                "{name}: read {} content bytes beyond the manifests and what it moved",
+                content.1
+            ),
+        }
+    }
 }

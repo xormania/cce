@@ -310,7 +310,9 @@ pub struct StoreStats {
     pub tree_height: usize,
     /// Tree pages written over retired pages instead of at new pages.
     pub pages_reused: u64,
-    /// Staged content bytes written into retired content extents instead of at the end.
+    /// Content bytes written into retired content extents instead of at the end, counted when a
+    /// publication consumes those extents (space a staging or relocation took and gave back again
+    /// does not count).
     pub content_bytes_reused: u64,
     /// Retired content bytes currently available for reuse (not held by a staging).
     pub reusable_content_bytes: u64,
