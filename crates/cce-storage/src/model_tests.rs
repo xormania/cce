@@ -1853,22 +1853,76 @@ fn branch_expect(m: &Model, req: &Request) -> (Expected, Vec<WriteKey>) {
     free.predict(req, None)
 }
 
-/// Feeds one live commit result to the model branches: an acknowledged commit must fit a branch
-/// (the others are dropped); a refused one changes nothing.
-fn live_result(allowed: &mut Allowed, req: &Request, got: &Result<CommitReceipt, CommitError>) {
+/// What the live store may answer after the failure, as established by its own reports: only a
+/// failure the store reported from a commit (a failed barrier or an uncertain publication) may
+/// fence later writes, and only the attempt it reported indeterminate may stay indeterminate.
+#[derive(Clone, Default)]
+struct Live {
+    fence_allowed: bool,
+    uncertain: Option<AttemptId>,
+}
+
+/// The logical kind of a refusal the model predicts; `None` for anything else (an integrity or
+/// I/O error, a fenced store, an indeterminate outcome).
+fn logical_kind(e: &CommitError) -> Option<ErrKind> {
+    match e {
+        CommitError::Conflict(_) => Some(ErrKind::Conflict),
+        CommitError::AttemptMismatch => Some(ErrKind::Mismatch),
+        CommitError::ReadersActive(_) => Some(ErrKind::ReadersActive),
+        CommitError::Rejected(StorageError::InvalidRequest(_)) => Some(ErrKind::Rejected),
+        _ => None,
+    }
+}
+
+fn is_fenced_refusal(e: &CommitError) -> bool {
+    matches!(e, CommitError::Rejected(StorageError::StoreState(m)) if m.starts_with("writes fenced"))
+}
+
+/// Whether a refusal fits a model branch that predicts `expected` (`committed`: the branch has
+/// the attempt committed already, so the store must answer from its record, fence or not).
+fn refusal_fits(
+    e: &CommitError,
+    expected: &Expected,
+    committed: bool,
+    req: &Request,
+    live: &Live,
+) -> bool {
+    match e {
+        CommitError::Indeterminate(_) => live.uncertain.as_ref() == Some(&req.attempt),
+        e if is_fenced_refusal(e) => live.fence_allowed && !committed,
+        e => match (logical_kind(e), expected) {
+            (Some(k), Expected::Failed(kinds)) => kinds.contains(&k),
+            _ => false,
+        },
+    }
+}
+
+/// Feeds one live commit result to the model branches: an acknowledged commit must fit a branch,
+/// and so must a refusal (a predicted refusal of its kind, or a fence the failure allows); the
+/// branches it does not fit are dropped. A refusal changes nothing.
+fn live_result(
+    allowed: &mut Allowed,
+    req: &Request,
+    got: &Result<CommitReceipt, CommitError>,
+    live: &Live,
+) {
     let fits = |m: &Model| -> Option<Model> {
         let (expected, written) = branch_expect(m, req);
+        let committed = m.committed.iter().any(|(c, _)| c.attempt == req.attempt);
         let mut m = m.clone();
         match (got, expected) {
             (Ok(r), Expected::Committed(p)) if r.position.0 == p => {
-                if !m.committed.iter().any(|(c, _)| c.attempt == req.attempt) {
+                if !committed {
                     m.apply_commit(req, written);
                 }
                 Some(m)
             }
             (Ok(_), _) => None,
-            (Err(_), _) => {
-                if !m.committed.iter().any(|(c, _)| c.attempt == req.attempt) {
+            (Err(e), expected) => {
+                if !refusal_fits(e, &expected, committed, req, live) {
+                    return None;
+                }
+                if !committed {
                     m.uncommitted.insert(req.attempt.clone());
                 }
                 Some(m)
@@ -1882,23 +1936,44 @@ fn live_result(allowed: &mut Allowed, req: &Request, got: &Result<CommitReceipt,
         .and_then(|(m, p)| fits(m).map(|m| (m, *p)));
     assert!(
         without.is_some() || with.is_some(),
-        "the store acknowledged {got:?} for {:?}, which fits no model state",
-        req.attempt
+        "the store answered {got:?} for {:?} after the failure, which fits no model state \
+         (fence allowed: {}, uncertain: {:?})",
+        req.attempt,
+        live.fence_allowed,
+        live.uncertain
     );
-    count(if got.is_ok() {
-        "acknowledged after the failure"
-    } else {
-        "refused after the failure"
+    count(match got {
+        Ok(_) => "acknowledged after the failure",
+        Err(e) if is_fenced_refusal(e) => "refused behind the fence after the failure",
+        Err(CommitError::Indeterminate(_)) => "indeterminate after the failure",
+        Err(_) => "refused as predicted after the failure",
     });
     allowed.without = without;
     allowed.with = with;
 }
 
 /// Replays `transitions` with operation `cut + 1` failing, keeps the process running for a few
-/// commits, and checks what it reported and what recovery finds.
-fn fail_at(transitions: &[Op], bounds: &[u64], cut: u64, lossy: bool, continue_live: bool) {
-    let Some(i) = bounds.iter().position(|b| *b > cut) else {
-        return;
+/// commits, and checks what it reported and what recovery finds. `post`: `cut` is where a
+/// committing step ends; that step runs to completion and the failing operation is a staging
+/// write right after its publication.
+fn fail_at(
+    transitions: &[Op],
+    bounds: &[u64],
+    cut: u64,
+    lossy: bool,
+    continue_live: bool,
+    post: bool,
+) {
+    let i = if post {
+        match bounds.iter().position(|b| *b >= cut) {
+            Some(i) if bounds[i] == cut => i,
+            _ => return,
+        }
+    } else {
+        match bounds.iter().position(|b| *b > cut) {
+            Some(i) => i,
+            None => return,
+        }
     };
     let mut e = Some(fresh_engine());
     let created = sim_of(e.as_ref().unwrap()).ops();
@@ -1910,9 +1985,39 @@ fn fail_at(transitions: &[Op], bounds: &[u64], cut: u64, lossy: bool, continue_l
     let before = replay_until(transitions, &shifted, i, &mut e);
     let mut e = e.unwrap();
     let after = ModelMachine::apply(before.clone(), &transitions[i]);
-    count(&format!("failure in: {}", op_name(&transitions[i])));
+    count(&format!(
+        "failure {}: {}",
+        if post { "after" } else { "in" },
+        op_name(&transitions[i])
+    ));
     let (request, got) = in_flight(&mut e, &after.action);
+    if post {
+        let staged = e
+            .store
+            .as_ref()
+            .map(|s| s.stage_content(&mut &b"staged after a publication"[..]));
+        match staged {
+            Some(Err(StorageError::Io(_))) => count("staging failed after a publication"),
+            other => panic!(
+                "the operation after step {i} was to fail: staging returned {:?}",
+                other.map(|r| r.map(|s| s.content))
+            ),
+        }
+    }
     let mut allowed = Allowed::around(&before, &after, request.clone());
+
+    // Only a failure the store reported from a commit may fence later writes.
+    let mut live = Live::default();
+    if let (Some(req), Some(Err(err))) = (&request, &got) {
+        match err {
+            CommitError::Indeterminate(_) => {
+                live.fence_allowed = true;
+                live.uncertain = Some(req.attempt.clone());
+            }
+            CommitError::Rejected(StorageError::Io(_)) => live.fence_allowed = true,
+            _ => {}
+        }
+    }
 
     // What the live store says about the failed attempt narrows the allowed states.
     if let (Some(req), Some(got), None) = (&request, &got, allowed.retry) {
@@ -1929,11 +2034,17 @@ fn fail_at(transitions: &[Op], bounds: &[u64], cut: u64, lossy: bool, continue_l
                 assert_eq!(r.position.0, *p, "receipt position");
                 allowed.without = None;
             }
+            Err(CommitError::Indeterminate(_)) => {}
             Err(err) => {
-                if !matches!(err, CommitError::Indeterminate(_)) {
-                    // A definitive refusal: nothing of the attempt may ever appear.
-                    allowed.with = None;
-                }
+                // A definitive refusal: the I/O error of the failure itself, or one the model
+                // predicts. Nothing of the attempt may ever appear.
+                let (expected, _) = branch_expect(&before, req);
+                assert!(
+                    matches!(err, CommitError::Rejected(StorageError::Io(_)))
+                        || refusal_fits(err, &expected, false, req, &Live::default()),
+                    "the failed step was refused with {err:?}; the model predicts {expected:?}"
+                );
+                allowed.with = None;
             }
         }
         match e.store().outcome(&req.attempt).expect("outcome") {
@@ -1961,8 +2072,16 @@ fn fail_at(transitions: &[Op], bounds: &[u64], cut: u64, lossy: bool, continue_l
     }
 
     if continue_live {
+        // The live commits are predicted without held views (`branch_expect`): release them.
+        e.held.clear();
         // Content staged before the failure is committed first: a failed barrier may have lost it.
-        if let (Some(handle), Some(bytes)) = (e.staged.pop(), before.staged.last()) {
+        // The handle is the one whose content is the model's last staged bytes.
+        let prestaged = before.staged.last().and_then(|bytes| {
+            let want = content_ref(bytes);
+            let k = e.staged.iter().position(|s| s.content == want)?;
+            Some((e.staged.remove(k), bytes.clone()))
+        });
+        if let Some((handle, bytes)) = prestaged {
             let probe = Request {
                 attempt: AttemptId::new(*b"after-failure-probe").unwrap(),
                 changes: vec![Change::PutContext {
@@ -1971,17 +2090,17 @@ fn fail_at(transitions: &[Op], bounds: &[u64], cut: u64, lossy: bool, continue_l
                     body: b"probe after an I/O failure".to_vec(),
                     content: Some(0),
                 }],
-                contents: vec![bytes.clone()],
+                contents: vec![bytes],
                 evidence: Vec::new(),
                 removal: RemovalMode::PreserveViews,
             };
             if let Some(got) = submit_tolerant(&mut e, None, &probe, Some(handle)) {
                 count("probe of content staged before the failure");
-                live_result(&mut allowed, &probe, &got);
+                live_result(&mut allowed, &probe, &got, &live);
             }
         }
         let mut m = after.clone();
-        let mut live = 0;
+        let mut steps = 0;
         for op in &transitions[i + 1..] {
             m = ModelMachine::apply(m, op);
             let req = match &m.action {
@@ -1989,10 +2108,10 @@ fn fail_at(transitions: &[Op], bounds: &[u64], cut: u64, lossy: bool, continue_l
                 _ => continue,
             };
             if let Some(got) = submit_tolerant(&mut e, None, &req, None) {
-                live_result(&mut allowed, &req, &got);
+                live_result(&mut allowed, &req, &got, &live);
             }
-            live += 1;
-            if live == LIVE_STEPS {
+            steps += 1;
+            if steps == LIVE_STEPS {
                 break;
             }
         }
@@ -2024,6 +2143,41 @@ struct CrashBudget {
     sampled: Option<u64>,
 }
 
+/// The operation spans `(start, end)` of the steps that commit (and of reopens, when
+/// `reopen`) and perform mutating I/O.
+fn step_spans(transitions: &[Op], bounds: &[u64], reopen: bool) -> Vec<(u64, u64)> {
+    transitions
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| match op {
+            Op::Commit(_) | Op::CommitFromHeld { .. } | Op::SubmitAndPoll(_) | Op::Retry { .. } => {
+                true
+            }
+            Op::Reopen => reopen,
+            _ => false,
+        })
+        .map(|(i, _)| (if i == 0 { 0 } else { bounds[i - 1] }, bounds[i]))
+        .filter(|(a, b)| b > a)
+        .collect()
+}
+
+/// Ends of committing steps after whose publication an operation fails: all of them, or `n / 2`
+/// spread over the sequence when sampling `n` cuts.
+fn publication_ends(transitions: &[Op], bounds: &[u64], sampled: Option<u64>) -> Vec<u64> {
+    let ends: Vec<u64> = step_spans(transitions, bounds, false)
+        .into_iter()
+        .map(|(_, b)| b)
+        .collect();
+    match sampled {
+        None => ends,
+        Some(n) => {
+            let k = (n / 2).max(1) as usize;
+            let stride = ends.len().div_ceil(k).max(1);
+            ends.into_iter().step_by(stride).collect()
+        }
+    }
+}
+
 /// Seeded cuts: half uniform over the sequence, half among the last three operations of a
 /// randomly chosen step that commits.
 fn sampled_cuts(transitions: &[Op], bounds: &[u64], n: u64, seed: u64) -> Vec<u64> {
@@ -2035,22 +2189,7 @@ fn sampled_cuts(transitions: &[Op], bounds: &[u64], n: u64, seed: u64) -> Vec<u6
         r ^= r << 17;
         r
     };
-    let tails: Vec<(u64, u64)> = transitions
-        .iter()
-        .enumerate()
-        .filter(|(_, op)| {
-            matches!(
-                op,
-                Op::Commit(_)
-                    | Op::CommitFromHeld { .. }
-                    | Op::SubmitAndPoll(_)
-                    | Op::Retry { .. }
-                    | Op::Reopen
-            )
-        })
-        .map(|(i, _)| (if i == 0 { 0 } else { bounds[i - 1] }, bounds[i]))
-        .filter(|(a, b)| b > a)
-        .collect();
+    let tails = step_spans(transitions, bounds, true);
     (0..n)
         .map(|k| {
             if k % 2 == 1 && !tails.is_empty() {
@@ -2074,7 +2213,7 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
         ..Config::default()
     };
     STATS.with(|s| s.borrow_mut().clear());
-    let totals = Arc::new(Mutex::new([0u64; 4]));
+    let totals = Arc::new(Mutex::new([0u64; 5]));
     let t = totals.clone();
     let sampled = b.sampled;
     let interruption = b.interruption;
@@ -2101,16 +2240,25 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
                     Interruption::Failure => {
                         for lossy in [false, true] {
                             for continue_live in [false, true] {
-                                fail_at(&transitions, &bounds, cut, lossy, continue_live);
+                                fail_at(&transitions, &bounds, cut, lossy, continue_live, false);
                             }
                         }
+                    }
+                }
+            }
+            if interruption == Interruption::Failure {
+                let ends = publication_ends(&transitions, &bounds, sampled);
+                t.lock().unwrap()[4] += ends.len() as u64;
+                for cut in ends {
+                    for continue_live in [false, true] {
+                        fail_at(&transitions, &bounds, cut, false, continue_live, true);
                     }
                 }
             }
             Ok(())
         },
     );
-    let [sequences, ops, cut_points, cuts] = *totals.lock().unwrap();
+    let [sequences, ops, cut_points, cuts, post_cuts] = *totals.lock().unwrap();
     let observed = STATS.with(|s| s.borrow().clone());
     let report = serde_json::json!({
         "campaign": b.name,
@@ -2123,7 +2271,7 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
         },
         "interruption": match b.interruption {
             Interruption::Crash => "crash: persist none, all, seeded 1, seeded 2; crash and failure during recovery; process exit then power loss",
-            Interruption::Failure => "one failed operation, sync failures lossy and not; stop or continue up to 6 commits; then process exit or persist none, all, seeded 1",
+            Interruption::Failure => "one failed operation, sync failures lossy and not, plus a failed staging write right after each (sampled) publication; stop or continue up to 6 commits; then process exit or persist none, all, seeded 1",
         },
         // Includes shrinking attempts when a case failed.
         "sequences_run": sequences,
@@ -2132,12 +2280,27 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
         "cuts_executed": cuts,
         "recovered_without_step": observed.get("recovered without the step").copied().unwrap_or(0),
         "recovered_with_step": observed.get("recovered with the step").copied().unwrap_or(0),
+        "failures_after_publication": post_cuts,
         "passed": result.is_ok(),
         "observed": observed,
     });
     println!("crash report: {report}");
     if let Err(e) = result {
         panic!("{e}");
+    }
+    if b.interruption == Interruption::Failure {
+        // The narrowing by an acknowledgement and by a committed live outcome must run, and a
+        // store that refuses everything after a failure must not pass.
+        for what in [
+            "failed step acknowledged",
+            "live outcome committed",
+            "acknowledged after the failure",
+        ] {
+            assert!(
+                observed.get(what).copied().unwrap_or(0) > 0,
+                "the failure campaign never observed \"{what}\""
+            );
+        }
     }
 }
 
