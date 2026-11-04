@@ -99,6 +99,18 @@ impl Node {
                     let k = d.raw(kl)?.to_vec();
                     let vl = d.u16()? as usize;
                     let v = d.raw(vl)?.to_vec();
+                    // The limits every write enforces; splitting a leaf relies on them.
+                    if kl > MAX_KEY {
+                        return Err(corrupt(format!(
+                            "leaf: key of {kl} bytes exceeds the {MAX_KEY}-byte key limit"
+                        )));
+                    }
+                    if kl + vl > MAX_ENTRY {
+                        return Err(corrupt(format!(
+                            "leaf: entry of {} bytes exceeds the {MAX_ENTRY}-byte entry limit",
+                            kl + vl
+                        )));
+                    }
                     if prev.as_ref().is_some_and(|p| *p >= k) {
                         return Err(corrupt("leaf: keys not strictly increasing"));
                     }
@@ -113,11 +125,19 @@ impl Node {
                 if n < 2 {
                     return Err(corrupt(format!("branch with {n} children")));
                 }
-                let mut seps: Vec<Vec<u8>> = Vec::with_capacity(n - 1);
-                let mut children = Vec::with_capacity(n);
+                let mut seps: Vec<Vec<u8>> =
+                    Vec::with_capacity(d.capacity_for(n, 16).saturating_sub(1));
+                let mut children = Vec::with_capacity(d.capacity_for(n, 16));
                 for i in 0..n {
                     if i > 0 {
                         let sl = d.u16()? as usize;
+                        // Separators are leaf keys; splitting a branch relies on the key limit.
+                        if sl > MAX_KEY {
+                            return Err(corrupt(format!(
+                                "branch: separator of {sl} bytes exceeds the {MAX_KEY}-byte key \
+                                 limit"
+                            )));
+                        }
                         let s = d.raw(sl)?.to_vec();
                         if seps.last().is_some_and(|p| *p >= s) {
                             return Err(corrupt("branch: separators not strictly increasing"));

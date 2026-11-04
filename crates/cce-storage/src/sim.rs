@@ -6,6 +6,9 @@
 //! pending writes, possibly torn at sector granularity, applied out of order where the policy says
 //! so. The engine under test is the production engine; only the I/O adapter differs.
 
+// Built for the `fuzz-api` feature as well, where only image construction and the adapter itself are
+// used; the crash and fault controls serve the tests.
+#![cfg_attr(not(test), allow(dead_code))]
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -119,6 +122,27 @@ fn xorshift(s: &mut u64) -> u64 {
 impl SimIo {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store directory holding exactly these file images, durable and unowned (fuzzing, and
+    /// replay of saved images).
+    pub fn from_images(meta: Vec<u8>, content: Vec<u8>) -> Self {
+        let sim = Self::new();
+        {
+            let mut st = sim.st.lock().expect("sim");
+            for (file, bytes) in [(FileId::Meta, meta), (FileId::Content, content)] {
+                st.files.insert(
+                    file,
+                    SimFile {
+                        durable: bytes.clone(),
+                        volatile: bytes,
+                        pending: Vec::new(),
+                    },
+                );
+                st.durable_entries.insert(file);
+            }
+        }
+        sim
     }
 
     /// Crash after `n` more mutating operations: operation n+1 and later fail and change nothing.

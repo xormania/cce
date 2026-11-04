@@ -18,8 +18,8 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
     ContentReader, ContentRef, ContextId, ContextRecord, Direction, HistoryEntry, HistoryPosition,
-    Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery, RemovalMode,
-    Revision, StagedContent, StagingToken, StorageError,
+    MAX_ID_LEN, Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery,
+    RemovalMode, Revision, StagedContent, StagingToken, StorageError,
 };
 use sha2::{Digest, Sha256};
 
@@ -62,14 +62,19 @@ pub(crate) struct Options {
     /// Largest length of any variable-length request field (record body, evidence label or bytes)
     /// and of any request list; bounded by the 32-bit length prefixes of the encoding.
     pub max_request_field: u64,
-    /// Largest encoded size of a whole request, which history stores as one length-prefixed field.
+    /// Largest encoded size of a whole request this open writes, which history stores as one
+    /// length-prefixed field. Reads are bounded by the format, not by this.
     pub max_request_len: u64,
+    /// Retained receipt information an open checks before touching the store.
+    pub guard: Option<crate::ReceiptGuard>,
 }
 
 /// Default number of recent commits whose write sets are kept for conflict validation.
 pub(crate) const DEFAULT_CONFLICT_WINDOW: usize = 4096;
 /// Default number of admitted commits that may wait for the commit worker.
 pub(crate) const DEFAULT_COMMIT_QUEUE: usize = 64;
+/// Default largest encoded request a store writes: 64 MiB, well below the format's `u32` limit.
+pub(crate) const DEFAULT_MAX_REQUEST_LEN: u64 = 64 << 20;
 
 impl Default for Options {
     fn default() -> Self {
@@ -79,7 +84,8 @@ impl Default for Options {
             commit_queue: DEFAULT_COMMIT_QUEUE,
             max_content_segments: DEFAULT_MAX_CONTENT_SEGMENTS,
             max_request_field: u32::MAX as u64,
-            max_request_len: u32::MAX as u64,
+            max_request_len: DEFAULT_MAX_REQUEST_LEN,
+            guard: None,
         }
     }
 }
@@ -536,6 +542,15 @@ impl NodeSource for Inner {
     }
 }
 
+/// Largest buffer held for a committed extent before its digest is verified. The same size as a
+/// content segment today, but a separate bound: it governs read buffering, not segment layout.
+const VERIFY_CHUNK: usize = 64 * 1024;
+
+/// Largest history entry the format can hold: its position, the length-prefixed attempt identifier
+/// and the length-prefixed encoded request. Reads are bounded by this, not by the open's options,
+/// which bound only what the open writes.
+pub(crate) const HISTORY_ENTRY_MAX: u64 = 8 + 4 + MAX_ID_LEN as u64 + 4 + u32::MAX as u64;
+
 impl Inner {
     pub fn create(
         io: Box<dyn Io>,
@@ -580,6 +595,7 @@ impl Inner {
     pub fn open(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
         io.open()?;
         let (desc, diagnostics) = read_publication(&*io)?;
+        check_guard(&desc, opts.guard)?;
         // The selected record and everything it references may still be only in the operating
         // system's cache (the previous owner exited before its barrier). Make them durable before
         // any receipt or new commit can rely on them.
@@ -602,6 +618,7 @@ impl Inner {
     pub fn open_read_only(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
         io.open_read_only()?;
         let (desc, diagnostics) = read_publication(&*io)?;
+        check_guard(&desc, opts.guard)?;
         let mut inner = Self::new(io, desc, diagnostics, opts);
         inner.read_only = true;
         inner
@@ -1133,6 +1150,18 @@ impl Inner {
         finish_pending(&self.pending, attempt);
     }
 
+    /// Both publication slots as stored now (inspection). Reads only.
+    pub(crate) fn publication_slots(&self) -> Result<Vec<Slot>, StorageError> {
+        (0..2u64)
+            .map(|s| {
+                let mut buf = vec![0; PAGE_SIZE];
+                self.io
+                    .read_at(FileId::Meta, s * PAGE_SIZE as u64, &mut buf)?;
+                Ok(decode_slot(&buf))
+            })
+            .collect()
+    }
+
     /// The current committed state without a pin (tests only: production reads go through
     /// `pin_current`, so nothing they can reach is reused under them).
     #[cfg(test)]
@@ -1216,7 +1245,20 @@ impl Inner {
         lock(&self.cache).capacity
     }
 
-    pub(crate) fn read_extent(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+    /// Reads and verifies a committed extent of at most `limit` bytes. The recorded length is
+    /// checked against `limit` and the committed content before anything is allocated or read.
+    pub(crate) fn read_extent(
+        &self,
+        x: &ExtentRef,
+        limit: u64,
+        what: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        if x.len > limit {
+            return Err(corrupt(format!(
+                "{what} of {} bytes exceeds the {limit} byte limit",
+                x.len
+            )));
+        }
         let committed = lock(&self.state).current.content_len;
         if x.offset
             .checked_add(x.len)
@@ -1228,13 +1270,32 @@ impl Inner {
             )));
         }
         let len = usize::try_from(x.len).map_err(|_| corrupt("extent too large"))?;
+        let mismatch = || corrupt(format!("content extent at {}: digest mismatch", x.offset));
+        // A recorded length can be damaged while still in bounds. Before holding more than one
+        // chunk, verify the extent's digest by streaming it through one reused chunk buffer;
+        // nothing read in this pass is kept or interpreted.
+        if len > VERIFY_CHUNK {
+            let mut chunk = vec![0; VERIFY_CHUNK];
+            let mut hash = Sha256::new();
+            let mut at = x.offset;
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(VERIFY_CHUNK);
+                self.io.read_at(FileId::Content, at, &mut chunk[..n])?;
+                hash.update(&chunk[..n]);
+                at += n as u64;
+                left -= n;
+            }
+            let got: [u8; 32] = hash.finalize().into();
+            if got != x.digest {
+                return Err(mismatch());
+            }
+        }
+        // The length is now authentic: hold the extent whole and check it again as decoded.
         let mut buf = vec![0; len];
         self.io.read_at(FileId::Content, x.offset, &mut buf)?;
         if sha256(&buf) != x.digest {
-            return Err(corrupt(format!(
-                "content extent at {}: digest mismatch",
-                x.offset
-            )));
+            return Err(mismatch());
         }
         Ok(buf)
     }
@@ -1933,7 +1994,19 @@ impl Inner {
                     if now == 0 {
                         t.put(ck, ContentEntry::Removed.encode())
                             .map_err(rejected)?;
-                        self.retire_content(t, &manifest, generation, &mut retired)?;
+                        // A committed manifest, named by the stored index: read it like any
+                        // reader does, bounded and verified before it is held whole.
+                        let m = Manifest::decode(
+                            &self
+                                .read_extent(
+                                    &manifest,
+                                    Manifest::encoded_len(u32::MAX as usize),
+                                    "content manifest",
+                                )
+                                .map_err(rejected)?,
+                        )
+                        .map_err(rejected)?;
+                        self.retire_content(t, &manifest, &m, generation, &mut retired)?;
                     } else {
                         live.push((manifest.offset, manifest.len));
                         if now as u64 != n {
@@ -1977,7 +2050,10 @@ impl Inner {
             }
         }
         for o in orphans {
-            self.retire_content(t, &o, generation, &mut retired)?;
+            // Staged by this instance in this commit, possibly beyond the committed length.
+            let m = Manifest::decode(&self.read_written_extent(&o).map_err(rejected)?)
+                .map_err(rejected)?;
+            self.retire_content(t, &o, &m, generation, &mut retired)?;
         }
         Ok((retired, live))
     }
@@ -1988,12 +2064,11 @@ impl Inner {
         &self,
         t: &mut TreeTxn,
         manifest: &ExtentRef,
+        m: &Manifest,
         generation: u64,
         retired: &mut Vec<(u64, u64)>,
     ) -> Result<(), CommitError> {
-        let m = Manifest::decode(&self.read_written_extent(manifest).map_err(rejected)?)
-            .map_err(rejected)?;
-        for x in std::iter::once(*manifest).chain(m.segments) {
+        for x in std::iter::once(*manifest).chain(m.segments.iter().copied()) {
             t.put(
                 retired_extent_key(generation, x.offset),
                 x.len.to_le_bytes().to_vec(),
@@ -2331,8 +2406,11 @@ impl Inner {
         let mut c = Cursor::new(&**self, d.root, &[P_CONTENT], None, d.next_page)?;
         while let Some((_, v)) = c.next_entry()? {
             if let ContentEntry::Live { manifest, .. } = ContentEntry::decode(&v)? {
+                let limit = Manifest::encoded_len(u32::MAX as usize);
                 r.live_content_bytes +=
-                    Manifest::decode(&self.read_extent(&manifest)?)?.content.len;
+                    Manifest::decode(&self.read_extent(&manifest, limit, "content manifest")?)?
+                        .content
+                        .len;
             }
         }
         let mut c = Cursor::new(&**self, d.root, &[P_HISTORY], None, d.next_page)?;
@@ -2527,7 +2605,8 @@ impl Inner {
         )?;
         Ok(cursor.map(move |entry| {
             let (_, v) = entry?;
-            decode_history(&self.read_extent(&ExtentRef::decode(&v)?)?)
+            let x = ExtentRef::decode(&v)?;
+            decode_history(&self.read_extent(&x, HISTORY_ENTRY_MAX, "history entry")?)
         }))
     }
 
@@ -2542,14 +2621,9 @@ impl Inner {
             ContentEntry::Live { manifest, .. } => manifest,
             ContentEntry::Removed => return Err(StorageError::ContentNotRetained),
         };
-        let limit = Manifest::encoded_len(self.max_segments);
-        if x.len > limit {
-            return Err(corrupt(format!(
-                "content manifest of {} bytes exceeds the {limit} byte limit",
-                x.len
-            )));
-        }
-        let m = Manifest::decode(&self.read_extent(&x)?)?;
+        // The format's maximum (a u32 segment count): the open's segment limit bounds staging only.
+        let limit = Manifest::encoded_len(u32::MAX as usize);
+        let m = Manifest::decode(&self.read_extent(&x, limit, "content manifest")?)?;
         if m.content != *c {
             return Err(corrupt(
                 "content manifest does not match the requested digest and length",
@@ -2712,6 +2786,28 @@ impl ConflictLog {
             }
         }
     }
+}
+
+/// Refuses an open whose selected record contradicts the caller's retained receipt information,
+/// before anything is synced or written: another store identity, or a published logical history
+/// position below the retained minimum. Generations are not compared: a store may publish
+/// generations that do not move the history position.
+fn check_guard(d: &Descriptor, guard: Option<crate::ReceiptGuard>) -> Result<(), StorageError> {
+    let Some(g) = guard else {
+        return Ok(());
+    };
+    if d.store.0 != g.store_id {
+        return Err(StorageError::GuardRefused(
+            "the store's identity differs from the guarded identity".into(),
+        ));
+    }
+    if d.history_pos < g.min_history_position.0 {
+        return Err(StorageError::GuardRefused(format!(
+            "published history position {} is below the guarded minimum {}",
+            d.history_pos, g.min_history_position.0
+        )));
+    }
+    Ok(())
 }
 
 /// A retirement record taken from the committed tree: key, value and the retired page.
