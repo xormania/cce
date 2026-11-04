@@ -168,6 +168,10 @@ pub(crate) struct Inner {
     /// takes any (tests forcing reader registration against that decision).
     #[cfg(test)]
     reuse_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once inside a relocation step, after its copy and before it publishes (tests that
+    /// commit in between).
+    #[cfg(test)]
+    relocate_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// View registrations currently waiting for a quiescent commit (tests of that interleaving).
     #[cfg(test)]
     waiting_registrations: std::sync::atomic::AtomicUsize,
@@ -557,6 +561,8 @@ impl Inner {
             panic_next_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             reuse_hook: Mutex::new(None),
+            #[cfg(test)]
+            relocate_hook: Mutex::new(None),
             #[cfg(test)]
             waiting_registrations: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -1526,31 +1532,37 @@ impl Inner {
         reusable_through: Option<u64>,
         taken: &mut Taken,
     ) -> Result<u64, StorageError> {
-        if let Some(bound) = reusable_through {
-            let mut pool = lock(&self.pool);
-            let best = pool
-                .free
-                .iter()
-                .filter(|(_, (len, retired_at))| *len >= need && *retired_at <= bound)
-                .min_by_key(|(offset, (len, _))| (*len, **offset))
-                .map(|(offset, (len, retired_at))| (*offset, *len, *retired_at));
-            if let Some((offset, record_len, retired_at)) = best {
-                pool.free.remove(&offset);
-                self.counters
-                    .content_bytes_reused
-                    .fetch_add(need, Ordering::Relaxed);
-                taken.taken.push(Reuse {
-                    offset,
-                    used: need,
-                    record_len,
-                    retired_at,
-                });
-                return Ok(offset);
-            }
+        if let Some(offset) =
+            reusable_through.and_then(|bound| self.take_retired(need, bound, taken))
+        {
+            return Ok(offset);
         }
         let offset = *at;
         *at = at.checked_add(need).ok_or_else(content_space_exhausted)?;
         Ok(offset)
+    }
+
+    /// Takes the smallest retired content extent of at least `need` bytes retired no later than
+    /// `bound` into `taken`, or `None` if there is none.
+    fn take_retired(&self, need: u64, bound: u64, taken: &mut Taken) -> Option<u64> {
+        let mut pool = lock(&self.pool);
+        let (offset, record_len, retired_at) = pool
+            .free
+            .iter()
+            .filter(|(_, (len, retired_at))| *len >= need && *retired_at <= bound)
+            .min_by_key(|(offset, (len, _))| (*len, **offset))
+            .map(|(offset, (len, retired_at))| (*offset, *len, *retired_at))?;
+        pool.free.remove(&offset);
+        self.counters
+            .content_bytes_reused
+            .fetch_add(need, Ordering::Relaxed);
+        taken.taken.push(Reuse {
+            offset,
+            used: need,
+            record_len,
+            retired_at,
+        });
+        Some(offset)
     }
 
     /// The newest retiring generation whose space may be overwritten by writes that become

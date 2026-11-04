@@ -4,7 +4,9 @@
 
 use cce_core::storage::{CommitError, StorageError};
 
-use super::{Inner, lock, rejected, sha256};
+use std::sync::{Arc, Mutex};
+
+use super::{ContentPool, Inner, Reuse, Taken, lock, rejected, sha256};
 use crate::codec::{corrupt, key_components};
 use crate::format::Descriptor;
 use crate::io::FileId;
@@ -17,11 +19,14 @@ use crate::{MaintenanceBudget, MaintenanceReport, MaintenanceTask};
 
 impl Inner {
     pub(crate) fn maintain(
-        &self,
+        self: &Arc<Self>,
         task: MaintenanceTask,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceReport, CommitError> {
         self.refuse_if_read_only("maintenance").map_err(rejected)?;
+        if task == MaintenanceTask::Relocate {
+            return self.relocate(budget);
+        }
         let _w = lock(&self.writer);
         let (cur, fence) = {
             let st = lock(&self.state);
@@ -190,6 +195,227 @@ impl Inner {
         })
     }
 
+    /// Moves committed content streams from the highest offsets into retired space below them.
+    ///
+    /// The plan and the copy run without the writer lock, on a pinned basis (so nothing they read
+    /// can be reused meanwhile), into destinations reserved in the pool as staging reserves them
+    /// (so no staging can take them). Publication then takes the writer lock and applies each move
+    /// to the newest state only if that content still has the manifest the move copied; any other
+    /// move is dropped and its reservations returned, leaving the copied bytes in retired space.
+    fn relocate(
+        self: &Arc<Self>,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceReport, CommitError> {
+        let (snap, _pin, ()) = self.pin_current_then(false, |_| ());
+        let basis = snap.desc;
+        let Some(bound) = self.reusable_through(basis.generation.saturating_add(1)) else {
+            return Ok(report(basis.generation, 0, true));
+        };
+        // Content streams by the end of their highest extent, highest first.
+        let mut candidates = Vec::new();
+        for entry in Cursor::new(&**self, basis.root, &[P_CONTENT], None, basis.next_page)
+            .map_err(rejected)?
+        {
+            let (k, v) = entry.map_err(rejected)?;
+            if let ContentEntry::Live { manifest, .. } =
+                ContentEntry::decode(&v).map_err(rejected)?
+            {
+                let m = Manifest::decode(&self.read_extent(&manifest).map_err(rejected)?)
+                    .map_err(rejected)?;
+                let end = m
+                    .segments
+                    .iter()
+                    .chain(std::iter::once(&manifest))
+                    .map(|x| x.offset + x.len)
+                    .max()
+                    .unwrap_or(0);
+                candidates.push((end, k, manifest, m));
+            }
+        }
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+
+        let mut taken = Taken {
+            pool: &self.pool,
+            taken: Vec::new(),
+        };
+        let mut moves = Vec::new();
+        let mut bytes = 0u64;
+        let mut complete = true;
+        for (_, key, old, m) in candidates {
+            let total = m.segments.iter().map(|s| s.len).sum::<u64>() + old.len;
+            if bytes + total > budget.max_content_bytes {
+                complete = false;
+                break;
+            }
+            let mark = taken.taken.len();
+            // Every piece must land below where it is now, or the move gains nothing.
+            let mut placed = Vec::new();
+            for s in m.segments.iter().chain(std::iter::once(&old)) {
+                match self.take_retired(s.len, bound, &mut taken) {
+                    Some(at) if at < s.offset => placed.push(at),
+                    _ => break,
+                }
+            }
+            if placed.len() != m.segments.len() + 1 {
+                give_back(&self.pool, &mut taken, mark);
+                continue;
+            }
+            // Copy one segment at a time, through the verified read.
+            let mut segments = Vec::with_capacity(m.segments.len());
+            for (s, &at) in m.segments.iter().zip(&placed) {
+                let data = self.read_extent(s).map_err(rejected)?;
+                self.io
+                    .write_at(FileId::Content, at, &data)
+                    .map_err(rejected)?;
+                segments.push(ExtentRef { offset: at, ..*s });
+            }
+            let encoded = Manifest {
+                content: m.content,
+                segments,
+            }
+            .encode();
+            let at = placed[placed.len() - 1];
+            self.io
+                .write_at(FileId::Content, at, &encoded)
+                .map_err(rejected)?;
+            let new = ExtentRef {
+                offset: at,
+                len: encoded.len() as u64,
+                digest: sha256(&encoded),
+            };
+            moves.push(Move {
+                key,
+                old,
+                old_segments: m.segments,
+                new,
+                takes: mark..taken.taken.len(),
+                bytes: total,
+            });
+            bytes += total;
+        }
+        #[cfg(test)]
+        {
+            let hook = lock(&self.relocate_hook).take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+
+        let _w = lock(&self.writer);
+        let (cur, fence) = {
+            let st = lock(&self.state);
+            (st.current, st.fenced.clone())
+        };
+        if let Some(f) = fence {
+            return Err(rejected(StorageError::StoreState(format!(
+                "writes fenced: {}",
+                f.why
+            ))));
+        }
+        let mut txn = TreeTxn::new(&**self, cur.root);
+        let mut applied = Vec::new();
+        let mut dropped = Vec::new();
+        for mv in moves {
+            let still = match txn.get(&mv.key).map_err(rejected)? {
+                Some(v) => match ContentEntry::decode(&v).map_err(rejected)? {
+                    ContentEntry::Live { manifest, refs } if manifest == mv.old => Some(refs),
+                    _ => None,
+                },
+                None => None,
+            };
+            match still {
+                Some(refs) => {
+                    txn.put(
+                        mv.key.clone(),
+                        ContentEntry::Live {
+                            manifest: mv.new,
+                            refs,
+                        }
+                        .encode(),
+                    )
+                    .map_err(rejected)?;
+                    applied.push(mv);
+                }
+                None => dropped.push(mv),
+            }
+        }
+        // Reservations of dropped moves go back to the pool; their copies stay in retired space.
+        for mv in dropped.iter().rev() {
+            for r in taken.taken.drain(mv.takes.clone()) {
+                lock(&self.pool)
+                    .free
+                    .insert(r.offset, (r.record_len, r.retired_at));
+            }
+        }
+        if applied.is_empty() {
+            return Ok(report(cur.generation, 0, complete && dropped.is_empty()));
+        }
+        let Some(generation) = cur.generation.checked_add(1) else {
+            return Err(rejected(StorageError::InvalidRequest(
+                "generation counter exhausted".into(),
+            )));
+        };
+        let mut retired = Vec::new();
+        for mv in &applied {
+            for x in mv.old_segments.iter().chain(std::iter::once(&mv.old)) {
+                txn.put(
+                    retired_extent_key(generation, x.offset),
+                    x.len.to_le_bytes().to_vec(),
+                )
+                .map_err(rejected)?;
+                retired.push((x.offset, x.len));
+            }
+        }
+        // The reservations become consumed space, exactly as a commit consumes a staging's.
+        let serial = {
+            let mut st = lock(&self.state);
+            let s = st.next_stage;
+            st.next_stage += 1;
+            s
+        };
+        let held: Vec<Reuse> = std::mem::take(&mut taken.taken);
+        lock(&self.pool).held.insert(serial, held);
+        let unbound = (
+            ExtentRef {
+                offset: 0,
+                len: 0,
+                digest: [0; 32],
+            },
+            cce_core::storage::ContentRef {
+                digest: cce_core::storage::ContentDigest([0; 32]),
+                len: 0,
+            },
+        );
+        let remainders = self.consume_reuse(&mut txn, &[(serial, unbound)]);
+        let published = remainders.and_then(|rem| {
+            self.publish(&cur, txn, generation, cur.history_pos, None)
+                .map(|p| (p, rem))
+        });
+        let ((desc, discarded), remainders) = match published {
+            Ok(p) => p,
+            Err(e) => {
+                // Nothing was published: the reservations return to the pool.
+                let mut pool = lock(&self.pool);
+                for r in pool.held.remove(&serial).unwrap_or_default() {
+                    pool.free.insert(r.offset, (r.record_len, r.retired_at));
+                }
+                return Err(e);
+            }
+        };
+        self.adopt(desc, &retired, &discarded);
+        let mut pool = lock(&self.pool);
+        pool.held.remove(&serial);
+        for (offset, len, retired_at) in remainders {
+            pool.free.insert(offset, (len, retired_at));
+        }
+        drop(pool);
+        let moved = applied.iter().map(|m| m.bytes).sum();
+        Ok(MaintenanceReport {
+            content_bytes_moved: moved,
+            ..report(generation, 0, complete && dropped.is_empty())
+        })
+    }
+
     /// Makes a maintenance generation current. `retired` content extents it recorded, and the
     /// discarded extents its publication retired, become reusable under the ordinary rule.
     fn adopt(&self, desc: Descriptor, retired: &[(u64, u64)], discarded: &[(u64, u64)]) {
@@ -200,6 +426,13 @@ impl Inner {
             pool.free.insert(offset, (len, generation));
         }
         pool.discarded.retain(|x| !discarded.contains(x));
+    }
+
+    /// Installs a callback run once by the next relocation step between its copy and its
+    /// publication.
+    #[cfg(test)]
+    pub(crate) fn set_relocate_hook_for_test(&self, hook: Option<Box<dyn FnOnce() + Send>>) {
+        *lock(&self.relocate_hook) = hook;
     }
 
     /// Publishes the current tree with `edit` applied, as a physical generation (tests that craft
@@ -217,6 +450,25 @@ impl Inner {
             self.publish(&cur, txn, cur.generation + 1, cur.history_pos, None)?;
         self.adopt(desc, &[], &discarded);
         Ok(())
+    }
+}
+
+/// One planned content move: from its old manifest and segments to a copy in reserved space.
+struct Move {
+    key: Vec<u8>,
+    old: ExtentRef,
+    old_segments: Vec<ExtentRef>,
+    new: ExtentRef,
+    /// Its reservations, as positions in the step's reservation list.
+    takes: std::ops::Range<usize>,
+    bytes: u64,
+}
+
+/// Returns reservations taken since `mark` to the pool.
+fn give_back(pool: &Mutex<ContentPool>, taken: &mut Taken, mark: usize) {
+    let mut pool = lock(pool);
+    for r in taken.taken.drain(mark..) {
+        pool.free.insert(r.offset, (r.record_len, r.retired_at));
     }
 }
 

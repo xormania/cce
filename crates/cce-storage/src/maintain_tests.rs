@@ -166,6 +166,7 @@ fn leaked(payload: usize, discard: bool) -> (SimIo, NativeStore, u64) {
 /// The published state's audit: reachable structures are disjoint, nothing is retired twice, and no
 /// retired extent overlaps a reachable one.
 fn audit(sim: &SimIo) {
+    crate::audit::check_retirement(sim).expect("retirement records");
     let d = crate::audit::published(sim).unwrap().pop().unwrap();
     let r = crate::audit::reach(sim, &d).expect("audit");
     assert!(r.disjoint(), "reachable extents overlap");
@@ -313,6 +314,86 @@ fn a_pending_staging_of_this_process_is_not_reclaimed() {
         },
     );
     assert_eq!(logical(&s).contexts["A"].2.as_deref(), Some(&pending[..]));
+    audit(&sim);
+}
+
+#[test]
+fn reclaiming_holes_never_touches_space_a_pinned_reader_still_reads() {
+    let (sim, s, leak) = leaked(100_000, false);
+    // A view and a content reader, mid-read, pin A's content X; replacing X retires its space.
+    let mut view = s.begin().unwrap();
+    let x = view.context(&cid("A")).unwrap().unwrap().content.unwrap();
+    let mut reader = view.content(&x).unwrap();
+    let mut head = vec![0; 1000];
+    reader.read_exact(&mut head).unwrap();
+    let pinned = {
+        let d = crate::audit::published(&sim).unwrap().pop().unwrap();
+        crate::audit::reach(&sim, &d).unwrap()
+    };
+    let staged = s.stage_content(&mut &[4u8; 10_000][..]).unwrap();
+    commit(
+        &s,
+        "replace-x",
+        ChangeSet {
+            changes: vec![put("A", "a3", Some(0))],
+            content: vec![ContentBinding::from(&staged)],
+            ..ChangeSet::default()
+        },
+    );
+    let r = s
+        .maintain(
+            MaintenanceTask::ReclaimContentHoles,
+            MaintenanceBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        r.content_bytes_reclaimed, leak,
+        "reclaimed more than the leak"
+    );
+    // What the step retired is disjoint from everything the pinned generation reaches.
+    let newest = crate::audit::published(&sim).unwrap().pop().unwrap();
+    let now = crate::audit::reach(&sim, &newest).unwrap();
+    let reached: Vec<(u64, u64)> = pinned
+        .manifests
+        .iter()
+        .chain(&pinned.content_segments)
+        .chain(&pinned.history_extents)
+        .copied()
+        .collect();
+    for (offset, (generation, len)) in &now.retired_extents {
+        if *generation == r.generation {
+            for (o, l) in &reached {
+                assert!(
+                    offset + len <= *o || o + l <= *offset,
+                    "reclaimed {offset}+{len} overlaps pinned {o}+{l}"
+                );
+            }
+        }
+    }
+    // Several commits that reuse space later; the pinned reader and view still read X exactly.
+    for i in 0..3u8 {
+        let staged = s.stage_content(&mut &vec![i; 40_000][..]).unwrap();
+        commit(
+            &s,
+            &format!("reuse-{i}"),
+            ChangeSet {
+                changes: vec![put("D", "d", Some(0))],
+                content: vec![ContentBinding::from(&staged)],
+                ..ChangeSet::default()
+            },
+        );
+    }
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest).unwrap();
+    let expected: Vec<u8> = (0..30_000u32).map(|i| (i % 239) as u8).collect();
+    assert_eq!(
+        [head, rest].concat(),
+        expected,
+        "the pinned reader read other bytes"
+    );
+    let mut again = Vec::new();
+    view.content(&x).unwrap().read_to_end(&mut again).unwrap();
+    assert_eq!(again, expected, "the pinned view read other bytes");
     audit(&sim);
 }
 
@@ -499,4 +580,299 @@ fn a_rebuild_causes_no_conflict_with_a_view_that_read_the_indexes() {
         },
     )
     .expect("a physical rebuild must not conflict with a logical read");
+}
+
+/// Records the largest single read and write of either file, to bound what a step holds.
+struct Sizes {
+    sim: SimIo,
+    largest: std::sync::Arc<std::sync::Mutex<(usize, usize)>>,
+}
+
+impl crate::io::Io for Sizes {
+    fn create(&self) -> Result<(), cce_core::storage::StorageError> {
+        self.sim.create()
+    }
+    fn open(&self) -> Result<(), cce_core::storage::StorageError> {
+        self.sim.open()
+    }
+    fn open_read_only(&self) -> Result<(), cce_core::storage::StorageError> {
+        self.sim.open_read_only()
+    }
+    fn read_at(
+        &self,
+        file: crate::io::FileId,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<(), cce_core::storage::StorageError> {
+        let mut l = self.largest.lock().unwrap();
+        l.0 = l.0.max(buf.len());
+        drop(l);
+        self.sim.read_at(file, offset, buf)
+    }
+    fn write_at(
+        &self,
+        file: crate::io::FileId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), cce_core::storage::StorageError> {
+        let mut l = self.largest.lock().unwrap();
+        l.1 = l.1.max(data.len());
+        drop(l);
+        self.sim.write_at(file, offset, data)
+    }
+    fn len(&self, file: crate::io::FileId) -> Result<u64, cce_core::storage::StorageError> {
+        self.sim.len(file)
+    }
+    fn sync(&self, file: crate::io::FileId) -> Result<(), cce_core::storage::StorageError> {
+        self.sim.sync(file)
+    }
+    fn sync_dir(&self) -> Result<(), cce_core::storage::StorageError> {
+        self.sim.sync_dir()
+    }
+}
+
+fn bytes_of(seed: u32, n: u32) -> Vec<u8> {
+    (0..n).map(|i| (i.wrapping_mul(31) ^ seed) as u8).collect()
+}
+
+/// A content of 100 000 bytes low in the file whose space is retired and reusable, and B's
+/// content of 100 000 bytes after it. Released.
+fn fragmented() -> SimIo {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    for (attempt, id, seed) in [("one", "A", 1), ("two", "B", 2)] {
+        let staged = s.stage_content(&mut &bytes_of(seed, 100_000)[..]).unwrap();
+        commit(
+            &s,
+            attempt,
+            ChangeSet {
+                changes: vec![put(id, id, Some(0))],
+                content: vec![ContentBinding::from(&staged)],
+                ..ChangeSet::default()
+            },
+        );
+    }
+    // A no longer binds content: its manifest and segments are retired; one more commit makes
+    // that space reusable.
+    commit(
+        &s,
+        "three",
+        ChangeSet {
+            changes: vec![put("A", "a", None)],
+            ..ChangeSet::default()
+        },
+    );
+    commit(
+        &s,
+        "four",
+        ChangeSet {
+            changes: vec![put("C", "c", None)],
+            ..ChangeSet::default()
+        },
+    );
+    drop(s);
+    sim.release();
+    sim
+}
+
+/// The end of the highest content stream extent (manifest or segment) the published state reaches.
+fn highest_content_end(sim: &SimIo) -> u64 {
+    let d = crate::audit::published(sim).unwrap().pop().unwrap();
+    let r = crate::audit::reach(sim, &d).unwrap();
+    r.manifests
+        .iter()
+        .chain(&r.content_segments)
+        .map(|(o, l)| o + l)
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn relocation_moves_content_into_lower_retired_space_and_changes_no_record() {
+    let sim = fragmented();
+    let largest = std::sync::Arc::new(std::sync::Mutex::new((0, 0)));
+    let s = NativeStore {
+        inner: Inner::open(
+            Box::new(Sizes {
+                sim: sim.clone(),
+                largest: largest.clone(),
+            }),
+            Options::default(),
+        )
+        .unwrap(),
+    };
+    let before = logical(&s);
+    let high = highest_content_end(&sim);
+    let history_pos = s.inner.snapshot().unwrap().desc.history_pos;
+    *largest.lock().unwrap() = (0, 0);
+    let r = s
+        .maintain(MaintenanceTask::Relocate, MaintenanceBudget::default())
+        .unwrap();
+    let (read, written) = *largest.lock().unwrap();
+    assert!(
+        read <= 64 * 1024 && written <= 64 * 1024,
+        "held {read} / {written} bytes at once"
+    );
+    assert_eq!(
+        r.content_bytes_moved,
+        100_000 + Manifest::encoded_len(2),
+        "B's segments and its new manifest"
+    );
+    assert!(highest_content_end(&sim) < high, "nothing moved down");
+    assert_eq!(logical(&s), before, "relocation changed logical state");
+    assert_eq!(s.inner.snapshot().unwrap().desc.history_pos, history_pos);
+    audit(&sim);
+    drop(s);
+    let s = open(&sim);
+    assert_eq!(logical(&s), before, "the move did not survive reopening");
+    assert_eq!(
+        logical(&s).contexts["B"].2.as_deref(),
+        Some(&bytes_of(2, 100_000)[..])
+    );
+}
+
+/// Runs `maintain(Relocate)` on another thread and `between` on this one once the copy is done
+/// and before the step publishes.
+fn relocate_around(s: &NativeStore, between: impl FnOnce()) -> crate::MaintenanceReport {
+    let (copied_tx, copied_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    s.inner.set_relocate_hook_for_test(Some(Box::new(move || {
+        copied_tx.send(()).unwrap();
+        go_rx.recv().unwrap();
+    })));
+    std::thread::scope(|t| {
+        let worker =
+            t.spawn(|| s.maintain(MaintenanceTask::Relocate, MaintenanceBudget::default()));
+        // A step that never reaches its publication must fail the test, not hang it.
+        if copied_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .is_err()
+        {
+            s.inner.set_relocate_hook_for_test(None);
+            let r = worker.join().unwrap();
+            panic!("relocation never reached its publication: {r:?}");
+        }
+        between();
+        go_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap()
+    })
+}
+
+#[test]
+fn a_commit_during_relocation_is_preserved_and_the_move_follows_it() {
+    let sim = fragmented();
+    let s = open(&sim);
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let r = relocate_around(&s, || {
+        commit(
+            &s,
+            "during",
+            ChangeSet {
+                changes: vec![put("D", "d", None)],
+                ..ChangeSet::default()
+            },
+        );
+        assert_eq!(
+            s.inner.snapshot().unwrap().desc.generation,
+            generation + 1,
+            "the injected commit published first"
+        );
+    });
+    assert_eq!(
+        r.generation,
+        generation + 2,
+        "relocation published after the commit"
+    );
+    assert_eq!(r.content_bytes_moved, 100_000 + Manifest::encoded_len(2));
+    let after = logical(&s);
+    assert_eq!(
+        after.contexts["D"].1, b"d",
+        "the commit made during relocation was lost"
+    );
+    assert_eq!(
+        after.history.len(),
+        5,
+        "history positions: four commits and the injected one"
+    );
+    assert_eq!(
+        after.contexts["B"].2.as_deref(),
+        Some(&bytes_of(2, 100_000)[..])
+    );
+    audit(&sim);
+}
+
+#[test]
+fn a_move_whose_source_changed_during_relocation_is_dropped() {
+    let sim = fragmented();
+    let s = open(&sim);
+    let r = relocate_around(&s, || {
+        // B's content is replaced: the copied bytes are no longer the current content.
+        let staged = s.stage_content(&mut &bytes_of(9, 20_000)[..]).unwrap();
+        commit(
+            &s,
+            "replace",
+            ChangeSet {
+                changes: vec![put("B", "B", Some(0))],
+                content: vec![ContentBinding::from(&staged)],
+                ..ChangeSet::default()
+            },
+        );
+    });
+    assert_eq!(r.content_bytes_moved, 0, "a stale move was published");
+    assert_eq!(
+        logical(&s).contexts["B"].2.as_deref(),
+        Some(&bytes_of(9, 20_000)[..])
+    );
+    audit(&sim);
+    drop(s);
+    let s = open(&sim);
+    audit(&sim);
+    assert_eq!(
+        logical(&s).contexts["B"].2.as_deref(),
+        Some(&bytes_of(9, 20_000)[..])
+    );
+}
+
+#[test]
+fn a_move_whose_content_was_committed_again_during_relocation_is_dropped() {
+    let sim = fragmented();
+    let s = open(&sim);
+    let r = relocate_around(&s, || {
+        // B gives up its content (now removed and retired), then E binds the same bytes again:
+        // the same content, indexed afresh with another manifest.
+        commit(
+            &s,
+            "release",
+            ChangeSet {
+                changes: vec![put("B", "B", None)],
+                ..ChangeSet::default()
+            },
+        );
+        let staged = s.stage_content(&mut &bytes_of(2, 100_000)[..]).unwrap();
+        commit(
+            &s,
+            "again",
+            ChangeSet {
+                changes: vec![put("D", "d", Some(0))],
+                content: vec![ContentBinding::from(&staged)],
+                ..ChangeSet::default()
+            },
+        );
+    });
+    assert_eq!(
+        r.content_bytes_moved, 0,
+        "a move of a superseded manifest was published"
+    );
+    assert_eq!(
+        logical(&s).contexts["D"].2.as_deref(),
+        Some(&bytes_of(2, 100_000)[..])
+    );
+    audit(&sim);
+    drop(s);
+    let s = open(&sim);
+    audit(&sim);
+    assert_eq!(
+        logical(&s).contexts["D"].2.as_deref(),
+        Some(&bytes_of(2, 100_000)[..])
+    );
 }

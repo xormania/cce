@@ -268,7 +268,9 @@ under the same writer lock, on the newest published state, and publishes its res
 physical generation. It writes no logical record, adds no history entry (the history position does
 not move) and records nothing a view's reads could conflict with. Opening a store never runs
 maintenance and never repairs anything; read-only handles refuse it. A step that finds nothing to do
-publishes nothing.
+publishes nothing. The budget bounds what one step moves or retires and so the size of what it
+publishes; finding that work reads the published state's index of content, history and retired
+space, which is proportional to the metadata (as for the integrity check).
 
 - `ReclaimContentHoles` retires content-file space below the committed length that no published
   structure reaches, no retirement record covers, and no staging of this process holds or has
@@ -277,6 +279,14 @@ publishes nothing.
   each relationship record again, in one publication; the old index is not consulted. It runs only
   when asked, for example after an integrity check reports index findings. Its memory grows with the
   size of the indexes.
+- `Relocate` moves committed content streams, highest first, into retired space below them: each
+  segment and a new manifest are copied, one segment at a time, into retired extents eligible for
+  reuse, and the old manifest and segments are retired. The copy runs without the writer lock, on a
+  pinned generation (so nothing it reads can be reused meanwhile), into extents reserved as
+  staging reserves them (so no staging can take them). Publication then takes the writer lock and
+  applies a move to the newest state only if that content still has the manifest the move copied;
+  any other move is dropped, its reserved extents return to the pool, and its copied bytes remain
+  in retired space. Commits made during the copy are therefore never overwritten.
 
 ## Not implemented yet
 
