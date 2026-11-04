@@ -3579,44 +3579,20 @@ fn a_failed_publication_with_a_staging_across_it_recovers_on_the_selected_public
         e.store().discard_staged(y_again).is_err(),
         "a staging bound by an uncertain publication was discarded"
     );
-    let y_ranges: Vec<(u64, u64)> = y.ranges().collect();
     e.staged.push(y);
     e.staged.push(z);
     ownership_check(&e, "a failed publication");
-    // Fenced: a new staging takes nothing from the reuse pool (no retired extent, nothing the
-    // uncertain commit owns).
+    // Fenced: a new staging is refused at entry (and so takes nothing from the reuse pool,
+    // nothing the uncertain commit owns).
     let wb = bytes_of(11, 2000);
-    let tap = e.tap().expect("tap").clone();
-    tap.writes.lock().unwrap().clear();
-    // Fencing stops reuse, not staging: the staging is made from fresh space.
-    let staged = e.store().stage_content(&mut &wb[..]);
-    assert!(
-        staged.is_ok(),
-        "staging after the fence: {:?}",
-        staged.as_ref().err()
-    );
-    if let Ok(handle) = staged {
-        let owns = std::mem::take(&mut *tap.writes.lock().unwrap());
-        let w = Staged {
-            handle,
-            owns,
-            rejected: 0,
-        };
-        let (_, r) = traverse(sim_of(&e), "staging after the fence");
-        for a in w.ranges() {
-            assert!(
-                !r.retired_extents
-                    .iter()
-                    .any(|(o, (_, l))| overlaps(a, (*o, *l))),
-                "a staging after the fence took reusable space {a:?}"
-            );
-            assert!(
-                !y_ranges.iter().any(|b| overlaps(a, *b)),
-                "a staging after the fence took the uncertain commit's space {a:?}"
-            );
+    match e.store().stage_content(&mut &wb[..]) {
+        Err(StorageError::StoreState(m)) if m.contains("fenced") => {
+            count("staging refused while fenced")
         }
-        count("staging after the fence");
-        e.staged.push(w);
+        other => panic!(
+            "staging after an uncertain publication: {:?}",
+            other.map(|h| h.content)
+        ),
     }
     ownership_check(&e, "staging after a failed publication");
     let prior: Vec<(u64, u64)> = e.staged.iter().flat_map(Staged::ranges).collect();
