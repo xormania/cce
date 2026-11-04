@@ -322,6 +322,14 @@ struct ContentPool {
     /// Extents of discarded stagings that no retirement record covers yet; the next commit
     /// retires them.
     discarded: Vec<(u64, u64)>,
+    /// Reservations of stagings bound by a commit whose publication is uncertain, by staging
+    /// serial, with that commit's attempt and generation. The publication may be durable and
+    /// have consumed them, so they stay owned by it until reopen decides: they are neither
+    /// offered for reuse nor freed by a discard.
+    uncertain: HashMap<u64, (AttemptId, u64, Vec<Reuse>)>,
+    /// Writes are fenced: staging takes nothing more from the pool. Set under the pool lock
+    /// together with any change of ownership the fence implies.
+    fenced: bool,
 }
 
 /// Extents one staging call took from the pool; returned to it unless the staging completes.
@@ -728,10 +736,12 @@ impl Inner {
                         // publication: its outcome is unknown, and writes stay fenced until
                         // reopen. Queued jobs keep being answered (refused behind the fence).
                         let why = format!("commit of attempt {attempt:?} failed unexpectedly");
-                        lock(&inner.state).fenced = Some(Fence {
+                        let generation = lock(&inner.state).current.generation.saturating_add(1);
+                        inner.fence(Fence {
                             why: why.clone(),
                             uncertain: Some(attempt.clone()),
                         });
+                        inner.hold_for_uncertain(&attempt, generation, &staged);
                         Err(CommitError::Indeterminate(why))
                     });
                     inner.release_admitted(&staged);
@@ -1303,7 +1313,7 @@ impl Inner {
         {
             // Nothing is published, but a failed barrier may have dropped written bytes that
             // staged content or later commits would reference: fence writes until reopen.
-            lock(&self.state).fenced = Some(Fence {
+            self.fence(Fence {
                 why: format!("data barrier failed: {e}"),
                 uncertain: None,
             });
@@ -1329,10 +1339,12 @@ impl Inner {
         if let Err(e) = published {
             // The record may or may not be durable: fence writes until reconciled.
             let why = format!("publication of generation {generation} uncertain: {e}");
-            lock(&self.state).fenced = Some(Fence {
+            self.fence(Fence {
                 why: why.clone(),
                 uncertain: Some(attempt.clone()),
             });
+            let serials: Vec<u64> = bound.iter().map(|(serial, _)| *serial).collect();
+            self.hold_for_uncertain(&attempt, generation, &serials);
             return Err(CommitError::Indeterminate(why));
         }
 
@@ -1516,6 +1528,13 @@ impl Inner {
     ) -> Result<u64, StorageError> {
         if let Some(bound) = reusable_through {
             let mut pool = lock(&self.pool);
+            // Re-checked at every take, under the lock a fence's change of ownership is made
+            // under: a staging that passed its entry check takes nothing once writes are fenced.
+            if pool.fenced {
+                return Err(StorageError::StoreState(
+                    "writes fenced while staging".into(),
+                ));
+            }
             let best = pool
                 .free
                 .iter()
@@ -1593,6 +1612,13 @@ impl Inner {
                     .into(),
             ));
         }
+        if pool.uncertain.contains_key(&serial) {
+            return Err(StorageError::StoreState(
+                "staged content is bound by a commit whose publication is uncertain; reopen the \
+                 store to resolve it"
+                    .into(),
+            ));
+        }
         st.staged.remove(&serial);
         let held = pool.held.remove(&serial).unwrap_or_default();
         for r in &held {
@@ -1604,6 +1630,36 @@ impl Inner {
                 .filter(|(offset, _)| !held.iter().any(|r| r.offset == *offset)),
         );
         Ok(())
+    }
+
+    /// Fences writes until reopen. The pool learns of it under its own lock, so no staging
+    /// takes reusable space afterwards.
+    fn fence(&self, fence: Fence) {
+        lock(&self.state).fenced = Some(fence);
+        lock(&self.pool).fenced = true;
+    }
+
+    /// Test hook: fences writes as a failed publication would, without one.
+    #[cfg(test)]
+    pub(crate) fn fence_for_test(&self, why: &str) {
+        self.fence(Fence {
+            why: why.into(),
+            uncertain: None,
+        });
+    }
+
+    /// The publication of `attempt` as generation `generation` is uncertain: it may be durable
+    /// and have consumed the reservations of the stagings it binds (`serials`). Those stay owned
+    /// by it, out of reach of reuse and discard, until reopen rebuilds the pool from the
+    /// publication that won. A hook for any publication that can become uncertain.
+    pub(crate) fn hold_for_uncertain(&self, attempt: &AttemptId, generation: u64, serials: &[u64]) {
+        let mut pool = lock(&self.pool);
+        pool.fenced = true;
+        for serial in serials {
+            let held = pool.held.remove(serial).unwrap_or_default();
+            pool.uncertain
+                .insert(*serial, (attempt.clone(), generation, held));
+        }
     }
 
     /// Marks the stagings of a resolved job as no longer admitted.

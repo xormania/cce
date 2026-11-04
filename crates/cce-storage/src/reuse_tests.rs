@@ -1920,6 +1920,155 @@ fn a_staging_bound_twice_in_a_refused_commit_can_still_be_discarded() {
     assert_eq!(s.discard_staged(staged), Ok(()));
 }
 
+/// A store whose next staging of `len` bytes reuses retired space: content committed, removed
+/// and two generations further on.
+fn with_retired_space(sim: &SimIo, len: usize) -> NativeStore {
+    let s = sim_create(sim);
+    committed_then_removed(&s, sim, "X", &payload(1, len));
+    put_body(&s, "advance-2", "advance", "2");
+    s
+}
+
+/// Commits `staged` as record `Y`.
+fn commit_y(s: &NativeStore, staged: &cce_core::storage::StagedContent) -> Result<(), CommitError> {
+    s.commit(
+        AttemptId::new(*b"y").unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![Change::PutContext {
+                id: cid("Y"),
+                expect: Precondition::Any,
+                body: b"Y".to_vec(),
+                content: Some(0),
+            }],
+            content: vec![ContentBinding::from(staged)],
+            ..ChangeSet::default()
+        },
+    )
+    .map(|_| ())
+}
+
+/// A commit whose publication record may or may not be durable keeps the reused space its
+/// staging holds: discarding that staging is refused and the space is not offered for reuse,
+/// whichever publication the store reopens with.
+#[test]
+fn an_uncertain_publication_keeps_the_reused_space_of_its_staging() {
+    let len = CONTENT_CHUNK + 300;
+    let y = payload(2, len);
+
+    // Probe: the operations a reusing commit of Y takes; its last one is the record's sync.
+    let probe = SimIo::new();
+    let p = with_retired_space(&probe, len);
+    let sp = p.stage_content(&mut &y[..]).unwrap();
+    let before = probe.ops();
+    assert_eq!(commit_y(&p, &sp), Ok(()));
+    let per_commit = probe.ops() - before;
+
+    let sim = SimIo::new();
+    let s = with_retired_space(&sim, len);
+    let free_before = s.inner.reusable_content_bytes();
+    let sy = s.stage_content(&mut &y[..]).unwrap();
+    let held = staged_extents(&s, &sy);
+    assert!(
+        s.inner.reusable_content_bytes() < free_before,
+        "the staging did not reuse retired space"
+    );
+    let free_staged = s.inner.reusable_content_bytes();
+    sim.fail_nth_op(per_commit);
+    let r = commit_y(&s, &sy);
+    assert!(
+        matches!(r, Err(CommitError::Indeterminate(_))),
+        "the publication did not become uncertain: {r:?}"
+    );
+
+    let d = s.discard_staged(sy);
+    assert!(
+        d.is_err(),
+        "discarding a staging an uncertain publication may have consumed was accepted"
+    );
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free_staged,
+        "the uncertain publication's reused space was offered for reuse"
+    );
+    drop(s);
+
+    // Whichever record survives, the reopened store is consistent and Y, if committed, reads
+    // back exactly.
+    for (what, img) in [
+        ("record durable", sim.after_process_exit()),
+        ("record lost", sim.after_crash(crate::sim::Persist::None)),
+    ] {
+        let rec = NativeStore {
+            inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
+        };
+        assert_eq!(crate::audit::check_retirement(&img), Ok(()), "{what}");
+        let y_record = rec.begin().unwrap().context(&cid("Y")).unwrap();
+        if let Some(r) = y_record {
+            let c = r.content.expect("Y has content");
+            assert_eq!(
+                read_all(&mut rec.begin().unwrap(), &c),
+                Ok(y.clone()),
+                "{what}"
+            );
+            assert!(
+                overlaps(&content_extents(&reach(&img, &desc(&rec)).unwrap()), &held),
+                "{what}: Y is not in the space its staging reused"
+            );
+        }
+    }
+}
+
+/// A staging that passed its entry check while writes were not fenced takes no reusable space
+/// once they are: the fence is re-checked at every take.
+#[test]
+fn a_staging_takes_no_reusable_space_once_writes_are_fenced() {
+    let len = CONTENT_CHUNK + 300;
+    let sim = SimIo::new();
+    let s = with_retired_space(&sim, len);
+    let free_before = s.inner.reusable_content_bytes();
+    assert!(free_before > 0, "no retired space to reuse");
+
+    /// Yields the first segment, then fences the store before yielding the rest.
+    struct FenceAfterFirst<'a> {
+        bytes: &'a [u8],
+        at: usize,
+        s: &'a NativeStore,
+    }
+    impl Read for FenceAfterFirst<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.at == CONTENT_CHUNK {
+                self.s.inner.fence_for_test("fenced while a staging runs");
+            }
+            let end = self
+                .bytes
+                .len()
+                .min(self.at + out.len())
+                .min(if self.at < CONTENT_CHUNK {
+                    CONTENT_CHUNK
+                } else {
+                    usize::MAX
+                });
+            let n = end - self.at;
+            out[..n].copy_from_slice(&self.bytes[self.at..end]);
+            self.at = end;
+            Ok(n)
+        }
+    }
+    let y = payload(3, 3 * CONTENT_CHUNK);
+    let r = s.stage_content(&mut FenceAfterFirst {
+        bytes: &y,
+        at: 0,
+        s: &s,
+    });
+    assert!(r.is_err(), "the staging completed after writes were fenced");
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free_before,
+        "the fenced staging kept reusable space"
+    );
+}
+
 #[test]
 fn two_stagings_of_the_same_bytes_in_one_commit_keep_one_and_retire_the_other() {
     let len = CONTENT_CHUNK + 300;
