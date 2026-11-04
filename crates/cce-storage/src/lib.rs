@@ -129,7 +129,12 @@ pub struct MaintenanceReport {
     pub content_bytes_reclaimed: u64,
     /// Relationship index entries written by an index rebuild.
     pub index_entries_written: u64,
-    /// False if the budget ran out before the task was done; call again to continue.
+    /// Content streams a relocation skipped because each alone is larger than the budget's
+    /// `max_content_bytes`: no call with this budget can move them, a call with a larger one can.
+    pub content_streams_over_budget: u64,
+    /// False if work remains: the budget ran out before the task was done, so another call
+    /// continues, or a stream is over the budget (see `content_streams_over_budget`), which only a
+    /// larger budget moves. False for that reason alone, it stays false across identical calls.
     pub complete: bool,
 }
 

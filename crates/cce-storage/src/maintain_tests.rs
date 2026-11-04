@@ -888,6 +888,101 @@ fn space_relocation_moves_out_of_is_not_reused_while_a_pinned_view_reads_it() {
     audit(&sim);
 }
 
+#[test]
+fn a_stream_over_the_budget_does_not_keep_smaller_streams_from_moving() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    // X is retired below everything; B is small; L, highest in the file, is larger than the budget.
+    commit_content(&s, "one", "X", 1, 100_000);
+    commit_content(&s, "two", "B", 2, 10_000);
+    commit_content(&s, "three", "L", 3, 150_000);
+    commit_plain(&s, "four", "X");
+    commit_plain(&s, "five", "C");
+    commit_plain(&s, "six", "D");
+    let budget = MaintenanceBudget {
+        max_pages: 1024,
+        max_content_bytes: 50_000,
+    };
+    let r = s.maintain(MaintenanceTask::Relocate, budget).unwrap();
+    assert_eq!(
+        r.content_bytes_moved,
+        10_000 + Manifest::encoded_len(1),
+        "the stream within the budget must move past the one over it"
+    );
+    assert_eq!(r.content_streams_over_budget, 1, "L is over the budget");
+    assert!(!r.complete, "L still waits for a larger budget");
+    let mut v = s.begin().unwrap();
+    assert_eq!(read_bound(&mut v, "B"), Ok(bytes_of(2, 10_000)));
+    assert_eq!(read_bound(&mut v, "L"), Ok(bytes_of(3, 150_000)));
+    drop(v);
+    // Further calls with the same budget may move B lower still, then stop moving; L keeps the
+    // task incomplete, and says why.
+    let mut calls = 0;
+    let last = loop {
+        let r = s.maintain(MaintenanceTask::Relocate, budget).unwrap();
+        if r.content_bytes_moved == 0 {
+            break r;
+        }
+        calls += 1;
+        assert!(calls < 8, "relocation kept moving within the same budget");
+    };
+    assert_eq!(
+        last.content_streams_over_budget, 1,
+        "L is still over the budget"
+    );
+    assert!(
+        !last.complete,
+        "an identical call cannot finish while L is over the budget"
+    );
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "B"),
+        Ok(bytes_of(2, 10_000))
+    );
+    audit(&sim);
+}
+
+#[test]
+fn relocation_takes_lower_space_when_a_tighter_fit_lies_above() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    // X below S is larger than S; Y above S fits S exactly. Both are retired.
+    commit_content(&s, "one", "X", 1, 20_000);
+    commit_content(&s, "two", "S", 2, 10_000);
+    commit_content(&s, "three", "Y", 3, 10_000);
+    commit_plain(&s, "four", "X");
+    commit_plain(&s, "five", "Y");
+    commit_plain(&s, "six", "C");
+    commit_plain(&s, "seven", "D");
+    let source = {
+        let d = crate::audit::published(&sim).unwrap().pop().unwrap();
+        crate::audit::reach(&sim, &d).unwrap().content_segments
+    };
+    assert_eq!(source.len(), 1, "S is the only live stream");
+    let r = s
+        .maintain(MaintenanceTask::Relocate, MaintenanceBudget::default())
+        .unwrap();
+    assert_eq!(
+        r.content_bytes_moved,
+        10_000 + Manifest::encoded_len(1),
+        "S must move into the retired space below it"
+    );
+    let moved = {
+        let d = crate::audit::published(&sim).unwrap().pop().unwrap();
+        crate::audit::reach(&sim, &d).unwrap().content_segments
+    };
+    let (from, _) = *source.iter().next().unwrap();
+    let (to, len) = *moved.iter().next().unwrap();
+    assert!(
+        to + len <= from,
+        "S's segment moved to {to}+{len}, not entirely below {from}"
+    );
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "S"),
+        Ok(bytes_of(2, 10_000))
+    );
+    audit(&sim);
+}
+
 /// Runs `maintain(Relocate)` on another thread and `between` on this one once the copy is done
 /// and before the step publishes.
 fn relocate_around(s: &NativeStore, between: impl FnOnce()) -> crate::MaintenanceReport {

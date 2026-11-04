@@ -250,19 +250,27 @@ impl Inner {
         let mut moves = Vec::new();
         let mut bytes = 0u64;
         let mut complete = true;
+        let mut over_budget = 0u64;
         for (_, key, old, m) in candidates {
             let total = m.segments.iter().map(|s| s.len).sum::<u64>() + old.len;
+            // A stream that does not fit is skipped, never a reason to stop: smaller streams below
+            // it may still fit. One larger than the whole budget can only move with a larger one.
+            if total > budget.max_content_bytes {
+                over_budget += 1;
+                complete = false;
+                continue;
+            }
             if bytes + total > budget.max_content_bytes {
                 complete = false;
-                break;
+                continue;
             }
             let mark = taken.taken.len();
-            // Every piece must land below where it is now, or the move gains nothing.
+            // Every piece must land entirely below where it is now, or the move gains nothing.
             let mut placed = Vec::new();
             for s in m.segments.iter().chain(std::iter::once(&old)) {
-                match self.take_retired(s.len, bound, &mut taken) {
-                    Some(at) if at < s.offset => placed.push(at),
-                    _ => break,
+                match self.take_retired(s.len, bound, Some(s.offset), &mut taken) {
+                    Some(at) => placed.push(at),
+                    None => break,
                 }
             }
             if placed.len() != m.segments.len() + 1 {
@@ -357,7 +365,10 @@ impl Inner {
             }
         }
         if applied.is_empty() {
-            return Ok(report(cur.generation, 0, complete && dropped.is_empty()));
+            return Ok(MaintenanceReport {
+                content_streams_over_budget: over_budget,
+                ..report(cur.generation, 0, complete && dropped.is_empty())
+            });
         }
         let Some(generation) = cur.generation.checked_add(1) else {
             return Err(rejected(StorageError::InvalidRequest(
@@ -422,6 +433,7 @@ impl Inner {
         let moved = applied.iter().map(|m| m.bytes).sum();
         Ok(MaintenanceReport {
             content_bytes_moved: moved,
+            content_streams_over_budget: over_budget,
             ..report(generation, 0, complete && dropped.is_empty())
         })
     }
@@ -436,6 +448,7 @@ impl Inner {
         Ok(MaintenanceReport {
             generation: pages.generation.max(content.generation),
             content_bytes_moved: content.content_bytes_moved,
+            content_streams_over_budget: content.content_streams_over_budget,
             pages_moved: pages.pages_moved,
             ..report(0, 0, content.complete && pages.complete)
         })
@@ -589,6 +602,7 @@ fn report(generation: u64, reclaimed: u64, complete: bool) -> MaintenanceReport 
         content_bytes_moved: 0,
         content_bytes_reclaimed: reclaimed,
         index_entries_written: 0,
+        content_streams_over_budget: 0,
         complete,
     }
 }
