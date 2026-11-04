@@ -217,6 +217,10 @@ class Campaigns(unittest.TestCase):
         _, gaps = self.check(self.model_batch, report("model", **dict(
             self.model, rejected_cases=3, attempted_cases=253)))
         self.assertEqual(gaps, [])
+        # A failed run counts shrinking attempts; it is a failure already, not a sum to check.
+        _, gaps = self.check(self.model_batch, report("model", **dict(
+            self.model, passed=False, rejected_cases=3, attempted_cases=400)))
+        self.assertEqual(gaps, ["the report says the campaign failed"])
 
     def test_a_report_printed_after_the_test_name_is_read(self):
         line = "test model_tests::m ... " + report("model", **self.model)
@@ -419,6 +423,21 @@ class EndToEnd(unittest.TestCase):
         for k in ("RUSTFLAGS", "CARGO_PROFILE_RELEASE_LTO", "RUSTUP_TOOLCHAIN", "CCE_MODEL_CASES"):
             self.assertEqual(got.get(k), env[k], k)
         self.assertNotIn("HOME_ISH", got)
+
+    def test_secret_settings_are_named_but_never_recorded(self):
+        secret = "s3cr3t-fake-token-value"
+        env = {"CARGO_REGISTRY_TOKEN": secret, "CARGO_REGISTRIES_MINE_TOKEN": secret,
+               "RUST_SIGNING_KEY": secret, "CCE_password": secret, "CARGO_HOME_SECRET": secret,
+               "CARGO_BUILD_JOBS": "2"}
+        with mock.patch.dict(os.environ, env):
+            self.run_tiers("--output", str(self.root / "run"))
+        r = json.loads((self.root / "run/results.json").read_text())
+        self.assertEqual(r["environment"].get("CARGO_BUILD_JOBS"), "2")
+        self.assertEqual(sorted(r["environment_excluded"]), sorted(
+            k for k in env if k != "CARGO_BUILD_JOBS"))
+        for f in (self.root / "run").rglob("*"):
+            if f.is_file():
+                self.assertNotIn(secret, f.read_text(errors="replace"), f)
 
     def test_an_existing_output_directory_is_refused(self):
         (self.root / "run").mkdir()

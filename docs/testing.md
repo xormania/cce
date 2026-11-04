@@ -76,7 +76,9 @@ candidate commit (and the digest of every file when the working copy is dirty),
 the toolchain, and for each tier its exact commands, environment additions,
 timing, exit status, outcome, test counts per test binary, every executed test
 as `package:target:name` with its result, and the SHA-256 of each log under
-`logs/`, and every `RUST*`, `CARGO*` and `CCE_*` environment variable. With
+`logs/`, and every `RUST*`, `CARGO*` and `CCE_*` environment variable except
+those whose names suggest credentials (containing `TOKEN`, `SECRET`, `PASSWORD`
+or `KEY`, in any case), which are listed by name only, never with their values. With
 `--timeout`, a command that runs too long is stopped together with every
 process it started, test binaries included. Runs that show test output use one
 test thread. The runner exits 0 only when every selected tier passed.

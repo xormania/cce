@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 
 SCHEMA = 1
+# Environment variable names that may hold credentials; their values are never recorded.
+SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.IGNORECASE)
 
 # Tests ignored in an ordinary run on purpose: the tier that runs them, or why none does.
 DECLARED_IGNORED = {
@@ -299,12 +301,13 @@ def check_batch(batch, found, minimums=CAMPAIGN_MINIMUMS):
             gaps.append("accepted generated cases not measured")
         elif accepted != batch["cases"]:
             gaps.append(f"accepted cases {accepted} != {batch['cases']}")
-        # Rejections are recorded, not forbidden: a count, adding up when attempts are reported.
+        # Rejections are recorded, not forbidden: a count, adding up when attempts are reported
+        # (for a passing run only: a failed run's attempts include its shrinking).
         if rejected is None:
             gaps.append("rejected generated cases not measured")
         elif not isinstance(rejected, int) or rejected < 0:
             gaps.append(f"rejected generated cases {rejected} is not a count")
-        elif accepted is not None and "attempted_cases" in r:
+        elif accepted is not None and "attempted_cases" in r and r.get("passed"):
             if accepted + rejected != r["attempted_cases"]:
                 gaps.append(f"accepted {accepted} + rejected {rejected} != attempted "
                             f"{r['attempted_cases']}")
@@ -407,8 +410,14 @@ class Runner:
             },
             "environment": {
                 k: v for k, v in sorted(os.environ.items())
-                if k.startswith(("RUST", "CARGO", "CCE_"))
+                if k.startswith(("RUST", "CARGO", "CCE_")) and not SECRET_NAME.search(k)
             },
+            # Settings that may hold credentials: named so their presence is visible, never
+            # their values.
+            "environment_excluded": sorted(
+                k for k in os.environ
+                if k.startswith(("RUST", "CARGO", "CCE_")) and SECRET_NAME.search(k)
+            ),
             "tiers": [],
         }
 
