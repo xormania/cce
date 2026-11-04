@@ -110,8 +110,9 @@ impl Node {
                 if n < 2 {
                     return Err(corrupt(format!("branch with {n} children")));
                 }
-                let mut seps: Vec<Vec<u8>> = Vec::with_capacity(n - 1);
-                let mut children = Vec::with_capacity(n);
+                let mut seps: Vec<Vec<u8>> =
+                    Vec::with_capacity(d.capacity_for(n, 16).saturating_sub(1));
+                let mut children = Vec::with_capacity(d.capacity_for(n, 16));
                 for i in 0..n {
                     if i > 0 {
                         let sl = d.u16()? as usize;

@@ -119,11 +119,14 @@ A history entry is `position: u64`, attempt id, and the canonical request encodi
 bound content as `(sha256, length)` pairs, and the supplied evidence as `(label, bytes)` pairs.
 Staging tokens and physical locations are not part of it. Every content index must refer to a
 binding of the same request; a request with an out-of-range index is rejected before it is
-fingerprinted. History entries return the bound content references with the changes. When a
-history entry is read, its recorded length is checked against the largest entry the open's request
-limit allows (`max_request_len` plus the position and the length-prefixed attempt id and request)
-before anything is allocated or read; a content manifest is checked the same way against the
-manifest size its segment limit allows.
+fingerprinted. History entries return the bound content references with the changes.
+
+A store's limits (`max_request_len`, `max_content_segments`) bound what an open writes, not what it
+reads: data written under larger limits reads back under smaller ones. Reads are bounded by the
+format itself. When a history entry or content manifest is read, its recorded length is checked
+against the largest the format can hold (a `u32`-prefixed request; a `u32` segment count) and
+against the committed content before anything is allocated or read, and decoders never reserve
+more elements than the remaining input can hold.
 
 The attempt fingerprint is SHA-256 over `"cce.attempt.v1\0"`, the attempt id (length-prefixed),
 and that canonical encoding. Retrying an attempt with an identical logical request returns the

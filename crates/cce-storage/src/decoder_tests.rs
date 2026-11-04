@@ -51,6 +51,10 @@ fn decode(p: &[u8]) -> Result<Vec<u8>, StorageError> {
 
 #[test]
 fn pages_at_the_edges_of_the_valid_range_decode() {
+    // The documented sizes, pinned independently of the constants.
+    assert_eq!(PAGE_SIZE, 4096);
+    assert_eq!(PAGE_HEADER_LEN, 48);
+    assert_eq!(PAGE_PAYLOAD_MAX, 4048);
     for len in [0, 1, PAGE_PAYLOAD_MAX] {
         let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
         assert_eq!(
@@ -274,16 +278,42 @@ fn tree_nodes_reject_malformed_payloads_and_accept_edge_cases() {
         b.extend(1u64.to_le_bytes());
     };
     // Valid edges: an empty leaf, an empty key and value, a two-child branch.
-    assert!(matches!(Node::decode(&leaf(&[])), Ok(Node::Leaf(e)) if e.is_empty()));
-    assert!(matches!(Node::decode(&leaf(&[(b"", b"")])), Ok(Node::Leaf(e)) if e.len() == 1));
+    assert_eq!(
+        Node::decode(&leaf(&[])).unwrap(),
+        Node::Leaf(Default::default())
+    );
+    assert_eq!(
+        Node::decode(&leaf(&[(b"", b""), (b"k\0", b"v")])).unwrap(),
+        Node::Leaf(
+            [
+                (b"".to_vec(), b"".to_vec()),
+                (b"k\0".to_vec(), b"v".to_vec())
+            ]
+            .into_iter()
+            .collect()
+        )
+    );
     let mut branch = vec![2];
     branch.extend(le32(2));
     child(&mut branch, 2);
     branch.extend(1u16.to_le_bytes());
     branch.push(b'm');
     child(&mut branch, 3);
-    assert!(
-        matches!(Node::decode(&branch), Ok(Node::Branch { children, .. }) if children.len() == 2)
+    assert_eq!(
+        Node::decode(&branch).unwrap(),
+        Node::Branch {
+            seps: vec![b"m".to_vec()],
+            children: vec![
+                PageRef {
+                    page: 2,
+                    incarnation: 1
+                },
+                PageRef {
+                    page: 3,
+                    incarnation: 1
+                },
+            ],
+        }
     );
 
     err_contains(Node::decode(&[]), "truncated", "empty payload");
@@ -343,9 +373,28 @@ fn content_manifests_reject_inconsistent_segments() {
         }
         b
     };
-    assert!(Manifest::decode(&manifest(0, &[])).is_ok(), "empty content");
-    assert!(
-        Manifest::decode(&manifest(SEGMENT_MAX, &[(0, SEGMENT_MAX)])).is_ok(),
+    let content = |len| cce_core::storage::ContentRef {
+        digest: cce_core::storage::ContentDigest([7; 32]),
+        len,
+    };
+    assert_eq!(
+        Manifest::decode(&manifest(0, &[])).unwrap(),
+        Manifest {
+            content: content(0),
+            segments: vec![],
+        },
+        "empty content"
+    );
+    assert_eq!(
+        Manifest::decode(&manifest(SEGMENT_MAX, &[(9, SEGMENT_MAX)])).unwrap(),
+        Manifest {
+            content: content(SEGMENT_MAX),
+            segments: vec![crate::records::ExtentRef {
+                offset: 9,
+                len: SEGMENT_MAX,
+                digest: [1; 32],
+            }],
+        },
         "full segment"
     );
     err_contains(
@@ -408,10 +457,10 @@ fn history_entries_reject_malformed_requests() {
         r.extend(le32(0));
         r
     };
-    assert!(
-        decode_history(&entry(&request(&[], 0, 0))).is_ok(),
-        "empty request"
-    );
+    let empty = decode_history(&entry(&request(&[], 0, 0))).unwrap();
+    assert_eq!(empty.position, cce_core::storage::HistoryPosition(1));
+    assert_eq!(empty.attempt.as_bytes(), b"a");
+    assert!(empty.changes.is_empty() && empty.content.is_empty() && empty.evidence.is_empty());
     err_contains(
         decode_history(&entry(&request(&[9], 1, 0))),
         "change tag",
@@ -427,8 +476,17 @@ fn history_entries_reject_malformed_requests() {
         c.extend(content);
         c
     };
-    assert!(
-        decode_history(&entry(&request(&put(&[0]), 1, 0))).is_ok(),
+    let put_a = |content| cce_core::storage::Change::PutContext {
+        id: cce_core::storage::ContextId::new(*b"A").unwrap(),
+        expect: cce_core::storage::Precondition::Any,
+        body: vec![],
+        content,
+    };
+    assert_eq!(
+        decode_history(&entry(&request(&put(&[0]), 1, 0)))
+            .unwrap()
+            .changes,
+        vec![put_a(None)],
         "put without content"
     );
     err_contains(
@@ -443,9 +501,14 @@ fn history_entries_reject_malformed_requests() {
         "missing content binding",
         "content index without a binding",
     );
-    assert!(
-        decode_history(&entry(&request(&put(&index), 1, 1))).is_ok(),
-        "index 0 of 1"
+    let bound = decode_history(&entry(&request(&put(&index), 1, 1))).unwrap();
+    assert_eq!(bound.changes, vec![put_a(Some(0))], "index 0 of 1");
+    assert_eq!(
+        bound.content,
+        vec![cce_core::storage::ContentRef {
+            digest: cce_core::storage::ContentDigest([0; 32]),
+            len: 0,
+        }]
     );
     let mut huge = vec![1];
     huge.extend(le32(u32::MAX));
@@ -476,7 +539,14 @@ fn record_values_reject_truncation_trailing_bytes_and_unknown_tags() {
         content: None,
     }
     .encode();
-    assert!(ContextValue::decode(&ctx).is_ok());
+    assert_eq!(
+        ContextValue::decode(&ctx).unwrap(),
+        ContextValue {
+            revision: u64::MAX,
+            body: vec![],
+            content: None,
+        }
+    );
     let mut tag = ctx.clone();
     *tag.last_mut().unwrap() = 2;
     err_contains(
@@ -502,6 +572,17 @@ fn record_values_reject_truncation_trailing_bytes_and_unknown_tags() {
         fingerprint: [0; 32],
     }
     .encode();
+    assert_eq!(ExtentRef::decode(&ext).unwrap().len, u64::MAX);
+    assert_eq!(
+        RelValue::decode(&rel).unwrap(),
+        RelValue {
+            revision: 1,
+            kind: b"k".to_vec(),
+            source: b"s".to_vec(),
+            target: b"t".to_vec(),
+        }
+    );
+    assert_eq!(AttemptValue::decode(&att).unwrap().position, 1);
     type Decoder = fn(&[u8]) -> Result<(), StorageError>;
     let decoders: [(&str, Vec<u8>, Decoder); 4] = [
         ("context", ctx, |b| ContextValue::decode(b).map(|_| ())),
@@ -585,82 +666,113 @@ impl crate::io::Io for LongestRead {
 }
 
 #[test]
-fn a_history_extent_beyond_its_limit_is_refused_before_it_is_read() {
+fn data_written_under_larger_limits_reads_back_under_smaller_ones() {
     use cce_core::storage::{
-        AttemptId, ChangeSet, Evidence, HistoryPosition, ReadView, StorageEngine,
+        AttemptId, Change, ChangeSet, ContentBinding, ContextId, Evidence, HistoryPosition,
+        Precondition, ReadView, StorageEngine,
     };
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::Read;
 
     use crate::NativeStore;
     use crate::engine::{Inner, Options};
     use crate::sim::SimIo;
 
-    // A history entry of about 100 KB, written under the default limits.
+    // Written under the default limits: a 100 KB history entry and content of five segments.
     let sim = SimIo::new();
     let s = NativeStore {
         inner: Inner::create(Box::new(sim.clone()), STORE, Options::default()).unwrap(),
     };
+    let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let staged = s.stage_content(&mut &payload[..]).unwrap();
     let cs = ChangeSet {
+        changes: vec![Change::PutContext {
+            id: ContextId::new(*b"A").unwrap(),
+            expect: Precondition::Absent,
+            body: b"a".to_vec(),
+            content: Some(0),
+        }],
+        content: vec![ContentBinding::from(&staged)],
         evidence: vec![Evidence {
             label: b"big".to_vec(),
             bytes: vec![7; 100_000],
         }],
-        ..ChangeSet::default()
     };
     s.commit(AttemptId::new(*b"a").unwrap(), s.begin().unwrap(), cs)
         .unwrap();
     drop(s);
     sim.release();
 
-    // Reopened with a limit far below that entry: the extent's recorded length alone refuses it.
-    let longest = Arc::new(AtomicUsize::new(0));
-    let limit = 1000;
+    // A later open with smaller limits bounds what it writes, not what it reads.
     let s = NativeStore {
         inner: Inner::open(
-            Box::new(LongestRead {
-                sim: sim.clone(),
-                longest: longest.clone(),
-            }),
+            Box::new(sim.clone()),
             Options {
-                max_request_len: limit,
+                max_request_len: 1000,
+                max_content_segments: 2,
                 ..Options::default()
             },
         )
         .unwrap(),
     };
     let mut v = s.begin().unwrap();
+    let entry = v.history(HistoryPosition(0)).unwrap().next().unwrap();
+    assert_eq!(entry.unwrap().evidence[0].bytes, vec![7; 100_000]);
+    let r = v.context(&ContextId::new(*b"A").unwrap()).unwrap().unwrap();
+    let mut got = Vec::new();
+    v.content(&r.content.unwrap())
+        .expect("content of five segments under a two-segment limit")
+        .read_to_end(&mut got)
+        .unwrap();
+    assert!(got == payload, "content read back differs");
+}
+
+#[test]
+fn an_extent_beyond_the_format_maximum_is_refused_before_it_is_read() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::NativeStore;
+    use crate::engine::{HISTORY_ENTRY_MAX, Inner, Options};
+    use crate::records::ExtentRef;
+    use crate::sim::SimIo;
+
+    // The format's own maximum: position, u32-prefixed attempt id of at most 255 bytes, and a
+    // u32-prefixed request of at most u32::MAX bytes.
+    assert_eq!(HISTORY_ENTRY_MAX, 8 + 4 + 255 + 4 + u32::MAX as u64);
+
+    let longest = Arc::new(AtomicUsize::new(0));
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(LongestRead {
+                sim: SimIo::new(),
+                longest: longest.clone(),
+            }),
+            STORE,
+            Options::default(),
+        )
+        .unwrap(),
+    };
     longest.store(0, Ordering::SeqCst);
-    let entries: Vec<_> = v.history(HistoryPosition(0)).unwrap().collect();
-    assert_eq!(entries.len(), 1);
-    match &entries[0] {
+    let crafted = ExtentRef {
+        offset: 0,
+        len: HISTORY_ENTRY_MAX + 1,
+        digest: [0; 32],
+    };
+    let r = s
+        .inner
+        .read_extent(&crafted, HISTORY_ENTRY_MAX, "history entry");
+    match r {
         Err(StorageError::Integrity(m)) => {
             assert!(
                 m.contains("history entry of") && m.contains("byte limit"),
                 "{m}"
             )
         }
-        other => panic!("expected the history extent to be refused, got {other:?}"),
+        other => panic!("expected the crafted extent to be refused, got {other:?}"),
     }
-    let read = longest.load(Ordering::SeqCst);
-    assert!(
-        read < 100_000 && (read as u64) <= limit + crate::format::PAGE_SIZE as u64,
-        "a refused extent was read: {read} bytes in one read"
+    assert_eq!(
+        longest.load(Ordering::SeqCst),
+        0,
+        "a refused extent was read"
     );
-
-    // Positive neighbour: under a limit that covers it, the same entry reads back.
-    drop(v);
-    drop(s);
-    sim.release();
-    let s = NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Options::default()).unwrap(),
-    };
-    let entry = s
-        .begin()
-        .unwrap()
-        .history(HistoryPosition(0))
-        .unwrap()
-        .next()
-        .unwrap();
-    assert_eq!(entry.unwrap().evidence[0].bytes.len(), 100_000);
 }

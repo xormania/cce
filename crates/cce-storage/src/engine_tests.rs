@@ -575,8 +575,8 @@ fn history_position_exhaustion_is_rejected_without_wrapping() {
 
 #[test]
 fn an_oversized_manifest_reference_is_refused_before_allocation() {
-    // A small segment quota keeps the largest valid manifest small, so a crafted reference only a
-    // little beyond it (backed by real bytes, within committed content) shows the size bound.
+    // A crafted, checksum-valid content record points at a manifest one byte longer than the
+    // largest the format can hold. The open's own segment quota bounds staging only.
     let opts = crate::engine::Options {
         max_content_segments: 4,
         ..Default::default()
@@ -593,14 +593,14 @@ fn an_oversized_manifest_reference_is_refused_before_allocation() {
     };
     commit(&s, "x", cs).unwrap();
     let cur = s.inner.snapshot().unwrap().desc;
-    // Crafted metadata: the content record points at a manifest far larger than any valid one.
+    // Crafted metadata: the content record points at a manifest larger than any valid one.
     let filler = vec![7u8; 1 << 20];
     sim.write_at(FileId::Content, cur.content_len, &filler)
         .unwrap();
     sim.sync(FileId::Content).unwrap();
     let huge = ExtentRef {
         offset: 0,
-        len: filler.len() as u64,
+        len: crate::records::Manifest::encoded_len(u32::MAX as usize) + 1,
         digest: [0; 32],
     };
     let mut t = TreeTxn::new(&*s.inner, cur.root);
@@ -624,7 +624,8 @@ fn an_oversized_manifest_reference_is_refused_before_allocation() {
     }
     let mut sink = Sink(&sim, cur.next_page, cur.generation + 1);
     let root = t.finish(&mut sink).unwrap();
-    // Enough committed content that the bounds check alone would not stop the read.
+    // The size check runs before the committed-content bounds and before any allocation, so the
+    // refusal names the limit.
     let d = Descriptor {
         generation: cur.generation + 1,
         root,

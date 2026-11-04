@@ -335,6 +335,11 @@ impl NodeSource for Inner {
     }
 }
 
+/// Largest history entry the format can hold: its position, the length-prefixed attempt identifier
+/// and the length-prefixed encoded request. Reads are bounded by this, not by the open's options,
+/// which bound only what the open writes.
+pub(crate) const HISTORY_ENTRY_MAX: u64 = 8 + 4 + MAX_ID_LEN as u64 + 4 + u32::MAX as u64;
+
 impl Inner {
     pub fn create(
         io: Box<dyn Io>,
@@ -1125,14 +1130,8 @@ impl Inner {
         Ok(cursor.map(move |entry| {
             let (_, v) = entry?;
             let x = ExtentRef::decode(&v)?;
-            decode_history(&self.read_extent(&x, self.history_entry_limit(), "history entry")?)
+            decode_history(&self.read_extent(&x, HISTORY_ENTRY_MAX, "history entry")?)
         }))
-    }
-
-    /// Largest history entry this open accepts: its position, the length-prefixed attempt
-    /// identifier and the length-prefixed encoded request (see `Options::max_request_len`).
-    fn history_entry_limit(&self) -> u64 {
-        (8 + 4 + MAX_ID_LEN as u64 + 4).saturating_add(self.max_request_len)
     }
 
     /// Physical segments holding committed content, in stream order (inspection for tests and tools).
@@ -1143,7 +1142,8 @@ impl Inner {
                 StorageError::InvalidRequest("content is not committed in this view".into())
             })?;
         let x = ExtentRef::decode(&x)?;
-        let limit = Manifest::encoded_len(self.max_segments);
+        // The format's maximum (a u32 segment count): the open's segment limit bounds staging only.
+        let limit = Manifest::encoded_len(u32::MAX as usize);
         let m = Manifest::decode(&self.read_extent(&x, limit, "content manifest")?)?;
         if m.content != *c {
             return Err(corrupt(
