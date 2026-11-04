@@ -105,6 +105,11 @@ fn rejected_for(why: &str, cs: ChangeSet, plant: JournalHook) {
         "{why}: the rejected commit published"
     );
     assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "{why}: the pool after the rejection"
+    );
+    assert_eq!(
         s.begin().unwrap().context(&cid("C")).unwrap(),
         body_c,
         "{why}: committed state changed"

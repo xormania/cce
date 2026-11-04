@@ -726,6 +726,109 @@ impl Inner {
         *lock(&self.apply_hook) = Some(hook);
     }
 
+    /// Test oracle: the published state's retired-content records and the reuse pool's
+    /// accounting correspond one to one. Every record (offset, length, retiring generation) is
+    /// exactly one of: a free extent, a reservation a staging holds, or a reservation an uncertain
+    /// publication owns, with the same offset, length and generation; and every free extent and
+    /// reservation is exactly one record. Discarded extents awaiting retirement have no record yet
+    /// and overlap neither records nor each other. For a store with no commit in progress.
+    #[cfg(test)]
+    pub(crate) fn ledger_check_for_test(&self) -> Result<(), String> {
+        let e = |x: StorageError| x.to_string();
+        let cur = lock(&self.state).current;
+        let mut records: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        let mut c = Cursor::new(self, cur.root, &[P_RETIRED], None, cur.next_page).map_err(e)?;
+        while let Some((k, v)) = c.next_entry().map_err(e)? {
+            if let Retired::Extent {
+                generation,
+                offset,
+                len,
+            } = decode_retired(&k, &v).map_err(e)?
+                && records.insert(offset, (len, generation)).is_some()
+            {
+                return Err(format!("two retirement records at offset {offset}"));
+            }
+        }
+        let pool = lock(&self.pool);
+        let mut entries: Vec<(u64, u64, u64, String)> = pool
+            .free
+            .iter()
+            .map(|(o, (l, g))| (*o, *l, *g, "free".to_string()))
+            .collect();
+        for (serial, rs) in &pool.held {
+            entries.extend(rs.iter().map(|r| {
+                (
+                    r.offset,
+                    r.record_len,
+                    r.retired_at,
+                    format!("staging {serial}"),
+                )
+            }));
+        }
+        for (serial, (attempt, g, rs)) in &pool.uncertain {
+            entries.extend(rs.iter().map(|r| {
+                (
+                    r.offset,
+                    r.record_len,
+                    r.retired_at,
+                    format!("staging {serial} under uncertain {attempt:?} at {g}"),
+                )
+            }));
+        }
+        let mut seen: BTreeMap<u64, String> = BTreeMap::new();
+        for (offset, len, g, owner) in &entries {
+            if let Some(other) = seen.insert(*offset, owner.clone()) {
+                return Err(format!(
+                    "content at offset {offset} accounted twice: {other} and {owner}"
+                ));
+            }
+            match records.get(offset) {
+                None => {
+                    return Err(format!(
+                        "{owner} accounts for content at offset {offset} ({len} bytes, \
+                         generation {g}) that no record retires"
+                    ));
+                }
+                Some(r) if *r != (*len, *g) => {
+                    return Err(format!(
+                        "{owner} accounts for content at offset {offset} as ({len}, {g}), its \
+                         record says {r:?}"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some((offset, (len, g))) = records.iter().find(|(o, _)| !seen.contains_key(o)) {
+            return Err(format!(
+                "the record retiring content at offset {offset} ({len} bytes, generation {g}) is \
+                 neither free nor reserved"
+            ));
+        }
+        let mut queued = pool.discarded.clone();
+        queued.sort_unstable();
+        if let Some(w) = queued.windows(2).find(|w| overlap(w[0], w[1])) {
+            return Err(format!(
+                "discarded extents {:?} and {:?} overlap",
+                w[0], w[1]
+            ));
+        }
+        if let Some(x) = queued
+            .iter()
+            .find(|x| records.iter().any(|(o, (l, _))| overlap(**x, (*o, *l))))
+        {
+            return Err(format!("discarded extent {x:?} already has a record"));
+        }
+        Ok(())
+    }
+
+    /// Test hook: removes the free extent at the lowest offset from the reuse pool.
+    #[cfg(test)]
+    pub(crate) fn drop_free_for_test(&self) -> Option<(u64, u64)> {
+        let mut pool = lock(&self.pool);
+        let (offset, (len, _)) = pool.free.pop_first()?;
+        Some((offset, len))
+    }
+
     /// Test hook: puts an extent in the reuse pool as free.
     #[cfg(test)]
     pub(crate) fn insert_free_for_test(&self, offset: u64, len: u64, retired_at: u64) {

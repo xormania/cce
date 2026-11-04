@@ -27,6 +27,8 @@ mod io;
 #[cfg(test)]
 mod key_bounds_tests;
 #[cfg(test)]
+mod ledger_tests;
+#[cfg(test)]
 mod merge_skip_tests;
 #[cfg(test)]
 mod quiescence_tests;
