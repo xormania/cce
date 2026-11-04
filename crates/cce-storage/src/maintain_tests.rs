@@ -14,7 +14,7 @@ use crate::engine::{Inner, Options};
 use crate::format::StoreId;
 use crate::records::Manifest;
 use crate::sim::SimIo;
-use crate::test_support::{cid, create_on, open_on, put_context};
+use crate::test_support::{changes, cid, create_on, open_on, put_context};
 use crate::{MaintenanceBudget, MaintenanceTask, NativeStore};
 
 const STORE: StoreId = StoreId(*b"maintenance-test");
@@ -326,7 +326,9 @@ fn a_pending_staging_of_this_process_is_not_reclaimed() {
             MaintenanceTask::ReclaimContentHoles,
             MaintenanceBudget::default(),
         )
-        .unwrap();
+        .unwrap_or_else(|e| {
+            panic!("reclaim must succeed and leave the pending staging alone: {e:?}")
+        });
     assert_eq!(
         r.content_bytes_reclaimed, 0,
         "pending staged bytes were reclaimed"
@@ -1368,6 +1370,54 @@ fn a_hole_over_reachable_content_is_refused_by_the_full_reach() {
     let r = s.maintain(MaintenanceTask::ReclaimContentHoles, FULL);
     refused_by_space_check(&s, r, generation, "hole over live content");
     assert_eq!(logical(&s), before, "a refused reclaim changed records");
+}
+
+/// A hole claimed over a staging of this process that a later commit's content length covers is
+/// refused by the space check before anything is written: the staging's space is in use.
+#[test]
+fn a_hole_over_a_pending_staging_is_refused_by_the_space_check() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    // Q is abandoned across a restart once a commit covers it: a real hole.
+    let abandoned = s.stage_content(&mut &bytes_of(5, 30_000)[..]).unwrap();
+    commit(&s, "cover-q", changes(vec![put("B", "b", None)]));
+    drop(abandoned);
+    drop(s);
+    let s = open(&sim);
+    // P stays registered while a later commit covers its bytes.
+    let staged = s.stage_content(&mut &bytes_of(6, 30_000)[..]).unwrap();
+    commit(&s, "cover-p", changes(vec![put("C", "c", None)]));
+    let pending = s.inner.staged_extents_for_test(&staged).unwrap();
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let x = *pending
+        .iter()
+        .find(|x| x.1 > 1000)
+        .expect("a staged segment");
+    // The journal claims P's segment as one more hole, with its record.
+    s.inner.set_journal_hook_for_test(Box::new(move |j, txn| {
+        j.retired_extents.push(x);
+        txn.put(
+            crate::records::retired_extent_key(j.generation, x.0),
+            x.1.to_le_bytes().to_vec(),
+        )
+        .unwrap();
+    }));
+    let r = s.maintain(MaintenanceTask::ReclaimContentHoles, FULL);
+    refused_by_space_check(&s, r, generation, "hole over a pending staging");
+    // P can still be committed and reads back exactly.
+    commit(
+        &s,
+        "bind",
+        ChangeSet {
+            changes: vec![put("A", "a", Some(0))],
+            content: vec![ContentBinding::from(&staged)],
+            ..ChangeSet::default()
+        },
+    );
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "A"),
+        Ok(bytes_of(6, 30_000))
+    );
 }
 
 #[test]

@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use super::{Fence, Inner, MaintenanceSpace, Reuse, Taken, lock, rejected, sha256};
 use crate::codec::{corrupt, key_components};
-use crate::format::Descriptor;
 use crate::format::PageRef;
+use crate::format::{Descriptor, PAGE_SIZE, PageKind, decode_page};
 use crate::io::FileId;
 use crate::records::{
     ContentEntry, ExtentRef, Manifest, P_CONTENT, P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED,
@@ -78,29 +78,88 @@ impl Inner {
     }
 
     /// Every content extent the published state `cur` reaches: each live entry's manifest and its
-    /// segments, and each history entry. One walk over the whole tree, by record family, sharing
-    /// nothing with how hole reclaim chooses its holes ([`Inner::content_in_use`]), so a hole that
-    /// choice got wrong is still found reachable here.
+    /// segments, and each history entry. Found from the raw image, as an independent audit would:
+    /// pages are read straight from the files (no cache, no cursor) and followed from the root,
+    /// and manifests are read raw and checked against their digest. It shares nothing with how
+    /// hole reclaim chooses its holes ([`Inner::content_in_use`]), so a hole that choice got wrong
+    /// is still found reachable here.
     fn full_reach(&self, cur: &Descriptor) -> Result<Vec<(u64, u64)>, StorageError> {
         let mut reach = Vec::new();
-        let mut c = Cursor::new(self, cur.root, &[], None, cur.next_page)?;
-        while let Some((k, v)) = c.next_entry()? {
-            match k.first() {
-                Some(&P_CONTENT) => {
-                    if let ContentEntry::Live { manifest, .. } = ContentEntry::decode(&v)? {
-                        let m = Manifest::decode(&self.read_extent(&manifest)?)?;
-                        reach.push((manifest.offset, manifest.len));
-                        reach.extend(m.segments.iter().map(|s| (s.offset, s.len)));
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![cur.root];
+        while let Some(at) = stack.pop() {
+            if !seen.insert(at.page) || at.page >= cur.next_page || at.incarnation > cur.generation
+            {
+                return Err(corrupt(format!(
+                    "page {}@{} reached twice or outside generation {}",
+                    at.page, at.incarnation, cur.generation
+                )));
+            }
+            let mut page = vec![0; PAGE_SIZE];
+            self.io
+                .read_at(FileId::Meta, at.page * PAGE_SIZE as u64, &mut page)?;
+            match Node::decode(&decode_page(cur.store, PageKind::Node, at, &page)?)? {
+                Node::Branch { children, .. } => stack.extend(children),
+                Node::Leaf(entries) => {
+                    for (k, v) in entries {
+                        match k.first() {
+                            Some(&P_CONTENT) => {
+                                if let ContentEntry::Live { manifest: x, .. } =
+                                    ContentEntry::decode(&v)?
+                                {
+                                    if x.offset
+                                        .checked_add(x.len)
+                                        .is_none_or(|e| e > cur.content_len)
+                                    {
+                                        return Err(corrupt(format!(
+                                            "manifest {}+{} beyond committed content",
+                                            x.offset, x.len
+                                        )));
+                                    }
+                                    reach.push((x.offset, x.len));
+                                    let m = Manifest::decode(&self.read_raw(&x)?)?;
+                                    reach.extend(m.segments.iter().map(|s| (s.offset, s.len)));
+                                }
+                            }
+                            Some(&P_HISTORY) => {
+                                let x = ExtentRef::decode(&v)?;
+                                reach.push((x.offset, x.len));
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                Some(&P_HISTORY) => {
-                    let x = ExtentRef::decode(&v)?;
-                    reach.push((x.offset, x.len));
-                }
-                _ => {}
             }
         }
         Ok(reach)
+    }
+
+    /// Every extent of the stagings this process has registered and not yet committed or
+    /// discarded: their manifests and segments, read from this process's own writes. Their bytes
+    /// can lie below the committed length once a later commit covers them.
+    fn staged_reach(&self) -> Result<Vec<(u64, u64)>, StorageError> {
+        let staged: Vec<ExtentRef> = lock(&self.state).staged.values().map(|(m, _)| *m).collect();
+        let mut reach = Vec::new();
+        for x in staged {
+            reach.push((x.offset, x.len));
+            let m = Manifest::decode(&self.read_raw(&x)?)?;
+            reach.extend(m.segments.iter().map(|s| (s.offset, s.len)));
+        }
+        Ok(reach)
+    }
+
+    /// Reads extent `x` straight from the content file and checks it against its digest.
+    fn read_raw(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+        let len = usize::try_from(x.len).map_err(|_| corrupt("extent too large"))?;
+        let mut buf = vec![0; len];
+        self.io.read_at(FileId::Content, x.offset, &mut buf)?;
+        if sha256(&buf) != x.digest {
+            return Err(corrupt(format!(
+                "content extent at {}: digest mismatch",
+                x.offset
+            )));
+        }
+        Ok(buf)
     }
 
     /// Content-file space below the committed length that is in use: reachable from the published
@@ -202,11 +261,16 @@ impl Inner {
             )
             .map_err(rejected)?;
         }
-        // Sealed against everything the published state reaches, found independently of how
-        // the holes were chosen: a hole over reachable content is refused.
+        // Sealed against everything the published state reaches, read from the raw image, and
+        // every registered staging, found independently of how the holes were chosen: a hole over
+        // either is refused.
         let space = MaintenanceSpace {
             retired: taken.clone(),
-            still_reachable: self.full_reach(cur).map_err(rejected)?,
+            still_reachable: {
+                let mut reach = self.full_reach(cur).map_err(rejected)?;
+                reach.extend(self.staged_reach().map_err(rejected)?);
+                reach
+            },
             ..MaintenanceSpace::default()
         };
         // A physical generation: the history position does not move.
