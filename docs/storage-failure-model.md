@@ -292,9 +292,83 @@ and compares length and digest at the end; a mismatch, a short stream or a sourc
 staged content. Space written by a failed or abandoned staging lies beyond the committed content
 length and is reused by later staging or after a restart.
 
+## Maintenance
+
+Maintenance is explicit: `NativeStore::maintain(task, budget)` runs one step, ordered with commits
+under the same writer lock, on the newest published state, and publishes its result as a new
+physical generation. It writes no logical record, adds no history entry (the history position does
+not move) and records nothing a view's reads could conflict with. Opening a store never runs
+maintenance and never repairs anything; read-only handles refuse it. A step that finds nothing to do
+publishes nothing. The budget bounds what one step moves or retires and so the size of what it
+publishes; finding that work reads the published state's index of content, history and retired
+space, which is proportional to the metadata (as for the integrity check).
+
+- `ReclaimContentHoles` retires content-file space below the committed length that no published
+  structure reaches, no retirement record covers, and no staging of this process holds or has
+  discarded, within the budget.
+- `RebuildRelationshipIndexes` removes every relationship index entry and writes both entries of
+  each relationship record again, in one publication; the old index is not consulted. It runs only
+  when asked, for example after an integrity check reports index findings. Its memory grows with the
+  size of the indexes.
+- `Relocate` moves committed content streams, highest first, into retired space below them: each
+  segment and a new manifest are copied, one segment at a time, into retired extents eligible for
+  reuse that lie entirely below the piece being moved, and the old manifest and segments are
+  retired. A stream that could move but does not fit what remains of the content budget is skipped
+  and smaller ones are still considered; a later call moves it. One larger than the whole budget
+  is counted in the report and keeps the task incomplete until a call with a larger budget moves
+  it. A stream with no retired space below it is not left work. The copy runs without the writer lock, on a
+  pinned generation (so nothing it reads can be reused meanwhile), into extents reserved as
+  staging reserves them (so no staging can take them). Publication then takes the writer lock and
+  applies a move to the newest state only if that content still has the manifest the move copied;
+  any other move is dropped, its reserved extents return to the pool, and its copied bytes remain
+  in retired space. Commits made during the copy are therefore never overwritten. The same step
+  then moves tree pages: under the writer lock, like a commit, it rewrites the highest pages (at
+  most the page budget) and their paths from the root into retired pages numbered below all of
+  them. If there are too few such pages it tries half as many, so it never writes a fresh page and
+  never extends the metadata file. Each part publishes only if it moved something. The page part
+  holds the writer lock throughout because it writes only metadata and at most the page budget,
+  about what a commit writes; the content part copies up to the content budget of stream bytes,
+  which is why it copies without the lock.
+
+What a step holds in memory, and what it reads:
+
+- Every step reads and writes at most one tree page or one content segment per operation, and in all
+  reads no more metadata than the file's tree pages once over.
+- `ReclaimContentHoles` reads no content but manifests, each twice: once to choose the holes and once
+  in an independent walk of everything the published state reaches, which the step is checked
+  against before it publishes. It scans the whole published state whatever
+  its budget, holding every extent in use (manifests, segments, history entries, retirement records,
+  stagings), so its memory grows with that count.
+- `RebuildRelationshipIndexes` reads no content. It holds every index key it removes and every entry
+  it writes, so its memory grows with the size of the indexes.
+- `Relocate` reads only the manifests and the content it moves. It holds the manifest of every
+  committed stream while it plans, and lists every tree page with one key below it for the page
+  part, so its memory grows with the number of streams and pages.
+
+The tests measure the per-operation bounds and the content read through the I/O the steps make;
+they do not see data a step keeps between operations, so the memory bounds above are stated, not
+measured.
+
+Every maintenance publication passes the same data barrier as a commit, so a crash at any point of a
+step, whether the process exits or power is lost, recovers either the state before the step or the
+state after it. A relocation that publishes both parts may also stop between them, with its content
+moved and its pages not; that is a whole state too.
+
+Every maintenance publication also passes the same space check as a commit before it writes
+anything: the pages it retires and reuses, the content it retires and the retirement records it
+touches must be exactly what its journal says, and nothing it frees may overlap space still in use.
+A relocation retires each moved stream's old manifest and segments and must keep the copies
+reachable, and every content entry it rewrites must name the new manifest. Hole reclaim is checked
+against everything the published state reaches, found independently of how it chose the holes. A
+failed check rejects the step definitely: what it reserved returns to the pool and nothing is
+published. If a step's publication record may be durable but its sync failed, the space its moves
+took stays owned by that uncertain publication, out of reach of staging, until reopen decides. A
+step that panics is treated the same way: its record may already be durable, so writes are fenced,
+the call reports an unknown outcome, and space a relocation reserved stays owned until reopen.
+
 ## Not implemented yet
 
-Recovery from an uncertain outcome without reopening, and a maintenance pass over the content
-file that would reclaim the content space reuse does not reach (see the storage format document).
+Recovery from an uncertain outcome without reopening, and shrinking the store files: maintenance
+moves data into retired space nearer the start of each file but never truncates a file.
 (Concurrent commit validation against views' observations is implemented; see "Concurrent views and
 conflict validation" above.)

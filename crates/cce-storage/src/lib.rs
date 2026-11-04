@@ -32,6 +32,8 @@ mod ledger;
 #[cfg(test)]
 mod ledger_tests;
 #[cfg(test)]
+mod maintain_tests;
+#[cfg(test)]
 mod merge_skip_tests;
 #[cfg(test)]
 mod quiescence_tests;
@@ -86,7 +88,86 @@ pub struct NativeStore {
     inner: Arc<Inner>,
 }
 
+/// A physical maintenance task for [`NativeStore::maintain`]. Maintenance changes only where and
+/// how committed information is stored, never what it is: it writes no logical record, adds no
+/// history, and causes no conflict with logical commits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MaintenanceTask {
+    /// Retire content-file space below the committed content length that no published structure
+    /// reaches and no retirement record covers (left by stagings that were covered by a later
+    /// commit and then abandoned or discarded across a restart), so later staging can reuse it.
+    ReclaimContentHoles,
+    /// Rebuild both relationship indexes from the relationship records.
+    RebuildRelationshipIndexes,
+    /// Move committed content and metadata pages from the end of their files into retired space
+    /// nearer the start.
+    Relocate,
+}
+
+/// How much one [`NativeStore::maintain`] call may do before it publishes and returns.
+/// [`MaintenanceTask::RebuildRelationshipIndexes`] is not bounded by it: it rebuilds both indexes
+/// in one publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaintenanceBudget {
+    /// Most tree pages a [`MaintenanceTask::Relocate`] step moves.
+    pub max_pages: u64,
+    /// Most content bytes a step moves ([`MaintenanceTask::Relocate`]) or retires
+    /// ([`MaintenanceTask::ReclaimContentHoles`]).
+    pub max_content_bytes: u64,
+}
+
+impl Default for MaintenanceBudget {
+    fn default() -> Self {
+        Self {
+            max_pages: 1024,
+            max_content_bytes: 64 << 20,
+        }
+    }
+}
+
+/// What one [`NativeStore::maintain`] call did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MaintenanceReport {
+    /// The generation current after the call (unchanged if there was nothing to do).
+    pub generation: u64,
+    /// Tree pages rewritten into retired pages.
+    pub pages_moved: u64,
+    /// Committed content bytes copied into retired space (manifests and segments).
+    pub content_bytes_moved: u64,
+    /// Content-file bytes retired as unreachable.
+    pub content_bytes_reclaimed: u64,
+    /// Relationship index entries written by an index rebuild.
+    pub index_entries_written: u64,
+    /// Content streams a relocation could move lower but skipped because each alone is larger than
+    /// the budget's `max_content_bytes`: no call with this budget can move them, a call with a
+    /// larger one can.
+    pub content_streams_over_budget: u64,
+    /// False if work remains: something that could move was left because the budget ran out, so
+    /// another call continues, or a stream is over the budget (see `content_streams_over_budget`),
+    /// which only a larger budget moves; false for that reason alone, it stays false across
+    /// identical calls. Streams with no retired space below them are not work left to do.
+    pub complete: bool,
+}
+
 impl NativeStore {
+    /// Runs one bounded step of physical maintenance and publishes its result as a new physical
+    /// generation, ordered with commits. Returns at once with nothing done if there is nothing to do.
+    /// Never run implicitly: opening a store does no maintenance.
+    ///
+    /// Refused with [`CommitError::Rejected`], writing nothing, while writes are fenced. A step
+    /// publishes through the same data barrier as a commit, and a failure there is reported and
+    /// fences writes as it does for a commit; a crash at any point recovers the state before or
+    /// after the step.
+    pub fn maintain(
+        &self,
+        task: MaintenanceTask,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceReport, CommitError> {
+        self.inner.maintain(task, budget)
+    }
+
     /// Creates a new store in `dir`. `store_id` is the caller-supplied identity recorded in every
     /// page; it lets the engine reject pages and handles from other stores. Refuses to create over
     /// an existing store.
@@ -294,7 +375,9 @@ pub struct StoreStats {
     pub tree_height: usize,
     /// Tree pages written over retired pages instead of at new pages.
     pub pages_reused: u64,
-    /// Staged content bytes written into retired content extents instead of at the end.
+    /// Content bytes written into retired content extents instead of at the end, counted when a
+    /// publication consumes those extents (space a staging or relocation took and gave back again
+    /// does not count).
     pub content_bytes_reused: u64,
     /// Retired content bytes currently available for reuse (not held by a staging).
     pub reusable_content_bytes: u64,
