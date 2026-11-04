@@ -23,6 +23,8 @@ mod format;
 mod fuzz_api;
 #[cfg(test)]
 mod fuzz_replay_tests;
+#[cfg(test)]
+mod guard_tests;
 mod io;
 #[cfg(test)]
 mod oracle_tests;
@@ -346,8 +348,10 @@ impl CommitTicket {
     }
 }
 
-/// Tuning that does not change stored bytes.
+/// Options that never change stored bytes. Construct with `StoreOptions::default()` and set
+/// fields; new fields may be added.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct StoreOptions {
     /// Decoded metadata nodes kept in memory. Larger stores still work with a small cache; they
     /// read more pages.
@@ -357,6 +361,23 @@ pub struct StoreOptions {
     /// lowering it never makes data written under a larger value unreadable: reads are bounded by
     /// the format, not by this.
     pub max_request_len: u64,
+    /// Checked when the store is opened, read-write or read-only; `None` opens without it.
+    pub guard: Option<ReceiptGuard>,
+}
+
+/// What a caller retained independently of a store, checked before an open touches anything.
+///
+/// An open with a guard is refused with [`StorageError::GuardRefused`], and leaves the store
+/// untouched, when the store has another identity or its published logical history position is
+/// below `min_history_position`. This is a rollback floor only: a position at or above the minimum
+/// does not prove that the history is the one the receipts came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReceiptGuard {
+    /// The identity the store was created with.
+    pub store_id: [u8; 16],
+    /// The highest history position of a receipt the caller retained (`HistoryPosition(0)` if
+    /// none): the published position must be at least this.
+    pub min_history_position: cce_core::storage::HistoryPosition,
 }
 
 impl Default for StoreOptions {
@@ -364,6 +385,7 @@ impl Default for StoreOptions {
         Self {
             cache_nodes: engine::DEFAULT_CACHE_NODES,
             max_request_len: engine::DEFAULT_MAX_REQUEST_LEN,
+            guard: None,
         }
     }
 }
@@ -373,6 +395,7 @@ impl From<StoreOptions> for Options {
         Options {
             cache_nodes: o.cache_nodes,
             max_request_len: o.max_request_len,
+            guard: o.guard,
             ..Options::default()
         }
     }

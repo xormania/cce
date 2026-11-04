@@ -223,10 +223,8 @@ impl Driver {
                 self.say("ok opened read-only");
             }
             ["open", dir, cache] => {
-                let opts = StoreOptions {
-                    cache_nodes: cache.parse().map_err(|_| "bad cache size")?,
-                    ..StoreOptions::default()
-                };
+                let mut opts = StoreOptions::default();
+                opts.cache_nodes = cache.parse().map_err(|_| "bad cache size")?;
                 self.store =
                     Some(NativeStore::open_with(Path::new(dir), opts).map_err(|e| e.to_string())?);
                 self.say("ok opened");

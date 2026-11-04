@@ -274,6 +274,10 @@ pub enum StorageError {
     Io(String),
     /// The handle/view/token belongs to a different store or open instance.
     ForeignHandle,
+    /// An open guarded by retained receipt information was refused: the store has another
+    /// identity, or its published history position is below the retained minimum. The store was
+    /// left untouched.
+    GuardRefused(String),
 }
 
 impl fmt::Display for StorageError {

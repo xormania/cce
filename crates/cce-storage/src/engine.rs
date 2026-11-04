@@ -63,6 +63,8 @@ pub(crate) struct Options {
     /// Largest encoded size of a whole request this open writes, which history stores as one
     /// length-prefixed field. Reads are bounded by the format, not by this.
     pub max_request_len: u64,
+    /// Retained receipt information an open checks before touching the store.
+    pub guard: Option<crate::ReceiptGuard>,
 }
 
 /// Default number of recent commits whose write sets are kept for conflict validation.
@@ -81,6 +83,7 @@ impl Default for Options {
             max_content_segments: DEFAULT_MAX_CONTENT_SEGMENTS,
             max_request_field: u32::MAX as u64,
             max_request_len: DEFAULT_MAX_REQUEST_LEN,
+            guard: None,
         }
     }
 }
@@ -391,6 +394,7 @@ impl Inner {
     pub fn open(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
         io.open()?;
         let (desc, diagnostics) = read_publication(&*io)?;
+        check_guard(&desc, opts.guard)?;
         // The selected record and everything it references may still be only in the operating
         // system's cache (the previous owner exited before its barrier). Make them durable before
         // any receipt or new commit can rely on them.
@@ -407,6 +411,7 @@ impl Inner {
     pub fn open_read_only(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
         io.open_read_only()?;
         let (desc, diagnostics) = read_publication(&*io)?;
+        check_guard(&desc, opts.guard)?;
         let mut inner = Self::new(io, desc, diagnostics, opts);
         inner.read_only = true;
         Ok(Arc::new(inner))
@@ -1334,6 +1339,28 @@ impl ConflictLog {
             }
         }
     }
+}
+
+/// Refuses an open whose selected record contradicts the caller's retained receipt information,
+/// before anything is synced or written: another store identity, or a published logical history
+/// position below the retained minimum. Generations are not compared: a store may publish
+/// generations that do not move the history position.
+fn check_guard(d: &Descriptor, guard: Option<crate::ReceiptGuard>) -> Result<(), StorageError> {
+    let Some(g) = guard else {
+        return Ok(());
+    };
+    if d.store.0 != g.store_id {
+        return Err(StorageError::GuardRefused(
+            "the store's identity differs from the guarded identity".into(),
+        ));
+    }
+    if d.history_pos < g.min_history_position.0 {
+        return Err(StorageError::GuardRefused(format!(
+            "published history position {} is below the guarded minimum {}",
+            d.history_pos, g.min_history_position.0
+        )));
+    }
+    Ok(())
 }
 
 /// Reads both publication slots and selects the record to recover from, checking its cursors

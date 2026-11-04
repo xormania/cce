@@ -158,6 +158,7 @@ const PUBLIC_ITEMS: &[&str] = &[
     "NativeView",
     "CommitTicket",
     "StoreOptions",
+    "ReceiptGuard",
     "StoreStats",
     "VerifyLevel",
     "Finding",

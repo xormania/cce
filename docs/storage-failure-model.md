@@ -59,6 +59,17 @@ from an interrupted write of that record. With two checksummed slots, recovery t
 the older record and reports the damaged slot; it cannot prove whether the newer one was ever
 acknowledged.
 
+### Receipt guard
+
+A caller that keeps receipt information independently of the store (its identity, and the highest
+history position of a commit receipt it retained) can pass it as `StoreOptions::guard`. Once the
+publication record is selected, and before anything is synced or written, an open (read-write or
+read-only) with a guard is refused with `StorageError::GuardRefused` if the store has another
+identity or its published logical history position is below the guarded minimum; the store is left
+untouched. The check compares history positions, not generations, which also advance without new
+history. It is a rollback floor only: a store at or above the minimum may still hold a different
+history than the one the receipts came from. Without a guard, opening is unchanged.
+
 ## Uncertain outcomes
 
 If writing or syncing the publication record fails, the commit returns `Indeterminate`: the record
