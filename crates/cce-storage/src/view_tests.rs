@@ -224,7 +224,8 @@ fn competing_updates_to_one_observed_record_do_not_both_commit() {
 
 #[test]
 fn a_basis_older_than_retained_conflict_history_is_refused_explicitly() {
-    let s = create_on(
+    let s = NativeStore {
+        inner: Inner::create(
             Box::new(SimIo::new()),
             StoreId([6; 16]),
             crate::engine::Options {
@@ -325,8 +326,7 @@ fn a_basis_from_another_store_is_rejected() {
 }
 
 fn store_with(opts: crate::engine::Options) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(Box::new(SimIo::new()), StoreId([7; 16]), opts).unwrap()
+    create_on(Box::new(SimIo::new()), StoreId([7; 16]), opts).unwrap()
 }
 
 fn wait_resolved(s: &NativeStore, a: &AttemptId) -> cce_core::storage::AttemptOutcome {

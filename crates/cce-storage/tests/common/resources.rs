@@ -31,41 +31,60 @@ impl TestDir {
 }
 
 fn allocate(root: &Path, label: &str, mut next: impl FnMut() -> u64) -> io::Result<TestDir> {
-        std::fs::create_dir_all(root)?;
-        let label: String = label.chars().take(80).map(|c| {
-            if c.is_ascii_alphanumeric() { c } else { '-' }
-        }).collect();
-        loop {
-            let n = next();
-            let path = root.join(format!("{label}-{}-{n}", std::process::id()));
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(TestDir { path, retained: false }),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
+    std::fs::create_dir_all(root)?;
+    let label: String = label
+        .chars()
+        .take(80)
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    loop {
+        let n = next();
+        let path = root.join(format!("{label}-{}-{n}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                return Ok(TestDir {
+                    path,
+                    retained: false,
+                });
             }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
+    }
 }
 
 impl std::ops::Deref for TestDir {
     type Target = Path;
-    fn deref(&self) -> &Path { &self.path }
+    fn deref(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl AsRef<Path> for TestDir {
-    fn as_ref(&self) -> &Path { &self.path }
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Drop for TestDir {
     fn drop(&mut self) {
         if self.retained || std::thread::panicking() {
-            eprintln!("test directory kept for inspection: {}", self.path.display());
+            eprintln!(
+                "test directory kept for inspection: {}",
+                self.path.display()
+            );
         } else if let Err(e) = std::fs::remove_dir_all(&self.path) {
-            eprintln!("could not remove test directory {}: {e}", self.path.display());
+            eprintln!(
+                "could not remove test directory {}: {e}",
+                self.path.display()
+            );
         }
     }
 }
 
-pub fn test_dir(label: &str) -> TestDir { TestDir::new(label) }
+pub fn test_dir(label: &str) -> TestDir {
+    TestDir::new(label)
+}
 
 #[cfg(test)]
 mod tests {
@@ -76,8 +95,12 @@ mod tests {
         let first = TestDir::new("same-label");
         std::fs::write(first.join("sentinel"), b"original").unwrap();
         let others = std::thread::scope(|scope| {
-            let jobs: Vec<_> = (0..8).map(|_| scope.spawn(|| TestDir::new("same-label"))).collect();
-            jobs.into_iter().map(|j| j.join().unwrap()).collect::<Vec<_>>()
+            let jobs: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| TestDir::new("same-label")))
+                .collect();
+            jobs.into_iter()
+                .map(|j| j.join().unwrap())
+                .collect::<Vec<_>>()
         });
         let mut paths: Vec<_> = others.iter().map(|d| d.to_path_buf()).collect();
         paths.push(first.to_path_buf());

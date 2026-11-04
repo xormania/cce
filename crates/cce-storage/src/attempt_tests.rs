@@ -329,7 +329,8 @@ fn outcome_after_any_cut_matches_the_recovered_state() {
     for cut in 0..=total {
         let sim = SimIo::new();
         let trace = Arc::new(Mutex::new(Vec::new()));
-        let s = create_on(
+        let s = NativeStore {
+            inner: Inner::create(
                 Box::new(Traced {
                     inner: sim.clone(),
                     trace: trace.clone(),
@@ -590,8 +591,7 @@ fn gated_store() -> (NativeStore, Gate) {
         inner: SimIo::new(),
         gate: gate.clone(),
     };
-    let s = NativeStore {
-        inner: Inner::create(Box::new(io), STORE, Default::default()).unwrap();
+    let s = create_on(Box::new(io), STORE, Default::default()).unwrap();
     seed(&s);
     (s, gate)
 }
