@@ -529,8 +529,7 @@ fn closing_waits_for_every_admitted_commit_and_refuses_new_ones() {
 #[test]
 fn after_close_returns_no_job_keeps_the_store_owned() {
     use cce_core::storage::StorageEngine;
-    let dir = std::env::temp_dir().join(format!("cce-close-owner-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::resources::test_dir("close-owner");
     let s = NativeStore::create(&dir, [9; 16]).unwrap();
     s.inner.slow_job_release_for_test();
     let engine = std::sync::Arc::downgrade(&s.inner);
@@ -556,5 +555,4 @@ fn after_close_returns_no_job_keeps_the_store_owned() {
     for t in tickets {
         assert!(t.wait().is_ok());
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }

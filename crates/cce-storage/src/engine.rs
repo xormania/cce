@@ -822,6 +822,12 @@ impl Inner {
         Ok(())
     }
 
+    /// Test hook: the extents queued for retirement by the next publication.
+    #[cfg(test)]
+    pub(crate) fn queued_for_test(&self) -> Vec<(u64, u64)> {
+        lock(&self.pool).discarded().to_vec()
+    }
+
     /// Test hook: removes the free extent at the lowest offset from the reuse pool.
     #[cfg(test)]
     pub(crate) fn drop_free_for_test(&self) -> Option<(u64, u64)> {

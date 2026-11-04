@@ -323,7 +323,8 @@ impl ContentPool {
 
     /// A definite rejection before publication of work that reserved space for staging
     /// `serial` (a relocation step, say): its reservations become free again at their original
-    /// retiring generation, all or none. Refused for a serial that reserves nothing or whose
+    /// retiring generation, all or none. Refused for a serial that reserves nothing, that an
+    /// admitted commit binds (that commit is about to consume the reservations), or whose
     /// reservations an uncertain publication owns. (Used by maintenance steps that reserve space.)
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn release(&mut self, serial: u64) -> Result<(), String> {
@@ -331,6 +332,9 @@ impl ContentPool {
             return Err(format!(
                 "staging {serial}'s reservations belong to an uncertain publication"
             ));
+        }
+        if self.is_admitted(serial) {
+            return Err(format!("staging {serial} is bound by an admitted commit"));
         }
         let Some(held) = self.held.remove(&serial) else {
             return Err(format!("staging {serial} reserves nothing"));
@@ -576,6 +580,7 @@ mod tests {
         refused(&mut p, |p| assert!(p.give_back(1, &others).is_err()));
         p.admit(1);
         refused(&mut p, |p| assert!(p.discard(1, &[(100, 10)]).is_err()));
+        refused(&mut p, |p| assert!(p.release(1).is_err()));
         p.resolve_admission(1);
         // Its own extent overlaps space already queued: nothing is given back or queued.
         assert_eq!(p.queue_discarded((100, 10)), Ok(()));
@@ -632,8 +637,13 @@ mod tests {
                 let ok = match rng(&mut s) % 12 {
                     11 => {
                         let mine: Vec<Reuse> = p.held_by(serial).to_vec();
+                        let admitted = p.is_admitted(serial);
                         match p.release(serial) {
                             Ok(()) => {
+                                assert!(
+                                    !admitted,
+                                    "seed {seed} step {step}: released an admitted staging"
+                                );
                                 // Exactly that serial's reservations, at their own generation.
                                 let mut want = before.0.clone();
                                 want.extend(
@@ -651,7 +661,7 @@ mod tests {
                                 // an unknown or uncertain-owned serial is refused.
                                 let reserved = before.1.iter().any(|(s, _)| *s == serial);
                                 assert!(
-                                    !reserved || p.is_uncertain(serial),
+                                    !reserved || p.is_uncertain(serial) || p.is_admitted(serial),
                                     "seed {seed} step {step}: release refused: {why}"
                                 );
                                 false
