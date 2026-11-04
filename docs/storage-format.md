@@ -35,7 +35,9 @@ Node page header (48 bytes), followed by the payload and zero padding:
 
 A page is accepted only if magic, version, checksum, store identity, page number, incarnation and
 kind all match what the referring structure expects. A page written to a reused location by a later
-generation therefore cannot be mistaken for its predecessor.
+generation therefore cannot be mistaken for its predecessor. The checksum is verified before the
+version and reserved byte are interpreted: a page that fails it is reported as damaged, and only an
+intact page with another version, or with its reserved byte set, is reported as unsupported.
 
 Node payload (page kind 1), first byte is the node tag:
 
@@ -117,7 +119,11 @@ A history entry is `position: u64`, attempt id, and the canonical request encodi
 bound content as `(sha256, length)` pairs, and the supplied evidence as `(label, bytes)` pairs.
 Staging tokens and physical locations are not part of it. Every content index must refer to a
 binding of the same request; a request with an out-of-range index is rejected before it is
-fingerprinted. History entries return the bound content references with the changes.
+fingerprinted. History entries return the bound content references with the changes. When a
+history entry is read, its recorded length is checked against the largest entry the open's request
+limit allows (`max_request_len` plus the position and the length-prefixed attempt id and request)
+before anything is allocated or read; a content manifest is checked the same way against the
+manifest size its segment limit allows.
 
 The attempt fingerprint is SHA-256 over `"cce.attempt.v1\0"`, the attempt id (length-prefixed),
 and that canonical encoding. Retrying an attempt with an identical logical request returns the

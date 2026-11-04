@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
     ContentReader, ContentRef, ContextId, ContextRecord, Direction, HistoryEntry, HistoryPosition,
-    Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery, Revision,
-    StagedContent, StagingToken, StorageError,
+    MAX_ID_LEN, Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery,
+    Revision, StagedContent, StagingToken, StorageError,
 };
 use sha2::{Digest, Sha256};
 
@@ -604,7 +604,20 @@ impl Inner {
         lock(&self.cache).capacity
     }
 
-    pub(crate) fn read_extent(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+    /// Reads and verifies a committed extent of at most `limit` bytes. The recorded length is
+    /// checked against `limit` and the committed content before anything is allocated or read.
+    pub(crate) fn read_extent(
+        &self,
+        x: &ExtentRef,
+        limit: u64,
+        what: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        if x.len > limit {
+            return Err(corrupt(format!(
+                "{what} of {} bytes exceeds the {limit} byte limit",
+                x.len
+            )));
+        }
         let committed = lock(&self.state).current.content_len;
         if x.offset
             .checked_add(x.len)
@@ -1111,8 +1124,15 @@ impl Inner {
         )?;
         Ok(cursor.map(move |entry| {
             let (_, v) = entry?;
-            decode_history(&self.read_extent(&ExtentRef::decode(&v)?)?)
+            let x = ExtentRef::decode(&v)?;
+            decode_history(&self.read_extent(&x, self.history_entry_limit(), "history entry")?)
         }))
+    }
+
+    /// Largest history entry this open accepts: its position, the length-prefixed attempt
+    /// identifier and the length-prefixed encoded request (see `Options::max_request_len`).
+    fn history_entry_limit(&self) -> u64 {
+        (8 + 4 + MAX_ID_LEN as u64 + 4).saturating_add(self.max_request_len)
     }
 
     /// Physical segments holding committed content, in stream order (inspection for tests and tools).
@@ -1124,13 +1144,7 @@ impl Inner {
             })?;
         let x = ExtentRef::decode(&x)?;
         let limit = Manifest::encoded_len(self.max_segments);
-        if x.len > limit {
-            return Err(corrupt(format!(
-                "content manifest of {} bytes exceeds the {limit} byte limit",
-                x.len
-            )));
-        }
-        let m = Manifest::decode(&self.read_extent(&x)?)?;
+        let m = Manifest::decode(&self.read_extent(&x, limit, "content manifest")?)?;
         if m.content != *c {
             return Err(corrupt(
                 "content manifest does not match the requested digest and length",

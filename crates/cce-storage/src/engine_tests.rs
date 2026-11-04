@@ -300,7 +300,7 @@ fn a_history_extent_outside_committed_content_is_rejected_before_reading() {
         len: 1 << 20,
         digest: [0; 32],
     };
-    let err = s.inner.read_extent(&bogus).unwrap_err();
+    let err = s.inner.read_extent(&bogus, u64::MAX, "extent").unwrap_err();
     assert!(
         format!("{err:?}").contains("outside committed content"),
         "{err:?}"
@@ -311,8 +311,13 @@ fn a_history_extent_outside_committed_content_is_rejected_before_reading() {
         digest: [0; 32],
     };
     assert!(
-        format!("{:?}", s.inner.read_extent(&overflow).unwrap_err())
-            .contains("outside committed content")
+        format!(
+            "{:?}",
+            s.inner
+                .read_extent(&overflow, u64::MAX, "extent")
+                .unwrap_err()
+        )
+        .contains("outside committed content")
     );
 }
 

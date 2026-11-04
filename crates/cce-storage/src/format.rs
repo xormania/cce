@@ -90,14 +90,8 @@ pub(crate) fn decode_page(
         return Err(corrupt(format!("page {}: bad magic", at.page)));
     }
     let version = d.u16()?;
-    if version != FORMAT_VERSION {
-        return Err(StorageError::Unsupported(format!(
-            "page {}: format version {version}",
-            at.page
-        )));
-    }
     let k = d.u8()?;
-    let _reserved = d.u8()?;
+    let reserved = d.u8()?;
     let s = d.array::<16>()?;
     let page = d.u64()?;
     let inc = d.u64()?;
@@ -106,10 +100,24 @@ pub(crate) fn decode_page(
     if len > PAGE_PAYLOAD_MAX {
         return Err(corrupt(format!("page {}: payload length {len}", at.page)));
     }
+    // The checksum covers the whole header: only an intact page can claim another encoding, and a
+    // damaged version or reserved byte is reported as damage.
     let mut check = bytes[..PAGE_HEADER_LEN + len].to_vec();
     check[PAGE_HEADER_LEN - 4..PAGE_HEADER_LEN].fill(0);
     if crc32fast::hash(&check) != crc {
         return Err(corrupt(format!("page {}: checksum mismatch", at.page)));
+    }
+    if version != FORMAT_VERSION {
+        return Err(StorageError::Unsupported(format!(
+            "page {}: format version {version}",
+            at.page
+        )));
+    }
+    if reserved != 0 {
+        return Err(StorageError::Unsupported(format!(
+            "page {}: reserved header byte {reserved:#04x} is set",
+            at.page
+        )));
     }
     if s != store.0 {
         return Err(corrupt(format!(

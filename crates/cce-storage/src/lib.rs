@@ -12,6 +12,8 @@ mod content_tests;
 #[cfg(test)]
 mod crash_tests;
 #[cfg(test)]
+mod decoder_tests;
+#[cfg(test)]
 mod descriptor_tests;
 mod engine;
 #[cfg(test)]
