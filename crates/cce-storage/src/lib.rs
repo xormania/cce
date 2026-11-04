@@ -379,19 +379,36 @@ pub struct StoreOptions {
     pub guard: Option<ReceiptGuard>,
 }
 
-/// What a caller retained independently of a store, checked before an open touches anything.
+/// What a caller retained independently of a store, checked before an open touches its data.
 ///
-/// An open with a guard is refused with [`StorageError::GuardRefused`], and leaves the store
-/// untouched, when the store has another identity or its published logical history position is
-/// below `min_history_position`. This is a rollback floor only: a position at or above the minimum
-/// does not prove that the history is the one the receipts came from.
+/// An open with a guard is refused with [`StorageError::GuardRefused`], and leaves the store's
+/// data untouched (a read-write open may have created the store's lock file), when the store has
+/// another identity or its published logical history position is below `min_history_position`.
+/// This is a rollback floor only: a position at or above the minimum does not prove that the
+/// history is the one the receipts came from. Construct it with [`ReceiptGuard::new`]; fields may
+/// be added.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReceiptGuard {
     /// The identity the store was created with.
     pub store_id: [u8; 16],
     /// The highest history position of a receipt the caller retained (`HistoryPosition(0)` if
     /// none): the published position must be at least this.
     pub min_history_position: cce_core::storage::HistoryPosition,
+}
+
+impl ReceiptGuard {
+    /// A guard for the store created with `store_id`, whose published history position must be
+    /// at least `min_history_position`.
+    pub fn new(
+        store_id: [u8; 16],
+        min_history_position: cce_core::storage::HistoryPosition,
+    ) -> Self {
+        Self {
+            store_id,
+            min_history_position,
+        }
+    }
 }
 
 impl Default for StoreOptions {

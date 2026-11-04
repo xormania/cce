@@ -12,10 +12,7 @@ const ID: [u8; 16] = *b"guard-store-test";
 
 fn guarded(min: u64) -> StoreOptions {
     let mut o = StoreOptions::default();
-    o.guard = Some(ReceiptGuard {
-        store_id: ID,
-        min_history_position: HistoryPosition(min),
-    });
+    o.guard = Some(ReceiptGuard::new(ID, HistoryPosition(min)));
     o
 }
 

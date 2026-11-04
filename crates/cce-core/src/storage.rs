@@ -299,8 +299,8 @@ pub enum StorageError {
     /// its bytes. Retained history may still name it by digest and length.
     ContentNotRetained,
     /// An open guarded by retained receipt information was refused: the store has another
-    /// identity, or its published history position is below the retained minimum. The store was
-    /// left untouched.
+    /// identity, or its published history position is below the retained minimum. The store's
+    /// data was left untouched (a read-write open may have created the store's lock file).
     GuardRefused(String),
 }
 
