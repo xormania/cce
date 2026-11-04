@@ -22,6 +22,9 @@
 //! dump <id>[,<id>...]                     prints the committed state reachable from those ids
 //! rels <id> out|in <kind|-> <limit> [<after-kind> <after-other> <after-id>]  paged query
 //! read-content <digest> <len>             reads content by logical reference through a new view
+//! keep-reader <id>                       opens and keeps a reader over a context's committed content
+//! drop-store                             drops the store handle (kept readers keep the engine alive)
+//! drop-readers                           drops kept readers
 //! hold                                    prints `holding` and blocks until killed
 //! close
 //! ```
@@ -157,6 +160,7 @@ fn change_tokens(c: &Change) -> String {
 
 struct Driver {
     store: Option<NativeStore>,
+    readers: Vec<Box<dyn cce_core::storage::ContentReader>>,
     staged: HashMap<String, StagedContent>,
     pending: ChangeSet,
     out: io::Stdout,
@@ -309,6 +313,26 @@ impl Driver {
                 }
             }
             ["dump", ids] => self.dump(ids)?,
+            ["keep-reader", id] => {
+                let mut view = self.store()?.begin().map_err(|e| e.to_string())?;
+                let cid = ContextId::new(id.as_bytes().to_vec()).map_err(|e| e.to_string())?;
+                let c = view
+                    .context(&cid)
+                    .map_err(|e| e.to_string())?
+                    .and_then(|r| r.content)
+                    .ok_or("no committed content")?;
+                let r = view.content(&c).map_err(|e| e.to_string())?;
+                self.readers.push(r);
+                self.say("ok reader kept");
+            }
+            ["drop-store"] => {
+                self.store = None;
+                self.say("ok store dropped");
+            }
+            ["drop-readers"] => {
+                self.readers.clear();
+                self.say("ok readers dropped");
+            }
             ["rels", node, dir, kind, limit, after @ ..] => {
                 let direction = match *dir {
                     "out" => Direction::Outgoing,
@@ -468,6 +492,7 @@ impl Driver {
 fn main() -> ExitCode {
     let mut d = Driver {
         store: None,
+        readers: Vec::new(),
         staged: HashMap::new(),
         pending: ChangeSet::default(),
         out: io::stdout(),

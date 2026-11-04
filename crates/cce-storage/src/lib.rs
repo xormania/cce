@@ -18,6 +18,8 @@ mod records;
 #[cfg(test)]
 mod sim;
 mod tree;
+#[cfg(test)]
+mod view_tests;
 
 use std::io::Read;
 use std::path::Path;
@@ -29,7 +31,7 @@ use cce_core::storage::{
     RelationshipQuery, StagedContent, StorageEngine, StorageError,
 };
 
-use engine::{Inner, Options, Snapshot};
+use engine::{Inner, Observation, Options, Snapshot};
 
 /// A native store owned by this process.
 ///
@@ -53,19 +55,20 @@ impl NativeStore {
         store_id: [u8; 16],
         options: StoreOptions,
     ) -> Result<Self, StorageError> {
+        let opts: Options = options.into();
         let inner = Inner::create(
             Box::new(io::FsIo::new(dir)),
             format::StoreId(store_id),
-            options.into(),
+            opts,
         )?;
         Ok(Self { inner })
     }
 
     /// Like [`NativeStore::open`], with explicit tuning options.
     pub fn open_with(dir: &Path, options: StoreOptions) -> Result<Self, StorageError> {
-        Ok(Self {
-            inner: Inner::open(Box::new(io::FsIo::new(dir)), options.into())?,
-        })
+        let opts: Options = options.into();
+        let inner = Inner::open(Box::new(io::FsIo::new(dir)), opts)?;
+        Ok(Self { inner })
     }
 
     /// Instrumentation counters and current tree shape. Counters never affect engine behavior.
@@ -83,6 +86,23 @@ impl NativeStore {
         })
     }
 
+    /// Admits a commit without waiting for it. The commit proceeds even if the ticket is dropped.
+    pub fn submit(
+        &self,
+        attempt: AttemptId,
+        basis: NativeView,
+        changes: ChangeSet,
+    ) -> Result<CommitTicket, CommitError> {
+        if !Arc::ptr_eq(&basis.inner, &self.inner) {
+            return Err(CommitError::Rejected(StorageError::ForeignHandle));
+        }
+        Ok(CommitTicket {
+            rx: self
+                .inner
+                .submit(attempt, basis.snap, basis.observed, changes)?,
+        })
+    }
+
     /// Recovery diagnostics from opening this store, such as an ignored damaged publication slot.
     pub fn recovery_diagnostics(&self) -> &[String] {
         &self.inner.diagnostics
@@ -91,6 +111,23 @@ impl NativeStore {
     /// Opens an existing store in `dir`. Never initializes a new store in its place.
     pub fn open(dir: &Path) -> Result<Self, StorageError> {
         Self::open_with(dir, StoreOptions::default())
+    }
+}
+
+/// An admitted commit. Dropping the ticket does not cancel the commit; reconcile its outcome with
+/// [`StorageEngine::outcome`] using the attempt identity.
+pub struct CommitTicket {
+    rx: std::sync::mpsc::Receiver<Result<CommitReceipt, CommitError>>,
+}
+
+impl CommitTicket {
+    /// Waits for the commit's result.
+    pub fn wait(self) -> Result<CommitReceipt, CommitError> {
+        self.rx.recv().unwrap_or_else(|_| {
+            Err(CommitError::Indeterminate(
+                "commit worker stopped before answering; reconcile with outcome".into(),
+            ))
+        })
     }
 }
 
@@ -136,10 +173,14 @@ pub struct StoreStats {
 pub struct NativeView {
     inner: Arc<Inner>,
     snap: Snapshot,
+    /// Logical reads made through this view; a commit from it is validated against them.
+    observed: Vec<Observation>,
 }
 
 impl ReadView for NativeView {
     fn context(&mut self, id: &ContextId) -> Result<Option<ContextRecord>, StorageError> {
+        self.observed
+            .push(Observation::Point(engine::context_key(id)));
         self.inner.context(&self.snap, id)
     }
 
@@ -148,6 +189,9 @@ impl ReadView for NativeView {
         query: &RelationshipQuery,
     ) -> Result<Box<dyn Iterator<Item = Result<Relationship, StorageError>> + '_>, StorageError>
     {
+        // Registered before any result is produced, so an empty or partly consumed range is protected.
+        self.observed
+            .push(Observation::Range(engine::relationship_range(query)));
         Ok(Box::new(self.inner.relationships(&self.snap, query)?))
     }
 
@@ -171,6 +215,7 @@ impl StorageEngine for NativeStore {
         Ok(NativeView {
             inner: self.inner.clone(),
             snap: self.inner.snapshot()?,
+            observed: Vec::new(),
         })
     }
 
@@ -192,10 +237,7 @@ impl StorageEngine for NativeStore {
         basis: NativeView,
         changes: ChangeSet,
     ) -> Result<CommitReceipt, CommitError> {
-        if !Arc::ptr_eq(&basis.inner, &self.inner) {
-            return Err(CommitError::Rejected(StorageError::ForeignHandle));
-        }
-        self.inner.commit(attempt, basis.snap, changes)
+        self.submit(attempt, basis, changes)?.wait()
     }
 
     fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
