@@ -42,6 +42,8 @@ mod maintain_tests;
 #[cfg(test)]
 mod merge_skip_tests;
 #[cfg(test)]
+mod model_tests;
+#[cfg(test)]
 mod oracle_tests;
 #[cfg(test)]
 mod quiescence_tests;

@@ -28,6 +28,8 @@ path = "src/bin/cce-verify.rs"
 workspace = true
 
 [dev-dependencies]
+proptest = "1"
+proptest-state-machine = "0.9"
 serde_json = "1"
 sha2 = "0.11"
 # Parses sources in the architecture checks.
