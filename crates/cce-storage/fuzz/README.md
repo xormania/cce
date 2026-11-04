@@ -29,4 +29,6 @@ normal test fails when the committed seeds differ from what the generator produc
 A finding becomes a permanent test: minimize it with `cargo +nightly fuzz tmin <target> <artifact>`,
 fix the cause, and save the minimized input as `regressions/<target>/<short-description>`. The
 ordinary test suite replays every seed and every saved finding through the same entry points, so
-no nightly toolchain is needed to keep them covered.
+no nightly toolchain is needed to keep them covered. It also runs a deterministic sweep of seeded
+mutations of the seeds through every decoder target (`CCE_DECODER_CASES` per target, default 10000)
+and of seeded random inputs through `ops` (`CCE_OPS_SWEEP_CASES`), without a fuzzing toolchain.

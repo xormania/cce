@@ -3469,8 +3469,9 @@ fn put_op(out: &mut Vec<u8>, op: &Op) {
 
 /// The `ops` fuzz target: decodes `data` and runs its sequence against the model, completely or
 /// interrupted once; any disagreement panics.
-pub(crate) fn run_bytes(data: &[u8]) {
+pub(crate) fn run_bytes(data: &[u8]) -> bool {
     let (run, ops) = ops_from_bytes(data);
+    let accepted = !ops.is_empty();
     if run == ByteRun::Complete {
         let mut m = Model::default();
         let mut e = Engine::init(false);
@@ -3479,12 +3480,12 @@ pub(crate) fn run_bytes(data: &[u8]) {
             e = Engine::apply(e, &m, op);
         }
         Engine::teardown(e, m);
-        return;
+        return accepted;
     }
     let bounds = boundaries(&ops);
     let total = bounds.last().copied().unwrap_or(0);
     if total == 0 {
-        return;
+        return accepted;
     }
     match run {
         ByteRun::Complete => unreachable!("handled above"),
@@ -3499,6 +3500,7 @@ pub(crate) fn run_bytes(data: &[u8]) {
             }
         }
     }
+    accepted
 }
 
 // ---------------------------------------------------------------------------------------------

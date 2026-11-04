@@ -1,6 +1,7 @@
 //! Stable side of fuzzing: the committed seed inputs are exactly what their generator produces and
 //! are valid inputs for their targets, and every seed and every saved finding replays through the
-//! same harness functions the fuzz targets call.
+//! same harness functions the fuzz targets call. Seeded mutations of the seeds sweep every
+//! decoder deterministically (`decoder report:`), and seeded random inputs sweep the `ops` target.
 //!
 //! Seeds live in `fuzz/seeds/<target>/` and saved findings (minimized crashing, hanging or
 //! oversized inputs) in `fuzz/regressions/<target>/`. Regenerate the seeds after a format change
@@ -717,4 +718,129 @@ fn seeded_random_operation_inputs_run_through_the_ops_harness() {
     }
     println!("ops sweep: {{\"cases\":{cases},\"seed\":\"{seed:#x}\",\"steps\":{steps}}}");
     assert!(steps > cases, "the sweep ran almost no steps");
+}
+
+/// One seeded mutation of `input`: between one and eight edits (bit flips, byte overwrites with
+/// random or boundary values, insertions, deletions, truncation, and splices from another seed of
+/// the same target), so most inputs keep the seed's structure and fail, if at all, deep inside it.
+fn mutate(mut input: Vec<u8>, pool: &[Vec<u8>], next: &mut impl FnMut() -> u64) -> Vec<u8> {
+    let most = pool.iter().map(Vec::len).max().unwrap_or(0) * 2 + 16;
+    for _ in 0..1 + next() % 8 {
+        let len = input.len() as u64;
+        let at = |n: u64| (n % len.max(1)) as usize;
+        match next() % 8 {
+            0 if len > 0 => {
+                let i = at(next());
+                input[i] ^= 1 << (next() % 8);
+            }
+            1 if len > 0 => {
+                let i = at(next());
+                input[i] = next() as u8;
+            }
+            2 if len > 0 => {
+                let i = at(next());
+                input[i] = [0, 1, 0x7f, 0x80, 0xfe, 0xff][(next() % 6) as usize];
+            }
+            3 if input.len() < most => {
+                let i = (next() % (len + 1)) as usize;
+                input.insert(i, next() as u8);
+            }
+            4 if len > 0 => {
+                input.remove(at(next()));
+            }
+            5 => input.truncate((next() % (len + 1)) as usize),
+            6 => {
+                let other = &pool[(next() % pool.len() as u64) as usize];
+                if !other.is_empty() && len > 0 {
+                    let from = (next() % other.len() as u64) as usize;
+                    let n = (1 + next() % 64) as usize;
+                    let to = at(next());
+                    for (k, b) in other[from..].iter().take(n).enumerate() {
+                        if let Some(slot) = input.get_mut(to + k) {
+                            *slot = *b;
+                        }
+                    }
+                }
+            }
+            _ if len > 8 => {
+                // An 8-byte little-endian field set to a boundary value.
+                let i = at(next()).min(input.len() - 8);
+                let v: u64 = [0, 1, u64::MAX, u64::from(u32::MAX), 1 << 32][(next() % 5) as usize];
+                input[i..i + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            _ => {}
+        }
+    }
+    input
+}
+
+/// Budget: `CCE_DECODER_CASES` mutated inputs per decoder target (default 10000) from the seed
+/// `CCE_DECODER_SEED`. Deterministic and independent of a fuzzing toolchain: each input runs
+/// through the same harness function the fuzz target calls, and any panic fails with the target,
+/// case and input. Prints one `decoder report:` line with valid and malformed counts per target.
+#[test]
+fn seeded_mutations_of_the_seeds_run_through_every_decoder() {
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .map(|v| {
+                v.parse()
+                    .unwrap_or_else(|_| panic!("{name} must be a number"))
+            })
+            .unwrap_or(default)
+    };
+    let cases = env("CCE_DECODER_CASES", 10_000);
+    let seed = env("CCE_DECODER_SEED", 0x0dec_0de5_eed0_0001);
+    let all = seeds();
+    let mut per_target = serde_json::Map::new();
+    let mut total = 0u64;
+    for (target, harness) in TARGETS.iter().filter(|(t, _)| *t != "ops") {
+        let pool: Vec<Vec<u8>> = all
+            .iter()
+            .filter(|((t, _), _)| t == target)
+            .map(|(_, b)| b.clone())
+            .collect();
+        assert!(!pool.is_empty(), "no seed for {target}");
+        let mut r =
+            seed ^ target.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            }) | 1;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let (mut valid, mut malformed) = (0u64, 0u64);
+        for case in 0..cases {
+            let base = pool[(next() % pool.len() as u64) as usize].clone();
+            let input = mutate(base, &pool, &mut next);
+            match std::panic::catch_unwind(|| harness(&input)) {
+                Ok(true) => valid += 1,
+                Ok(false) => malformed += 1,
+                Err(_) => panic!(
+                    "{target} case {case} (seed {seed:#x}) panicked on input {}",
+                    input.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                ),
+            }
+        }
+        total += cases;
+        per_target.insert(
+            target.to_string(),
+            serde_json::json!({"cases": cases, "valid": valid, "malformed": malformed}),
+        );
+    }
+    let report = serde_json::json!({
+        "seed": format!("{seed:#x}"),
+        "cases": total,
+        "per_target": per_target,
+        "passed": true,
+    });
+    println!("decoder report: {report}");
+    for (target, counts) in &per_target {
+        assert!(
+            counts["valid"].as_u64() > Some(0) && counts["malformed"].as_u64() > Some(0),
+            "the {target} sweep reached only one outcome: {counts}"
+        );
+    }
 }
