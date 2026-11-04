@@ -204,11 +204,17 @@ pub struct MaintenanceReport {
     /// the budget's `max_content_bytes`: no call with this budget can move them, a call with a
     /// larger one can.
     pub content_streams_over_budget: u64,
-    /// True if this step finished all the work it found, within its budget. False if some of it
-    /// remains: something that could move was left because the budget ran out, so another call
-    /// continues, or a stream is over the budget (see `content_streams_over_budget`), which only a
-    /// larger budget moves; false for that reason alone, it stays false across identical calls.
-    /// Streams with no retired space below them are not work left to do.
+    /// For content (hole reclaim and the content part of a relocation): true if this step finished
+    /// all the work it found, within its budget. False if some of it remains: something that could
+    /// move was left because the budget ran out, so another call continues, or a stream is over the
+    /// budget (see `content_streams_over_budget`), which only a larger budget moves; false for that
+    /// reason alone, it stays false across identical calls. Streams with no retired space below
+    /// them are not work left to do.
+    ///
+    /// For the tree pages of a relocation: true if the step rewrote every tree page, or none could
+    /// move into retired pages below them. False if it rewrote only some, because of the page
+    /// budget or because only that many fit into lower retired pages, or if the page budget is
+    /// zero. A relocation is complete only if both parts are.
     ///
     /// Only for `ReclaimContentHoles` does a complete step mean that an identical call finds
     /// nothing, as long as nothing is committed or discarded in between. A further `Relocate` step

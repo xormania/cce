@@ -418,9 +418,13 @@ space, which is proportional to the metadata (as for the integrity check).
   never extends the metadata file. Each part publishes only if it moved something. The page part
   holds the writer lock throughout because it writes only metadata and at most the page budget,
   about what a commit writes; the content part copies up to the content budget of stream bytes,
-  which is why it copies without the lock. A complete report means the step finished what it found
-  within its budget, not that a further step finds nothing: the space a step retires, and space
-  retired while a view was pinned once that view is gone, can lie below data a later step moves.
+  which is why it copies without the lock. For content, a complete report means the step finished
+  what it found within its budget. For tree pages it means the step rewrote every tree page or none
+  could move; it is incomplete when only some moved, because of the page budget or because only
+  that many fit into lower retired pages, or when the page budget is zero. A relocation is complete
+  only if both parts are. Neither means a further step finds nothing: the space a step retires, and
+  space retired while a view was pinned once that view is gone, can lie below data a later step
+  moves.
 
 What a step holds in memory, and what it reads:
 
