@@ -169,7 +169,7 @@ impl NativeReadOnly {
     }
 }
 
-fn stats_of(inner: &Inner) -> Result<StoreStats, StorageError> {
+fn stats_of(inner: &Arc<Inner>) -> Result<StoreStats, StorageError> {
     let c = &inner.counters;
     let get = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
     Ok(StoreStats {

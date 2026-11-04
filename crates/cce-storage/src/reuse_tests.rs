@@ -1328,3 +1328,86 @@ fn discarding_is_refused_for_pending_committed_repeated_or_foreign_handles() {
     crate::audit::check_retirement(&sim).unwrap();
     assert_eq!(read_all(&mut s.begin().unwrap(), &cc).unwrap(), c_bytes);
 }
+
+// ----- walkers outside views -------------------------------------------------------------------
+
+/// Parks the next tree walk of `outcome` or `height` until `go` is sent; `parked` signals it.
+fn park_next_walk(s: &NativeStore) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (parked_tx, parked) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    assert!(
+        s.inner
+            .set_walk_hook_for_test(Some(Box::new(move || {
+                parked_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+            })))
+            .is_none()
+    );
+    (parked, go)
+}
+
+fn pages_reused(s: &NativeStore) -> u64 {
+    s.inner
+        .counters
+        .pages_reused
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+fn outcome_and_stats_walk_their_own_state_while_commits_reuse_pages() {
+    let sim = SimIo::new();
+    // No node cache: every walk reads its pages from the file.
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(sim.clone()),
+            STORE,
+            crate::engine::Options {
+                cache_nodes: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    };
+    churn(&s, None, 0..LIVE * 4);
+    let receipt = cce_core::storage::CommitReceipt {
+        attempt: AttemptId::new(*b"c3").unwrap(),
+        position: cce_core::storage::HistoryPosition(4),
+    };
+
+    // outcome(): parked after choosing its state, while 48 commits reuse pages.
+    let (parked, go) = park_next_walk(&s);
+    let reused = pages_reused(&s);
+    let answer = std::thread::scope(|sc| {
+        let walker = sc.spawn(|| s.outcome(&receipt.attempt));
+        parked.recv().unwrap();
+        churn(&s, None, LIVE * 4..LIVE * 10);
+        go.send(()).unwrap();
+        walker.join().unwrap()
+    });
+    assert!(
+        pages_reused(&s) > reused,
+        "no page was reused while the walk was parked"
+    );
+    assert_eq!(
+        answer,
+        Ok(cce_core::storage::AttemptOutcome::Committed(
+            receipt.clone()
+        ))
+    );
+
+    // stats(): its height walk, parked the same way.
+    let (parked, go) = park_next_walk(&s);
+    let reused = pages_reused(&s);
+    let height = std::thread::scope(|sc| {
+        let walker = sc.spawn(|| s.stats().map(|st| st.tree_height));
+        parked.recv().unwrap();
+        churn(&s, None, LIVE * 10..LIVE * 16);
+        go.send(()).unwrap();
+        walker.join().unwrap()
+    });
+    assert!(
+        pages_reused(&s) > reused,
+        "no page was reused while the walk was parked"
+    );
+    assert!(matches!(height, Ok(h) if h >= 1), "{height:?}");
+}

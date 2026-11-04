@@ -223,7 +223,10 @@ replaces (`ChangeSet::removal`):
   and its staged content stays bound to its handles for a retry. The request's own basis view is
   consumed when the commit is admitted and is not counted; a content reader opened from it before
   that still is. While such a commit runs, new views wait and then read the state it published (or,
-  if it failed, the unchanged state); reads through existing handles are unaffected. The count is
+  if it failed, the unchanged state); reads through existing handles are unaffected. Answering
+  `outcome` and reporting statistics take a view of the current state too, so they also wait
+  (except `outcome` for an attempt that is itself still pending, which answers at once). A
+  quiescent commit held up in I/O therefore holds up those calls for as long as it lasts. The count is
   store-wide and covers this process only: no other process can hold the store open, read-write or
   read-only, while it is owned.
 

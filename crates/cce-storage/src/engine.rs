@@ -168,6 +168,10 @@ pub(crate) struct Inner {
     /// View registrations currently waiting for a quiescent commit (tests of that interleaving).
     #[cfg(test)]
     waiting_registrations: std::sync::atomic::AtomicUsize,
+    /// Runs once when `outcome` or `height` has chosen the state to walk, before its first page
+    /// read (tests parking a walker while commits proceed).
+    #[cfg(test)]
+    walk_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Makes the worker pause after answering each job (tests of shutdown ordering only).
     #[cfg(test)]
     slow_job_release: std::sync::atomic::AtomicBool,
@@ -546,6 +550,8 @@ impl Inner {
             #[cfg(test)]
             waiting_registrations: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            walk_hook: Mutex::new(None),
+            #[cfg(test)]
             slow_job_release: std::sync::atomic::AtomicBool::new(false),
             conflicts: Mutex::new(ConflictLog {
                 floor: desc.history_pos,
@@ -592,6 +598,27 @@ impl Inner {
     #[cfg(test)]
     pub(crate) fn waiting_registrations_for_test(&self) -> &std::sync::atomic::AtomicUsize {
         &self.waiting_registrations
+    }
+
+    /// Test hook: installs (or with `None` removes) the callback the next tree walk of
+    /// `outcome` or `height` runs before its first page read. Returns the one it replaced.
+    #[cfg(test)]
+    pub(crate) fn set_walk_hook_for_test(
+        &self,
+        hook: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        std::mem::replace(&mut *lock(&self.walk_hook), hook)
+    }
+
+    /// Runs the walk hook once, if one is installed (no-op outside tests).
+    fn run_walk_hook(&self) {
+        #[cfg(test)]
+        {
+            let hook = lock(&self.walk_hook).take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
     }
 
     /// The conflict log as (floor, every recorded position with its written keys) (tests that a
@@ -753,6 +780,12 @@ impl Inner {
     /// The current committed state, pinned: the pin is registered under the same lock that reads
     /// the current state, so no publication can slip between choosing the generation and pinning it.
     pub(crate) fn pin_current(self: &Arc<Self>) -> Result<(Snapshot, Pin), StorageError> {
+        let (snap, pin, ()) = self.pin_current_then(|_| ());
+        Ok((snap, pin))
+    }
+
+    /// Like `pin_current`, also reading `read` from the same state, under the same lock.
+    fn pin_current_then<R>(self: &Arc<Self>, read: impl FnOnce(&State) -> R) -> (Snapshot, Pin, R) {
         let mut st = lock(&self.state);
         // Never register on a state a quiescent commit is about to replace.
         while st.quiescing {
@@ -767,14 +800,16 @@ impl Inner {
         }
         let desc = st.current;
         *lock(&self.pins).entry(desc.generation).or_default() += 1;
+        let r = read(&st);
         drop(st);
-        Ok((
+        (
             Snapshot { desc },
             Pin {
                 inner: self.clone(),
                 generation: desc.generation,
             },
-        ))
+            r,
+        )
     }
 
     /// Live pins by generation.
@@ -794,9 +829,11 @@ impl Inner {
         }
     }
 
-    pub fn height(&self) -> Result<usize, StorageError> {
-        let root = lock(&self.state).current.root;
-        tree::height(self, root)
+    pub fn height(self: &Arc<Self>) -> Result<usize, StorageError> {
+        let (snap, _pin) = self.pin_current()?;
+        let root = snap.desc.root;
+        self.run_walk_hook();
+        tree::height(&**self, root)
     }
 
     pub fn cache_capacity(&self) -> usize {
@@ -1543,24 +1580,26 @@ impl Inner {
         Ok(remainders)
     }
 
-    pub fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
+    pub fn outcome(self: &Arc<Self>, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
         // Order matters: an attempt leaves `pending` only after its publication, so checking
         // `pending` first and the published state second can never miss a finishing commit.
         if lock(&self.pending).contains_key(attempt) {
             return Ok(AttemptOutcome::Pending);
         }
-        let st = lock(&self.state);
-        if st
-            .fenced
-            .as_ref()
-            .is_some_and(|f| f.uncertain.as_ref() == Some(attempt))
-        {
+        // The walk reads a pinned state: commits meanwhile cannot reuse its pages. Like any new
+        // view, this waits while a commit requiring quiescence runs.
+        let (snap, _pin, uncertain) = self.pin_current_then(|st| {
+            st.fenced
+                .as_ref()
+                .is_some_and(|f| f.uncertain.as_ref() == Some(attempt))
+        });
+        if uncertain {
             return Ok(AttemptOutcome::Unknown);
         }
-        let cur = st.current;
-        drop(st);
+        let cur = snap.desc;
+        self.run_walk_hook();
         Ok(
-            match tree::get(self, cur.root, &key(P_ATTEMPT, &[attempt.as_bytes()]))? {
+            match tree::get(&**self, cur.root, &key(P_ATTEMPT, &[attempt.as_bytes()]))? {
                 Some(v) => AttemptOutcome::Committed(CommitReceipt {
                     attempt: attempt.clone(),
                     position: HistoryPosition(AttemptValue::decode(&v)?.position),

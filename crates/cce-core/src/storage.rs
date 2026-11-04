@@ -277,8 +277,9 @@ pub enum AttemptOutcome {
     Unknown,
 }
 
-/// Errors from storage operations.
+/// Errors from storage operations. New kinds of error may be added.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StorageError {
     /// The operation is not implemented yet.
     NotImplemented(&'static str),
@@ -307,8 +308,9 @@ impl fmt::Display for StorageError {
 
 impl std::error::Error for StorageError {}
 
-/// Errors from [`StorageEngine::commit`].
+/// Errors from [`StorageEngine::commit`]. New kinds of error may be added.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CommitError {
     /// A logical dependency changed; nothing committed.
     Conflict(String),
