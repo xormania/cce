@@ -2937,7 +2937,7 @@ pub(crate) struct SegmentReader {
     manifest: Manifest,
     next: usize,
     buf: Vec<u8>,
-    /// Bytes of `buf` counted as held in the store's content buffer counter.
+    /// Bytes of `buf`'s allocation counted as held in the store's content buffer counter.
     held: u64,
     pos: usize,
     total: Sha256,
@@ -2972,9 +2972,10 @@ impl Drop for SegmentReader {
 }
 
 impl SegmentReader {
-    /// Keeps the store's buffer counter equal to the bytes `buf` now holds.
+    /// Keeps the store's buffer counter equal to the bytes `buf` has allocated. A shorter segment
+    /// reuses the allocation, so its capacity, not its length, is what the reader holds.
     fn account(&mut self) {
-        let now = self.buf.len() as u64;
+        let now = self.buf.capacity() as u64;
         if now > self.held {
             self.inner.buffer_held(now - self.held);
         } else {
@@ -3053,7 +3054,8 @@ impl Read for SegmentReader {
                 // Nothing of a segment that was not read and verified may stay readable.
                 let why = format!("content segment {} at offset {}: {e}", self.next, x.offset);
                 self.failed = Some(why.clone());
-                self.buf.clear();
+                // Free the allocation: a failed reader holds no buffer.
+                self.buf = Vec::new();
                 self.account();
                 self.pos = 0;
                 return Err(io::Error::other(why));
@@ -3064,7 +3066,8 @@ impl Read for SegmentReader {
                     self.next, x.offset
                 );
                 self.failed = Some(why.clone());
-                self.buf.clear();
+                // Free the allocation: a failed reader holds no buffer.
+                self.buf = Vec::new();
                 self.account();
                 self.pos = 0;
                 return Err(io::Error::new(io::ErrorKind::InvalidData, why));
