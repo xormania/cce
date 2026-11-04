@@ -61,13 +61,15 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      # Test fixtures and failure reproductions go here, outside the cached target directory.
-      TMPDIR: ${{ runner.temp }}/cce-tests
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
+      # Test fixtures and failure reproductions go here, outside the cached target directory.
+      - name: Test temporary directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/cce-tests"
+          echo "TMPDIR=$RUNNER_TEMP/cce-tests" >> "$GITHUB_ENV"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -77,13 +79,10 @@ jobs:
           key: cargo-test-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: cargo-test-${{ runner.os }}-
       - name: Test
-        run: |
-          mkdir -p "$TMPDIR"
-          cargo test --workspace --locked
+        run: cargo test --workspace --locked
       - name: Describe the failed candidate
         if: failure()
         run: |
-          mkdir -p "$TMPDIR"
           { echo "sha: $GITHUB_SHA"; echo "ref: $GITHUB_REF"; echo "event: $GITHUB_EVENT_NAME"
             rustc -vV; cargo -V; } > "$TMPDIR/candidate.txt"
       - name: Keep reproduction images of failed cases
