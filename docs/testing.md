@@ -94,7 +94,8 @@ attempted operations, every requested case accepted and none rejected (both
 measured, not assumed); in the crash and failure campaigns, exactly the
 configured cases, a reported nonzero number of cut points, every cut or exactly
 the sampled cuts per case executed, and recoveries both before and after the
-step. The totals must reach at least 1,000 generated
+step; in the decoder sweep, every decoder target reported with exactly its
+per-target budget. The totals must reach at least 1,000 generated
 sequences on the simulator and 10,000 decoder cases. Anything short or missing
 is listed as a gap and the tier is `incomplete`, never passed.
 

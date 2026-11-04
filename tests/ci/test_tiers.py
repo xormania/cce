@@ -278,6 +278,22 @@ class Campaigns(unittest.TestCase):
         totals, gaps = t.campaign_totals(batches[1:4] + [{"batch": decoder, "report_line": None}])
         self.assertEqual(gaps, ["generated sequences 750 < 1000", "decoder cases 0 < 10000"])
 
+    def test_the_decoder_sweep_must_cover_every_target_at_its_budget(self):
+        batch = next(b for b in t.CAMPAIGN_BATCHES if b["report"] == "decoder")
+        per = int(batch["env"]["CCE_DECODER_CASES"])
+        full = {n: {"cases": per, "valid": 1, "malformed": 1} for n in batch["targets"]}
+        line = dict(passed=True, cases=per * len(full), per_target=full)
+        self.assertEqual(self.check(batch, report("decoder", **line))[1], [])
+        dropped = dict(full)
+        missing = sorted(dropped)[0]
+        del dropped[missing]
+        _, gaps = self.check(batch, report("decoder", **dict(line, per_target=dropped)))
+        self.assertEqual(gaps, [f"decoder target {missing} not reported"])
+        short = dict(full, **{missing: {"cases": per - 1, "valid": 1, "malformed": 1}})
+        _, gaps = self.check(batch, report("decoder", **dict(line, per_target=short)))
+        self.assertEqual(gaps, [f"decoder target {missing}: cases {per - 1} != {per}"])
+        self.assertEqual(len(batch["targets"]), 7)
+
     def test_every_crash_batch_states_its_configured_cases(self):
         for b in t.CAMPAIGN_BATCHES:
             if b["report"] == "crash":

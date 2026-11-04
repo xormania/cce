@@ -88,6 +88,7 @@ def _batches():
                           "CCE_CRASH_SEED": seed}})
     b.append({"test": "fuzz_replay_tests::seeded_mutations_of_the_seeds_run_through_every_decoder",
               "report": "decoder", "total": "decoder_cases",
+              "targets": ["page", "slots", "node", "manifest", "history", "records", "image"],
               "env": {"CCE_DECODER_CASES": "10000"}})
     return b
 
@@ -302,6 +303,15 @@ def check_batch(batch, found, minimums=CAMPAIGN_MINIMUMS):
             gaps.append("rejected generated cases not measured")
         elif rejected != 0:
             gaps.append(f"{rejected} generated cases rejected")
+    if batch["report"] == "decoder":
+        # Every decoder target at its budget, so a target dropped from the sweep is noticed.
+        per = int(batch["env"]["CCE_DECODER_CASES"])
+        reported = r.get("per_target") or {}
+        for name in batch["targets"]:
+            if name not in reported:
+                gaps.append(f"decoder target {name} not reported")
+            elif reported[name].get("cases") != per:
+                gaps.append(f"decoder target {name}: cases {reported[name].get('cases')} != {per}")
     if batch["report"] == "crash":
         points = r.get("cut_points_available") or 0
         if points <= 0:
