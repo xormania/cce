@@ -36,8 +36,10 @@ receipt — survives a crash, and no part of it appears without the rest.
 Opening reads both slots. A slot is usable if its checksum, magic, version and slot position are
 valid. Recovery selects the usable record with the highest generation; damaged slots are ignored and
 reported through `NativeStore::recovery_diagnostics`. If neither slot is usable, opening fails and
-the store is left untouched; the engine never initializes a new store over existing files. An
-unsupported format version is refused without modification.
+the store is left untouched; the engine never initializes a new store over existing files. A record
+of an unsupported format version, or one that requires features this build does not implement, is
+refused without modification, whatever the other slot holds: an older record does not make a store
+this build cannot read readable.
 
 Before the recovered state is used, its cursors are checked against the files (the root lies below
 the next unallocated page, the metadata file holds every allocated page, the content file holds the
@@ -89,7 +91,9 @@ The simulator tests run the production engine with a simulated I/O adapter. They
   initializes a store.
 - **Injected I/O errors at chosen operations:** the content and metadata syncs of the data barrier,
   the sync of the publication record, each mutating operation of opening, the first read of
-  opening, and a read while streaming content.
+  opening, a read while streaming content, and each operation of a commit that reuses retired
+  tree pages, retires others and grows the metadata file. An injected error fails the whole
+  operation; a write that stops part-way is provoked only by the file size limit below.
 - **Lossy sync failures:** a failed sync may discard the file's unsynced writes, as an operating
   system may when write-back fails, so a later successful sync cannot make them durable. This is
   injected at the content and metadata syncs of the data barrier and at the publication sync.
@@ -106,7 +110,10 @@ The simulator tests run the production engine with a simulated I/O adapter. They
 Separately, real processes are killed and the store is reopened by a fresh process (process exit,
 not power loss); one scenario run on the filesystem adapter and on the simulator must issue the
 same persistence operations in the same order; and on a real filesystem, a file size limit makes a
-commit's write stop part-way and fail, as on a full disk, which must fail the commit explicitly.
+commit's write stop part-way and fail, as on a full disk, which must fail the commit explicitly:
+once in the history write to the content file, and once in a metadata page write of a commit that
+reuses retired pages but needs more than are retired. After the second, the same process keeps
+committing within the limit, and a fresh process sees the failed commit absent and can retry it.
 
 The filesystem adapter repeats a positional read or write interrupted by a signal and continues a
 short one where it stopped. A read that reaches the end of the file early is reported as an
@@ -123,8 +130,8 @@ write (the commit is rejected, its attempt absent, and the store keeps committin
 on read; transfers that make no progress; and an interrupted sync, at the adapter and at each sync
 of a commit (each fails the commit and fences writes; a fresh open settles the outcome).
 
-When a case of a cut sweep fails (the commit sweeps, the store-creation sweep, or the
-faults-during-recovery sweep), its crash image (durable bytes, and the bytes still cached after a
+When a case of a cut sweep fails (the commit sweeps, the space-reuse sweeps, the store-creation
+sweep, or the faults-during-recovery sweep), its crash image (durable bytes, and the bytes still cached after a
 process exit), the operation trace and a label naming the cut and the survival choice (which of the
 sampled subsets, or process exit) are written to a new directory under the system temporary
 directory, named in the failure message. Passing runs write nothing there.
@@ -244,7 +251,35 @@ attempt outcomes.
 The lock is an advisory `flock` lock: it excludes processes that use this engine, on local
 filesystems. Network filesystems may not provide it.
 
+## Removal and live readers
+
+A commit chooses how it treats views and content readers that may still read the state it
+replaces (`ChangeSet::removal`):
+
+- `PreserveViews` (the default): existing views and readers keep reading their state; the space the
+  commit retires is reused only after they are gone.
+- `RequireQuiescence`: before writing anything, the commit counts the live views and content
+  readers of the store. If there are any, it fails with `ReadersActive` (the message gives the
+  count only) and nothing changes: no write or sync, no published state, the attempt stays absent,
+  and its staged content stays bound to its handles for a retry. The request's own basis view is
+  consumed when the commit is admitted and is not counted; a content reader opened from it before
+  that still is. While such a commit runs, new views wait and then read the state it published (or,
+  if it failed, the unchanged state); reads through existing handles are unaffected. Answering
+  `outcome` and reporting statistics read a pinned current state too, so they also wait
+  (except `outcome` for an attempt that is itself still pending, which answers at once). A
+  quiescent commit held up in I/O therefore holds up those calls for as long as it lasts. Those
+  walks are not views: a quiescent commit does not count them as live readers, although their pins
+  still keep the space they read from being reused. The count is
+  store-wide and covers this process only: no other process can hold the store open, read-write or
+  read-only, while it is owned.
+
 ## Readers and content integrity
+
+When the last record using some content is removed or replaced, retained history still names the
+content by digest and length, but reading it through a view that began after that commit fails
+with `ContentNotRetained`. It never returns other bytes. A view, or a content reader, that began
+before the commit still reads the content whole: its space is retired, not reused, while it can
+still be reached.
 
 A view reads the generation that was current when it began. Content streams one segment at a time
 through a buffer of one segment. Each segment is read whole and checked against its SHA-256 before
@@ -259,6 +294,7 @@ length and is reused by later staging or after a restart.
 
 ## Not implemented yet
 
-Space reuse, removal modes, and recovery from an uncertain outcome without reopening. (Concurrent
-commit validation against views' observations is implemented; see "Concurrent views and conflict
-validation" above.)
+Recovery from an uncertain outcome without reopening, and a maintenance pass over the content
+file that would reclaim the content space reuse does not reach (see the storage format document).
+(Concurrent commit validation against views' observations is implemented; see "Concurrent views and
+conflict validation" above.)

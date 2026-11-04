@@ -16,7 +16,8 @@
 
 use cce_core::storage::{
     AttemptId, Change, ChangeSet, ContentDigest, ContentRef, ContextId, Evidence, HistoryEntry,
-    HistoryPosition, Precondition, RelationshipId, RelationshipKind, Revision, StorageError,
+    HistoryPosition, Precondition, RelationshipId, RelationshipKind, RemovalMode, Revision,
+    StorageError,
 };
 use sha2::{Digest, Sha256};
 
@@ -29,15 +30,89 @@ pub(crate) const P_IN: u8 = 0x04;
 pub(crate) const P_HISTORY: u8 = 0x05;
 pub(crate) const P_ATTEMPT: u8 = 0x06;
 pub(crate) const P_CONTENT: u8 = 0x07;
+/// Retirement records: space a published generation no longer reaches.
+pub(crate) const P_RETIRED: u8 = 0x08;
 
-/// Version tag of the canonical request encoding used for attempt fingerprints.
+/// Kind byte of a retired metadata page in a retirement key.
+pub(crate) const RETIRED_PAGE: u8 = 0;
+/// Kind byte of a retired content-file extent in a retirement key.
+pub(crate) const RETIRED_EXTENT: u8 = 1;
+
+/// Version tags of the canonical request encoding used for attempt fingerprints. Version 2 ends
+/// with the removal mode; version 1 (no mode, read as preserving views) is still decoded.
 const REQUEST_ENCODING_V1: u8 = 1;
+const REQUEST_ENCODING_V2: u8 = 2;
 
 pub(crate) fn key(prefix: u8, parts: &[&[u8]]) -> Vec<u8> {
     let mut k = vec![prefix];
     for p in parts {
         key_component(&mut k, p);
     }
+    k
+}
+
+/// Key recording that metadata page `page` is unreachable from generation `generation` on. Keys
+/// sort by retiring generation. The value is the retired page's incarnation.
+pub(crate) fn retired_page_key(generation: u64, page: u64) -> Vec<u8> {
+    let mut k = vec![P_RETIRED];
+    k.extend_from_slice(&generation.to_be_bytes());
+    k.push(RETIRED_PAGE);
+    k.extend_from_slice(&page.to_be_bytes());
+    k
+}
+
+/// One retirement record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retired {
+    /// A tree page and the incarnation it held.
+    Page {
+        generation: u64,
+        page: u64,
+        incarnation: u64,
+    },
+    /// A content-file extent.
+    Extent {
+        generation: u64,
+        offset: u64,
+        len: u64,
+    },
+}
+
+/// Parses a retirement record (prefix, retiring generation, kind, page or offset).
+pub(crate) fn decode_retired(key: &[u8], value: &[u8]) -> Result<Retired, StorageError> {
+    let bad = || corrupt("retirement record");
+    let [P_RETIRED, rest @ ..] = key else {
+        return Err(bad());
+    };
+    let (generation, rest) = rest.split_first_chunk::<8>().ok_or_else(bad)?;
+    let generation = u64::from_be_bytes(*generation);
+    let [kind, at @ ..] = rest else {
+        return Err(bad());
+    };
+    let at = u64::from_be_bytes(at.try_into().map_err(|_| bad())?);
+    let v = u64::from_le_bytes(value.try_into().map_err(|_| bad())?);
+    match *kind {
+        RETIRED_PAGE => Ok(Retired::Page {
+            generation,
+            page: at,
+            incarnation: v,
+        }),
+        RETIRED_EXTENT => Ok(Retired::Extent {
+            generation,
+            offset: at,
+            len: v,
+        }),
+        _ => Err(bad()),
+    }
+}
+
+/// Key recording that the content-file extent at `offset` is unreachable from generation
+/// `generation` on. The value is the extent's length.
+pub(crate) fn retired_extent_key(generation: u64, offset: u64) -> Vec<u8> {
+    let mut k = vec![P_RETIRED];
+    k.extend_from_slice(&generation.to_be_bytes());
+    k.push(RETIRED_EXTENT);
+    k.extend_from_slice(&offset.to_be_bytes());
     k
 }
 
@@ -76,6 +151,46 @@ impl ExtentRef {
         let r = Self::dec(&mut d)?;
         d.finish()?;
         Ok(r)
+    }
+}
+
+/// Value of a content index entry (prefix `07`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentEntry {
+    /// Committed content: its manifest extent and how many records use it.
+    Live { manifest: ExtentRef, refs: u64 },
+    /// Content that was committed, but that no record uses any more; its space is retired.
+    Removed,
+}
+
+impl ContentEntry {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::default();
+        match self {
+            ContentEntry::Live { manifest, refs } => {
+                e.u8(1);
+                manifest.enc(&mut e);
+                e.u64(*refs);
+            }
+            ContentEntry::Removed => {
+                e.u8(0);
+            }
+        }
+        e.buf
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, StorageError> {
+        let mut d = Dec::new(b, "content entry");
+        let entry = match d.u8()? {
+            1 => ContentEntry::Live {
+                manifest: ExtentRef::dec(&mut d)?,
+                refs: d.u64()?,
+            },
+            0 => ContentEntry::Removed,
+            t => return Err(corrupt(format!("content entry tag {t}"))),
+        };
+        d.finish()?;
+        Ok(entry)
     }
 }
 
@@ -213,7 +328,7 @@ fn dec_id<T>(d: &mut Dec, f: fn(Vec<u8>) -> Result<T, StorageError>) -> Result<T
 /// logical request restaged elsewhere has the same encoding.
 pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
     let mut e = Enc::default();
-    e.u8(REQUEST_ENCODING_V1);
+    e.u8(REQUEST_ENCODING_V2);
     e.u32(changes.changes.len() as u32);
     for c in &changes.changes {
         match c {
@@ -262,6 +377,10 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
     for ev in &changes.evidence {
         e.bytes(&ev.label).bytes(&ev.bytes);
     }
+    e.u8(match changes.removal {
+        RemovalMode::PreserveViews => 0,
+        RemovalMode::RequireQuiescence => 1,
+    });
     debug_assert_eq!(e.buf.len() as u64, encoded_request_len(changes));
     e.buf
 }
@@ -309,7 +428,7 @@ pub(crate) fn encoded_request_len(changes: &ChangeSet) -> u64 {
     for ev in &changes.evidence {
         n += field(ev.label.len()) + field(ev.bytes.len());
     }
-    n
+    n + 1
 }
 
 /// Checks that every variable-length field and list of a request fits the encoding's 32-bit length
@@ -378,7 +497,8 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
     let req = d.bytes()?;
     d.finish()?;
     let mut d = Dec::new(req, "history request");
-    if d.u8()? != REQUEST_ENCODING_V1 {
+    let version = d.u8()?;
+    if version != REQUEST_ENCODING_V1 && version != REQUEST_ENCODING_V2 {
         return Err(StorageError::Unsupported("history request encoding".into()));
     }
     let n = d.count(2)?;
@@ -443,6 +563,9 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
             bytes: d.bytes()?.to_vec(),
         });
     }
+    if version == REQUEST_ENCODING_V2 && d.u8()? > 1 {
+        return Err(corrupt("history request removal mode"));
+    }
     d.finish()?;
     Ok(HistoryEntry {
         position,
@@ -486,6 +609,7 @@ mod tests {
                 label: b"l".to_vec(),
                 bytes: b"\x00e".to_vec(),
             }],
+            ..ChangeSet::default()
         }
     }
 

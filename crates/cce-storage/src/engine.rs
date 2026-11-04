@@ -10,16 +10,16 @@
 //! 5. publication barrier: sync the metadata file;
 //! 6. expose the new generation to new views and acknowledge.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
     ContentReader, ContentRef, ContextId, ContextRecord, Direction, HistoryEntry, HistoryPosition,
-    Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery, Revision,
-    StagedContent, StagingToken, StorageError,
+    Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery, RemovalMode,
+    Revision, StagedContent, StagingToken, StorageError,
 };
 use sha2::{Digest, Sha256};
 
@@ -29,9 +29,11 @@ use crate::format::{
     decode_slot, encode_page,
 };
 use crate::io::{FileId, Io};
+use crate::ledger::{ContentPool, Reuse, overlap};
 use crate::records::{
-    AttemptValue, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT, P_HISTORY,
-    P_IN, P_OUT, P_REL, RelValue, decode_history, encode_history, fingerprint, history_key, key,
+    AttemptValue, ContentEntry, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT,
+    P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, decode_history, decode_retired,
+    encode_history, fingerprint, history_key, key, retired_extent_key, retired_page_key,
 };
 use crate::tree::{self, Cursor, MAX_KEY, Node, NodeSink, NodeSource, TreeTxn};
 
@@ -90,6 +92,10 @@ pub(crate) struct Counters {
     pub content_bytes_written: AtomicU64,
     pub cache_misses: AtomicU64,
     pub cache_evictions: AtomicU64,
+    /// Tree pages written over retired pages.
+    pub pages_reused: AtomicU64,
+    /// Staged content bytes written into retired content extents.
+    pub content_bytes_reused: AtomicU64,
 }
 
 /// The committed state a view reads.
@@ -106,6 +112,9 @@ struct State {
     next_stage: u64,
     /// Set when durability became uncertain; further writes are refused until reopen.
     fenced: Option<Fence>,
+    /// A commit requiring quiescence is in progress: views register only after it ends, and so
+    /// read the state it publishes.
+    quiescing: bool,
 }
 
 /// Why writes are fenced, and which attempt (if any) has an unknown publication outcome.
@@ -131,6 +140,12 @@ pub(crate) struct Inner {
     writer: Mutex<()>,
     /// Content-file allocation cursor; held while streaming an allocation.
     alloc: Mutex<u64>,
+    /// Retired content extents staging may reuse, and those stagings of this instance hold.
+    pool: Mutex<ContentPool>,
+    /// Inconsistencies in space ownership found during cleanup, where no caller could be told.
+    faults: Mutex<Vec<String>>,
+    /// Next taker id for the reuse pool (one per staging call).
+    next_taker: AtomicU64,
     cache: Mutex<NodeCache>,
     /// Logical write sets of recent commits, for validating older read bases.
     conflicts: Mutex<ConflictLog>,
@@ -141,11 +156,42 @@ pub(crate) struct Inner {
     pending: Arc<Recorded<HashMap<AttemptId, u32>>>,
     /// Set (under the `pending` lock) once `close` began: new commits are refused from then on.
     closing: AtomicBool,
+    /// Live reader pins: committed generation -> number of views and content readers reading it.
+    /// Space a pinned generation can reach must not be reused.
+    pins: Mutex<BTreeMap<u64, u32>>,
+    /// Pins held by views and content readers (not by the engine's own short walks): what a
+    /// commit requiring quiescence counts as live readers.
+    readers: AtomicU64,
+    /// Signalled when a quiescent commit ends.
+    quiesced: Condvar,
     #[cfg(test)]
     gate: Mutex<()>,
     /// Makes the next commit panic inside the worker (tests of worker robustness only).
     #[cfg(test)]
     panic_next_commit: std::sync::atomic::AtomicBool,
+    /// Runs once inside a commit, after it fixed which retired pages it may reuse and before it
+    /// takes any (tests forcing reader registration against that decision).
+    #[cfg(test)]
+    reuse_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once inside a commit on its space journal and tree just before the journal is sealed
+    /// (tests planting a faulty change of ownership).
+    #[cfg(test)]
+    journal_hook: Mutex<Option<JournalHook>>,
+    /// Runs once inside a commit after its publication and before the pool is updated (tests
+    /// planting a conflicting pool change).
+    #[cfg(test)]
+    apply_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// View registrations currently waiting for a quiescent commit (tests of that interleaving).
+    #[cfg(test)]
+    waiting_registrations: std::sync::atomic::AtomicUsize,
+    /// Runs once when `outcome` or `height` has chosen the state to walk, before its first page
+    /// read (tests parking a walker while commits proceed).
+    #[cfg(test)]
+    walk_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once right after a commit is admitted to the worker's queue, on the submitting thread
+    /// (tests of what the submitter still holds while the commit runs).
+    #[cfg(test)]
+    admitted_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Makes the worker pause after answering each job (tests of shutdown ordering only).
     #[cfg(test)]
     slow_job_release: std::sync::atomic::AtomicBool,
@@ -254,23 +300,153 @@ fn rejected(e: StorageError) -> CommitError {
     CommitError::Rejected(e)
 }
 
-/// Writes new tree nodes at fresh pages for one generation.
+/// Ends a quiescent commit when dropped (after its publication, or on any failure): views may
+/// register again.
+struct Quiescing<'a> {
+    inner: &'a Inner,
+}
+
+impl Drop for Quiescing<'_> {
+    fn drop(&mut self) {
+        lock(&self.inner.state).quiescing = false;
+        self.inner.quiesced.notify_all();
+    }
+}
+
+/// Every change of space ownership one commit makes, sealed before it writes anything.
+pub(crate) struct SpaceJournal {
+    pub(crate) generation: u64,
+    /// Committed pages the new tree no longer refers to, retired at `generation`.
+    pub(crate) retired_pages: Vec<PageRef>,
+    /// Retired pages the commit writes its new nodes into.
+    pub(crate) reused_pages: Vec<u64>,
+    /// Content extents retired at `generation`: removed or orphaned content, discarded stagings.
+    pub(crate) retired_extents: Vec<(u64, u64)>,
+    /// Unused parts of reused retirement records, as `(offset, len, retiring generation)`: they
+    /// stay retired at their record's original generation.
+    pub(crate) remainders: Vec<(u64, u64, u64)>,
+    /// Keys of the retirement records of reserved content the commit consumes (deleted).
+    pub(crate) consumed: Vec<Vec<u8>>,
+    /// Keys of the retirement records of the pages it reuses (deleted).
+    pub(crate) reused_records: Vec<Vec<u8>>,
+    /// Extents the new published state still reaches (live manifests and segments of touched
+    /// digests; for maintenance, relocation's new extents or reclaim's independent full reach)
+    /// that this publication must not free.
+    pub(crate) still_reachable: Vec<(u64, u64)>,
+    /// Serials of the stagings the commit binds (their reservations are its to consume).
+    pub(crate) bound: Vec<u64>,
+}
+
+#[cfg(test)]
+pub(crate) type JournalHook = Box<dyn for<'a> FnOnce(&mut SpaceJournal, &mut TreeTxn<'a>) + Send>;
+
+/// Content-file extents as `(offset, len)`.
+type ExtentList = Vec<(u64, u64)>;
+
+/// A retirement record's key in words, for error messages.
+fn retired_key_label(k: &[u8]) -> String {
+    match decode_retired(k, &[0; 8]) {
+        Ok(Retired::Page {
+            generation, page, ..
+        }) => format!("of page {page} at generation {generation}"),
+        Ok(Retired::Extent {
+            generation, offset, ..
+        }) => format!("of content at offset {offset}, generation {generation}"),
+        Err(_) => format!("{k:?}"),
+    }
+}
+
+/// Remainders of consumed reservations, `(offset, len, retiring generation)`, and the keys of the
+/// consumed records.
+type Consumed = (Vec<(u64, u64, u64)>, Vec<Vec<u8>>);
+
+/// Content a commit wrote that no publication references yet. If the commit ends before its
+/// publication record is written, the extent joins the discarded extents, which the next
+/// publication retires with a record: it is never made free without one.
+struct Unpublished<'a> {
+    inner: &'a Inner,
+    extent: Option<(u64, u64)>,
+}
+
+impl Drop for Unpublished<'_> {
+    fn drop(&mut self) {
+        if let Some(x) = self.extent.take() {
+            let queued = lock(&self.inner.pool).queue_discarded(x);
+            if let Err(why) = queued {
+                self.inner.fault(&why);
+            }
+        }
+    }
+}
+
+/// Extents one staging call took from the pool; returned to it unless the staging completes.
+struct Taken<'a> {
+    inner: &'a Inner,
+    /// This staging call's taker id in the pool.
+    owner: u64,
+    taken: Vec<Reuse>,
+}
+
+impl Taken<'_> {
+    /// Records the extents as held by staging `serial`.
+    fn hold(mut self, serial: u64) {
+        let taken = std::mem::take(&mut self.taken);
+        if !taken.is_empty() {
+            let held = lock(&self.inner.pool).hold(self.owner, serial, taken);
+            if let Err(taken) = held {
+                // A staging reserves once; give the space back rather than lose it.
+                self.taken = taken;
+                self.inner
+                    .fault(&format!("staging {serial} reserved space twice"));
+            }
+        }
+    }
+}
+
+impl Drop for Taken<'_> {
+    /// Gives the space back. An inconsistency found here cannot be returned to anyone: it is
+    /// recorded as a fault and fences writes (never a second panic while unwinding).
+    fn drop(&mut self) {
+        if !self.taken.is_empty() {
+            let taken = std::mem::take(&mut self.taken);
+            let given = lock(&self.inner.pool).give_back(self.owner, &taken);
+            if let Err(why) = given {
+                self.inner.fault(&why);
+            }
+        }
+    }
+}
+
+/// Writes new tree nodes for one generation: first into retired pages the commit took for reuse,
+/// then at fresh pages.
 struct PageWriter<'a> {
     inner: &'a Inner,
     next_page: u64,
     generation: u64,
+    reuse: Vec<u64>,
 }
 
 impl NodeSink for PageWriter<'_> {
     fn write(&mut self, node: &Node) -> Result<PageRef, StorageError> {
+        let (page, next) = match self.reuse.pop() {
+            Some(page) => {
+                self.inner
+                    .counters
+                    .pages_reused
+                    .fetch_add(1, Ordering::Relaxed);
+                (page, self.next_page)
+            }
+            None => (
+                self.next_page,
+                self.next_page
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::InvalidRequest("page counter exhausted".into()))?,
+            ),
+        };
         let at = PageRef {
-            page: self.next_page,
+            page,
             incarnation: self.generation,
         };
-        let next = self
-            .next_page
-            .checked_add(1)
-            .ok_or_else(|| StorageError::InvalidRequest("page counter exhausted".into()))?;
         let offset = at
             .page
             .checked_mul(PAGE_SIZE as u64)
@@ -385,6 +561,7 @@ impl Inner {
         io.sync(FileId::Content)?;
         io.sync(FileId::Meta)?;
         let inner = Arc::new(Self::new(io, desc, diagnostics, opts));
+        inner.load_content_pool()?;
         inner.start_worker(opts.commit_queue)?;
         Ok(inner)
     }
@@ -415,6 +592,9 @@ impl Inner {
             store: desc.store,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             alloc: Mutex::new(desc.content_len),
+            pool: Mutex::new(ContentPool::default()),
+            faults: Mutex::new(Vec::new()),
+            next_taker: AtomicU64::new(0),
             state: Recorded::new(
                 "state",
                 State {
@@ -422,6 +602,7 @@ impl Inner {
                     staged: HashMap::new(),
                     next_stage: 1,
                     fenced: None,
+                    quiescing: false,
                 },
             ),
             writer: Mutex::new(()),
@@ -433,10 +614,25 @@ impl Inner {
             worker: Mutex::new(None),
             pending: Arc::new(Recorded::new("pending", HashMap::new())),
             closing: AtomicBool::new(false),
+            pins: Mutex::new(BTreeMap::new()),
+            readers: AtomicU64::new(0),
+            quiesced: Condvar::new(),
             #[cfg(test)]
             gate: Mutex::new(()),
             #[cfg(test)]
             panic_next_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            reuse_hook: Mutex::new(None),
+            #[cfg(test)]
+            journal_hook: Mutex::new(None),
+            #[cfg(test)]
+            apply_hook: Mutex::new(None),
+            #[cfg(test)]
+            waiting_registrations: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            walk_hook: Mutex::new(None),
+            #[cfg(test)]
+            admitted_hook: Mutex::new(None),
             #[cfg(test)]
             slow_job_release: std::sync::atomic::AtomicBool::new(false),
             conflicts: Mutex::new(ConflictLog {
@@ -470,6 +666,272 @@ impl Inner {
         lock(&self.gate)
     }
 
+    /// Test hook: installs (or with `None` removes) the callback a commit runs once after fixing
+    /// which retired pages it may reuse. Returns the callback it replaced.
+    #[cfg(test)]
+    pub(crate) fn set_reuse_hook_for_test(
+        &self,
+        hook: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        std::mem::replace(&mut *lock(&self.reuse_hook), hook)
+    }
+
+    /// Test hook: the callback the next commit runs on its space journal before sealing it.
+    #[cfg(test)]
+    pub(crate) fn set_journal_hook_for_test(&self, hook: JournalHook) {
+        *lock(&self.journal_hook) = Some(hook);
+    }
+
+    /// Test hook: the callback the next commit runs after publishing, before updating the pool.
+    #[cfg(test)]
+    pub(crate) fn set_apply_hook_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock(&self.apply_hook) = Some(hook);
+    }
+
+    /// Test oracle: the published state's retired-content records and the reuse pool's
+    /// accounting correspond one to one. Every record (offset, length, retiring generation) is
+    /// exactly one of: a free extent, a reservation a staging holds, or a reservation an uncertain
+    /// publication owns, with the same offset, length and generation; and every free extent and
+    /// reservation is exactly one record. Records never overlap one another. Discarded extents
+    /// awaiting retirement have no record yet and overlap neither records, nor each other, nor
+    /// anything the published state reaches.
+    ///
+    /// Only meaningful while nothing is in flight: a staging's takes stay outside the pool's
+    /// reservations until it registers, and a commit changes ownership as it publishes. The check
+    /// refuses to run otherwise.
+    #[cfg(test)]
+    pub(crate) fn ledger_check_for_test(&self) -> Result<(), String> {
+        let e = |x: StorageError| x.to_string();
+        let staging = lock(&self.pool).taking().len();
+        let committing = lock(&self.pending).len();
+        if staging > 0 || committing > 0 {
+            return Err(format!(
+                "not quiescent: {staging} extent(s) being taken by stagings and {committing} \
+                 commit(s) in flight"
+            ));
+        }
+        let cur = lock(&self.state).current;
+        let mut records: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        let mut c = Cursor::new(self, cur.root, &[P_RETIRED], None, cur.next_page).map_err(e)?;
+        while let Some((k, v)) = c.next_entry().map_err(e)? {
+            if let Retired::Extent {
+                generation,
+                offset,
+                len,
+            } = decode_retired(&k, &v).map_err(e)?
+                && records.insert(offset, (len, generation)).is_some()
+            {
+                return Err(format!("two retirement records at offset {offset}"));
+            }
+        }
+        if let Some(w) = records
+            .iter()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|w| overlap((*w[0].0, w[0].1.0), (*w[1].0, w[1].1.0)))
+        {
+            return Err(format!(
+                "retirement records at offsets {} and {} overlap",
+                w[0].0, w[1].0
+            ));
+        }
+        let reached = crate::audit::reach(&*self.io, &cur).map_err(e)?;
+        let live: Vec<(u64, u64)> = reached
+            .manifests
+            .iter()
+            .chain(&reached.content_segments)
+            .chain(&reached.history_extents)
+            .copied()
+            .collect();
+        let pool = lock(&self.pool);
+        let mut entries: Vec<(u64, u64, u64, String)> = pool
+            .free()
+            .map(|(o, l, g)| (o, l, g, "free".to_string()))
+            .collect();
+        for (serial, rs) in pool.held() {
+            entries.extend(rs.iter().map(|r| {
+                (
+                    r.offset,
+                    r.record_len,
+                    r.retired_at,
+                    format!("staging {serial}"),
+                )
+            }));
+        }
+        for (serial, attempt, g, rs) in pool.uncertain() {
+            entries.extend(rs.iter().map(|r| {
+                (
+                    r.offset,
+                    r.record_len,
+                    r.retired_at,
+                    format!("staging {serial} under uncertain {attempt:?} at {g}"),
+                )
+            }));
+        }
+        let mut seen: BTreeMap<u64, String> = BTreeMap::new();
+        for (offset, len, g, owner) in &entries {
+            if let Some(other) = seen.insert(*offset, owner.clone()) {
+                return Err(format!(
+                    "content at offset {offset} accounted twice: {other} and {owner}"
+                ));
+            }
+            match records.get(offset) {
+                None => {
+                    return Err(format!(
+                        "{owner} accounts for content at offset {offset} ({len} bytes, \
+                         generation {g}) that no record retires"
+                    ));
+                }
+                Some(r) if *r != (*len, *g) => {
+                    return Err(format!(
+                        "{owner} accounts for content at offset {offset} as ({len}, {g}), its \
+                         record says {r:?}"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some((offset, (len, g))) = records.iter().find(|(o, _)| !seen.contains_key(o)) {
+            return Err(format!(
+                "the record retiring content at offset {offset} ({len} bytes, generation {g}) is \
+                 neither free nor reserved"
+            ));
+        }
+        let mut queued = pool.discarded().to_vec();
+        queued.sort_unstable();
+        if let Some(w) = queued.windows(2).find(|w| overlap(w[0], w[1])) {
+            return Err(format!(
+                "discarded extents {:?} and {:?} overlap",
+                w[0], w[1]
+            ));
+        }
+        if let Some(x) = queued
+            .iter()
+            .find(|x| records.iter().any(|(o, (l, _))| overlap(**x, (*o, *l))))
+        {
+            return Err(format!("discarded extent {x:?} already has a record"));
+        }
+        if let Some(x) = queued
+            .iter()
+            .find(|x| live.iter().any(|l| overlap(**x, *l)))
+        {
+            return Err(format!(
+                "discarded extent {x:?} overlaps content the published state reaches"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Test hook: the extents queued for retirement by the next publication.
+    #[cfg(test)]
+    pub(crate) fn queued_for_test(&self) -> Vec<(u64, u64)> {
+        lock(&self.pool).discarded().to_vec()
+    }
+
+    /// Test hook: removes the free extent at the lowest offset from the reuse pool.
+    #[cfg(test)]
+    pub(crate) fn drop_free_for_test(&self) -> Option<(u64, u64)> {
+        lock(&self.pool).drop_first_free_for_test()
+    }
+
+    /// Test hook: puts an extent in the reuse pool as free.
+    #[cfg(test)]
+    pub(crate) fn insert_free_for_test(&self, offset: u64, len: u64, retired_at: u64) {
+        lock(&self.pool).plant_free_for_test(offset, len, retired_at);
+    }
+
+    /// How many view registrations are waiting for a quiescent commit to publish.
+    #[cfg(test)]
+    pub(crate) fn waiting_registrations_for_test(&self) -> &std::sync::atomic::AtomicUsize {
+        &self.waiting_registrations
+    }
+
+    /// Test hook: installs (or with `None` removes) the callback the next tree walk of
+    /// `outcome` or `height` runs before its first page read. Returns the one it replaced.
+    #[cfg(test)]
+    pub(crate) fn set_walk_hook_for_test(
+        &self,
+        hook: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        std::mem::replace(&mut *lock(&self.walk_hook), hook)
+    }
+
+    /// Test hook: installs the callback the next admitted commit runs on the submitting thread.
+    #[cfg(test)]
+    pub(crate) fn set_admitted_hook_for_test(
+        &self,
+        hook: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        std::mem::replace(&mut *lock(&self.admitted_hook), hook)
+    }
+
+    /// How many attempts are admitted and not yet resolved.
+    #[cfg(test)]
+    pub(crate) fn pending_attempts_for_test(&self) -> usize {
+        lock(&self.pending).len()
+    }
+
+    /// Runs the walk hook once, if one is installed (no-op outside tests).
+    fn run_walk_hook(&self) {
+        #[cfg(test)]
+        {
+            let hook = lock(&self.walk_hook).take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+    }
+
+    /// The conflict log as (floor, every recorded position with its written keys) (tests that a
+    /// refused commit leaves it unchanged).
+    #[cfg(test)]
+    pub(crate) fn conflict_log_for_test(&self) -> (u64, Vec<ConflictEntry>) {
+        let log = lock(&self.conflicts);
+        (log.floor, log.entries.iter().cloned().collect())
+    }
+
+    /// What the engine would reuse right now under its own rules: retired tree pages the next
+    /// commit may take, and retired content extents a staging may take (tests auditing reuse
+    /// against every retained root and pin).
+    #[cfg(test)]
+    pub(crate) fn reusable_for_test(&self) -> Result<Reusable, StorageError> {
+        let cur = lock(&self.state).current;
+        let bound = self.reusable_through(cur.generation.saturating_add(1));
+        let (page_bound, content_bound) = (bound, bound);
+        let mut pages = Vec::new();
+        let mut c = Cursor::new(self, cur.root, &[P_RETIRED], None, cur.next_page)?;
+        while let Some((k, v)) = c.next_entry()? {
+            if let Retired::Page {
+                generation, page, ..
+            } = decode_retired(&k, &v)?
+                && page_bound.is_some_and(|b| generation <= b)
+            {
+                pages.push(page);
+            }
+        }
+        let extents = lock(&self.pool)
+            .free()
+            .filter(|(_, _, retired_at)| content_bound.is_some_and(|b| *retired_at <= b))
+            .map(|(offset, len, _)| (offset, len))
+            .collect();
+        Ok((pages, extents))
+    }
+
+    /// The content-file extents `(offset, len)` of a staging issued by this instance: its
+    /// manifest and segments (tests of space reuse only).
+    #[cfg(test)]
+    pub(crate) fn staged_extents_for_test(
+        &self,
+        staged: &StagedContent,
+    ) -> Result<Vec<(u64, u64)>, StorageError> {
+        let (_, (manifest, _)) = self.staged_extent(&staged.token, &staged.content)?;
+        let m = Manifest::decode(&self.read_written_extent(&manifest)?)?;
+        Ok(std::iter::once(manifest)
+            .chain(m.segments)
+            .map(|x| (x.offset, x.len))
+            .collect())
+    }
+
     /// Starts the store's commit worker: the single thread that orders publications. The worker
     /// holds no reference to the engine; each queued job holds a strong one, so admitted work
     /// completes even if every caller handle is dropped, and an idle worker never keeps the store
@@ -489,6 +951,7 @@ impl Inner {
                         observed,
                         changes,
                         reply,
+                        staged,
                     } = job;
                     #[cfg(test)]
                     drop(lock(&inner.gate));
@@ -500,12 +963,15 @@ impl Inner {
                         // publication: its outcome is unknown, and writes stay fenced until
                         // reopen. Queued jobs keep being answered (refused behind the fence).
                         let why = format!("commit of attempt {attempt:?} failed unexpectedly");
-                        lock(&inner.state).fenced = Some(Fence {
+                        let generation = lock(&inner.state).current.generation.saturating_add(1);
+                        inner.fence(Fence {
                             why: why.clone(),
                             uncertain: Some(attempt.clone()),
                         });
+                        inner.hold_for_uncertain(&attempt, generation, &staged);
                         Err(CommitError::Indeterminate(why))
                     });
+                    inner.release_admitted(&staged);
                     #[cfg(test)]
                     let slow = inner.slow_job_release.load(Ordering::SeqCst);
                     // Release this job's hold on the engine before its attempt stops being
@@ -550,6 +1016,18 @@ impl Inner {
             }
             *pending.entry(attempt.clone()).or_default() += 1;
         }
+        // Mark the stagings this job binds as admitted, so they cannot be discarded under it.
+        let staged: Vec<u64> = {
+            let st = lock(&self.state);
+            let mut pool = lock(&self.pool);
+            changes
+                .content
+                .iter()
+                .filter_map(|b| self.token_serial(&b.token))
+                .filter(|serial| st.staged.contains_key(serial))
+                .inspect(|serial| pool.admit(*serial))
+                .collect()
+        };
         let job = Job {
             inner: self.clone(),
             attempt: attempt.clone(),
@@ -557,10 +1035,21 @@ impl Inner {
             observed,
             changes,
             reply,
+            staged: staged.clone(),
         };
         match tx.try_send(job) {
-            Ok(()) => Ok(rx),
+            Ok(()) => {
+                #[cfg(test)]
+                {
+                    let hook = lock(&self.admitted_hook).take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                Ok(rx)
+            }
             Err(e) => {
+                self.release_admitted(&staged);
                 self.finish_pending(&attempt);
                 Err(rejected(match e {
                     mpsc::TrySendError::Full(_) => {
@@ -578,10 +1067,65 @@ impl Inner {
         finish_pending(&self.pending, attempt);
     }
 
+    /// The current committed state without a pin (tests only: production reads go through
+    /// `pin_current`, so nothing they can reach is reused under them).
+    #[cfg(test)]
     pub fn snapshot(&self) -> Result<Snapshot, StorageError> {
         Ok(Snapshot {
             desc: lock(&self.state).current,
         })
+    }
+
+    /// The current committed state, pinned: the pin is registered under the same lock that reads
+    /// the current state, so no publication can slip between choosing the generation and pinning it.
+    /// The pin belongs to a reader (a view and the content readers it opens).
+    pub(crate) fn pin_current(self: &Arc<Self>) -> Result<(Snapshot, Pin), StorageError> {
+        let (snap, pin, ()) = self.pin_current_then(true, |_| ());
+        Ok((snap, pin))
+    }
+
+    /// Like `pin_current`, also reading `read` from the same state, under the same lock. A pin
+    /// that is not a `reader`'s (the engine's own walk) protects reuse like any other, but a
+    /// commit requiring quiescence does not count it as a live reader.
+    fn pin_current_then<R>(
+        self: &Arc<Self>,
+        reader: bool,
+        read: impl FnOnce(&State) -> R,
+    ) -> (Snapshot, Pin, R) {
+        let mut st = lock(&self.state);
+        // Never register on a state a quiescent commit is about to replace.
+        while st.quiescing {
+            #[cfg(test)]
+            self.waiting_registrations.fetch_add(1, Ordering::SeqCst);
+            st = self
+                .quiesced
+                .wait(st)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            #[cfg(test)]
+            self.waiting_registrations.fetch_sub(1, Ordering::SeqCst);
+        }
+        let desc = st.current;
+        *lock(&self.pins).entry(desc.generation).or_default() += 1;
+        if reader {
+            self.readers.fetch_add(1, Ordering::SeqCst);
+        }
+        let r = read(&st);
+        drop(st);
+        (
+            Snapshot { desc },
+            Pin {
+                inner: self.clone(),
+                generation: desc.generation,
+                reader,
+            },
+            r,
+        )
+    }
+
+    /// Live pins by generation.
+    #[cfg(test)]
+    pub(crate) fn pinned_generations(&self) -> BTreeMap<u64, u32> {
+        lock(&self.pins).clone()
     }
 
     /// Moves the page and content allocation cursors (boundary tests only).
@@ -595,9 +1139,11 @@ impl Inner {
         }
     }
 
-    pub fn height(&self) -> Result<usize, StorageError> {
-        let root = lock(&self.state).current.root;
-        tree::height(self, root)
+    pub fn height(self: &Arc<Self>) -> Result<usize, StorageError> {
+        let (snap, _pin, ()) = self.pin_current_then(false, |_| ());
+        let root = snap.desc.root;
+        self.run_walk_hook();
+        tree::height(&**self, root)
     }
 
     pub fn cache_capacity(&self) -> usize {
@@ -649,6 +1195,17 @@ impl Inner {
             )));
         }
         let mut cursor = lock(&self.alloc);
+        // Retired content this staging may reuse: no publication slot reaches it (retired at
+        // most one generation before the current one) and no live reader's generation does.
+        let reusable_through = {
+            let current = lock(&self.state).current.generation;
+            self.reusable_through(current.saturating_add(1))
+        };
+        let mut taken = Taken {
+            inner: self,
+            owner: self.next_taker.fetch_add(1, Ordering::Relaxed),
+            taken: Vec::new(),
+        };
         let start = *cursor;
         let mut at = start;
         let mut total = Sha256::new();
@@ -694,20 +1251,17 @@ impl Inner {
                 )));
             }
             let seg = &buf[..filled];
-            let end = at
-                .checked_add(filled as u64)
-                .ok_or_else(content_space_exhausted)?;
-            self.io.write_at(FileId::Content, at, seg)?;
+            let place = self.place(&mut at, filled as u64, reusable_through, &mut taken)?;
+            self.io.write_at(FileId::Content, place, seg)?;
             self.counters
                 .content_bytes_written
                 .fetch_add(filled as u64, Ordering::Relaxed);
             segments.push(ExtentRef {
-                offset: at,
+                offset: place,
                 len: filled as u64,
                 digest: sha256(seg),
             });
             total.update(seg);
-            at = end;
             len += filled as u64;
             if filled < buf.len() {
                 break;
@@ -726,19 +1280,17 @@ impl Inner {
             )));
         }
         let manifest = Manifest { content, segments }.encode();
-        let end = at
-            .checked_add(manifest.len() as u64)
-            .ok_or_else(content_space_exhausted)?;
-        self.io.write_at(FileId::Content, at, &manifest)?;
+        let place = self.place(&mut at, manifest.len() as u64, reusable_through, &mut taken)?;
+        self.io.write_at(FileId::Content, place, &manifest)?;
         self.counters
             .content_bytes_written
             .fetch_add(manifest.len() as u64, Ordering::Relaxed);
         let mref = ExtentRef {
-            offset: at,
+            offset: place,
             len: manifest.len() as u64,
             digest: sha256(&manifest),
         };
-        *cursor = end;
+        *cursor = at;
         let serial = {
             let mut st = lock(&self.state);
             let serial = st.next_stage;
@@ -746,6 +1298,7 @@ impl Inner {
             st.staged.insert(serial, (mref, content));
             serial
         };
+        taken.hold(serial);
         let mut t = Enc::default();
         t.raw(&self.store.0)
             .u64(self.instance)
@@ -854,6 +1407,24 @@ impl Inner {
             ))));
         }
 
+        // Requiring quiescence: refuse, before writing anything, while any view or content
+        // reader is live (the request's own basis view was consumed at admission and is not).
+        // Otherwise keep new views from registering until this commit ends.
+        let _quiescing = if cs.removal == RemovalMode::RequireQuiescence {
+            let mut st = lock(&self.state);
+            let live = self.readers.load(Ordering::SeqCst);
+            if live > 0 {
+                return Err(CommitError::ReadersActive(format!(
+                    "{live} view or content reader{} live",
+                    if live == 1 { " is" } else { "s are" }
+                )));
+            }
+            st.quiescing = true;
+            Some(Quiescing { inner: self })
+        } else {
+            None
+        };
+
         // The basis must still hold: nothing it observed may have been written since.
         lock(&self.conflicts).validate(basis.desc.history_pos, observed)?;
 
@@ -863,8 +1434,15 @@ impl Inner {
             ))
         })?;
         let bound = self.resolve_content(&cs)?;
+        // Changes refer to bindings by position, so `extents` keeps one entry per binding. A
+        // staging bound more than once is still one staging: from here on it is settled, consumed
+        // and released once.
         let extents: Vec<BoundContent> = bound.iter().map(|(_, x)| *x).collect();
-        apply(&mut txn, &cs, &extents, pos)?;
+        let content_refs = apply(&mut txn, &cs, &extents, pos)?;
+        let mut seen = BTreeSet::new();
+        let bound: Vec<(u64, BoundContent)> =
+            bound.into_iter().filter(|(s, _)| seen.insert(*s)).collect();
+        let stagings: Vec<BoundContent> = bound.iter().map(|(_, x)| *x).collect();
         let written: Vec<Vec<u8>> = txn
             .touched()
             .iter()
@@ -895,6 +1473,12 @@ impl Inner {
             *cursor = end;
             x
         };
+        // Until the publication record is written, nothing references the history entry: a
+        // commit that ends earlier hands its bytes to the next publication to retire.
+        let mut unpublished = Unpublished {
+            inner: self,
+            extent: Some((hist_ref.offset, hist_ref.len)),
+        };
         txn.put(history_key(pos), hist_ref.encode())
             .map_err(rejected)?;
         txn.put(
@@ -912,12 +1496,71 @@ impl Inner {
                 "generation counter exhausted".into(),
             )));
         };
+        let (retired_content, live_manifests) =
+            self.settle_content(&mut txn, &stagings, content_refs, generation)?;
+        let (remainders, consumed) = self.consume_reuse(&mut txn, &bound)?;
+        // Discarded stagings' own space becomes retired with this commit. The queue is copied
+        // here and only the copied entries are removed from it after publication: a discard
+        // that arrives meanwhile only appends, and publications are serialised by the commit
+        // worker, so no entry is retired twice or lost.
+        let discarded: Vec<(u64, u64)> = lock(&self.pool).discarded().to_vec();
+        for (offset, len) in &discarded {
+            txn.put(
+                retired_extent_key(generation, *offset),
+                len.to_le_bytes().to_vec(),
+            )
+            .map_err(rejected)?;
+        }
+        // Retired pages this commit may reuse: none that either publication slot can still reach
+        // while this commit is unpublished (retired at most two generations before it), and none
+        // a live reader's generation can reach (retired no later than the oldest pinned one). A
+        // reader registering from now on pins the current generation, which reaches none of them.
+        let reusable_through = self.reusable_through(generation);
+        #[cfg(test)]
+        {
+            let hook = lock(&self.reuse_hook).take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let reused = settle_allocation(&mut txn, self, &cur, generation, reusable_through)
+            .map_err(rejected)?;
+        let reuse: Vec<u64> = reused.iter().map(|(page, _)| *page).collect();
+        // Every change of space ownership this commit makes, checked as a whole before anything
+        // it writes can become reachable.
+        #[allow(unused_mut)]
+        let mut journal = SpaceJournal {
+            generation,
+            retired_pages: txn.replaced().to_vec(),
+            reused_pages: reuse.clone(),
+            retired_extents: retired_content.iter().chain(&discarded).copied().collect(),
+            remainders: remainders.clone(),
+            consumed,
+            reused_records: reused.into_iter().map(|(_, k)| k).collect(),
+            still_reachable: live_manifests,
+            bound: bound.iter().map(|(serial, _)| *serial).collect(),
+        };
+        #[cfg(test)]
+        {
+            let hook = lock(&self.journal_hook).take();
+            if let Some(hook) = hook {
+                hook(&mut journal, &mut txn);
+            }
+        }
+        self.seal(&txn, cur.root, &journal).map_err(rejected)?;
         let mut sink = PageWriter {
             inner: self,
             next_page: cur.next_page,
             generation,
+            reuse,
         };
         let root = txn.finish(&mut sink).map_err(rejected)?;
+        if !sink.reuse.is_empty() {
+            return Err(rejected(StorageError::InvalidRequest(format!(
+                "{} pages taken for reuse were not written",
+                sink.reuse.len()
+            ))));
+        }
         let next_page = sink.next_page;
 
         // Data barrier: every byte the new generation references must be durable first. Capture
@@ -931,7 +1574,7 @@ impl Inner {
         {
             // Nothing is published, but a failed barrier may have dropped written bytes that
             // staged content or later commits would reference: fence writes until reopen.
-            lock(&self.state).fenced = Some(Fence {
+            self.fence(Fence {
                 why: format!("data barrier failed: {e}"),
                 uncertain: None,
             });
@@ -946,6 +1589,8 @@ impl Inner {
             content_len,
             history_pos: pos,
         };
+        // From the record write on the publication may be durable and reference the entry.
+        unpublished.extent = None;
         let published = self
             .io
             .write_at(
@@ -957,10 +1602,12 @@ impl Inner {
         if let Err(e) = published {
             // The record may or may not be durable: fence writes until reconciled.
             let why = format!("publication of generation {generation} uncertain: {e}");
-            lock(&self.state).fenced = Some(Fence {
+            self.fence(Fence {
                 why: why.clone(),
                 uncertain: Some(attempt.clone()),
             });
+            let serials: Vec<u64> = bound.iter().map(|(serial, _)| *serial).collect();
+            self.hold_for_uncertain(&attempt, generation, &serials);
             return Err(CommitError::Indeterminate(why));
         }
 
@@ -969,6 +1616,47 @@ impl Inner {
         st.current = desc;
         for (serial, _) in &bound {
             st.staged.remove(serial);
+        }
+        drop(st);
+        // The published state's retired content, as this commit changed it: what it retired is
+        // reusable from the next generation on; what bound stagings held is consumed, apart from
+        // unused remainders.
+        #[cfg(test)]
+        {
+            let hook = lock(&self.apply_hook).take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let mut pool = lock(&self.pool);
+        for (serial, _) in &bound {
+            pool.consume(*serial);
+        }
+        // Sealed before publication; checked again here as an invariant, since the record is
+        // durable and nothing can be rejected any more: an extent that would overlap space the
+        // pool already accounts for is left out (unused until reopen) and writes are fenced.
+        // The queued extents this commit retired leave the queue first, then become free.
+        pool.trim_discarded(&discarded);
+        let mut clashes = Vec::new();
+        let frees = retired_content
+            .iter()
+            .map(|(o, l)| (*o, *l, generation))
+            .chain(remainders.iter().copied())
+            .chain(discarded.iter().map(|(o, l)| (*o, *l, generation)));
+        for (offset, len, retired_at) in frees {
+            if pool.insert_free(&[(offset, len, retired_at)]).is_err() {
+                clashes.push((offset, len));
+            }
+        }
+        drop(pool);
+        if !clashes.is_empty() {
+            self.fence(Fence {
+                why: format!(
+                    "space check failed after publishing generation {generation}: {clashes:?} \
+                     overlap space the pool already accounts for"
+                ),
+                uncertain: None,
+            });
         }
         Ok(CommitReceipt {
             attempt,
@@ -983,24 +1671,486 @@ impl Inner {
             .collect()
     }
 
-    pub fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
+    /// Brings content index entries in line with the records that use them: `refs` is this
+    /// commit's change in users per digest. Content gaining its first user is indexed with the
+    /// commit's binding for it; content losing its last user becomes a removed entry and its
+    /// manifest and segments are retired at `generation`. Bound content the index does not take
+    /// (a second staging of committed bytes, or a binding no change uses) is retired too: no
+    /// published state ever reaches it. `bound` names each staging once. Returns the extents it
+    /// retired and the manifests the new state's entries for the touched digests name.
+    fn settle_content(
+        &self,
+        t: &mut TreeTxn,
+        bound: &[BoundContent],
+        refs: BTreeMap<[u8; 32], i64>,
+        generation: u64,
+    ) -> Result<(ExtentList, ExtentList), CommitError> {
+        let mut retired = Vec::new();
+        let mut live = Vec::new();
+        let mut first: BTreeMap<[u8; 32], ExtentRef> = BTreeMap::new();
+        let mut orphans: Vec<ExtentRef> = Vec::new();
+        for (manifest, c) in bound {
+            match first.entry(c.digest.0) {
+                std::collections::btree_map::Entry::Occupied(_) => orphans.push(*manifest),
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(*manifest);
+                }
+            }
+        }
+        let digests: BTreeSet<[u8; 32]> = refs.keys().chain(first.keys()).copied().collect();
+        for d in digests {
+            let delta = refs.get(&d).copied().unwrap_or(0);
+            let binding = first.get(&d).copied();
+            let ck = key(P_CONTENT, &[&d]);
+            let entry = t
+                .get(&ck)
+                .map_err(rejected)?
+                .map(|v| ContentEntry::decode(&v))
+                .transpose()
+                .map_err(rejected)?;
+            match entry {
+                Some(ContentEntry::Live { manifest, refs: n }) => {
+                    let now = i64::try_from(n)
+                        .ok()
+                        .and_then(|n| n.checked_add(delta))
+                        .filter(|n| *n >= 0)
+                        .ok_or_else(|| {
+                            rejected(corrupt(format!(
+                                "content used by {n} records cannot change by {delta}"
+                            )))
+                        })?;
+                    if now == 0 {
+                        t.put(ck, ContentEntry::Removed.encode())
+                            .map_err(rejected)?;
+                        self.retire_content(t, &manifest, generation, &mut retired)?;
+                    } else {
+                        live.push((manifest.offset, manifest.len));
+                        if now as u64 != n {
+                            t.put(
+                                ck,
+                                ContentEntry::Live {
+                                    manifest,
+                                    refs: now as u64,
+                                }
+                                .encode(),
+                            )
+                            .map_err(rejected)?;
+                        }
+                    }
+                    orphans.extend(binding);
+                }
+                Some(ContentEntry::Removed) | None => {
+                    if delta < 0 {
+                        return Err(rejected(corrupt(
+                            "a record used content that is not committed",
+                        )));
+                    }
+                    if delta > 0 {
+                        let manifest = binding.ok_or_else(|| {
+                            rejected(corrupt("new use of content without a binding"))
+                        })?;
+                        live.push((manifest.offset, manifest.len));
+                        t.put(
+                            ck,
+                            ContentEntry::Live {
+                                manifest,
+                                refs: delta as u64,
+                            }
+                            .encode(),
+                        )
+                        .map_err(rejected)?;
+                    } else {
+                        orphans.extend(binding);
+                    }
+                }
+            }
+        }
+        for o in orphans {
+            self.retire_content(t, &o, generation, &mut retired)?;
+        }
+        Ok((retired, live))
+    }
+
+    /// Records a content manifest and every segment it names as retired at `generation`, and
+    /// lists them in `retired` as `(offset, len)`.
+    fn retire_content(
+        &self,
+        t: &mut TreeTxn,
+        manifest: &ExtentRef,
+        generation: u64,
+        retired: &mut Vec<(u64, u64)>,
+    ) -> Result<(), CommitError> {
+        let m = Manifest::decode(&self.read_written_extent(manifest).map_err(rejected)?)
+            .map_err(rejected)?;
+        for x in std::iter::once(*manifest).chain(m.segments) {
+            t.put(
+                retired_extent_key(generation, x.offset),
+                x.len.to_le_bytes().to_vec(),
+            )
+            .map_err(rejected)?;
+            retired.push((x.offset, x.len));
+        }
+        Ok(())
+    }
+
+    /// Reads an extent this store wrote, committed or staged, checking its digest.
+    fn read_written_extent(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+        let len = usize::try_from(x.len).map_err(|_| corrupt("extent too large"))?;
+        let mut buf = vec![0; len];
+        self.io.read_at(FileId::Content, x.offset, &mut buf)?;
+        if sha256(&buf) != x.digest {
+            return Err(corrupt(format!(
+                "content extent at {}: digest mismatch",
+                x.offset
+            )));
+        }
+        Ok(buf)
+    }
+
+    /// Where to write `need` bytes of a staging: the smallest retired extent recorded no later
+    /// than `reusable_through` that fits (taken from the pool into `taken`), else the append
+    /// cursor `at`.
+    fn place(
+        &self,
+        at: &mut u64,
+        need: u64,
+        reusable_through: Option<u64>,
+        taken: &mut Taken,
+    ) -> Result<u64, StorageError> {
+        if let Some(bound) = reusable_through {
+            // The fence is re-checked at every take, under the lock a fence's change of
+            // ownership is made under: a staging that passed its entry check takes nothing once
+            // writes are fenced.
+            let took = lock(&self.pool)
+                .take(taken.owner, need, bound, None)
+                .map_err(StorageError::StoreState)?;
+            if let Some(r) = took {
+                self.counters
+                    .content_bytes_reused
+                    .fetch_add(need, Ordering::Relaxed);
+                taken.taken.push(r);
+                return Ok(r.offset);
+            }
+        }
+        let offset = *at;
+        *at = at.checked_add(need).ok_or_else(content_space_exhausted)?;
+        Ok(offset)
+    }
+
+    /// The newest retiring generation whose space may be overwritten by writes that become
+    /// visible no earlier than generation `next` (a commit producing it, or staging while the
+    /// current generation is `next - 1`): retired at most two generations before `next`, so
+    /// neither publication slot reaches it, and no later than the oldest generation a live view
+    /// or content reader pins. `None`: nothing may be reused.
+    fn reusable_through(&self, next: u64) -> Option<u64> {
+        let oldest_pin = lock(&self.pins).keys().next().copied();
+        next.checked_sub(2)
+            .map(|g| oldest_pin.map_or(g, |p| g.min(p)))
+    }
+
+    /// Loads the retired content extents of the current state into the reuse pool (at open).
+    fn load_content_pool(&self) -> Result<(), StorageError> {
+        let cur = lock(&self.state).current;
+        let mut c = Cursor::new(self, cur.root, &[P_RETIRED], None, cur.next_page)?;
+        let mut pool = lock(&self.pool);
+        while let Some((k, v)) = c.next_entry()? {
+            if let Retired::Extent {
+                generation,
+                offset,
+                len,
+            } = decode_retired(&k, &v)?
+            {
+                pool.insert_free(&[(offset, len, generation)])
+                    .map_err(|why| corrupt(format!("retirement records: {why}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives up staged content that will not be committed (see the port). Retired content the
+    /// staging took returns to the pool at once (its retirement records were never consumed);
+    /// the staging's own space is retired by the next commit.
+    pub fn discard_staged(&self, staged: StagedContent) -> Result<(), StorageError> {
+        self.refuse_if_read_only("discarding staged content is")?;
+        let (serial, (manifest, _)) = self.staged_extent(&staged.token, &staged.content)?;
+        let m = Manifest::decode(&self.read_written_extent(&manifest)?)?;
+        let extents: Vec<(u64, u64)> = std::iter::once(manifest)
+            .chain(m.segments)
+            .map(|x| (x.offset, x.len))
+            .collect();
+        let mut st = lock(&self.state);
+        if !st.staged.contains_key(&serial) {
+            return Err(StorageError::ForeignHandle);
+        }
+        let mut pool = lock(&self.pool);
+        if pool.is_admitted(serial) {
+            return Err(StorageError::InvalidRequest(
+                "staged content is bound by an admitted commit; discard it only after that \
+                 commit resolves"
+                    .into(),
+            ));
+        }
+        if pool.is_uncertain(serial) {
+            return Err(StorageError::StoreState(
+                "staged content is bound by a commit whose publication is uncertain; reopen the \
+                 store to resolve it"
+                    .into(),
+            ));
+        }
+        pool.discard(serial, &extents)
+            .map_err(|why| StorageError::StoreState(format!("space check failed: {why}")))?;
+        st.staged.remove(&serial);
+        Ok(())
+    }
+
+    /// Checks a commit's changes of space ownership as a whole, after its allocation settled and
+    /// before it writes anything: no page retired twice or while the new tree still refers to it,
+    /// no retired page reused while referenced, the retirement records it wrote at its generation
+    /// exactly the retirements checked, no content retired twice or while a touched digest's live
+    /// entry names it, and nothing it frees overlapping space the pool already accounts for. A
+    /// violation rejects the commit.
+    fn seal(
+        &self,
+        txn: &TreeTxn,
+        committed: PageRef,
+        j: &SpaceJournal,
+    ) -> Result<(), StorageError> {
+        let fail = |why: String| {
+            Err(StorageError::StoreState(format!(
+                "space check failed: {why}"
+            )))
+        };
+        let mut pages = HashSet::new();
+        for p in &j.retired_pages {
+            if !pages.insert(p.page) {
+                return fail(format!("page {} retired twice", p.page));
+            }
+        }
+        let frontier: HashSet<u64> = txn.frontier().iter().map(|p| p.page).collect();
+        if let Some(p) = j.retired_pages.iter().find(|p| frontier.contains(&p.page)) {
+            return fail(format!("retired page {} is still referenced", p.page));
+        }
+        if let Some(p) = j.reused_pages.iter().find(|p| frontier.contains(p)) {
+            return fail(format!("reused page {p} is still referenced"));
+        }
+        let mut freed: Vec<(u64, u64)> = j
+            .retired_extents
+            .iter()
+            .copied()
+            .chain(j.remainders.iter().map(|(o, l, _)| (*o, *l)))
+            .collect();
+        freed.sort_unstable();
+        if let Some(w) = freed.windows(2).find(|w| overlap(w[0], w[1])) {
+            return fail(format!(
+                "content {:?} and {:?} retired over each other",
+                w[0], w[1]
+            ));
+        }
+        if let Some(x) = freed
+            .iter()
+            .find(|x| j.still_reachable.iter().any(|m| overlap(**x, *m)))
+        {
+            return fail(format!("retired content {x:?} is still referenced"));
+        }
+        {
+            let pool = lock(&self.pool);
+            if let Some(x) = freed.iter().find(|x| pool.overlaps(**x, &j.bound)) {
+                return fail(format!(
+                    "content {x:?} would be freed over space the pool accounts for"
+                ));
+            }
+        }
+        // Every retirement record the commit touched ends exactly as the journal says: new
+        // records at its generation for what it retires, remainder records at their original
+        // generation, consumed and reused records deleted; any other touched record unchanged
+        // from the committed state (taken for reuse, then given back).
+        let mut expected: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
+        let mut expect = |k: Vec<u8>, v: Option<Vec<u8>>| expected.insert(k, v).is_none();
+        let mut distinct = true;
+        for p in &j.retired_pages {
+            distinct &= expect(
+                retired_page_key(j.generation, p.page),
+                Some(p.incarnation.to_le_bytes().to_vec()),
+            );
+        }
+        for (offset, len) in &j.retired_extents {
+            distinct &= expect(
+                retired_extent_key(j.generation, *offset),
+                Some(len.to_le_bytes().to_vec()),
+            );
+        }
+        for (offset, len, retired_at) in &j.remainders {
+            distinct &= expect(
+                retired_extent_key(*retired_at, *offset),
+                Some(len.to_le_bytes().to_vec()),
+            );
+        }
+        for k in j.consumed.iter().chain(&j.reused_records) {
+            distinct &= expect(k.clone(), None);
+        }
+        if !distinct {
+            return fail("one retirement record is changed twice".into());
+        }
+        for (k, want) in &expected {
+            if txn.get(k)? != *want {
+                return fail(format!(
+                    "retirement record {} is not as the journal says",
+                    retired_key_label(k)
+                ));
+            }
+        }
+        for k in txn
+            .touched()
+            .iter()
+            .filter(|k| k.first() == Some(&P_RETIRED) && !expected.contains_key(*k))
+        {
+            if txn.get(k)? != tree::get(self, committed, k)? {
+                return fail(format!(
+                    "retirement record {} changed outside the journal",
+                    retired_key_label(k)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fences writes until reopen. The pool learns of it under its own lock, so no staging
+    /// takes reusable space afterwards.
+    fn fence(&self, fence: Fence) {
+        lock(&self.state).fenced = Some(fence);
+        lock(&self.pool).fence();
+    }
+
+    /// Records an inconsistency in space ownership found where it cannot be returned to a caller
+    /// (cleanup in a destructor), and fences writes. An existing fence, and the uncertain attempt
+    /// it may name, is kept; the fault is recorded beside it, never instead of an operation's own
+    /// error, and never by panicking.
+    fn fault(&self, why: &str) {
+        let why = format!("space check failed: {why}");
+        lock(&self.faults).push(why.clone());
+        {
+            let mut st = lock(&self.state);
+            if st.fenced.is_none() {
+                st.fenced = Some(Fence {
+                    why,
+                    uncertain: None,
+                });
+            }
+        }
+        lock(&self.pool).fence();
+    }
+
+    /// Test hook: total length of the retired extents stagings hold, and of those an uncertain
+    /// publication owns.
+    #[cfg(test)]
+    pub(crate) fn reserved_bytes_for_test(&self) -> (u64, u64) {
+        let pool = lock(&self.pool);
+        let sum = |rs: &[Reuse]| rs.iter().map(|r| r.record_len).sum::<u64>();
+        (
+            pool.held().map(|(_, rs)| sum(rs)).sum(),
+            pool.uncertain().map(|(_, _, _, rs)| sum(rs)).sum(),
+        )
+    }
+
+    /// Test hook: why writes are fenced, if they are.
+    #[cfg(test)]
+    pub(crate) fn fence_reason(&self) -> Option<String> {
+        lock(&self.state).fenced.as_ref().map(|f| f.why.clone())
+    }
+
+    /// Test hook: fences writes as a failed publication would, without one.
+    #[cfg(test)]
+    pub(crate) fn fence_for_test(&self, why: &str) {
+        self.fence(Fence {
+            why: why.into(),
+            uncertain: None,
+        });
+    }
+
+    /// The publication of `attempt` as generation `generation` is uncertain: it may be durable
+    /// and have consumed the reservations of the stagings it binds (`serials`). Those stay owned
+    /// by it, out of reach of reuse and discard, until reopen rebuilds the pool from the
+    /// publication that won. A hook for any publication that can become uncertain.
+    pub(crate) fn hold_for_uncertain(&self, attempt: &AttemptId, generation: u64, serials: &[u64]) {
+        lock(&self.pool).hand_to_uncertain(attempt, generation, serials);
+    }
+
+    /// Marks the stagings of a resolved job as no longer admitted.
+    fn release_admitted(&self, staged: &[u64]) {
+        let mut pool = lock(&self.pool);
+        for serial in staged {
+            pool.resolve_admission(*serial);
+        }
+    }
+
+    /// The serial of a staging token this open instance issued, if it is one.
+    fn token_serial(&self, token: &StagingToken) -> Option<u64> {
+        let mut d = Dec::new(&token.0, "staging token");
+        let s: [u8; 16] = d.array().ok()?;
+        let inst = d.u64().ok()?;
+        let serial = d.u64().ok()?;
+        (s == self.store.0 && inst == self.instance).then_some(serial)
+    }
+
+    /// Total length of retired content extents no staging holds.
+    pub fn reusable_content_bytes(&self) -> u64 {
+        lock(&self.pool).free_bytes()
+    }
+
+    /// Consumes, in the transaction, the retirement records of extents held by the stagings this
+    /// commit binds; a record longer than what its staging wrote leaves a record for the rest,
+    /// still retired at its original generation. Returns those remainders and the keys of the
+    /// records it consumed.
+    fn consume_reuse(
+        &self,
+        t: &mut TreeTxn,
+        bound: &[(u64, BoundContent)],
+    ) -> Result<Consumed, CommitError> {
+        let held: Vec<Reuse> = {
+            let pool = lock(&self.pool);
+            bound
+                .iter()
+                .flat_map(|(serial, _)| pool.held_by(*serial).to_vec())
+                .collect()
+        };
+        let (mut remainders, mut consumed) = (Vec::new(), Vec::new());
+        for r in held {
+            let k = retired_extent_key(r.retired_at, r.offset);
+            t.delete(&k).map_err(rejected)?;
+            consumed.push(k);
+            if r.record_len > r.used {
+                let (offset, len) = (r.offset + r.used, r.record_len - r.used);
+                t.put(
+                    retired_extent_key(r.retired_at, offset),
+                    len.to_le_bytes().to_vec(),
+                )
+                .map_err(rejected)?;
+                remainders.push((offset, len, r.retired_at));
+            }
+        }
+        Ok((remainders, consumed))
+    }
+
+    pub fn outcome(self: &Arc<Self>, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
         // Order matters: an attempt leaves `pending` only after its publication, so checking
         // `pending` first and the published state second can never miss a finishing commit.
         if lock(&self.pending).contains_key(attempt) {
             return Ok(AttemptOutcome::Pending);
         }
-        let st = lock(&self.state);
-        if st
-            .fenced
-            .as_ref()
-            .is_some_and(|f| f.uncertain.as_ref() == Some(attempt))
-        {
+        // The walk reads a pinned state: commits meanwhile cannot reuse its pages. Like any new
+        // view, this waits while a commit requiring quiescence runs.
+        let (snap, _pin, uncertain) = self.pin_current_then(false, |st| {
+            st.fenced
+                .as_ref()
+                .is_some_and(|f| f.uncertain.as_ref() == Some(attempt))
+        });
+        if uncertain {
             return Ok(AttemptOutcome::Unknown);
         }
-        let cur = st.current;
-        drop(st);
+        let cur = snap.desc;
+        self.run_walk_hook();
         Ok(
-            match tree::get(self, cur.root, &key(P_ATTEMPT, &[attempt.as_bytes()]))? {
+            match tree::get(&**self, cur.root, &key(P_ATTEMPT, &[attempt.as_bytes()]))? {
                 Some(v) => AttemptOutcome::Committed(CommitReceipt {
                     attempt: attempt.clone(),
                     position: HistoryPosition(AttemptValue::decode(&v)?.position),
@@ -1122,7 +2272,10 @@ impl Inner {
             tree::get(self, s.desc.root, &key(P_CONTENT, &[&c.digest.0]))?.ok_or_else(|| {
                 StorageError::InvalidRequest("content is not committed in this view".into())
             })?;
-        let x = ExtentRef::decode(&x)?;
+        let x = match ContentEntry::decode(&x)? {
+            ContentEntry::Live { manifest, .. } => manifest,
+            ContentEntry::Removed => return Err(StorageError::ContentNotRetained),
+        };
         let limit = Manifest::encoded_len(self.max_segments);
         if x.len > limit {
             return Err(corrupt(format!(
@@ -1171,6 +2324,7 @@ impl Inner {
             pos: 0,
             total: Sha256::new(),
             failed: None,
+            _pin: None,
         })
     }
 }
@@ -1183,6 +2337,8 @@ pub(crate) struct Job {
     observed: Vec<Observation>,
     changes: ChangeSet,
     reply: mpsc::Sender<Result<CommitReceipt, CommitError>>,
+    /// Stagings this job binds, marked admitted until it resolves.
+    staged: Vec<u64>,
 }
 
 /// A logical read a view made, protected until the view's commit is validated.
@@ -1224,9 +2380,16 @@ pub(crate) fn relationship_range(q: &RelationshipQuery) -> Vec<u8> {
 
 /// Logical write sets of recent commits. `floor` is the newest history position whose successors'
 /// writes are all retained; a basis older than that cannot be validated.
+/// Reusable space as (tree pages, content extents `(offset, len)`) (tests only).
+#[cfg(test)]
+pub(crate) type Reusable = (Vec<u64>, Vec<(u64, u64)>);
+
+/// One recorded commit: its history position and the logical keys it wrote.
+type ConflictEntry = (u64, Vec<Vec<u8>>);
+
 struct ConflictLog {
     floor: u64,
-    entries: VecDeque<(u64, Vec<Vec<u8>>)>,
+    entries: VecDeque<ConflictEntry>,
     capacity: usize,
 }
 
@@ -1284,6 +2447,101 @@ impl ConflictLog {
     }
 }
 
+/// A retirement record taken from the committed tree: key, value and the retired page.
+type RetiredRecord = (Vec<u8>, Vec<u8>, u64);
+
+/// Upper bound on rounds of settling a commit's page allocation. Each round's edits touch pages
+/// already being rewritten (or split from them), so replaced pages and page demand stop changing
+/// within a few rounds; a commit that does not settle is rejected.
+const ALLOCATION_ROUNDS: usize = 16;
+
+/// Records every committed page the transaction replaces as retired at `generation` and takes,
+/// for the pages the transaction will write, retired pages recorded no later than
+/// `reusable_through` (deleting their records). Recording, consuming and returning records all
+/// edit the tree, which can replace further pages and change how many pages it needs, so this
+/// repeats until a round changes nothing. Returns the pages to write first.
+fn settle_allocation(
+    txn: &mut TreeTxn,
+    src: &dyn NodeSource,
+    cur: &Descriptor,
+    generation: u64,
+    reusable_through: Option<u64>,
+) -> Result<Vec<(u64, Vec<u8>)>, StorageError> {
+    // Candidates in record order (oldest retirement first), from the committed tree.
+    let mut candidates = match reusable_through {
+        Some(_) => Some(Cursor::new(
+            src,
+            cur.root,
+            &[P_RETIRED],
+            None,
+            cur.next_page,
+        )?),
+        None => None,
+    };
+    let next_candidate = |c: &mut Option<Cursor>| -> Result<Option<RetiredRecord>, StorageError> {
+        let Some(cursor) = c else { return Ok(None) };
+        // Records sort by retiring generation; content extents are not reused by tree pages.
+        while let Some((k, v)) = cursor.next_entry()? {
+            let retired_at = match decode_retired(&k, &v)? {
+                Retired::Page {
+                    generation, page, ..
+                } => {
+                    if reusable_through.is_some_and(|b| generation <= b) {
+                        return Ok(Some((k, v, page)));
+                    }
+                    generation
+                }
+                Retired::Extent { generation, .. } => generation,
+            };
+            if reusable_through.is_none_or(|b| retired_at > b) {
+                break;
+            }
+        }
+        *c = None;
+        Ok(None)
+    };
+    let mut taken: Vec<RetiredRecord> = Vec::new();
+    let mut returned: Vec<RetiredRecord> = Vec::new();
+    let mut recorded = 0;
+    for _ in 0..ALLOCATION_ROUNDS {
+        let mut changed = false;
+        let fresh: Vec<PageRef> = txn.replaced()[recorded..].to_vec();
+        recorded += fresh.len();
+        for p in fresh {
+            changed = true;
+            txn.put(
+                retired_page_key(generation, p.page),
+                p.incarnation.to_le_bytes().to_vec(),
+            )?;
+        }
+        let need = txn.dirty_pages();
+        while taken.len() < need {
+            let next = match returned.pop() {
+                Some(x) => Some(x),
+                None => next_candidate(&mut candidates)?,
+            };
+            let Some((k, v, page)) = next else { break };
+            txn.delete(&k)?;
+            taken.push((k, v, page));
+            changed = true;
+        }
+        while taken.len() > need {
+            let Some((k, v, page)) = taken.pop() else {
+                break;
+            };
+            txn.put(k.clone(), v.clone())?;
+            returned.push((k, v, page));
+            changed = true;
+        }
+        if !changed {
+            return Ok(taken.into_iter().map(|(k, _, page)| (page, k)).collect());
+        }
+    }
+    Err(StorageError::InvalidRequest(format!(
+        "page allocation did not settle within {ALLOCATION_ROUNDS} rounds"
+    )))
+}
+
 /// Reads both publication slots and selects the record to recover from, checking its cursors
 /// against the files. Reads only.
 fn read_publication(io: &dyn Io) -> Result<(Descriptor, Vec<String>), StorageError> {
@@ -1335,9 +2593,11 @@ fn select(slots: &[Slot]) -> Result<(Descriptor, Vec<String>), StorageError> {
             )),
             Slot::Empty => {}
             Slot::Invalid(why) => diags.push(format!("slot {i}: damaged or torn ({why}); ignored")),
-            Slot::Unsupported(v) => {
+            // Never the other slot instead: an older record does not make a store this build cannot
+            // read readable.
+            Slot::Unsupported(why) => {
                 return Err(StorageError::Unsupported(format!(
-                    "publication record format version {v}"
+                    "publication record of {why}"
                 )));
             }
         }
@@ -1364,8 +2624,10 @@ fn apply(
     cs: &ChangeSet,
     bound: &[BoundContent],
     pos: u64,
-) -> Result<(), CommitError> {
+) -> Result<BTreeMap<[u8; 32], i64>, CommitError> {
     let invalid = |m: String| CommitError::Rejected(StorageError::InvalidRequest(m));
+    // Change in the number of records using each content digest.
+    let mut content_refs: BTreeMap<[u8; 32], i64> = BTreeMap::new();
     // Each logical identity may appear at most once per change set.
     let mut seen = BTreeSet::new();
     for c in &cs.changes {
@@ -1456,11 +2718,11 @@ fn apply(
                             .ok_or_else(|| invalid(format!("content index {i} out of range")))?,
                     ),
                 };
-                if let Some((manifest, c)) = content {
-                    let ck = key(P_CONTENT, &[&c.digest.0]);
-                    if t.get(&ck).map_err(rejected)?.is_none() {
-                        t.put(ck, manifest.encode()).map_err(rejected)?;
-                    }
+                if let Some(p) = prev.as_ref().and_then(|p| p.content) {
+                    *content_refs.entry(p.digest.0).or_default() -= 1;
+                }
+                if let Some((_, c)) = content {
+                    *content_refs.entry(c.digest.0).or_default() += 1;
                 }
                 let revision = pos;
                 t.put(
@@ -1487,8 +2749,11 @@ fn apply(
                     prev.as_ref().map(|p| p.revision),
                     expect,
                 )?;
-                if prev.is_none() {
+                let Some(prev) = prev else {
                     return Err(invalid(format!("remove of absent {id:?}")));
+                };
+                if let Some(p) = prev.content {
+                    *content_refs.entry(p.digest.0).or_default() -= 1;
                 }
                 t.delete(&k).map_err(rejected)?;
             }
@@ -1549,7 +2814,7 @@ fn apply(
             }
         }
     }
-    Ok(())
+    Ok(content_refs)
 }
 
 /// Streams committed content one segment at a time.
@@ -1566,6 +2831,54 @@ pub(crate) struct SegmentReader {
     pos: usize,
     total: Sha256,
     failed: Option<String>,
+    /// Keeps the generation this reader's content was found in pinned for the reader's life.
+    _pin: Option<Pin>,
+}
+
+impl SegmentReader {
+    /// Holds `pin` (normally a clone of the issuing view's pin) for the reader's life.
+    pub(crate) fn pinned(mut self, pin: Pin) -> Self {
+        self._pin = Some(pin);
+        self
+    }
+}
+
+/// One live reader's hold on a committed generation. Cloning pins the same generation again;
+/// dropping releases it.
+pub(crate) struct Pin {
+    inner: Arc<Inner>,
+    generation: u64,
+    /// Held by a view or content reader rather than by one of the engine's own walks.
+    reader: bool,
+}
+
+impl Clone for Pin {
+    fn clone(&self) -> Self {
+        *lock(&self.inner.pins).entry(self.generation).or_default() += 1;
+        if self.reader {
+            self.inner.readers.fetch_add(1, Ordering::SeqCst);
+        }
+        Self {
+            inner: self.inner.clone(),
+            generation: self.generation,
+            reader: self.reader,
+        }
+    }
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        if self.reader {
+            self.inner.readers.fetch_sub(1, Ordering::SeqCst);
+        }
+        let mut pins = lock(&self.inner.pins);
+        if let Some(n) = pins.get_mut(&self.generation) {
+            *n -= 1;
+            if *n == 0 {
+                pins.remove(&self.generation);
+            }
+        }
+    }
 }
 
 impl Read for SegmentReader {

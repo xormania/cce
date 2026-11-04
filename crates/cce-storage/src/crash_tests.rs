@@ -197,6 +197,8 @@ fn every_cut_of_a_commit_recovers_a_whole_old_or_new_state() {
             let label = format!("commit cut {cut}, {}", survival(p));
             with_repro(&label, &[("image", &pristine)], &trace, || {
                 let recovered = open(Box::new(img.clone()));
+                crate::audit::check_retirement(&img)
+                    .unwrap_or_else(|e| panic!("cut {cut} {p:?}: after recovery: {e}"));
                 let got = logical_state(&recovered);
                 assert!(
                     &got == old || &got == new,
@@ -216,6 +218,8 @@ fn every_cut_of_a_commit_recovers_a_whole_old_or_new_state() {
                     commit_step(&recovered, 3),
                     "cut {cut} {p:?}: store unusable after recovery"
                 );
+                crate::audit::check_retirement(&img)
+                    .unwrap_or_else(|e| panic!("cut {cut} {p:?}: after the next commit: {e}"));
                 let after = logical_state(&recovered);
                 drop(recovered);
                 img.release();

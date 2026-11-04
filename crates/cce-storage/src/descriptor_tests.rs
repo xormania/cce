@@ -12,14 +12,16 @@ use cce_core::storage::{
 };
 
 use crate::NativeStore;
-use crate::format::{DESC_MAGIC, Descriptor, PAGE_HEADER_LEN, PAGE_SIZE, StoreId};
+use crate::engine::Inner;
+use crate::format::{DESC_MAGIC, Descriptor, FORMAT_VERSION, PAGE_HEADER_LEN, PAGE_SIZE, StoreId};
 use crate::io::{FileId, Io};
 use crate::sim::SimIo;
 
 const STORE: StoreId = StoreId(*b"descriptor-tests");
 const IDS: [&str; 2] = ["A", "B"];
-/// Encoded publication record length: magic, version, store, six counters, checksum.
-const RECORD_LEN: usize = 4 + 2 + 16 + 8 * 6 + 4;
+/// Encoded publication record length: magic, version, required features, store, six counters,
+/// checksum.
+const RECORD_LEN: usize = 4 + 2 + 4 + 16 + 8 * 6 + 4;
 
 fn step_attempt(step: u32) -> AttemptId {
     AttemptId::new(format!("attempt-{step}").into_bytes()).unwrap()
@@ -50,6 +52,7 @@ fn commit_step(s: &NativeStore, step: u32) {
             label: b"decision".to_vec(),
             bytes: format!("evidence {step}").into_bytes(),
         }],
+        ..ChangeSet::default()
     };
     let r = s
         .commit(step_attempt(step), s.begin().unwrap(), cs)
@@ -218,6 +221,118 @@ fn a_store_recovered_past_a_damaged_record_commits_again_and_replaces_it() {
     );
     assert_eq!(descriptor(&s).generation, 3);
     assert_eq!(logical_state(&s), after);
+}
+
+/// The generation 3 record of `t` requiring `features`, its checksum recomputed: intact and of
+/// this format version.
+fn requiring(t: &TwoCommits, features: u32) -> Vec<u8> {
+    let mut slot = t.gen3.encode();
+    slot[6..10].copy_from_slice(&features.to_le_bytes());
+    let crc = crc32fast::hash(&slot[..RECORD_LEN - 4]);
+    slot[RECORD_LEN - 4..RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
+    slot
+}
+
+/// Durable and cached bytes of both store files.
+fn file_images(sim: &SimIo) -> Vec<Option<(Vec<u8>, Vec<u8>)>> {
+    [FileId::Meta, FileId::Content]
+        .into_iter()
+        .map(|f| sim.file_images_for_test(f))
+        .collect()
+}
+
+#[test]
+fn a_record_requiring_unknown_features_is_refused_without_falling_back_or_writing() {
+    let t = two_commits();
+    for bit in [0, 7, 31] {
+        let img = t.sim.after_process_exit();
+        write_durably(&img, PAGE_SIZE as u64, &requiring(&t, 1 << bit));
+        let before = file_images(&img);
+        for read_only in [false, true] {
+            let r = if read_only {
+                Inner::open_read_only(Box::new(img.clone()), Default::default()).map(drop)
+            } else {
+                try_open(&img).map(drop)
+            };
+            img.release();
+            // Never the intact older record in the other slot: the store needs what this build
+            // lacks.
+            assert!(
+                matches!(&r, Err(StorageError::Unsupported(m)) if m.contains("required features")),
+                "bit {bit}, read_only {read_only}: {r:?}"
+            );
+            assert!(
+                file_images(&img) == before,
+                "bit {bit}: the refused open changed the store"
+            );
+        }
+    }
+    // Positive neighbour: the same record requiring nothing opens at generation 3.
+    let img = t.sim.after_process_exit();
+    write_durably(&img, PAGE_SIZE as u64, &requiring(&t, 0));
+    let s = open(&img);
+    assert_eq!(descriptor(&s), t.gen3);
+    assert!(s.recovery_diagnostics().is_empty());
+}
+
+#[test]
+fn a_later_version_extending_the_record_is_refused_as_unsupported_not_damaged() {
+    // A later version keeps bytes 0..78 as this one does and appends an extension after them,
+    // with its own check; this build reads its version and refuses it.
+    let t = two_commits();
+    let mut slot = t.gen3.encode();
+    slot[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+    let crc = crc32fast::hash(&slot[..RECORD_LEN - 4]);
+    slot[RECORD_LEN - 4..RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
+    for (i, b) in slot[RECORD_LEN..RECORD_LEN + 64].iter_mut().enumerate() {
+        *b = 0xa0 | i as u8;
+    }
+    let img = t.sim.after_process_exit();
+    write_durably(&img, PAGE_SIZE as u64, &slot);
+    let before = file_images(&img);
+    for read_only in [false, true] {
+        let r = if read_only {
+            Inner::open_read_only(Box::new(img.clone()), Default::default()).map(drop)
+        } else {
+            try_open(&img).map(drop)
+        };
+        img.release();
+        let version = format!("format version {}", FORMAT_VERSION + 1);
+        assert!(
+            matches!(&r, Err(StorageError::Unsupported(m)) if m.contains(&version)),
+            "read_only {read_only}: {r:?}"
+        );
+        assert!(
+            file_images(&img) == before,
+            "the refused open changed the store"
+        );
+    }
+}
+
+#[test]
+fn a_record_of_this_version_in_the_earlier_layout_is_damaged_not_unsupported() {
+    // This version's fields without the required features, checksummed as earlier versions were:
+    // no build ever wrote it, so it is a damaged slot, and the previous generation is recovered.
+    let t = two_commits();
+    let current = t.gen3.encode();
+    let mut earlier = [&current[..6], &current[10..RECORD_LEN - 4]].concat();
+    let crc = crc32fast::hash(&earlier);
+    earlier.extend(crc.to_le_bytes());
+    assert_eq!(earlier.len(), RECORD_LEN - 4);
+    let mut slot = earlier;
+    slot.resize(PAGE_SIZE, 0);
+    assert!(matches!(
+        crate::format::decode_slot(&slot),
+        crate::format::Slot::Invalid(_)
+    ));
+    let img = t.sim.after_process_exit();
+    write_durably(&img, PAGE_SIZE as u64, &slot);
+    assert_recovers_generation_2(
+        &t,
+        &img,
+        &[CHECKSUM_DIAGNOSTIC],
+        "this version, earlier layout",
+    );
 }
 
 #[test]

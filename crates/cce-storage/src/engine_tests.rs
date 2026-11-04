@@ -150,6 +150,7 @@ fn retained_history_reports_the_content_each_commit_bound() {
         ..ChangeSet::default()
     };
     commit(&s, "c1", cs).unwrap();
+    let mut before = s.begin().unwrap();
     // Replace the record so the current state no longer refers to that content.
     commit(
         &s,
@@ -169,8 +170,15 @@ fn retained_history_reports_the_content_each_commit_bound() {
         "history lost the bound content reference"
     );
     assert!(h[1].content.is_empty());
+    // No record uses the content any more: history names it, but its bytes are not retained.
+    assert_eq!(
+        v.content(&h[0].content[0]).err(),
+        Some(StorageError::ContentNotRetained)
+    );
+    // A view from before the replacement still reads them.
     let mut got = Vec::new();
-    v.content(&h[0].content[0])
+    before
+        .content(&h[0].content[0])
         .unwrap()
         .read_to_end(&mut got)
         .unwrap();
@@ -198,9 +206,9 @@ fn a_retry_with_an_unrepresentable_content_index_is_not_matched_to_the_original(
 
 // ----- security review findings ------------------------------------------------------------------
 
-use crate::format::{Descriptor, PAGE_SIZE, PageKind, PageRef, encode_page};
+use crate::format::{Descriptor, FORMAT_VERSION, PAGE_SIZE, PageKind, PageRef, encode_page};
 use crate::io::{FileId, Io};
-use crate::records::{ExtentRef, P_CONTENT, key};
+use crate::records::{ContentEntry, ExtentRef, P_CONTENT, key};
 use crate::sim::Persist;
 use crate::tree::{Node, NodeSink, TreeTxn};
 
@@ -428,36 +436,60 @@ fn content_is_served_only_for_the_requested_digest() {
 }
 
 #[test]
-fn a_store_in_the_previous_format_version_is_refused_without_modification() {
-    let sim = SimIo::new();
-    let s = sim_store(&sim);
-    commit(
-        &s,
-        "x",
-        changes(vec![put("A", Precondition::Absent, b"a", None)]),
-    )
-    .unwrap();
-    let d = s.inner.snapshot().unwrap().desc;
-    drop(s);
-    // Rewrite the publication record as format version 1 (the single-leaf node encoding).
-    let slot = Descriptor::slot(d.generation) * PAGE_SIZE as u64;
-    let mut rec = d.encode();
-    rec[4..6].copy_from_slice(&1u16.to_le_bytes());
-    // magic 4 + version 2 + store 16 + six u64 fields = 70 bytes, then the CRC-32.
-    let crc = crc32fast::hash(&rec[..70]);
-    rec[70..74].copy_from_slice(&crc.to_le_bytes());
-    sim.write_at(FileId::Meta, slot, &rec).unwrap();
-    sim.sync(FileId::Meta).unwrap();
-    let mut before = vec![0; sim.len(FileId::Meta).unwrap() as usize];
-    sim.read_at(FileId::Meta, 0, &mut before).unwrap();
-    sim.release();
-    let err = Inner::open(Box::new(sim.clone()), Default::default())
-        .err()
-        .expect("an older format version opened");
-    assert!(matches!(err, StorageError::Unsupported(_)), "{err:?}");
-    let mut after = vec![0; before.len()];
-    sim.read_at(FileId::Meta, 0, &mut after).unwrap();
-    assert_eq!(before, after, "refusing the store modified it");
+fn a_store_in_an_older_format_version_is_refused_without_modification() {
+    // Version 4 is the format before space reuse; version 1 the single-leaf node encoding.
+    for version in [FORMAT_VERSION - 1, 1] {
+        let sim = SimIo::new();
+        let s = sim_store(&sim);
+        commit(
+            &s,
+            "x",
+            changes(vec![put("A", Precondition::Absent, b"a", None)]),
+        )
+        .unwrap();
+        drop(s);
+        // Both publication records rewritten as the older version, as an older engine left them.
+        // Record layout: magic 4 + version 2 + store 16 + six u64 fields = 70 bytes, then CRC-32.
+        for slot in [0, PAGE_SIZE as u64] {
+            let mut rec = vec![0; 74];
+            sim.read_at(FileId::Meta, slot, &mut rec).unwrap();
+            rec[4..6].copy_from_slice(&version.to_le_bytes());
+            let crc = crc32fast::hash(&rec[..70]);
+            rec[70..74].copy_from_slice(&crc.to_le_bytes());
+            sim.write_at(FileId::Meta, slot, &rec).unwrap();
+        }
+        sim.sync(FileId::Meta).unwrap();
+        let image = |sim: &SimIo| {
+            [FileId::Meta, FileId::Content].map(|f| {
+                let mut b = vec![0; sim.len(f).unwrap() as usize];
+                sim.read_at(f, 0, &mut b).unwrap();
+                b
+            })
+        };
+        let before = image(&sim);
+        for how in ["read-write", "read-only"] {
+            sim.release();
+            let io = Box::new(sim.clone());
+            let r = match how {
+                "read-write" => Inner::open(io, Default::default()),
+                _ => Inner::open_read_only(io, Default::default()),
+            };
+            let err = r
+                .err()
+                .unwrap_or_else(|| panic!("version {version} opened {how}"));
+            assert!(
+                matches!(&err, StorageError::Unsupported(m) if m.contains(&version.to_string())),
+                "version {version}, {how}: {err:?}"
+            );
+            sim.release();
+            assert!(
+                image(&sim) == before,
+                "refusing a version {version} store {how} modified it"
+            );
+        }
+        // After a power loss too: the refusal wrote nothing, durable or not.
+        assert!(image(&sim.after_crash(crate::sim::Persist::None)) == before);
+    }
 }
 
 #[test]
@@ -573,8 +605,15 @@ fn an_oversized_manifest_reference_is_refused_before_allocation() {
         digest: [0; 32],
     };
     let mut t = TreeTxn::new(&*s.inner, cur.root);
-    t.put(key(P_CONTENT, &[&staged.content.digest.0]), huge.encode())
-        .unwrap();
+    t.put(
+        key(P_CONTENT, &[&staged.content.digest.0]),
+        ContentEntry::Live {
+            manifest: huge,
+            refs: 1,
+        }
+        .encode(),
+    )
+    .unwrap();
     struct Sink<'a>(&'a SimIo, u64, u64);
     impl NodeSink for Sink<'_> {
         fn write(&mut self, n: &Node) -> Result<PageRef, StorageError> {
@@ -1037,6 +1076,7 @@ fn the_computed_request_length_matches_the_encoding_for_every_change_shape() {
                                     bytes: vec![3; n],
                                 })
                                 .collect(),
+                            ..ChangeSet::default()
                         };
                         assert_eq!(
                             encoded_request_len(&cs),

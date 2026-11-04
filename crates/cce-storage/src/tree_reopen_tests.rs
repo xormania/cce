@@ -14,7 +14,8 @@ use crate::NativeStore;
 use crate::engine::{Inner, Options, context_key};
 use crate::format::StoreId;
 use crate::records::{
-    AttemptValue, ContextValue, P_ATTEMPT, P_CONTEXT, P_HISTORY, fingerprint, history_key, key,
+    AttemptValue, ContextValue, P_ATTEMPT, P_CONTEXT, P_HISTORY, P_RETIRED, fingerprint,
+    history_key, key,
 };
 use crate::sim::{Persist, SimIo};
 use crate::tree::{self, Cursor, NodeSource};
@@ -133,6 +134,10 @@ fn a_tree_of_height_three_reads_back_whole_after_reopening_from_the_files() {
         history_keys,
         (1..=COMMITS as u64).map(history_key).collect::<Vec<_>>()
     );
+    // Retirement records of the pages each commit replaced are physical bookkeeping, not part of
+    // the logical model below.
+    let (retired, rest): (Vec<_>, Vec<_>) = rest.into_iter().partition(|(k, _)| k[0] == P_RETIRED);
+    assert!(!retired.is_empty(), "the commits recorded no retired pages");
     assert!(
         rest.iter()
             .all(|(k, _)| k[0] == P_CONTEXT || k[0] == P_ATTEMPT),

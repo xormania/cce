@@ -160,6 +160,26 @@ pub struct ChangeSet {
     pub content: Vec<ContentBinding>,
     /// Supplied decision evidence recorded with this change, in order.
     pub evidence: Vec<Evidence>,
+    /// How this commit treats live views and content readers. Part of the request: an attempt
+    /// retried with a different mode is a different request.
+    pub removal: RemovalMode,
+}
+
+/// How a commit that removes or replaces records treats views and content readers that may still
+/// read the state it replaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RemovalMode {
+    /// Existing views and content readers keep reading their state; storage reuses the space the
+    /// commit retires only after they are gone.
+    #[default]
+    PreserveViews,
+    /// Commit only while no other view or content reader of the store is live. Otherwise nothing
+    /// is committed and the commit fails with [`CommitError::ReadersActive`]; once those readers
+    /// are gone, the same request can be prepared and committed. The mode applies to every commit
+    /// that carries it, whether or not it removes anything. The check is store-wide: it counts
+    /// every live view and reader of the owning process, not only those that could reach a
+    /// removed record (no other process can hold the store open while it is owned).
+    RequireQuiescence,
 }
 
 /// A staged content item bound into a change set.
@@ -257,8 +277,9 @@ pub enum AttemptOutcome {
     Unknown,
 }
 
-/// Errors from storage operations.
+/// Errors from storage operations. New kinds of error may be added.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StorageError {
     /// The operation is not implemented yet.
     NotImplemented(&'static str),
@@ -274,6 +295,9 @@ pub enum StorageError {
     Io(String),
     /// The handle/view/token belongs to a different store or open instance.
     ForeignHandle,
+    /// The content was committed once, but no record uses it any more and storage no longer keeps
+    /// its bytes. Retained history may still name it by digest and length.
+    ContentNotRetained,
 }
 
 impl fmt::Display for StorageError {
@@ -284,8 +308,9 @@ impl fmt::Display for StorageError {
 
 impl std::error::Error for StorageError {}
 
-/// Errors from [`StorageEngine::commit`].
+/// Errors from [`StorageEngine::commit`]. New kinds of error may be added.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CommitError {
     /// A logical dependency changed; nothing committed.
     Conflict(String),
@@ -295,6 +320,9 @@ pub enum CommitError {
     Rejected(StorageError),
     /// The outcome cannot be established now; reconcile with [`StorageEngine::outcome`].
     Indeterminate(String),
+    /// [`RemovalMode::RequireQuiescence`] and other views or content readers are live; nothing
+    /// committed. The message says how many.
+    ReadersActive(String),
 }
 
 impl fmt::Display for CommitError {
@@ -326,6 +354,9 @@ pub trait ReadView: Send {
     ) -> Result<Box<dyn Iterator<Item = Result<HistoryEntry, StorageError>> + '_>, StorageError>;
 
     /// Opens a reader over committed content. The reader remains valid after the view drops.
+    ///
+    /// Content that no record in this view uses any more, and whose bytes storage no longer keeps,
+    /// fails with [`StorageError::ContentNotRetained`] even though history may still name it.
     fn content(&mut self, content: &ContentRef) -> Result<Box<dyn ContentReader>, StorageError>;
 }
 
@@ -346,6 +377,13 @@ pub trait StorageEngine: Send + Sync {
         bytes: &mut dyn Read,
         expected: &ContentRef,
     ) -> Result<StagedContent, StorageError>;
+
+    /// Gives up staged content that will not be committed, so its space can be reused. Consumes
+    /// the handle. Content bound by an admitted commit cannot be discarded until that commit
+    /// resolves; content already committed, already discarded, or staged by another store or open
+    /// instance is refused without effect. Staged content that is neither committed nor
+    /// discarded keeps its space until the store is reopened.
+    fn discard_staged(&self, staged: StagedContent) -> Result<(), StorageError>;
 
     /// Atomically commits one complete change against the given basis.
     fn commit(
