@@ -2706,10 +2706,11 @@ fn sampled_cuts_of_long_generated_sequences_recover_a_model_state() {
 
 // Budget floor for the failure tiers: each requires an acknowledged failed step, a committed live
 // outcome and a live acknowledgement (`run_crash_campaign`), so a budget can be too small to pass
-// even when the store is right. The defaults (3 short sequences; 2 long sequences with 12 sampled
-// cuts) are the minimum: they pass at the default seed and at seeds 1 to 4, while one sequence
-// per tier passes at the default seed but not at seed 1. Overrides may raise the budget; below
-// the defaults those assertions can fail without a fault.
+// even when the store is right (no sequence at all always fails). Measured with this generator,
+// one sequence per tier already satisfies them at seeds 0 to 8. The defaults (4 short sequences;
+// 2 long sequences with 12 sampled cuts) are set by detection instead: the short tier needs 4 at
+// the default seed to catch a data barrier that does not fence. Overrides may raise the budget;
+// below the defaults detection is not established.
 #[test]
 fn an_io_failure_at_every_cut_of_short_generated_sequences_is_reported_and_recovered() {
     run_crash_campaign(
@@ -2717,7 +2718,7 @@ fn an_io_failure_at_every_cut_of_short_generated_sequences_is_reported_and_recov
             name: "I/O failure at every cut, short sequences",
             interruption: Interruption::Failure,
             ops: 8..=16,
-            cases: env_or("CCE_FAILURE_CASES", 3),
+            cases: env_or("CCE_FAILURE_CASES", 4),
             sampled: None,
         },
         env_or("CCE_CRASH_SEED", CRASH_SEED),
