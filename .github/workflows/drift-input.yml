@@ -1,0 +1,27 @@
+name: drift-input
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drift-input-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Drift tooling tests
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit and replay tests
+        run: python3 -m unittest discover -s tests/ci -v
