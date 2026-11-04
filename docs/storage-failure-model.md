@@ -120,7 +120,9 @@ fail with `Busy` without admitting anything, and reads continue normally.
 
 `close` stops admission first (later `submit`/`commit` calls fail with a store-state error saying the
 store is closing), then waits until every admitted commit has resolved, so no commit publishes after
-`close` has returned.
+`close` has returned, and no admitted commit still keeps the store owned. `close` waits as long as an
+admitted commit takes: a commit blocked in I/O (for example a filesystem that never completes a
+sync) keeps `close` waiting with it.
 
 ## Ownership
 
