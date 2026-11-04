@@ -69,6 +69,8 @@ mod sim;
 #[cfg(test)]
 mod split_sweep_tests;
 #[cfg(test)]
+mod staging_budget_tests;
+#[cfg(test)]
 mod test_support;
 mod tree;
 #[cfg(test)]
@@ -473,6 +475,7 @@ fn stats_of(inner: &Arc<Inner>) -> Result<StoreStats, StorageError> {
         entries_visited: get(&c.entries_visited),
         content_buffer_bytes: get(&c.content_buffer_bytes),
         content_buffer_bytes_peak: get(&c.content_buffer_bytes_peak),
+        staged_bytes: inner.staged_bytes(),
     })
 }
 
@@ -506,6 +509,13 @@ pub struct StoreOptions {
     /// lowering it never makes data written under a larger value unreadable: reads are bounded by
     /// the format, not by this.
     pub max_request_len: u64,
+    /// Largest total content length of the stagings outstanding at once, 64 GiB by default:
+    /// content staged and neither committed nor discarded. Manifests are not counted. A staging
+    /// that would exceed it fails with [`StorageError::ResourceExhausted`] and changes nothing;
+    /// committing or discarding outstanding stagings releases their share. It bounds only new
+    /// staging: lowering it never affects reading, committing or discarding what is already
+    /// staged or committed.
+    pub max_staged_bytes: u64,
     /// Checked when the store is opened, read-write or read-only; `None` opens without it.
     pub guard: Option<ReceiptGuard>,
 }
@@ -547,6 +557,7 @@ impl Default for StoreOptions {
         Self {
             cache_nodes: engine::DEFAULT_CACHE_NODES,
             max_request_len: engine::DEFAULT_MAX_REQUEST_LEN,
+            max_staged_bytes: engine::DEFAULT_MAX_STAGED_BYTES,
             guard: None,
         }
     }
@@ -557,6 +568,7 @@ impl From<StoreOptions> for Options {
         Options {
             cache_nodes: o.cache_nodes,
             max_request_len: o.max_request_len,
+            max_staged_bytes: o.max_staged_bytes,
             guard: o.guard,
             ..Options::default()
         }
@@ -600,6 +612,9 @@ pub struct StoreStats {
     pub content_buffer_bytes: u64,
     /// The most `content_buffer_bytes` has been since the store was opened.
     pub content_buffer_bytes_peak: u64,
+    /// Total content length of the outstanding stagings right now (what `max_staged_bytes`
+    /// bounds).
+    pub staged_bytes: u64,
 }
 
 /// Space use of one committed state, by kind.

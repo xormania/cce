@@ -47,6 +47,11 @@ pub(crate) const DEFAULT_CACHE_NODES: usize = 256;
 /// Staged or bound content: its manifest's location and its logical reference.
 type BoundContent = (ExtentRef, ContentRef);
 
+/// Total content length of the outstanding stagings in `st`.
+fn staged_total(st: &State) -> u64 {
+    st.staged.values().map(|(_, c)| c.len).sum()
+}
+
 static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 /// Engine tuning that does not affect stored bytes.
@@ -65,6 +70,8 @@ pub(crate) struct Options {
     /// Largest encoded size of a whole request this open writes, which history stores as one
     /// length-prefixed field. Reads are bounded by the format, not by this.
     pub max_request_len: u64,
+    /// Largest total content length of the stagings outstanding at once.
+    pub max_staged_bytes: u64,
     /// Retained receipt information an open checks before touching the store.
     pub guard: Option<crate::ReceiptGuard>,
 }
@@ -75,6 +82,9 @@ pub(crate) const DEFAULT_CONFLICT_WINDOW: usize = 4096;
 pub(crate) const DEFAULT_COMMIT_QUEUE: usize = 64;
 /// Default largest encoded request a store writes: 64 MiB, well below the format's `u32` limit.
 pub(crate) const DEFAULT_MAX_REQUEST_LEN: u64 = 64 << 20;
+/// Default largest total content length of outstanding stagings: 64 GiB, the default largest
+/// single content stream (2^20 segments of 64 KiB).
+pub(crate) const DEFAULT_MAX_STAGED_BYTES: u64 = 64 << 30;
 
 impl Default for Options {
     fn default() -> Self {
@@ -85,6 +95,7 @@ impl Default for Options {
             max_content_segments: DEFAULT_MAX_CONTENT_SEGMENTS,
             max_request_field: u32::MAX as u64,
             max_request_len: DEFAULT_MAX_REQUEST_LEN,
+            max_staged_bytes: DEFAULT_MAX_STAGED_BYTES,
             guard: None,
         }
     }
@@ -219,6 +230,8 @@ pub(crate) struct Inner {
     slow_job_release: std::sync::atomic::AtomicBool,
     /// Largest number of segments one content stream may have.
     max_segments: usize,
+    /// Largest total content length of the stagings outstanding at once.
+    max_staged_bytes: u64,
     /// Largest variable-length request field or list (see `Options::max_request_field`).
     max_request_field: u64,
     /// Largest encoded request (see `Options::max_request_len`).
@@ -726,6 +739,7 @@ impl Inner {
             max_segments: opts.max_content_segments,
             max_request_field: opts.max_request_field,
             max_request_len: opts.max_request_len,
+            max_staged_bytes: opts.max_staged_bytes,
             read_only: false,
             counters: Counters::default(),
             diagnostics,
@@ -1302,6 +1316,28 @@ impl Inner {
 
     // ----- staging -----------------------------------------------------------------------------
 
+    /// Total content length of this instance's outstanding stagings: staged and neither
+    /// committed nor discarded (manifests are not counted).
+    pub fn staged_bytes(&self) -> u64 {
+        staged_total(&lock(&self.state))
+    }
+
+    /// Refuses a staging of `len` content bytes that would take the outstanding total past the
+    /// staging budget.
+    fn check_staging_budget(&self, len: u64) -> Result<(), StorageError> {
+        let outstanding = self.staged_bytes();
+        if outstanding.saturating_add(len) <= self.max_staged_bytes {
+            return Ok(());
+        }
+        Err(StorageError::ResourceExhausted(format!(
+            "staging {len} bytes would exceed the budget of {} bytes for outstanding staged \
+             content ({outstanding} bytes outstanding); commit or discard outstanding stagings \
+             to release it (stagings bound by a commit whose publication is uncertain are \
+             released only by reopening the store)",
+            self.max_staged_bytes
+        )))
+    }
+
     pub fn stage(&self, bytes: &mut dyn Read) -> Result<StagedContent, StorageError> {
         self.stage_checked(bytes, None)
     }
@@ -1320,6 +1356,9 @@ impl Inner {
                 "writes fenced: {}",
                 f.why
             )));
+        }
+        if let Some(e) = expected {
+            self.check_staging_budget(e.len)?;
         }
         let mut cursor = lock(&self.alloc);
         // Retired content this staging may reuse: no publication slot reaches it (retired at
@@ -1378,6 +1417,9 @@ impl Inner {
                     self.max_segments
                 )));
             }
+            // Before this segment is written: outstanding stagings (read now, so a commit or a
+            // discard meanwhile has released its share) plus this stream so far must fit.
+            self.check_staging_budget(len + filled as u64)?;
             let seg = &buf[..filled];
             let place = self.place(&mut at, filled as u64, reusable_through, &mut taken)?;
             self.io.write_at(FileId::Content, place, seg)?;
