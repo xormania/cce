@@ -135,7 +135,8 @@ pub(crate) struct Inner {
     /// Sender to the commit worker.
     worker: Mutex<Option<mpsc::SyncSender<Job>>>,
     /// Attempts admitted to the worker and not yet resolved.
-    pending: Recorded<HashMap<AttemptId, u32>>,
+    /// Shared with the worker so it can resolve an attempt after releasing its engine reference.
+    pending: Arc<Recorded<HashMap<AttemptId, u32>>>,
     /// Set (under the `pending` lock) once `close` began: new commits are refused from then on.
     closing: AtomicBool,
     /// Live reader pins: committed generation -> number of views and content readers reading it.
@@ -146,6 +147,9 @@ pub(crate) struct Inner {
     /// Makes the next commit panic inside the worker (tests of worker robustness only).
     #[cfg(test)]
     panic_next_commit: std::sync::atomic::AtomicBool,
+    /// Makes the worker pause after answering each job (tests of shutdown ordering only).
+    #[cfg(test)]
+    slow_job_release: std::sync::atomic::AtomicBool,
     /// Largest number of segments one content stream may have.
     max_segments: usize,
     /// Largest variable-length request field or list (see `Options::max_request_field`).
@@ -191,6 +195,12 @@ mod locks {
         }
     }
 
+    impl<T, L: Lockable<T>> Lockable<T> for std::sync::Arc<L> {
+        fn acquire(&self) -> MutexGuard<'_, T> {
+            (**self).acquire()
+        }
+    }
+
     impl<T> Lockable<T> for Recorded<T> {
         fn acquire(&self) -> MutexGuard<'_, T> {
             #[cfg(test)]
@@ -226,6 +236,17 @@ fn sha256(b: &[u8]) -> [u8; 32] {
 /// The content file cannot grow further without wrapping its byte offsets.
 fn content_space_exhausted() -> StorageError {
     StorageError::InvalidRequest("content space exhausted".into())
+}
+
+/// Resolves one admission of `attempt`: it stops being pending once every admission resolved.
+fn finish_pending(pending: &Recorded<HashMap<AttemptId, u32>>, attempt: &AttemptId) {
+    let mut p = lock(pending);
+    if let Some(n) = p.get_mut(attempt) {
+        *n -= 1;
+        if *n == 0 {
+            p.remove(attempt);
+        }
+    }
 }
 
 fn rejected(e: StorageError) -> CommitError {
@@ -409,13 +430,15 @@ impl Inner {
                 capacity: opts.cache_nodes,
             }),
             worker: Mutex::new(None),
-            pending: Recorded::new("pending", HashMap::new()),
+            pending: Arc::new(Recorded::new("pending", HashMap::new())),
             closing: AtomicBool::new(false),
             pins: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             gate: Mutex::new(()),
             #[cfg(test)]
             panic_next_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            slow_job_release: std::sync::atomic::AtomicBool::new(false),
             conflicts: Mutex::new(ConflictLog {
                 floor: desc.history_pos,
                 entries: VecDeque::new(),
@@ -431,6 +454,11 @@ impl Inner {
 
     /// Test hook: makes the next commit panic inside the worker.
     #[cfg(test)]
+    pub(crate) fn slow_job_release_for_test(&self) {
+        self.slow_job_release.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     pub(crate) fn panic_next_commit_for_test(&self) {
         self.panic_next_commit.store(true, Ordering::SeqCst);
     }
@@ -444,7 +472,7 @@ impl Inner {
     /// Starts the store's commit worker: the single thread that orders publications. The worker
     /// holds no reference to the engine; each queued job holds a strong one, so admitted work
     /// completes even if every caller handle is dropped, and an idle worker never keeps the store
-    /// owned. The worker exits when the engine (and with it the queue's sender) is dropped.
+    /// owned A job's reference is released before its attempt stops being pending. The worker exits when the engine (and with it the queue's sender) is dropped.
     fn start_worker(self: &Arc<Self>, capacity: usize) -> Result<(), StorageError> {
         let (tx, rx) = mpsc::sync_channel::<Job>(capacity.max(1));
         *lock(&self.worker) = Some(tx);
@@ -452,12 +480,18 @@ impl Inner {
             .name("cce-commit".into())
             .spawn(move || {
                 for job in rx {
-                    let inner = job.inner.clone();
+                    let Job {
+                        inner,
+                        attempt,
+                        basis,
+                        observed,
+                        changes,
+                        reply,
+                    } = job;
                     #[cfg(test)]
                     drop(lock(&inner.gate));
-                    let attempt = job.attempt.clone();
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        inner.commit(attempt.clone(), job.basis, &job.observed, job.changes)
+                        inner.commit(attempt.clone(), basis, &observed, changes)
                     }))
                     .unwrap_or_else(|_| {
                         // A commit that panicked may have written anything up to its
@@ -470,9 +504,20 @@ impl Inner {
                         });
                         Err(CommitError::Indeterminate(why))
                     });
-                    inner.finish_pending(&job.attempt);
+                    #[cfg(test)]
+                    let slow = inner.slow_job_release.load(Ordering::SeqCst);
+                    // Release this job's hold on the engine before its attempt stops being
+                    // pending: once nothing is pending (what `close` waits for), no job keeps the
+                    // store owned.
+                    let pending = inner.pending.clone();
+                    drop(inner);
+                    finish_pending(&pending, &attempt);
                     // The caller may have gone away; the commit stands either way.
-                    let _ = job.reply.send(r);
+                    let _ = reply.send(r);
+                    #[cfg(test)]
+                    if slow {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
                 }
             })
             .map_err(|e| StorageError::Io(format!("start commit worker: {e}")))?;
@@ -528,13 +573,7 @@ impl Inner {
     }
 
     fn finish_pending(&self, attempt: &AttemptId) {
-        let mut p = lock(&self.pending);
-        if let Some(n) = p.get_mut(attempt) {
-            *n -= 1;
-            if *n == 0 {
-                p.remove(attempt);
-            }
-        }
+        finish_pending(&self.pending, attempt);
     }
 
     /// The current committed state without a pin (tests only: production reads go through
