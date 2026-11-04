@@ -459,6 +459,34 @@ fn history_entries_reject_malformed_requests() {
     };
     let empty = decode_history(&entry(&request(&[], 0, 0))).unwrap();
     assert_eq!(empty.position, cce_core::storage::HistoryPosition(1));
+    // Version 2 ends with the removal mode: 0 or 1, nothing else, and nothing after it.
+    let v2 = |mode: &[u8]| {
+        let mut r = request(&[], 0, 0);
+        r[0] = 2;
+        r.extend(mode);
+        r
+    };
+    for mode in [0u8, 1] {
+        assert!(
+            decode_history(&entry(&v2(&[mode]))).is_ok(),
+            "removal mode {mode}"
+        );
+    }
+    err_contains(
+        decode_history(&entry(&v2(&[2]))),
+        "removal mode",
+        "unknown removal mode",
+    );
+    err_contains(
+        decode_history(&entry(&v2(&[]))),
+        "truncated",
+        "missing removal mode",
+    );
+    err_contains(
+        decode_history(&entry(&v2(&[0, 0]))),
+        "trailing",
+        "byte after the mode",
+    );
     assert_eq!(empty.attempt.as_bytes(), b"a");
     assert!(empty.changes.is_empty() && empty.content.is_empty() && empty.evidence.is_empty());
     err_contains(
@@ -523,7 +551,7 @@ fn history_entries_reject_malformed_requests() {
     err_contains(decode_history(&entry(&[])), "truncated", "empty request");
     assert!(
         matches!(
-            decode_history(&entry(&[2])),
+            decode_history(&entry(&[3])),
             Err(StorageError::Unsupported(_))
         ),
         "a request encoding of another version is unsupported"
@@ -879,7 +907,18 @@ fn forged(
         digest: [0; 32],
     };
     let mut t = TreeTxn::new(&*s.inner, cur.root);
-    t.put(entry_key(&staged), crafted.encode()).unwrap();
+    // A content entry holds the manifest extent of live content; a history entry, the extent.
+    let k = entry_key(&staged);
+    let v = if k.first() == Some(&crate::records::P_CONTENT) {
+        crate::records::ContentEntry::Live {
+            manifest: crafted,
+            refs: 1,
+        }
+        .encode()
+    } else {
+        crafted.encode()
+    };
+    t.put(k, v).unwrap();
     struct Sink<'a>(&'a SimIo, u64, u64);
     impl NodeSink for Sink<'_> {
         fn write(&mut self, n: &Node) -> Result<PageRef, StorageError> {

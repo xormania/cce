@@ -14,7 +14,8 @@ use crate::engine::{Inner, Options, context_key};
 use crate::format::{Descriptor, PAGE_SIZE, PageKind, PageRef, StoreId, encode_page};
 use crate::io::{FileId, Io};
 use crate::records::{
-    AttemptValue, ContextValue, P_ATTEMPT, P_CONTENT, P_IN, P_OUT, history_key, key,
+    AttemptValue, ContentEntry, ContextValue, P_ATTEMPT, P_CONTENT, P_IN, P_OUT, P_RETIRED,
+    Retired, decode_retired, history_key, key, retired_extent_key, retired_page_key,
 };
 use crate::sim::SimIo;
 use crate::tree::{Entries, Node, NodeSink, TreeTxn};
@@ -200,13 +201,45 @@ fn publish(sim: &SimIo, build: impl FnOnce(&Inner, &Descriptor, &mut Sink) -> Pa
     sim.release();
 }
 
-/// Publishes the current tree with `edit` applied.
+/// Publishes the current tree with `edit` applied, recording every page it replaces as retired
+/// at the new generation, as a commit does.
 fn edit_tree(sim: &SimIo, edit: impl FnOnce(&mut TreeTxn)) {
     publish(sim, |inner, cur, sink| {
         let mut t = TreeTxn::new(inner, cur.root);
         edit(&mut t);
-        t.finish(sink).unwrap()
+        finish_retiring(t, cur, sink)
     });
+}
+
+/// Writes `t`, first recording every page it replaces as retired at the next generation, as a
+/// commit does, so that only the crafted damage is inconsistent.
+fn finish_retiring(mut t: TreeTxn, cur: &Descriptor, sink: &mut Sink) -> PageRef {
+    let mut recorded = 0;
+    while recorded < t.replaced().len() {
+        let fresh: Vec<PageRef> = t.replaced()[recorded..].to_vec();
+        recorded += fresh.len();
+        for p in fresh {
+            t.put(
+                retired_page_key(cur.generation + 1, p.page),
+                p.incarnation.to_le_bytes().to_vec(),
+            )
+            .unwrap();
+        }
+    }
+    t.finish(sink).unwrap()
+}
+
+/// Like [`assert_only`], for a tree built from scratch: the replaced tree's pages are then
+/// neither reachable nor retired, which is reported too.
+fn assert_only_besides_coverage(r: &Report, check: &str) {
+    let mut found = checks(r);
+    found.remove("page-coverage");
+    assert_eq!(
+        found,
+        BTreeSet::from([check]),
+        "expected only {check} findings: {:#?}",
+        r.findings
+    );
 }
 
 fn leaf(ids: &[&str]) -> Node {
@@ -326,6 +359,207 @@ fn relationships_with_absent_endpoints_are_not_findings() {
     }
 }
 
+/// A store that has reused retired pages and content, holds content no record uses any more but
+/// that history still binds, and was committed to under both removal modes. Released.
+fn reused() -> SimIo {
+    let sim = SimIo::new();
+    let s = NativeStore {
+        inner: Inner::create(Box::new(sim.clone()), STORE, Options::default()).unwrap(),
+    };
+    let bytes = |seed: u8, n: usize| -> Vec<u8> { (0..n).map(|i| (i as u8) ^ seed).collect() };
+    for round in 0..6u8 {
+        let staged = s.stage_content(&mut &bytes(round, 70_000)[..]).unwrap();
+        commit(
+            &s,
+            &format!("round-{round}"),
+            ChangeSet {
+                removal: if round % 2 == 0 {
+                    cce_core::storage::RemovalMode::PreserveViews
+                } else {
+                    cce_core::storage::RemovalMode::RequireQuiescence
+                },
+                changes: (0..40)
+                    .map(|i| put(&format!("ctx-{i:03}"), (i == 0).then_some(0)))
+                    .chain([rel(&format!("r{round}"), "ctx-000", "ctx-001")])
+                    .collect(),
+                content: vec![ContentBinding::from(&staged)],
+                ..ChangeSet::default()
+            },
+        );
+    }
+    let st = s.stats().unwrap();
+    assert!(
+        st.pages_reused > 0 && st.content_bytes_reused > 0,
+        "nothing was reused: {st:?}"
+    );
+    drop(s);
+    sim.release();
+    sim
+}
+
+fn assert_consistent(sim: &SimIo) {
+    for level in [VerifyLevel::Structure, VerifyLevel::Scrub] {
+        let r = verify_at(sim, level);
+        assert!(r.findings.is_empty(), "{level:?}: {:#?}", r.findings);
+    }
+}
+
+#[test]
+fn a_store_with_reused_space_removed_content_and_both_removal_modes_is_consistent() {
+    assert_consistent(&reused());
+}
+
+/// The leftmost leaf of the published tree: no record this module adds lands there.
+fn leftmost_leaf(sim: &SimIo) -> PageRef {
+    let inner = Inner::open_read_only(Box::new(sim.clone()), Options::default()).unwrap();
+    let (snap, _pin) = inner.pin_current().unwrap();
+    let mut at = snap.desc.root;
+    while let Node::Branch { children, .. } = &*crate::tree::NodeSource::load(&*inner, at).unwrap()
+    {
+        at = children[0];
+    }
+    drop(_pin);
+    drop(inner);
+    sim.release();
+    at
+}
+
+fn content_key_of(sim: &SimIo, id: &str) -> (Vec<u8>, Vec<u8>) {
+    let inner = Inner::open_read_only(Box::new(sim.clone()), Options::default()).unwrap();
+    let (snap, _pin) = inner.pin_current().unwrap();
+    let ctx = crate::tree::get(&*inner, snap.desc.root, &context_key(&cid(id)))
+        .unwrap()
+        .unwrap();
+    let digest = ContextValue::decode(&ctx).unwrap().content.unwrap().digest;
+    let k = key(P_CONTENT, &[&digest.0]);
+    let v = crate::tree::get(&*inner, snap.desc.root, &k)
+        .unwrap()
+        .unwrap();
+    drop(_pin);
+    drop(inner);
+    sim.release();
+    (k, v)
+}
+
+#[test]
+fn a_context_bound_to_removed_content_is_a_content_ref_finding() {
+    let sim = reused();
+    let (k, _) = content_key_of(&sim, "ctx-000");
+    edit_tree(&sim, |t| t.put(k, ContentEntry::Removed.encode()).unwrap());
+    assert_only(&verify(&sim), "content-ref");
+}
+
+#[test]
+fn a_content_entry_whose_count_differs_from_its_binding_contexts_is_a_content_ref_finding() {
+    let sim = reused();
+    let (k, v) = content_key_of(&sim, "ctx-000");
+    let ContentEntry::Live { manifest, refs } = ContentEntry::decode(&v).unwrap() else {
+        panic!("bound content is not live");
+    };
+    edit_tree(&sim, |t| {
+        t.put(
+            k,
+            ContentEntry::Live {
+                manifest,
+                refs: refs + 1,
+            }
+            .encode(),
+        )
+        .unwrap()
+    });
+    assert_only(&verify(&sim), "content-ref");
+}
+
+#[test]
+fn a_reachable_page_recorded_as_retired_is_a_retirement_finding() {
+    // A tree of several levels: its leftmost leaf stays reachable when retirement records, which
+    // sort last, are added.
+    let sim = rich();
+    let leaf = leftmost_leaf(&sim);
+    edit_tree(&sim, |t| {
+        t.put(
+            retired_page_key(1, leaf.page),
+            leaf.incarnation.to_le_bytes().to_vec(),
+        )
+        .unwrap()
+    });
+    let r = verify(&sim);
+    assert_only(&r, "retirement");
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.detail == format!("retired page {} is reachable", leaf.page)),
+        "{:#?}",
+        r.findings
+    );
+}
+
+/// The published retirement records of tree pages: key and page.
+fn retired_page_records(sim: &SimIo) -> Vec<(Vec<u8>, u64)> {
+    let inner = Inner::open_read_only(Box::new(sim.clone()), Options::default()).unwrap();
+    let (snap, _pin) = inner.pin_current().unwrap();
+    let d = snap.desc;
+    let out = crate::tree::Cursor::new(&*inner, d.root, &[P_RETIRED], None, d.next_page)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter_map(|(k, v)| match decode_retired(&k, &v).unwrap() {
+            Retired::Page { page, .. } => Some((k, page)),
+            Retired::Extent { .. } => None,
+        })
+        .collect();
+    drop(_pin);
+    drop(inner);
+    sim.release();
+    out
+}
+
+#[test]
+fn a_page_retired_twice_or_beyond_the_tree_is_a_retirement_finding() {
+    for beyond in [false, true] {
+        let sim = reused();
+        let page = if beyond {
+            u64::MAX / 2
+        } else {
+            retired_page_records(&sim)
+                .first()
+                .expect("a retired page")
+                .1
+        };
+        edit_tree(&sim, |t| {
+            t.put(retired_page_key(0, page), 1u64.to_le_bytes().to_vec())
+                .unwrap()
+        });
+        assert_only(&verify(&sim), "retirement");
+    }
+}
+
+#[test]
+fn a_page_neither_reachable_nor_retired_is_a_page_coverage_finding() {
+    let sim = reused();
+    let (k, _) = retired_page_records(&sim).remove(0);
+    edit_tree(&sim, |t| {
+        t.delete(&k).unwrap();
+    });
+    assert_only(&verify(&sim), "page-coverage");
+}
+
+#[test]
+fn a_retired_extent_overlapping_live_content_is_an_extent_finding() {
+    let sim = reused();
+    let (_, v) = content_key_of(&sim, "ctx-000");
+    let ContentEntry::Live { manifest, .. } = ContentEntry::decode(&v).unwrap() else {
+        panic!("bound content is not live");
+    };
+    edit_tree(&sim, |t| {
+        t.put(
+            retired_extent_key(1, manifest.offset),
+            manifest.len.to_le_bytes().to_vec(),
+        )
+        .unwrap()
+    });
+    assert_only(&verify(&sim), "extent");
+}
+
 #[test]
 fn a_record_in_the_wrong_slot_is_a_slot_finding() {
     let sim = rich();
@@ -362,7 +596,7 @@ fn an_unreadable_reachable_page_is_a_page_finding() {
         })
         .unwrap()
     });
-    assert_only(&verify(&sim), "page");
+    assert_only_besides_coverage(&verify(&sim), "page");
 }
 
 #[test]
@@ -376,7 +610,7 @@ fn a_page_reached_twice_is_a_shared_page_finding() {
         })
         .unwrap()
     });
-    assert_only(&verify(&sim), "shared-page");
+    assert_only_besides_coverage(&verify(&sim), "shared-page");
 }
 
 #[test]
@@ -398,7 +632,7 @@ fn leaves_at_different_depths_are_a_depth_finding() {
         })
         .unwrap()
     });
-    assert_only(&verify(&sim), "depth");
+    assert_only_besides_coverage(&verify(&sim), "depth");
 }
 
 #[test]
@@ -414,7 +648,7 @@ fn a_key_outside_its_parents_range_is_a_separator_finding() {
         })
         .unwrap()
     });
-    assert_only(&verify(&sim), "separator");
+    assert_only_besides_coverage(&verify(&sim), "separator");
 }
 
 #[test]
@@ -459,7 +693,7 @@ fn a_content_reference_without_its_manifest_record_is_a_content_ref_finding() {
         let c = ContextValue::decode(&a).unwrap().content.unwrap();
         let mut t = TreeTxn::new(inner, cur.root);
         t.delete(&key(P_CONTENT, &[&c.digest.0])).unwrap();
-        t.finish(sink).unwrap()
+        finish_retiring(t, cur, sink)
     });
     assert_only(&verify(&sim), "content-ref");
 }
@@ -473,9 +707,10 @@ fn a_history_entry_beyond_the_committed_position_is_a_history_finding() {
             .unwrap();
         let mut t = TreeTxn::new(inner, cur.root);
         t.put(history_key(cur.history_pos + 1), first).unwrap();
-        t.finish(sink).unwrap()
+        finish_retiring(t, cur, sink)
     });
-    assert_only(&verify(&sim), "history");
+    // The extra record also names the first entry's bytes, so the two overlap.
+    assert_eq!(checks(&verify(&sim)), BTreeSet::from(["extent", "history"]));
 }
 
 #[test]
@@ -488,7 +723,7 @@ fn an_attempt_record_that_does_not_match_its_history_entry_is_an_attempt_finding
         v.fingerprint[0] ^= 1;
         let mut t = TreeTxn::new(inner, cur.root);
         t.put(k, v.encode()).unwrap();
-        t.finish(sink).unwrap()
+        finish_retiring(t, cur, sink)
     });
     assert_only(&verify(&sim), "attempt");
 }
@@ -612,7 +847,7 @@ fn a_manifest_record_naming_other_content_is_found_by_a_scrub() {
         let mut t = TreeTxn::new(inner, cur.root);
         t.put(ka, vc).unwrap();
         t.put(kc, va).unwrap();
-        t.finish(sink).unwrap()
+        finish_retiring(t, cur, sink)
     });
     assert!(verify(&sim).is_consistent());
     assert_only(&verify_at(&sim, VerifyLevel::Scrub), "content");
@@ -628,7 +863,7 @@ fn a_binding_whose_length_differs_from_its_manifest_is_found_by_a_scrub() {
         v.content.as_mut().unwrap().len += 1;
         let mut t = TreeTxn::new(inner, cur.root);
         t.put(k, v.encode()).unwrap();
-        t.finish(sink).unwrap()
+        finish_retiring(t, cur, sink)
     });
     assert!(verify(&sim).is_consistent());
     assert_only(&verify_at(&sim, VerifyLevel::Scrub), "content");
@@ -689,10 +924,12 @@ fn a_history_binding_that_differs_from_its_manifest_is_found_by_a_scrub() {
 
     use crate::records::{ExtentRef, decode_history, encode_history, fingerprint};
 
-    let (sim, _) = bound_only_by_history();
+    // Content that is still retained: history entry 1 binds A's and C's, which contexts bind too.
+    // (Content that only history binds is not retained, so a scrub has nothing to compare.)
+    let sim = rich();
     let content = sim.clone();
-    // Rewrite history entry 1 so that it binds X with the wrong length, as a new, checksum-valid
-    // extent, with its attempt record's fingerprint updated to match: only the binding is wrong.
+    // Rewrite history entry 1 so that its bindings have the wrong length, as a new, checksum-valid
+    // extent, with its attempt record's fingerprint updated to match: only the bindings are wrong.
     publish(&sim, |inner, cur, sink| {
         let old = ExtentRef::decode(
             &crate::tree::get(inner, cur.root, &history_key(1))
@@ -743,7 +980,7 @@ fn a_history_binding_that_differs_from_its_manifest_is_found_by_a_scrub() {
             .encode(),
         )
         .unwrap();
-        t.finish(sink).unwrap()
+        finish_retiring(t, cur, sink)
     });
     assert!(verify(&sim).is_consistent(), "{:#?}", verify(&sim).findings);
     assert_only(&verify_at(&sim, VerifyLevel::Scrub), "content");

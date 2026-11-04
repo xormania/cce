@@ -9,17 +9,17 @@
 use std::collections::{BTreeMap, HashSet};
 
 use cce_core::storage::{
-    AttemptId, ChangeSet, ContentBinding, ContentRef, ContextId, RelationshipId, RelationshipKind,
-    StagingToken, StorageError,
+    AttemptId, ContentRef, ContextId, RelationshipId, RelationshipKind, StorageError,
 };
 use sha2::{Digest, Sha256};
 
 use crate::codec::key_components;
 use crate::engine::{HISTORY_ENTRY_MAX, Inner};
-use crate::format::{Descriptor, PageRef, Slot};
+use crate::format::{Descriptor, FIRST_NODE_PAGE, PageRef, Slot};
 use crate::records::{
-    AttemptValue, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT, P_HISTORY,
-    P_IN, P_OUT, P_REL, RelValue, SEGMENT_MAX, decode_history, fingerprint, history_key, key,
+    AttemptValue, ContentEntry, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT,
+    P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, SEGMENT_MAX, decode_history,
+    decode_retired, history_key, key, stored_fingerprint,
 };
 use crate::tree::{MAX_HEIGHT, Node, NodeSource};
 use crate::{Finding, Report, VerifyLevel};
@@ -40,6 +40,8 @@ pub(crate) fn run(
         records: BTreeMap::new(),
         content_bytes: 0,
         history_bindings: Vec::new(),
+        retired_pages: Vec::new(),
+        extents: Vec::new(),
     };
     let slots = v.slots()?;
     v.visit(d.root, 1, None, None);
@@ -48,6 +50,7 @@ pub(crate) fn run(
     if level == VerifyLevel::Scrub {
         v.content();
     }
+    v.space();
     let mut findings = std::mem::take(&mut v.findings);
     findings.sort();
     findings.dedup();
@@ -73,6 +76,11 @@ struct Verifier<'a> {
     content_bytes: u64,
     /// Content each history entry binds, by position (compared with the manifests by a scrub).
     history_bindings: Vec<(u64, ContentRef)>,
+    /// Retired tree pages: page, retiring generation and the record's location.
+    retired_pages: Vec<(u64, u64, String)>,
+    /// Content-file extents the state uses or has retired, `(offset, len, location)`: manifests,
+    /// history entries and retired extents, and at the scrub level the segments too.
+    extents: Vec<(u64, u64, String)>,
 }
 
 /// A record's location: its key family and the first 8 bytes of the SHA-256 of its key.
@@ -85,6 +93,7 @@ fn locate(k: &[u8]) -> String {
         Some(&P_HISTORY) => "history",
         Some(&P_ATTEMPT) => "attempt",
         Some(&P_CONTENT) => "content",
+        Some(&P_RETIRED) => "retirement",
         _ => "unknown family",
     };
     let h = Sha256::digest(k);
@@ -210,6 +219,9 @@ impl Verifier<'_> {
     fn records_and_relations(&mut self) {
         let records = std::mem::take(&mut self.records);
         let committed = self.desc.content_len;
+        // Contexts binding each live content entry, and the count each entry records.
+        let mut bound: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut live: Vec<(Vec<u8>, u64)> = Vec::new();
         for (k, val) in &records {
             let at = locate(k);
             let Some(&family) = k.first() else {
@@ -220,7 +232,13 @@ impl Verifier<'_> {
                 if k.len() != 9 {
                     self.find("key", at.clone(), "history key is not a position");
                 }
-                self.extent(val, committed, &at);
+                if let Some(x) = self.extent(val, committed, &at) {
+                    self.extents.push((x.offset, x.len, at));
+                }
+                continue;
+            }
+            if family == P_RETIRED {
+                self.retirement(k, val, committed, at);
                 continue;
             }
             let parts = match key_components(&k[1..]) {
@@ -265,10 +283,21 @@ impl Verifier<'_> {
             match family {
                 P_CONTEXT => match ContextValue::decode(val) {
                     Ok(cv) => {
-                        if let Some(c) = cv.content
-                            && !records.contains_key(&key(P_CONTENT, &[&c.digest.0]))
-                        {
-                            self.find("content-ref", at, "bound content has no manifest record");
+                        if let Some(c) = cv.content {
+                            let ck = key(P_CONTENT, &[&c.digest.0]);
+                            match records.get(&ck).map(|v| ContentEntry::decode(v)) {
+                                None => self.find(
+                                    "content-ref",
+                                    at,
+                                    "bound content has no manifest record",
+                                ),
+                                Some(Ok(ContentEntry::Removed)) => self.find(
+                                    "content-ref",
+                                    at,
+                                    "bound content is no longer retained",
+                                ),
+                                Some(_) => *bound.entry(ck).or_insert(0) += 1,
+                            }
                         }
                     }
                     Err(e) => self.find("value", at, e.to_string()),
@@ -314,12 +343,139 @@ impl Verifier<'_> {
                         self.find("value", at, e.to_string());
                     }
                 }
-                _ => {
-                    self.extent(val, committed, &at);
-                }
+                _ => match ContentEntry::decode(val) {
+                    Ok(ContentEntry::Live { manifest, refs }) => {
+                        if self.within(&manifest, committed, &at) {
+                            self.extents.push((manifest.offset, manifest.len, at));
+                        }
+                        live.push((k.clone(), refs));
+                    }
+                    Ok(ContentEntry::Removed) => {}
+                    Err(e) => self.find("value", at, e.to_string()),
+                },
+            }
+        }
+        // A live content entry counts the contexts that bind it.
+        for (k, refs) in live {
+            let binding = bound.get(&k).copied().unwrap_or(0);
+            if refs != binding {
+                self.find(
+                    "content-ref",
+                    locate(&k),
+                    format!("counts {refs} binding records, {binding} contexts bind it"),
+                );
             }
         }
         self.records = records;
+    }
+
+    /// A retirement record: its key and value decode, its generation is no newer than the state's,
+    /// and an extent lies within committed content. Pages are checked once all are known.
+    fn retirement(&mut self, k: &[u8], val: &[u8], committed: u64, at: String) {
+        match decode_retired(k, val) {
+            Ok(r) => {
+                let generation = match r {
+                    Retired::Page { generation, .. } | Retired::Extent { generation, .. } => {
+                        generation
+                    }
+                };
+                if generation > self.desc.generation {
+                    self.find(
+                        "retirement",
+                        at.clone(),
+                        format!(
+                            "retired at generation {generation}, after the state's {}",
+                            self.desc.generation
+                        ),
+                    );
+                }
+                match r {
+                    Retired::Page { page, .. } => self.retired_pages.push((page, generation, at)),
+                    Retired::Extent { offset, len, .. } => {
+                        let x = ExtentRef {
+                            offset,
+                            len,
+                            digest: [0; 32],
+                        };
+                        if self.within(&x, committed, &at) {
+                            self.extents.push((offset, len, at));
+                        }
+                    }
+                }
+            }
+            Err(e) => self.find("key", at, e.to_string()),
+        }
+    }
+
+    /// Whether `x` lies within committed content; a finding at `at` if not.
+    fn within(&mut self, x: &ExtentRef, committed: u64, at: &str) -> bool {
+        let inside = x
+            .offset
+            .checked_add(x.len)
+            .is_some_and(|end| end <= committed);
+        if !inside {
+            self.find("value", at, "extent lies outside committed content");
+        }
+        inside
+    }
+
+    /// Space accounting of the inspected state: every retired page is unreachable, retired once,
+    /// and a tree page; every tree page is reachable or retired; and the content-file extents the
+    /// state uses or has retired do not overlap. (Content-file space a staging wrote but no commit
+    /// bound is not accounted: abandoning it is a documented leak.)
+    fn space(&mut self) {
+        let end = self.desc.next_page;
+        let mut retired: BTreeMap<u64, usize> = BTreeMap::new();
+        for (page, _, at) in std::mem::take(&mut self.retired_pages) {
+            if !(FIRST_NODE_PAGE..end).contains(&page) {
+                self.find(
+                    "retirement",
+                    at,
+                    format!("retired page {page} is not a tree page"),
+                );
+                continue;
+            }
+            if self.visited.contains(&page) {
+                self.find(
+                    "retirement",
+                    at.clone(),
+                    format!("retired page {page} is reachable"),
+                );
+            }
+            let n = retired.entry(page).or_insert(0);
+            *n += 1;
+            if *n == 2 {
+                self.find(
+                    "retirement",
+                    at,
+                    format!("page {page} is retired more than once"),
+                );
+            }
+        }
+        for page in FIRST_NODE_PAGE..end {
+            if !self.visited.contains(&page) && !retired.contains_key(&page) {
+                self.find(
+                    "page-coverage",
+                    format!("page {page}"),
+                    "neither reachable nor retired",
+                );
+            }
+        }
+        let mut extents = std::mem::take(&mut self.extents);
+        extents.retain(|(_, len, _)| *len > 0);
+        extents.sort();
+        let mut reach: Option<(u64, String)> = None;
+        for (offset, len, at) in extents {
+            if let Some((until, other)) = &reach
+                && offset < *until
+            {
+                self.find("extent", at.clone(), format!("overlaps {other}"));
+            }
+            let end = offset + len;
+            if reach.as_ref().is_none_or(|(until, _)| end > *until) {
+                reach = Some((end, at));
+            }
+        }
     }
 
     /// An extent record must decode and lie within committed content.
@@ -376,10 +532,10 @@ impl Verifier<'_> {
             else {
                 continue; // reported as a value finding
             };
-            let entry = match self
+            let (entry, recorded) = match self
                 .inner
                 .read_extent(&x, HISTORY_ENTRY_MAX, "history entry")
-                .and_then(|b| decode_history(&b))
+                .and_then(|b| Ok((decode_history(&b)?, stored_fingerprint(&b)?.1)))
             {
                 Ok(e) => e,
                 Err(e) => {
@@ -406,20 +562,6 @@ impl Verifier<'_> {
                 }
                 self.history_bindings.push((p, *c));
             }
-            // The fingerprint covers the canonical request; staging tokens are not part of it.
-            let request = ChangeSet {
-                removal: Default::default(),
-                changes: entry.changes,
-                content: entry
-                    .content
-                    .into_iter()
-                    .map(|content| ContentBinding {
-                        content,
-                        token: StagingToken(Vec::new()),
-                    })
-                    .collect(),
-                evidence: entry.evidence,
-            };
             let akey = key(P_ATTEMPT, &[entry.attempt.as_bytes()]);
             match self
                 .records
@@ -432,7 +574,8 @@ impl Verifier<'_> {
                     locate(&akey),
                     format!("points at position {}, its entry is at {p}", a.position),
                 ),
-                Some(a) if a.fingerprint != fingerprint(&entry.attempt, &request) => self.find(
+                // The commit fingerprinted the request bytes it stored, in whichever encoding.
+                Some(a) if a.fingerprint != recorded => self.find(
                     "attempt",
                     locate(&akey),
                     "fingerprint differs from its history entry",
@@ -483,8 +626,9 @@ impl Verifier<'_> {
             else {
                 continue; // reported as a key finding
             };
-            let Some(x) = ExtentRef::decode(&val).ok() else {
-                continue; // reported as a value finding
+            // Content no record uses any more is not retained and never read.
+            let Ok(ContentEntry::Live { manifest: x, .. }) = ContentEntry::decode(&val) else {
+                continue; // removed, or reported as a value finding
             };
             let m = match self
                 .inner
@@ -521,6 +665,8 @@ impl Verifier<'_> {
                     intact = false;
                     break;
                 }
+                self.extents
+                    .push((seg.offset, seg.len, format!("{at} segment {i}")));
                 match self.inner.read_extent(seg, SEGMENT_MAX, "content segment") {
                     Ok(bytes) => {
                         stream.update(&bytes);

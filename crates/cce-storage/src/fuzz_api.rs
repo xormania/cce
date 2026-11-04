@@ -177,7 +177,8 @@ pub fn image(data: &[u8]) {
 
 /// Context identities stored in the tree of the store's current state.
 fn context_ids(store: &NativeReadOnly) -> Vec<ContextId> {
-    let Ok(snap) = store.inner.snapshot() else {
+    // A pinned state: nothing the walk reads can be reused under it.
+    let Ok((snap, _pin)) = store.inner.pin_current() else {
         return Vec::new();
     };
     let Ok(cursor) = crate::tree::Cursor::new(

@@ -473,12 +473,29 @@ pub(crate) fn check_request_bounds(
 
 /// Fingerprint binding an attempt identity to its exact logical request.
 pub(crate) fn fingerprint(attempt: &AttemptId, changes: &ChangeSet) -> [u8; 32] {
+    fingerprint_encoded(attempt, &encode_request(changes))
+}
+
+/// The fingerprint of an attempt and its request as encoded.
+fn fingerprint_encoded(attempt: &AttemptId, request: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"cce.attempt.v1\0");
     h.update((attempt.as_bytes().len() as u32).to_le_bytes());
     h.update(attempt.as_bytes());
-    h.update(encode_request(changes));
+    h.update(request);
     h.finalize().into()
+}
+
+/// The attempt of a stored history entry and the fingerprint of its request bytes exactly as
+/// stored, whatever their encoding version: what its commit recorded.
+pub(crate) fn stored_fingerprint(b: &[u8]) -> Result<(AttemptId, [u8; 32]), StorageError> {
+    let mut d = Dec::new(b, "history entry");
+    d.u64()?;
+    let attempt = dec_id(&mut d, AttemptId::new)?;
+    let request = d.bytes()?;
+    d.finish()?;
+    let fp = fingerprint_encoded(&attempt, request);
+    Ok((attempt, fp))
 }
 
 /// Encodes a retained history entry (stored as a content extent).

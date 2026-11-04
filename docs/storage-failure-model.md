@@ -254,11 +254,18 @@ The structure level checks, for the current publication record:
 - every record's key family, key components and identifiers, and its value encoding;
 - every relationship has both directional index entries, and every index entry matches a
   relationship;
-- every context's bound content, and all content a history entry binds, has its manifest record,
-  and every extent record lies within committed content;
+- every context's bound content has a content entry for content that is still retained, and each
+  retained content entry counts exactly the contexts that bind it; content a history entry binds has
+  a content entry, which may record content that is no longer retained; every extent lies within
+  committed content;
 - history positions are exactly 1 through the committed position, and each history entry's attempt
-  record points back to it with the fingerprint recomputed from the entry; every attempt record
-  points at an entry.
+  record points back to it with the fingerprint of the request bytes the entry stores; every attempt
+  record points at an entry;
+- every retirement record decodes and is no newer than the state; a retired tree page is retired
+  once, lies among the tree's pages and is not reachable; every tree page is reachable or retired;
+  and the content-file extents the state uses or has retired (manifests, history entries, retired
+  extents and, at the scrub level, segments) do not overlap. Space that a staging wrote but no commit
+  bound is not accounted for: abandoning a staging leaks its space.
 
 It reads the history entries but no content bytes, and holds every record for the cross-checks, so
 its memory grows with the metadata. A relationship whose source or target context is absent, never
@@ -267,10 +274,11 @@ removes no relationship when a context goes, only the caller's preconditions and
 relationship records with both indexes.
 
 The scrub level (`VerifyLevel::Scrub`, `--scrub`) also reads every committed content stream: each
-manifest record's manifest must describe the content its key names, every segment must match its
+retained content entry's manifest must describe the content its key names, every segment must match its
 SHA-256, the whole stream must match the content's digest and length, and every context's binding
-and every history entry's binding must match its content's manifest. Manifests and segments are read through the verified read, one at
-a time; the report counts the content bytes read.
+and every history entry's binding of retained content must match its content's manifest; content
+that is no longer retained is never read. Manifests and segments are read through the verified
+read, one at a time; the report counts the content bytes read.
 
 `--json` prints one JSON object per line in a deterministic order: a summary, both slots, the
 recovery diagnostics, each finding (`check`, `location`, `detail`), and a result line. Findings name
