@@ -1,6 +1,7 @@
-//! Opening an existing store on real files whose publication records are damaged or written in
-//! another format version is refused, read-write and read-only, and the refusal leaves every file
-//! of the store directory byte-identical: nothing is reinitialized, rewritten or added.
+//! Opening an existing store on real files whose publication records are damaged, written in
+//! another format version (current or earlier record layout) or require a feature this build
+//! lacks is refused, read-write and read-only, and the refusal leaves every file of the store
+//! directory byte-identical: nothing is reinitialized, rewritten or added.
 
 mod common;
 
@@ -14,8 +15,11 @@ use cce_core::storage::{
 use cce_storage::NativeStore;
 
 const PAGE: usize = 4096;
-/// Publication record: magic 4, version 2, store identity 16, six u64 fields, then CRC-32.
-const RECORD: usize = 4 + 2 + 16 + 6 * 8;
+/// Publication record: magic 4, version 2, required features 4, store identity 16, six u64
+/// fields, then CRC-32 of everything before it.
+const RECORD: usize = 4 + 2 + 4 + 16 + 6 * 8;
+/// The record of earlier format versions: no required-features field.
+const EARLIER_RECORD: usize = 4 + 2 + 16 + 6 * 8;
 
 fn context() -> ContextId {
     ContextId::new(*b"A").unwrap()
@@ -70,17 +74,36 @@ fn copy_store(from: &Path, to: &Path) {
     }
 }
 
-/// Rewrites every publication record in `meta` as format `version`, with a valid checksum, as an
-/// engine of that version would have written it.
-fn rewrite_version(meta: &mut [u8], version: u16) {
+/// Applies `edit` to every publication record in `meta` and gives it a valid checksum again, as an
+/// engine writing such a record would have.
+fn rewrite_records(meta: &mut [u8], edit: impl Fn(&mut [u8])) {
     for slot in [0, PAGE] {
         let rec = &mut meta[slot..slot + RECORD + 4];
         if &rec[..4] != b"CCED" {
             continue;
         }
-        rec[4..6].copy_from_slice(&version.to_le_bytes());
+        edit(rec);
         let crc = crc32fast::hash(&rec[..RECORD]);
         rec[RECORD..].copy_from_slice(&crc.to_le_bytes());
+    }
+}
+
+/// Rewrites every publication record in the earlier layout (no required-features field) as format
+/// `version`, as an engine of that version would have written it.
+fn rewrite_earlier_layout(meta: &mut [u8], version: u16) {
+    for slot in [0, PAGE] {
+        let rec = &mut meta[slot..slot + RECORD + 4];
+        if &rec[..4] != b"CCED" {
+            continue;
+        }
+        let mut old = Vec::with_capacity(EARLIER_RECORD + 4);
+        old.extend_from_slice(&rec[..4]);
+        old.extend_from_slice(&version.to_le_bytes());
+        old.extend_from_slice(&rec[10..RECORD]);
+        let crc = crc32fast::hash(&old);
+        old.extend_from_slice(&crc.to_le_bytes());
+        rec.fill(0);
+        rec[..old.len()].copy_from_slice(&old);
     }
 }
 
@@ -100,14 +123,37 @@ fn opening_a_damaged_or_other_version_store_is_refused_and_changes_no_file() {
     for b in &mut damaged[..2 * PAGE] {
         *b ^= 0x5a;
     }
-    let mut cases: Vec<(String, Vec<u8>)> = vec![("damaged records".into(), damaged)];
+    // (what, meta file, expected refusal message)
+    let mut cases: Vec<(String, Vec<u8>, String)> = vec![(
+        "damaged records".into(),
+        damaged,
+        "no valid publication record".into(),
+    )];
     for v in [version - 1, 1, version + 1] {
         let mut m = original.clone();
-        rewrite_version(&mut m, v);
-        cases.push((format!("format version {v}"), m));
+        rewrite_records(&mut m, |r| r[4..6].copy_from_slice(&v.to_le_bytes()));
+        cases.push((
+            format!("format version {v}"),
+            m,
+            format!("format version {v}"),
+        ));
     }
+    let mut m = original.clone();
+    rewrite_earlier_layout(&mut m, version - 1);
+    cases.push((
+        format!("earlier record layout, format version {}", version - 1),
+        m,
+        format!("format version {}", version - 1),
+    ));
+    let mut m = original.clone();
+    rewrite_records(&mut m, |r| r[6..10].copy_from_slice(&1u32.to_le_bytes()));
+    cases.push((
+        "unknown required feature".into(),
+        m,
+        "unknown required features 0x1".into(),
+    ));
 
-    for (i, (what, meta)) in cases.iter().enumerate() {
+    for (i, (what, meta, message)) in cases.iter().enumerate() {
         let copy = dir.join(format!("case-{i}"));
         copy_store(&store, &copy);
         std::fs::write(copy.join("meta.cce"), meta).unwrap();
@@ -121,12 +167,12 @@ fn opening_a_damaged_or_other_version_store_is_refused_and_changes_no_file() {
             let err = err.unwrap_or_else(|| panic!("{what}: opened (read-only {read_only})"));
             if what.starts_with("damaged") {
                 assert!(
-                    matches!(&err, StorageError::Integrity(m) if m.contains("no valid publication record")),
+                    matches!(&err, StorageError::Integrity(m) if m.contains(message.as_str())),
                     "{what}: {err:?}"
                 );
             } else {
                 assert!(
-                    matches!(&err, StorageError::Unsupported(_)),
+                    matches!(&err, StorageError::Unsupported(m) if m.contains(message.as_str())),
                     "{what}: {err:?}"
                 );
             }
