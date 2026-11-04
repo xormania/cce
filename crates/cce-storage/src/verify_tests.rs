@@ -822,6 +822,87 @@ fn an_attempt_record_that_does_not_match_its_history_entry_is_an_attempt_finding
 }
 
 #[test]
+fn an_attempt_record_pointing_at_another_attempts_entry_is_an_attempt_finding() {
+    // An extra record naming a committed position, with that entry's fingerprint or another one.
+    for flip in [false, true] {
+        let sim = rich();
+        publish(&sim, |inner, cur, sink| {
+            let one = crate::tree::get(inner, cur.root, &key(P_ATTEMPT, &[b"one"]))
+                .unwrap()
+                .unwrap();
+            let mut v = AttemptValue::decode(&one).unwrap();
+            if flip {
+                v.fingerprint[0] ^= 1;
+            }
+            let mut t = TreeTxn::new(inner, cur.root);
+            t.put(key(P_ATTEMPT, &[b"stranger"]), v.encode()).unwrap();
+            finish_retiring(t, cur, sink)
+        });
+        let r = verify(&sim);
+        assert_only(&r, "attempt");
+        assert_eq!(r.findings.len(), 1, "{:#?}", r.findings);
+    }
+}
+
+/// Publishes the current tree again under a checksum-valid record claiming history position
+/// `claimed`.
+fn claim_history_position(sim: &SimIo, claimed: u64) {
+    let inner = Inner::open(Box::new(sim.clone()), Options::default()).unwrap();
+    let cur = inner.snapshot().unwrap().desc;
+    drop(inner);
+    sim.release();
+    let d = Descriptor {
+        generation: cur.generation + 1,
+        history_pos: claimed,
+        ..cur
+    };
+    sim.write_at(
+        FileId::Meta,
+        Descriptor::slot(d.generation) * PAGE_SIZE as u64,
+        &d.encode(),
+    )
+    .unwrap();
+    sim.sync(FileId::Meta).unwrap();
+}
+
+#[test]
+fn missing_history_is_reported_once_per_gap_however_far_the_record_claims() {
+    // The findings must grow with the history records present, not with the claimed position.
+    for claimed in [1_000_003, u64::MAX] {
+        let sim = rich();
+        claim_history_position(&sim, claimed);
+        let r = verify(&sim);
+        let history: Vec<_> = r.findings.iter().filter(|f| f.check == "history").collect();
+        assert_eq!(
+            history.len(),
+            1,
+            "history findings for a claimed position {claimed}"
+        );
+        assert_only(&r, "history");
+        assert_eq!(
+            history[0].location,
+            format!("history positions 4 to {claimed}")
+        );
+        assert_eq!(history[0].detail, "missing");
+    }
+}
+
+#[test]
+fn a_single_missing_history_entry_is_named_by_its_position() {
+    let sim = rich();
+    edit_tree(&sim, |t| {
+        t.delete(&history_key(2)).unwrap();
+    });
+    let r = verify(&sim);
+    // The second attempt's record now points at a missing entry too.
+    assert_eq!(checks(&r), BTreeSet::from(["attempt", "history"]));
+    let history: Vec<_> = r.findings.iter().filter(|f| f.check == "history").collect();
+    assert_eq!(history.len(), 1, "{history:#?}");
+    assert_eq!(history[0].location, "history position 2");
+    assert_eq!(history[0].detail, "missing");
+}
+
+#[test]
 fn inspection_reports_no_stored_bytes_and_changes_nothing() {
     const MARK: &str = "SECRET-MARK-7319";
     let sim = SimIo::new();

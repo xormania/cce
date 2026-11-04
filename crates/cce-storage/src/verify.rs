@@ -6,7 +6,7 @@
 //! for the cross-checks. Findings name records by key family and a hash prefix of the key, never by
 //! stored bytes.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cce_core::storage::{
     AttemptId, ContentRef, ContextId, RelationshipId, RelationshipKind, StorageError,
@@ -502,7 +502,9 @@ impl Verifier<'_> {
     }
 
     /// History positions are exactly 1..=history_pos; each entry's attempt record points back to
-    /// it with the fingerprint recomputed from the entry; every attempt record points at an entry.
+    /// it with the fingerprint recomputed from the entry; every attempt record points at an entry
+    /// that records that attempt. Missing positions are reported once per gap, so the findings
+    /// grow with the records present, not with the position the publication record claims.
     fn history_and_attempts(&mut self) {
         let last = self.desc.history_pos;
         let positions: Vec<u64> = self
@@ -520,13 +522,33 @@ impl Verifier<'_> {
                 );
             }
         }
-        let present: HashSet<u64> = positions.iter().copied().collect();
-        for p in 1..=last {
-            let at = format!("history position {p}");
-            if !present.contains(&p) {
-                self.find("history", at, "missing");
-                continue;
+        let mut held: Vec<u64> = positions
+            .iter()
+            .copied()
+            .filter(|p| (1..=last).contains(p))
+            .collect();
+        held.sort_unstable();
+        held.dedup();
+        // The next position the history must hold (`None` once past the largest position).
+        let mut expected = Some(1u64);
+        for &p in &held {
+            if let Some(e) = expected
+                && e < p
+            {
+                self.missing_history(e, p - 1);
             }
+            expected = p.checked_add(1);
+        }
+        if let Some(e) = expected
+            && e <= last
+        {
+            self.missing_history(e, last);
+        }
+        let present: HashSet<u64> = held.iter().copied().collect();
+        // The attempt record key each readable entry names.
+        let mut owners: HashMap<u64, Vec<u8>> = HashMap::new();
+        for &p in &held {
+            let at = format!("history position {p}");
             let Some(x) = self
                 .records
                 .get(&history_key(p))
@@ -565,6 +587,7 @@ impl Verifier<'_> {
                 self.history_bindings.push((p, *c));
             }
             let akey = key(P_ATTEMPT, &[entry.attempt.as_bytes()]);
+            owners.insert(p, akey.clone());
             match self
                 .records
                 .get(&akey)
@@ -602,8 +625,24 @@ impl Verifier<'_> {
                     locate(&k),
                     format!("points at missing history position {p}"),
                 );
+            } else if owners.get(&p).is_some_and(|owner| *owner != k) {
+                self.find(
+                    "attempt",
+                    locate(&k),
+                    format!("points at position {p}, whose entry records another attempt"),
+                );
             }
         }
+    }
+
+    /// Reports history positions `first..=last` as missing, as one finding.
+    fn missing_history(&mut self, first: u64, last: u64) {
+        let at = if first == last {
+            format!("history position {first}")
+        } else {
+            format!("history positions {first} to {last}")
+        };
+        self.find("history", at, "missing");
     }
 }
 
