@@ -19,22 +19,12 @@ use crate::io::{CONTENT_FILE, Call, Fault, Faults, FileId, FsIo, Injector, Io, S
 const ENOSPC: i32 = 28;
 const EIO: i32 = 5;
 
-/// A fresh directory under the system temporary directory, removed when dropped.
-struct Scratch(PathBuf);
+use crate::test_support::resources::TestDir;
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A scratch directory and the store path inside it.
-fn scratch(name: &str) -> (Scratch, PathBuf) {
-    let d = std::env::temp_dir().join(format!("cce-fs-seam-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    let store = d.join("store");
-    (Scratch(d), store)
+fn scratch(name: &str) -> (TestDir, PathBuf) {
+    let dir = TestDir::new(name);
+    let store = dir.join("store");
+    (dir, store)
 }
 
 fn pattern(n: usize, seed: u8) -> Vec<u8> {

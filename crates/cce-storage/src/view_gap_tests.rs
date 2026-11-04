@@ -2,6 +2,8 @@
 //! combined state of disjoint commits from one basis, and views taken from an earlier open of the
 //! same store.
 
+use crate::test_support::{attempt, create_on, open_on};
+
 use std::io::Read;
 
 use cce_core::storage::{
@@ -11,7 +13,6 @@ use cce_core::storage::{
 };
 
 use crate::NativeStore;
-use crate::engine::Inner;
 use crate::format::StoreId;
 use crate::io::FileId;
 use crate::sim::SimIo;
@@ -19,9 +20,7 @@ use crate::sim::SimIo;
 const STORE: StoreId = StoreId([7; 16]);
 
 fn store_on(sim: &SimIo) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), STORE, Default::default()).unwrap(),
-    }
+    create_on(Box::new(sim.clone()), STORE, Default::default()).unwrap()
 }
 
 fn store() -> NativeStore {
@@ -38,10 +37,6 @@ fn rid(s: &str) -> RelationshipId {
 
 fn kind(s: &[u8]) -> RelationshipKind {
     RelationshipKind::new(s.to_vec()).unwrap()
-}
-
-fn attempt(s: &str) -> AttemptId {
-    AttemptId::new(s.as_bytes().to_vec()).unwrap()
 }
 
 fn put(id: &[u8], body: &[u8]) -> Change {
@@ -381,9 +376,7 @@ fn a_view_from_an_earlier_open_of_the_same_store_is_refused_and_writes_nothing()
     s1.close().unwrap();
     sim.release();
 
-    let s2 = NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Default::default()).unwrap(),
-    };
+    let s2 = open_on(Box::new(sim.clone()), Default::default()).unwrap();
     let files = |sim: &SimIo| [FileId::Meta, FileId::Content].map(|f| sim.file_images_for_test(f));
     let before = files(&sim);
     let state = contents(&s2, &[b"A", b"B"]);

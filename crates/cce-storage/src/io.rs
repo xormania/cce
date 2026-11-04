@@ -665,9 +665,7 @@ mod tests {
 
     #[test]
     fn creating_a_store_makes_every_new_directory_entry_durable() {
-        let base = std::env::temp_dir().join(format!("cce-dirsync-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
+        let base = scratch("dirsync");
         let store = base.join("a").join("b").join("store");
         let io = FsIo::new(&store);
         io.create().unwrap();
@@ -675,7 +673,7 @@ mod tests {
         let synced = io.synced_dirs.lock().unwrap().clone();
         // The entries for a, a/b and a/b/store live in their parents; each parent must be synced.
         for parent in [
-            base.clone(),
+            base.to_path_buf(),
             base.join("a"),
             base.join("a").join("b"),
             store.clone(),
@@ -687,44 +685,9 @@ mod tests {
             );
         }
         // Positive neighbour: an existing directory's parent is not required to change.
-        let _ = fs::remove_dir_all(&base);
     }
 
-    /// A fresh scratch directory, removed when the test passes and kept (path printed) when it fails.
-    fn scratch(name: &str) -> Scratch {
-        let d = std::env::temp_dir().join(format!("cce-io-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        Scratch(d)
-    }
-
-    struct Scratch(PathBuf);
-
-    impl std::ops::Deref for Scratch {
-        type Target = Path;
-        fn deref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl AsRef<Path> for Scratch {
-        fn as_ref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            if std::thread::panicking() {
-                eprintln!(
-                    "scratch directory kept for inspection: {}",
-                    self.0.display()
-                );
-            } else {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-    }
+    use crate::test_support::resources::test_dir as scratch;
 
     #[test]
     fn opening_refuses_store_files_that_are_symlinks() {
@@ -750,7 +713,6 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(fs::read(&outside).unwrap(), b"must not change");
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -764,7 +726,6 @@ mod tests {
         for f in [META_FILE, CONTENT_FILE, LOCK_FILE] {
             assert_eq!(mode(&store.join(f)), 0o600, "{f} mode");
         }
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
