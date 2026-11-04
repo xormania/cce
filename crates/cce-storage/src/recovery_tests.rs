@@ -11,24 +11,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cce_core::storage::{
-    AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, ContentBinding, ContextId,
-    Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
-    RelationshipQuery, StagedContent, StorageEngine, StorageError,
+    AttemptOutcome, Change, ChangeSet, CommitError, HistoryPosition, Precondition, ReadView,
+    StagedContent, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;
 use crate::engine::Inner;
 use crate::format::{PAGE_SIZE, StoreId};
 use crate::io::{FileId, Io, Op, Traced};
+use crate::oracle_tests::{
+    State, attempt, cid, commit_step, history_len, payload, reference_states, request,
+    request_with, state,
+};
 use crate::sim::{Persist, SimIo};
 
 const STORE: StoreId = StoreId(*b"recovery-store-1");
-const IDS: [&str; 4] = ["A", "B", "C", "D"];
-
-fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
-}
-
 fn create(io: Box<dyn Io>) -> NativeStore {
     NativeStore {
         inner: Inner::create(io, STORE, Default::default()).expect("create"),
@@ -53,117 +50,6 @@ fn images(sim: &SimIo) -> Vec<Option<(Vec<u8>, Vec<u8>)>> {
         .into_iter()
         .map(|f| sim.file_images_for_test(f))
         .collect()
-}
-
-/// A complete logical request: records, both relationship directions, content, evidence.
-fn request(store: &NativeStore, step: u32) -> Option<(AttemptId, ChangeSet)> {
-    let staged = store.stage_content(&mut &payload(step)[..]).ok()?;
-    Some(request_with(&staged, step))
-}
-
-fn payload(step: u32) -> Vec<u8> {
-    (0..(150_000 + step as usize * 7))
-        .map(|i| (i * 31 + step as usize) as u8)
-        .collect()
-}
-
-/// The request of `step`, binding already staged content.
-fn request_with(staged: &StagedContent, step: u32) -> (AttemptId, ChangeSet) {
-    let mut cs = ChangeSet {
-        content: vec![ContentBinding::from(staged)],
-        ..ChangeSet::default()
-    };
-    let (a, b) = (IDS[step as usize % 4], IDS[(step as usize + 1) % 4]);
-    cs.changes.push(Change::PutContext {
-        id: cid(a),
-        expect: Precondition::Any,
-        body: format!("body {a} at step {step}").into_bytes(),
-        content: Some(0),
-    });
-    cs.changes.push(Change::PutRelationship {
-        id: RelationshipId::new(format!("r{step}").into_bytes()).unwrap(),
-        expect: Precondition::Absent,
-        kind: RelationshipKind::new(*b"depends").unwrap(),
-        source: cid(a),
-        target: cid(b),
-    });
-    cs.evidence.push(Evidence {
-        label: b"decision".to_vec(),
-        bytes: format!("evidence {step}").into_bytes(),
-    });
-    (attempt(step), cs)
-}
-
-fn attempt(step: u32) -> AttemptId {
-    AttemptId::new(format!("attempt-{step}").into_bytes()).unwrap()
-}
-
-fn commit_step(store: &NativeStore, step: u32) -> bool {
-    let Some((attempt, cs)) = request(store, step) else {
-        return false;
-    };
-    let Ok(view) = store.begin() else {
-        return false;
-    };
-    store.commit(attempt, view, cs).is_ok()
-}
-
-fn history_len(store: &NativeStore) -> usize {
-    let mut v = store.begin().expect("begin");
-    v.history(HistoryPosition(0))
-        .expect("history")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("history entry")
-        .len()
-}
-
-/// The complete logical state, read through the port.
-fn logical_state(store: &NativeStore) -> Vec<String> {
-    let mut v = store.begin().expect("begin");
-    let mut out = Vec::new();
-    for id in IDS {
-        let id = cid(id);
-        match v.context(&id).expect("context") {
-            None => out.push(format!("{id:?} absent")),
-            Some(r) => {
-                out.push(format!("{id:?} rev {} body {:?}", r.revision.0, r.body));
-                if let Some(c) = r.content {
-                    let mut bytes = Vec::new();
-                    v.content(&c)
-                        .expect("content")
-                        .read_to_end(&mut bytes)
-                        .expect("read content");
-                    out.push(format!(
-                        "{id:?} content {} bytes, sum {}",
-                        bytes.len(),
-                        bytes.iter().map(|&b| b as u64).sum::<u64>()
-                    ));
-                }
-            }
-        }
-        for d in [Direction::Outgoing, Direction::Incoming] {
-            let q = RelationshipQuery {
-                from: id.clone(),
-                direction: d,
-                kind: None,
-                after: None,
-            };
-            for r in v.relationships(&q).expect("rels") {
-                out.push(format!("{id:?} {d:?} {:?}", r.expect("rel")));
-            }
-        }
-    }
-    for h in v.history(HistoryPosition(0)).expect("history") {
-        let h = h.expect("history entry");
-        out.push(format!(
-            "history {} {:?} {:?} {} changes",
-            h.position.0,
-            h.attempt,
-            h.evidence,
-            h.changes.len()
-        ));
-    }
-    out
 }
 
 /// Runs one case of a cut loop. If it fails, the durable images of `images` and the operation
@@ -217,17 +103,6 @@ fn save_repro(label: &str, images: &[(&str, &SimIo)], trace: &[Op]) -> std::io::
     Ok(dir)
 }
 
-/// Independent expected states after each committed step, from an uninterrupted run.
-fn reference_states(steps: u32) -> Vec<Vec<String>> {
-    let s = create(Box::new(SimIo::new()));
-    let mut states = vec![logical_state(&s)];
-    for step in 1..=steps {
-        assert!(commit_step(&s, step));
-        states.push(logical_state(&s));
-    }
-    states
-}
-
 #[test]
 fn failed_opens_change_nothing_and_a_clean_open_recovers_the_committed_state() {
     let expected = reference_states(2).pop().unwrap();
@@ -277,7 +152,7 @@ fn failed_opens_change_nothing_and_a_clean_open_recovers_the_committed_state() {
     img.release();
 
     let s = open(Box::new(img.clone()));
-    assert_eq!(logical_state(&s), expected);
+    assert_eq!(state(&s), expected);
     assert_eq!(history_len(&s), 2);
     let first = images(&img);
     // Opening only makes existing bytes durable; it never writes.
@@ -295,7 +170,7 @@ fn failed_opens_change_nothing_and_a_clean_open_recovers_the_committed_state() {
     img.release();
 
     let s = open(Box::new(img.clone()));
-    assert_eq!(logical_state(&s), expected);
+    assert_eq!(state(&s), expected);
     assert_eq!(history_len(&s), 2);
     assert_eq!(
         images(&img),
@@ -339,7 +214,7 @@ fn every_cut_of_store_creation_opens_the_empty_store_or_refuses_to_initialize() 
             with_repro(&label, &[("image", &pristine)], &ops, || {
                 match try_open(Box::new(img.clone())) {
                     Ok(s) => {
-                        assert_eq!(logical_state(&s), empty, "cut {cut} {p:?}");
+                        assert_eq!(state(&s), empty, "cut {cut} {p:?}");
                         assert_eq!(history_len(&s), 0, "cut {cut} {p:?}");
                         assert_eq!(generation(&s), 1, "cut {cut} {p:?}");
                         opened += 1;
@@ -477,7 +352,7 @@ fn an_indeterminate_publication_leaves_new_views_on_the_old_state() {
     );
     assert_eq!(s.outcome(&attempt).unwrap(), AttemptOutcome::Unknown);
     assert_eq!(generation(&s), old, "uncertain generation became visible");
-    assert_eq!(logical_state(&s), states[1]);
+    assert_eq!(state(&s), states[1]);
     assert_eq!(history_len(&s), 1);
 }
 
@@ -663,7 +538,7 @@ fn assert_recovers_pre_failure_state(
     let states = reference_states(3);
     for img in images {
         let s = open(Box::new(img));
-        assert_eq!(logical_state(&s), states[1], "{barrier:?}");
+        assert_eq!(state(&s), states[1], "{barrier:?}");
         assert!(
             matches!(s.outcome(&attempt(1)).unwrap(), AttemptOutcome::Committed(r) if r.position == HistoryPosition(1)),
             "{barrier:?}: acknowledged commit lost"
@@ -692,7 +567,7 @@ fn assert_recovers_pre_failure_state(
             commit_step(&s, 3),
             "{barrier:?}: store unusable after recovery"
         );
-        assert_eq!(logical_state(&s), states[3], "{barrier:?}");
+        assert_eq!(state(&s), states[3], "{barrier:?}");
     }
 }
 
@@ -748,7 +623,7 @@ fn a_lossy_failure_of_the_publication_barrier_is_indeterminate_and_recovers_a_wh
     );
     assert_eq!(s.outcome(&attempt(2)).unwrap(), AttemptOutcome::Unknown);
     assert_later_writes_fenced(barrier, &later);
-    assert_eq!(logical_state(&s), states[1]);
+    assert_eq!(state(&s), states[1]);
     drop(s);
     let images = vec![
         sim.after_process_exit(),
@@ -773,13 +648,13 @@ enum OpenFault {
 }
 
 /// What the outcomes of the two commits must be in a recovered state.
-fn assert_outcomes_agree(s: &NativeStore, got: &[String], states: &[Vec<String>]) {
+fn assert_outcomes_agree(s: &NativeStore, got: &State, states: &[State]) {
     assert!(
         matches!(s.outcome(&attempt(1)).unwrap(), AttemptOutcome::Committed(r) if r.position == HistoryPosition(1)),
         "acknowledged commit 1 lost"
     );
     let second = s.outcome(&attempt(2)).unwrap();
-    if got == states[2].as_slice() {
+    if got == &states[2] {
         assert!(
             matches!(&second, AttemptOutcome::Committed(r) if r.position == HistoryPosition(2)),
             "state has commit 2 but its outcome is {second:?}"
@@ -816,15 +691,15 @@ fn a_fault_during_recovery_of_any_crashed_commit_leaves_the_image_recoverable() 
     // Opens `img` cleanly, checks outcomes and that a second open leaves the files unchanged, and
     // returns the recovered state. Reporting attempt 2 as committed acknowledges it, so from then
     // on it must survive a power loss.
-    let recover = |img: &SimIo| -> Vec<String> {
+    let recover = |img: &SimIo| -> State {
         let s = open(Box::new(img.clone()));
-        let got = logical_state(&s);
+        let got = state(&s);
         assert!(&got == old || &got == new, "recovered a partial state");
         assert_outcomes_agree(&s, &got, &states);
         if &got == new {
             let lost = img.after_crash(Persist::None);
             assert_eq!(
-                &logical_state(&open(Box::new(lost))),
+                &state(&open(Box::new(lost))),
                 new,
                 "a commit that recovery reported as committed was lost on power loss"
             );
@@ -833,7 +708,7 @@ fn a_fault_during_recovery_of_any_crashed_commit_leaves_the_image_recoverable() 
         drop(s);
         img.release();
         let s = open(Box::new(img.clone()));
-        assert_eq!(logical_state(&s), got);
+        assert_eq!(state(&s), got);
         assert_eq!(images(img), first, "a second clean open changed the files");
         got
     };
@@ -867,7 +742,7 @@ fn a_fault_during_recovery_of_any_crashed_commit_leaves_the_image_recoverable() 
         crashed.push(("process exit".into(), sim.after_process_exit()));
         for (what, img) in &crashed {
             // What an uninterrupted recovery of this image gives.
-            let expected = logical_state(&open(Box::new(img.after_process_exit())));
+            let expected = state(&open(Box::new(img.after_process_exit())));
             assert!(
                 &expected == old || &expected == new,
                 "cut {cut} {what}: uninterrupted recovery gave a partial state"
@@ -950,7 +825,7 @@ fn staged_content_is_not_visible_through_any_view_until_committed() {
     let sim = SimIo::new();
     let s = create(Box::new(sim.clone()));
     assert!(commit_step(&s, 1));
-    let state = logical_state(&s);
+    let before = state(&s);
     let earlier = s.begin().unwrap();
     let x = s.stage_content(&mut &payload(2)[..]).expect("stage");
 
@@ -970,7 +845,7 @@ fn staged_content_is_not_visible_through_any_view_until_committed() {
             history.iter().all(|h| !h.content.contains(&x.content)),
             "{what}: history references staged content"
         );
-        assert_eq!(logical_state(s), state, "{what}: records changed");
+        assert_eq!(state(s), before, "{what}: records changed");
     };
     // Views begun before and after staging, in the staging instance.
     assert_invisible(&s, earlier, "view begun before staging");

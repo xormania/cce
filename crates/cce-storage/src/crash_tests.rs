@@ -6,25 +6,18 @@
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
-use cce_core::storage::{
-    AttemptId, AttemptOutcome, Change, ChangeSet, CommitReceipt, ContentBinding, ContextId,
-    Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
-    RelationshipQuery, StorageEngine,
-};
+use cce_core::storage::{AttemptOutcome, CommitReceipt, ReadView, StorageEngine};
 
 use crate::NativeStore;
 use crate::engine::Inner;
 use crate::format::StoreId;
 use crate::io::{FsIo, Io, Op, Traced};
+use crate::oracle_tests::{
+    IDS, State, cid, commit_step, payload, reference_states, request, state,
+};
 use crate::sim::{Persist, SimIo};
 
 const STORE: StoreId = StoreId(*b"crash-test-store");
-const IDS: [&str; 4] = ["A", "B", "C", "D"];
-
-fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
-}
-
 fn traced<I: Io + 'static>(io: I, trace: &Arc<Mutex<Vec<Op>>>) -> Box<dyn Io> {
     Box::new(Traced {
         inner: io,
@@ -42,116 +35,6 @@ fn open(io: Box<dyn Io>) -> NativeStore {
     NativeStore {
         inner: Inner::open(io, Default::default()).expect("recovery must open the store"),
     }
-}
-
-/// The content bytes bound by `step`.
-fn payload(step: u32) -> Vec<u8> {
-    (0..(150_000 + step as usize * 7))
-        .map(|i| (i * 31 + step as usize) as u8)
-        .collect()
-}
-
-/// A complete logical request: records, both relationship directions, content, evidence.
-fn request(store: &NativeStore, step: u32) -> Option<(AttemptId, ChangeSet)> {
-    let payload = payload(step);
-    let staged = store.stage_content(&mut &payload[..]).ok()?;
-    let mut cs = ChangeSet {
-        content: vec![ContentBinding::from(&staged)],
-        ..ChangeSet::default()
-    };
-    let (a, b) = (IDS[step as usize % 4], IDS[(step as usize + 1) % 4]);
-    cs.changes.push(Change::PutContext {
-        id: cid(a),
-        expect: Precondition::Any,
-        body: format!("body {a} at step {step}").into_bytes(),
-        content: Some(0),
-    });
-    cs.changes.push(Change::PutRelationship {
-        id: RelationshipId::new(format!("r{step}").into_bytes()).unwrap(),
-        expect: Precondition::Absent,
-        kind: RelationshipKind::new(*b"depends").unwrap(),
-        source: cid(a),
-        target: cid(b),
-    });
-    cs.evidence.push(Evidence {
-        label: b"decision".to_vec(),
-        bytes: format!("evidence {step}").into_bytes(),
-    });
-    Some((
-        AttemptId::new(format!("attempt-{step}").into_bytes()).unwrap(),
-        cs,
-    ))
-}
-
-fn commit_step(store: &NativeStore, step: u32) -> bool {
-    let Some((attempt, cs)) = request(store, step) else {
-        return false;
-    };
-    let Ok(view) = store.begin() else {
-        return false;
-    };
-    store.commit(attempt, view, cs).is_ok()
-}
-
-/// The complete logical state, read through the port.
-fn logical_state(store: &NativeStore) -> Vec<String> {
-    let mut v = store.begin().expect("begin");
-    let mut out = Vec::new();
-    for id in IDS {
-        let id = cid(id);
-        match v.context(&id).expect("context") {
-            None => out.push(format!("{id:?} absent")),
-            Some(r) => {
-                out.push(format!("{id:?} rev {} body {:?}", r.revision.0, r.body));
-                if let Some(c) = r.content {
-                    let mut bytes = Vec::new();
-                    v.content(&c)
-                        .expect("content")
-                        .read_to_end(&mut bytes)
-                        .expect("read content");
-                    out.push(format!(
-                        "{id:?} content {} bytes, sum {}",
-                        bytes.len(),
-                        bytes.iter().map(|&b| b as u64).sum::<u64>()
-                    ));
-                }
-            }
-        }
-        for d in [Direction::Outgoing, Direction::Incoming] {
-            let q = RelationshipQuery {
-                from: id.clone(),
-                direction: d,
-                kind: None,
-                after: None,
-            };
-            for r in v.relationships(&q).expect("rels") {
-                out.push(format!("{id:?} {d:?} {:?}", r.expect("rel")));
-            }
-        }
-    }
-    for h in v.history(HistoryPosition(0)).expect("history") {
-        let h = h.expect("history entry");
-        out.push(format!(
-            "history {} {:?} {:?} {} changes",
-            h.position.0,
-            h.attempt,
-            h.evidence,
-            h.changes.len()
-        ));
-    }
-    out
-}
-
-/// Independent expected states after each committed step, from an uninterrupted run.
-fn reference_states(steps: u32) -> Vec<Vec<String>> {
-    let sim = SimIo::new();
-    let s = create(Box::new(sim));
-    let mut states = vec![logical_state(&s)];
-    for step in 1..=steps {
-        assert!(commit_step(&s, step));
-        states.push(logical_state(&s));
-    }
-    states
 }
 
 #[test]
@@ -197,7 +80,7 @@ fn every_cut_of_a_commit_recovers_a_whole_old_or_new_state() {
         for p in persists {
             let img = sim.after_crash(p);
             let recovered = open(Box::new(img.clone()));
-            let got = logical_state(&recovered);
+            let got = state(&recovered);
             assert!(
                 &got == old || &got == new,
                 "cut {cut} {p:?}: recovered a partial state:\n{got:#?}"
@@ -216,10 +99,10 @@ fn every_cut_of_a_commit_recovers_a_whole_old_or_new_state() {
                 commit_step(&recovered, 3),
                 "cut {cut} {p:?}: store unusable after recovery"
             );
-            let after = logical_state(&recovered);
+            let after = state(&recovered);
             drop(recovered);
             img.release();
-            assert_eq!(logical_state(&open(Box::new(img))), after);
+            assert_eq!(state(&open(Box::new(img))), after);
             checked += 1;
         }
     }
@@ -230,7 +113,7 @@ fn every_cut_of_a_commit_recovers_a_whole_old_or_new_state() {
 fn filesystem_and_simulator_run_the_same_protocol() {
     /// Logical state, receipts, outcomes after reopen, and every record's content bytes.
     type Observed = (
-        Vec<String>,
+        State,
         Vec<CommitReceipt>,
         Vec<AttemptOutcome>,
         Vec<(&'static str, Vec<u8>)>,
@@ -269,7 +152,7 @@ fn filesystem_and_simulator_run_the_same_protocol() {
                 contents.push((id, bytes));
             }
         }
-        (logical_state(&s), receipts, outcomes, contents)
+        (state(&s), receipts, outcomes, contents)
     }
 
     let sim_trace = Arc::new(Mutex::new(Vec::new()));

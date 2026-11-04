@@ -25,6 +25,8 @@ mod fuzz_api;
 mod fuzz_replay_tests;
 mod io;
 #[cfg(test)]
+mod oracle_tests;
+#[cfg(test)]
 mod reader_race_tests;
 #[cfg(test)]
 mod readonly_tests;
