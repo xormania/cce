@@ -719,6 +719,9 @@ impl Model {
                         written.push(WriteKey::Index(false, p.target.clone(), p.kind.clone()));
                     }
                 }
+                Change::RemoveHistory { .. } => {
+                    unreachable!("the model does not generate history removal")
+                }
             }
         }
         if errs.is_empty() {
@@ -774,6 +777,9 @@ impl Model {
                 }
                 Change::RemoveRelationship { id, .. } => {
                     self.state.rels.remove(id);
+                }
+                Change::RemoveHistory { .. } => {
+                    unreachable!("the model does not generate history removal")
                 }
             }
         }

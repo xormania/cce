@@ -146,11 +146,12 @@ fn opening_a_damaged_or_other_version_store_is_refused_and_changes_no_file() {
         format!("format version {}", version - 1),
     ));
     let mut m = original.clone();
-    rewrite_records(&mut m, |r| r[6..10].copy_from_slice(&1u32.to_le_bytes()));
+    // Bit 0 (history markers) is known; the next bit is not.
+    rewrite_records(&mut m, |r| r[6..10].copy_from_slice(&2u32.to_le_bytes()));
     cases.push((
         "unknown required feature".into(),
         m,
-        "unknown required features 0x1".into(),
+        "unknown required features 0x2".into(),
     ));
 
     for (i, (what, meta, message)) in cases.iter().enumerate() {

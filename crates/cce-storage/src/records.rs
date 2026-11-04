@@ -32,6 +32,9 @@ pub(crate) const P_ATTEMPT: u8 = 0x06;
 pub(crate) const P_CONTENT: u8 = 0x07;
 /// Retirement records: space a published generation no longer reaches.
 pub(crate) const P_RETIRED: u8 = 0x08;
+/// Markers of removed history entries, by position. The value is the attempt id the entry
+/// recorded; nothing else of the entry is kept.
+pub(crate) const P_HISTORY_REMOVED: u8 = 0x09;
 
 /// Kind byte of a retired metadata page in a retirement key.
 pub(crate) const RETIRED_PAGE: u8 = 0;
@@ -39,9 +42,12 @@ pub(crate) const RETIRED_PAGE: u8 = 0;
 pub(crate) const RETIRED_EXTENT: u8 = 1;
 
 /// Version tags of the canonical request encoding used for attempt fingerprints. Version 2 ends
-/// with the removal mode; version 1 (no mode, read as preserving views) is still decoded.
+/// with the removal mode; version 1 (no mode, read as preserving views) is still decoded. Version
+/// 3 is version 2 with history removal changes; a request with none is still written as version
+/// 2, so its fingerprint and encoding do not change.
 const REQUEST_ENCODING_V1: u8 = 1;
 const REQUEST_ENCODING_V2: u8 = 2;
+const REQUEST_ENCODING_V3: u8 = 3;
 
 pub(crate) fn key(prefix: u8, parts: &[&[u8]]) -> Vec<u8> {
     let mut k = vec![prefix];
@@ -118,6 +124,13 @@ pub(crate) fn retired_extent_key(generation: u64, offset: u64) -> Vec<u8> {
 
 pub(crate) fn history_key(pos: u64) -> Vec<u8> {
     let mut k = vec![P_HISTORY];
+    k.extend_from_slice(&pos.to_be_bytes());
+    k
+}
+
+/// Key of the marker left by removing the history entry at `pos`.
+pub(crate) fn removed_history_key(pos: u64) -> Vec<u8> {
+    let mut k = vec![P_HISTORY_REMOVED];
     k.extend_from_slice(&pos.to_be_bytes());
     k
 }
@@ -328,7 +341,15 @@ fn dec_id<T>(d: &mut Dec, f: fn(Vec<u8>) -> Result<T, StorageError>) -> Result<T
 /// logical request restaged elsewhere has the same encoding.
 pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
     let mut e = Enc::default();
-    e.u8(REQUEST_ENCODING_V2);
+    let removes_history = changes
+        .changes
+        .iter()
+        .any(|c| matches!(c, Change::RemoveHistory { .. }));
+    e.u8(if removes_history {
+        REQUEST_ENCODING_V3
+    } else {
+        REQUEST_ENCODING_V2
+    });
     e.u32(changes.changes.len() as u32);
     for c in &changes.changes {
         match c {
@@ -366,6 +387,9 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
             Change::RemoveRelationship { id, expect } => {
                 e.u8(4).bytes(id.as_bytes());
                 enc_expect(&mut e, expect);
+            }
+            Change::RemoveHistory { position } => {
+                e.u8(5).u64(position.0);
             }
         }
     }
@@ -421,6 +445,7 @@ pub(crate) fn encoded_request_len(changes: &ChangeSet) -> u64 {
                     + field(target.as_bytes().len())
             }
             Change::RemoveRelationship { id, expect: p } => field(id.as_bytes().len()) + expect(p),
+            Change::RemoveHistory { .. } => 8,
         };
     }
     n += 4 + changes.content.len() as u64 * (32 + 8);
@@ -498,7 +523,10 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
     d.finish()?;
     let mut d = Dec::new(req, "history request");
     let version = d.u8()?;
-    if version != REQUEST_ENCODING_V1 && version != REQUEST_ENCODING_V2 {
+    if !matches!(
+        version,
+        REQUEST_ENCODING_V1 | REQUEST_ENCODING_V2 | REQUEST_ENCODING_V3
+    ) {
         return Err(StorageError::Unsupported("history request encoding".into()));
     }
     let n = d.count(2)?;
@@ -536,6 +564,9 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
                 id: dec_id(&mut d, RelationshipId::new)?,
                 expect: dec_expect(&mut d)?,
             },
+            5 if version == REQUEST_ENCODING_V3 => Change::RemoveHistory {
+                position: HistoryPosition(d.u64()?),
+            },
             t => return Err(corrupt(format!("history change tag {t}"))),
         });
     }
@@ -563,7 +594,7 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
             bytes: d.bytes()?.to_vec(),
         });
     }
-    if version == REQUEST_ENCODING_V2 && d.u8()? > 1 {
+    if version != REQUEST_ENCODING_V1 && d.u8()? > 1 {
         return Err(corrupt("history request removal mode"));
     }
     d.finish()?;

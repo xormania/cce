@@ -23,6 +23,8 @@ mod engine_tests;
 mod format;
 #[cfg(test)]
 mod fs_seam_tests;
+#[cfg(test)]
+mod history_removal_tests;
 mod io;
 #[cfg(test)]
 mod key_bounds_tests;

@@ -25,15 +25,16 @@ use sha2::{Digest, Sha256};
 
 use crate::codec::{Dec, Enc, corrupt, key_component, key_components};
 use crate::format::{
-    Descriptor, FIRST_NODE_PAGE, PAGE_SIZE, PageKind, PageRef, Slot, StoreId, decode_page,
-    decode_slot, encode_page,
+    Descriptor, FEATURE_HISTORY_MARKERS, FIRST_NODE_PAGE, PAGE_SIZE, PageKind, PageRef, Slot,
+    StoreId, decode_page, decode_slot, encode_page,
 };
 use crate::io::{FileId, Io};
 use crate::ledger::{ContentPool, Reuse, overlap};
 use crate::records::{
     AttemptValue, ContentEntry, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT,
     P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, decode_history, decode_retired,
-    encode_history, fingerprint, history_key, key, retired_extent_key, retired_page_key,
+    encode_history, fingerprint, history_key, key, removed_history_key, retired_extent_key,
+    retired_page_key,
 };
 use crate::tree::{self, Cursor, MAX_KEY, Node, NodeSink, NodeSource, TreeTxn};
 
@@ -553,6 +554,7 @@ impl Inner {
             next_page: FIRST_NODE_PAGE + 1,
             content_len: 0,
             history_pos: 0,
+            features: 0,
         };
         io.write_at(
             FileId::Meta,
@@ -1515,8 +1517,15 @@ impl Inner {
                 "generation counter exhausted".into(),
             )));
         };
-        let (retired_content, live_manifests) =
+        let removed_history = self.remove_history(&mut txn, &cs, pos, generation)?;
+        let (mut retired_content, live_manifests) =
             self.settle_content(&mut txn, &stagings, content_refs, generation)?;
+        let removed_features = if removed_history.is_empty() {
+            0
+        } else {
+            FEATURE_HISTORY_MARKERS
+        };
+        retired_content.extend(removed_history);
         let (remainders, consumed) = self.consume_reuse(&mut txn, &bound)?;
         // Discarded stagings' own space becomes retired with this commit. The queue is copied
         // here and only the copied entries are removed from it after publication: a discard
@@ -1607,6 +1616,7 @@ impl Inner {
             next_page,
             content_len,
             history_pos: pos,
+            features: cur.features | removed_features,
         };
         // From the record write on the publication may be durable and reference the entry.
         unpublished.extent = None;
@@ -1806,6 +1816,8 @@ impl Inner {
             next_page,
             content_len,
             history_pos: pos,
+            // Maintenance carries the features of the state it publishes over.
+            features: cur.features,
         };
         let published = self
             .io
@@ -1954,6 +1966,66 @@ impl Inner {
             retired.push((x.offset, x.len));
         }
         Ok(())
+    }
+
+    /// Removes the history entries `cs` designates: each entry's key is replaced by a marker that
+    /// keeps only the attempt it recorded, and its extent is retired at `generation`. Returns the
+    /// retired extents. An entry that is not retained (never written, already removed, or the
+    /// commit's own at `pos`) rejects the commit; a position named twice was already refused by
+    /// `apply`.
+    fn remove_history(
+        &self,
+        t: &mut TreeTxn,
+        cs: &ChangeSet,
+        pos: u64,
+        generation: u64,
+    ) -> Result<ExtentList, CommitError> {
+        let invalid = |m: String| CommitError::Rejected(StorageError::InvalidRequest(m));
+        let mut retired = Vec::new();
+        for c in &cs.changes {
+            let Change::RemoveHistory { position } = c else {
+                continue;
+            };
+            let k = history_key(position.0);
+            let retained = if position.0 < pos {
+                t.get(&k).map_err(rejected)?
+            } else {
+                None
+            };
+            let Some(v) = retained else {
+                let removed = t
+                    .get(&removed_history_key(position.0))
+                    .map_err(rejected)?
+                    .is_some();
+                return Err(invalid(if removed {
+                    format!("history position {} is already removed", position.0)
+                } else {
+                    format!("history position {} is not retained", position.0)
+                }));
+            };
+            let x = ExtentRef::decode(&v).map_err(rejected)?;
+            let entry =
+                decode_history(&self.read_extent(&x).map_err(rejected)?).map_err(rejected)?;
+            if entry.position != *position {
+                return Err(rejected(corrupt(format!(
+                    "history entry at position {} records position {}",
+                    position.0, entry.position.0
+                ))));
+            }
+            t.delete(&k).map_err(rejected)?;
+            t.put(
+                removed_history_key(position.0),
+                entry.attempt.as_bytes().to_vec(),
+            )
+            .map_err(rejected)?;
+            t.put(
+                retired_extent_key(generation, x.offset),
+                x.len.to_le_bytes().to_vec(),
+            )
+            .map_err(rejected)?;
+            retired.push((x.offset, x.len));
+        }
+        Ok(retired)
     }
 
     /// Reads an extent this store wrote, committed or staged, checking its digest.
@@ -2832,6 +2904,7 @@ fn apply(
             Change::PutRelationship { id, .. } | Change::RemoveRelationship { id, .. } => {
                 key(P_REL, &[id.as_bytes()])
             }
+            Change::RemoveHistory { position } => history_key(position.0),
         };
         if !seen.insert(k) {
             return Err(invalid(format!(
@@ -3006,6 +3079,8 @@ fn apply(
                 t.delete(&p.in_key(id.as_bytes())).map_err(rejected)?;
                 t.delete(&k).map_err(rejected)?;
             }
+            // History removal reads the entry it removes; the commit does it (`remove_history`).
+            Change::RemoveHistory { .. } => {}
         }
     }
     Ok(content_refs)

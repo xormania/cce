@@ -158,6 +158,7 @@ fn change_tokens(c: &Change) -> String {
         Change::RemoveRelationship { id, expect } => {
             format!("remove-rel {} {}", hex(id.as_bytes()), expect_token(expect))
         }
+        Change::RemoveHistory { position } => format!("remove-history {}", position.0),
     }
 }
 
