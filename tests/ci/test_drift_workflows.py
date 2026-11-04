@@ -20,6 +20,8 @@ class WorkflowBoundaryTests(unittest.TestCase):
         self.assertNotIn('pull_request_target:', text)
         self.assertIn('checks: write', text)
         self.assertIn('workflow_run:', text)
+        self.assertIn('            .github/workflows', text)
+        self.assertIn('            tools/ci', text)
         paths = re.findall(r'^\s+path:\s+(.+)$', text, re.M)
         self.assertTrue(paths)
         self.assertTrue(all('private' not in p and 'packets' not in p for p in paths))

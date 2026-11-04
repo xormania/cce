@@ -230,22 +230,34 @@ class ExecutionEvidenceTests(unittest.TestCase):
                 {'id': 12, 'name': 'rust', 'path': '.github/workflows/rust.yml',
                  'head_sha': HEAD, 'head_repository': {'full_name': REPOSITORY}, 'event': 'push', 'run_number': 2,
                  'run_attempt': 1, 'status': 'completed'}]
+        for row in runs:
+            row.update(conclusion='success', head_branch='feature', pull_requests=[])
+        runs.append({'id':13, 'name':'leak-guard', 'path':'.github/workflows/leak-guard.yml',
+                     'head_sha':HEAD, 'head_repository':{'full_name':REPOSITORY}, 'event':'pull_request',
+                     'run_number':3, 'run_attempt':1, 'status':'completed', 'conclusion':'success',
+                     'pull_requests':[{'number':9,'head':{'sha':HEAD},'base':{'sha':BASE}}]})
         return FakeApi({
             '/actions/runs?head_sha=' + HEAD + '&per_page=50': {'workflow_runs': runs},
+            '/pulls/9':{'state':'open','head':{'sha':HEAD},'base':{'sha':BASE},'merge_commit_sha':TRUSTED},
             '/actions/runs/11/jobs?per_page=50': {'jobs': [{'id': 111, 'conclusion': 'success', 'steps': [
                 {'name': 'Unit and replay tests', 'conclusion': 'success'}]}]},
             '/actions/runs/12/jobs?per_page=50': {'jobs': [{'id': 112, 'conclusion': 'success', 'steps': [
                 {'name': 'Format', 'conclusion': 'success'},
                 {'name': 'Clippy', 'conclusion': 'success'},
                 {'name': 'Test', 'conclusion': test_status}]}]},
-        }, logs={111: 'Ran 27 tests in 0.3s\nOK\n',
-                 112: 'test result: ok. 10 passed; 0 failed; 0 ignored\n'})
+            '/actions/runs/13/jobs?per_page=50':{'jobs':[{'id':113,'conclusion':'success','steps':[
+                {'name':'Scan PR text, commits and diff','conclusion':'success'}]}]},
+        }, files={'.github/workflows/'+name+'.yml':(ROOT/'.github/workflows'/(name+'.yml')).read_text()
+                  for name in ('drift-input','rust','leak-guard')},
+           logs={111: 'Ran 27 tests in 0.3s\nOK\n',
+                 112: 'test result: ok. 10 passed; 0 failed; 0 ignored\n',
+                 113:'[command]/usr/bin/git log -1 --format=%H\n'+TRUSTED+'\nScan finished\n'})
 
     def test_successful_steps_are_identified_by_actual_candidate(self):
         checks, limits, waiting = runner.execution_checks(self.api_for(), source(), False)
         self.assertFalse(waiting)
         self.assertEqual(limits, [])
-        self.assertEqual(len(checks), 4)
+        self.assertEqual(len(checks), 5)
         self.assertTrue(all(row['executed'] and row['source_sha'] == HEAD for row in checks))
         self.assertEqual(evaluate({'source': source(), 'checks': checks})['violations'], [])
 
@@ -258,15 +270,14 @@ class ExecutionEvidenceTests(unittest.TestCase):
         api = self.api_for()
         checks, _, waiting = runner.execution_checks(api, source(), True)
         self.assertFalse(waiting)
-        self.assertEqual([row['id'] for row in checks], ['Unit and replay tests'])
+        self.assertEqual([row['id'] for row in checks], ['Unit and replay tests','Scan PR text, commits and diff'])
         self.assertFalse(any(call[0].startswith('/actions/runs/12/jobs') for call in api.calls))
 
     def test_absent_required_execution_does_not_become_success(self):
         api = FakeApi({'/actions/runs?head_sha=' + HEAD + '&per_page=50': {'workflow_runs': []}})
         checks, limits, waiting = runner.execution_checks(api, source(), False)
-        self.assertEqual(checks, [])
-        self.assertTrue(waiting)
-        self.assertIn('required_execution_unavailable', limits)
+        self.assertTrue(waiting or evaluate({'source':source(),'checks':checks})['violations'])
+        self.assertIn('producer_definition_unverified', limits)
 
     def test_display_name_alone_cannot_satisfy_required_workflow(self):
         for changed in [{'path': '.github/workflows/unrelated.yml'}, {'head_sha': OTHER},
@@ -276,7 +287,7 @@ class ExecutionEvidenceTests(unittest.TestCase):
                 rows = api.responses['/actions/runs?head_sha=' + HEAD + '&per_page=50']['workflow_runs']
                 rows[0].update(changed)
                 checks, limits, waiting = runner.execution_checks(api, source(), True)
-                self.assertEqual(checks, [])
+                self.assertFalse(any(row['id'] == 'Unit and replay tests' for row in checks))
                 self.assertTrue(waiting)
                 self.assertIn('required_execution_unavailable', limits)
                 self.assertFalse(any(c[0].startswith('/actions/runs/11/jobs') for c in api.calls))
@@ -462,7 +473,9 @@ class CollectionIntegrationTests(unittest.TestCase):
                  'run_attempt': 1, 'status': 'completed'}]},
             '/actions/runs/7/jobs?per_page=50': {'jobs': [{'id': 71, 'conclusion': 'success', 'steps': [
                 {'name': 'Unit and replay tests', 'conclusion': 'success'}]}]},
-        }, {'README.md': 'The reader preserves the expected bytes.'}, logs={71: 'Ran 27 tests in 0.3s\nOK\n'})
+        }, {'README.md': 'The reader preserves the expected bytes.',
+            **{'.github/workflows/'+name+'.yml':(ROOT/'.github/workflows'/(name+'.yml')).read_text()
+               for name in ('drift-input','rust','leak-guard')}}, logs={71: 'Ran 27 tests in 0.3s\nOK\n'})
         event = {'workflow_run': {'id': 7, 'run_attempt': 1, 'head_sha': HEAD}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

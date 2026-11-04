@@ -22,11 +22,32 @@ A collection error replaces the candidate's previous success with failure or an
 in-progress result. The publisher rechecks the branch/PR head and check ownership;
 an older consumer cannot clear a newer candidate or overwrite a newer analysis.
 
+Producer names and printed test counts alone are insufficient. The collector
+compares producer workflow contents with the trusted checkout before accepting
+execution. PR producers also identify the checked-out merge commit and current
+base. The applicable PR leak scan is evaluated alongside tooling and Rust tests;
+an emitted skipped-scan message cannot certify execution.
+
+For a Markdown follow-up to a mixed PR, an earlier Rust push run can supply evidence
+only when a bounded ancestor comparison proves every intervening changed and
+renamed path matches the trusted producer's Markdown filter. Its actual revision,
+run, attempt and workflow hash remain attached. An applicable newer failure is
+preserved. An unfiltered PR producer still requires its current merge-candidate run.
+
+Changing a producer definition cannot certify that definition through its own
+output. A mismatch with the trusted definition fails validation; such changes need
+execution through an existing trusted producer before its results can be accepted.
+
 Jev answers independent typed questions about proof, guarantees, witnesses,
 deferrals and resolutions. These answers are advisory. They never change test
 outcomes or convert a deterministic failure to success. The summary shows the
 classification and the relevant public file where one is available. Private
 subjects use opaque references.
+
+Packets join affected before/after functions or document sections with linked
+contracts and named proof. Hunk locations select the context; assertions near the
+end of long tests are retained. Excerpts identify immutable revisions, line ranges,
+content hashes and omissions. Unavailable or ambiguous proof is reported explicitly.
 
 Only candidate-applicable evidence can fail the candidate. Historical notes,
 honestly partial work and unavailable local source are not automatically defects.
@@ -89,6 +110,15 @@ and `evidence`; and a summary table with a `verified-at` candidate stamp. An exp
 `N/N green` summary is compared with the mapped cases. Free-form text remains a
 semantic question rather than a brittle deterministic parser rule.
 
+The adapter follows existing requirement acceptance lists, case test names, and
+bounded relative links in existing records. It joins private claim/decision context
+to the named public assertions without publishing private locations. Recorded
+claims identify the pinned data revision; public proof identifies the code revision.
+Mapped proof is collected in rotating batches of eight cases with bounded reads;
+deferred recipes can request their original case directly, regardless of rotation.
+The configured data inventory supports up to forty summary groups; exceeding this
+bound reports incomplete coverage and fails when that input is explicitly required.
+
 Data is fetched at one resolved commit. A candidate-matching, clean mutation
 receipt is compared per run; raw aggregate `caught` cannot override the accepted
 disposition. The adapter reads at most twelve current mutation receipts and
@@ -124,6 +154,22 @@ scan provide further evaluations. A changed-file comparison is limited to forty
 files; omitted files and unavailable logs are reported as coverage limitations.
 Truncated excerpts are marked. Large allocations, crash campaigns and mutation
 commands appearing in logs are never executed by this observer.
+
+Deferred, reserved, unavailable and tracked relationships also retain allowlisted
+reconstruction recipes. These contain original public source identities and opaque
+data selectors, without private paths or excerpts. They survive unrelated pushes
+and branch integration. Reconstruction refetches the pinned original context; a
+historical observation is labelled as such and cannot fail a newer candidate.
+Unavailable originals stay unfinished. At most two original contexts are rebuilt
+per run, with unfinished work ahead of tracked results and rotation to avoid
+starvation. The retained inventory is bounded at two hundred recipes; overflow is
+reported as continuing coverage loss.
+
+Reservation artifacts preserve these recipes before a provider call, including if
+the job is cancelled before publication. Missing credentials do not reserve an
+unattempted request. The latest published queue supersedes older snapshots so a
+resolved relationship cannot be resurrected by an old artifact. Unchanged semantic
+content reuses its result even when source revision annotations change.
 
 ## Local validation
 
