@@ -150,5 +150,4 @@ fn opening_a_damaged_or_other_version_store_is_refused_and_changes_no_file() {
     assert!(bytes == payload(), "committed content bytes");
     drop(v);
     s.close().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
