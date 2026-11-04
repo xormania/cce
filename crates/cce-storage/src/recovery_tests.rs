@@ -4,6 +4,8 @@
 //! Expected states come from an independent run of the same logical requests, never from what
 //! recovery chose.
 
+use crate::test_support::{cid, create_on, open_on};
+
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -18,21 +20,20 @@ use crate::engine::Inner;
 use crate::format::{PAGE_SIZE, StoreId};
 use crate::io::{FileId, Io, Op, Traced};
 use crate::oracle_tests::{
-    State, attempt, cid, commit_step, history_len, payload, reference_states, request,
-    request_with, state,
+    State, attempt, commit_step, history_len, payload, reference_states, request, request_with,
+    state,
 };
 use crate::repro_tests::{PROCESS_EXIT, survival, with_repro};
 use crate::sim::{Persist, SimIo};
 
 const STORE: StoreId = StoreId(*b"recovery-store-1");
+
 fn create(io: Box<dyn Io>) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(io, STORE, Default::default()).expect("create"),
-    }
+    create_on(io, STORE, Default::default()).expect("create")
 }
 
 fn try_open(io: Box<dyn Io>) -> Result<NativeStore, StorageError> {
-    Inner::open(io, Default::default()).map(|inner| NativeStore { inner })
+    open_on(io, Default::default())
 }
 
 fn open(io: Box<dyn Io>) -> NativeStore {

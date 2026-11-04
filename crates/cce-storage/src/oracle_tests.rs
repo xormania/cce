@@ -18,9 +18,7 @@ use crate::sim::SimIo;
 
 pub(crate) const IDS: [&str; 4] = ["A", "B", "C", "D"];
 
-pub(crate) fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
-}
+pub(crate) use crate::test_support::cid;
 
 /// The content bound by the request of `step`.
 pub(crate) fn payload(step: u32) -> Vec<u8> {

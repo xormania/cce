@@ -3,22 +3,22 @@
 //! Expected states come from an independent run of the same logical requests, never from what
 //! recovery chose.
 
+use crate::test_support::{cid, create_on, open_on};
+
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::{AttemptOutcome, CommitReceipt, ReadView, StorageEngine};
 
 use crate::NativeStore;
-use crate::engine::Inner;
 use crate::format::StoreId;
 use crate::io::{FsIo, Io, Op, Traced};
-use crate::oracle_tests::{
-    IDS, State, cid, commit_step, payload, reference_states, request, state,
-};
+use crate::oracle_tests::{IDS, State, commit_step, payload, reference_states, request, state};
 use crate::repro_tests::{survival, with_repro};
 use crate::sim::{Persist, SimIo};
 
 const STORE: StoreId = StoreId(*b"crash-test-store");
+
 fn traced<I: Io + 'static>(io: I, trace: &Arc<Mutex<Vec<Op>>>) -> Box<dyn Io> {
     Box::new(Traced {
         inner: io,
@@ -27,15 +27,11 @@ fn traced<I: Io + 'static>(io: I, trace: &Arc<Mutex<Vec<Op>>>) -> Box<dyn Io> {
 }
 
 fn create(io: Box<dyn Io>) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(io, STORE, Default::default()).expect("create"),
-    }
+    create_on(io, STORE, Default::default()).expect("create")
 }
 
 fn open(io: Box<dyn Io>) -> NativeStore {
-    NativeStore {
-        inner: Inner::open(io, Default::default()).expect("recovery must open the store"),
-    }
+    open_on(io, Default::default()).expect("recovery must open the store")
 }
 
 #[test]

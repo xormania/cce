@@ -36,7 +36,7 @@ fn files(store: &Path) -> Vec<Vec<u8>> {
 
 /// A store with one commit of `n` contexts, closed, and the guard of the directory holding it
 /// (removed when the test passes).
-fn store(name: &str, n: usize) -> (common::TestDir, std::path::PathBuf) {
+fn store(name: &str, n: usize) -> (common::resources::TestDir, std::path::PathBuf) {
     let base = common::test_dir(name);
     let dir = base.join("store");
     let s = NativeStore::create(&dir, *b"verify-cli-store").unwrap();

@@ -32,7 +32,7 @@ fn files(dir: &Path) -> Vec<(&'static str, Vec<u8>)> {
 }
 
 /// A copy of fixture `name` in a fresh test directory, and the guard of that directory.
-fn copy_of(name: &str) -> (common::TestDir, PathBuf) {
+fn copy_of(name: &str) -> (common::resources::TestDir, PathBuf) {
     let base = common::test_dir(&format!("golden-{name}"));
     let dir = base.join("store");
     std::fs::create_dir(&dir).unwrap();
