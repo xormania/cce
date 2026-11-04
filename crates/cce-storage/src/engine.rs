@@ -147,7 +147,7 @@ pub(crate) struct Inner {
     faults: Mutex<Vec<String>>,
     /// Next taker id for the reuse pool (one per staging call).
     next_taker: AtomicU64,
-    /// Most rounds any commit of this instance took to settle its page allocation.
+    /// Most rounds any publication of this instance took to settle its page allocation.
     allocation_rounds_max: AtomicUsize,
     cache: Mutex<NodeCache>,
     /// Logical write sets of recent commits, for validating older read bases.
@@ -176,6 +176,17 @@ pub(crate) struct Inner {
     /// takes any (tests forcing reader registration against that decision).
     #[cfg(test)]
     reuse_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once inside a relocation step, after its copy and before it publishes (tests that
+    /// commit in between).
+    #[cfg(test)]
+    relocate_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The next relocation step applies its moves without checking that each source manifest is
+    /// still the one indexed (tests of what the space check alone refuses).
+    #[cfg(test)]
+    skip_relocation_revalidation: std::sync::atomic::AtomicBool,
+    /// The next relocation step panics right after its publication (tests of that outcome).
+    #[cfg(test)]
+    panic_next_maintenance: std::sync::atomic::AtomicBool,
     /// Runs once inside a commit on its space journal and tree just before the journal is sealed
     /// (tests planting a faulty change of ownership).
     #[cfg(test)]
@@ -210,6 +221,8 @@ pub(crate) struct Inner {
     /// Recovery diagnostics from open (for example an ignored damaged slot).
     pub diagnostics: Vec<String>,
 }
+
+mod maintain;
 
 /// Engine locks. `Recorded` keeps its mutex private to this module, so engine code can reach a
 /// recorded lock only through `lock()` (a bypass would not compile).
@@ -628,6 +641,12 @@ impl Inner {
             #[cfg(test)]
             reuse_hook: Mutex::new(None),
             #[cfg(test)]
+            relocate_hook: Mutex::new(None),
+            #[cfg(test)]
+            skip_relocation_revalidation: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            panic_next_maintenance: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             journal_hook: Mutex::new(None),
             #[cfg(test)]
             apply_hook: Mutex::new(None),
@@ -659,11 +678,28 @@ impl Inner {
         self.slow_job_release.store(true, Ordering::SeqCst);
     }
 
-    /// Most rounds any commit of this instance took to settle its page allocation (0 before the
-    /// first commit).
+    /// Most rounds any publication of this instance (a commit or a maintenance step) took to
+    /// settle its page allocation (0 before the first).
     #[cfg(test)]
     pub(crate) fn allocation_rounds_max(&self) -> usize {
         self.allocation_rounds_max.load(Ordering::Relaxed)
+    }
+
+    /// Settles a publication's page allocation (see [`settle_allocation`]) and records the rounds
+    /// it took. Every publication settles through here.
+    fn settle(
+        &self,
+        txn: &mut TreeTxn,
+        cur: &Descriptor,
+        generation: u64,
+        reusable_through: Option<u64>,
+        below: Option<u64>,
+    ) -> Result<ReusedPages, StorageError> {
+        let (pages, rounds) =
+            settle_allocation(txn, self, cur, generation, reusable_through, below)?;
+        self.allocation_rounds_max
+            .fetch_max(rounds, Ordering::Relaxed);
+        Ok(pages)
     }
 
     #[cfg(test)]
@@ -1534,11 +1570,9 @@ impl Inner {
                 hook();
             }
         }
-        let (reused, rounds) =
-            settle_allocation(&mut txn, self, &cur, generation, reusable_through)
-                .map_err(rejected)?;
-        self.allocation_rounds_max
-            .fetch_max(rounds, Ordering::Relaxed);
+        let reused = self
+            .settle(&mut txn, &cur, generation, reusable_through, None)
+            .map_err(rejected)?;
         let reuse: Vec<u64> = reused.iter().map(|(page, _)| *page).collect();
         // Every change of space ownership this commit makes, checked as a whole before anything
         // it writes can become reachable.
@@ -1644,7 +1678,8 @@ impl Inner {
         }
         let mut pool = lock(&self.pool);
         for (serial, _) in &bound {
-            pool.consume(*serial);
+            let held = pool.consume(*serial);
+            self.count_reused(&held);
         }
         // Sealed before publication; checked again here as an invariant, since the record is
         // durable and nothing can be rejected any more: an extent that would overlap space the
@@ -1676,6 +1711,150 @@ impl Inner {
             attempt,
             position: HistoryPosition(pos),
         })
+    }
+
+    /// Publishes a maintenance step's `txn` as generation `generation` at history position `pos`
+    /// (unchanged: maintenance adds no history): retires the space of discarded stagings, settles
+    /// page retirement and reuse, checks every change of space ownership against the step's
+    /// journal (as a commit does), writes the tree, and runs the data and publication barriers.
+    /// Returns the published record and the discarded extents it retired; the caller makes the
+    /// record current.
+    fn publish(
+        &self,
+        cur: &Descriptor,
+        txn: TreeTxn<'_>,
+        generation: u64,
+        pos: u64,
+        space: MaintenanceSpace,
+    ) -> Result<Published, CommitError> {
+        self.publish_below(cur, txn, generation, pos, space, None)?
+            .ok_or_else(|| {
+                rejected(StorageError::InvalidRequest(
+                    "an unrestricted publication found no pages to write".into(),
+                ))
+            })
+    }
+
+    /// [`Inner::publish`], but with `below` every tree page it writes must be a retired page
+    /// numbered below it: if there are too few, it writes and publishes nothing and returns `None`.
+    fn publish_below(
+        &self,
+        cur: &Descriptor,
+        mut txn: TreeTxn<'_>,
+        generation: u64,
+        pos: u64,
+        space: MaintenanceSpace,
+        below: Option<u64>,
+    ) -> Result<Option<Published>, CommitError> {
+        // Discarded stagings' own space becomes retired with this publication; only the copied
+        // entries leave the queue afterwards (see `commit`).
+        let discarded: Vec<(u64, u64)> = lock(&self.pool).discarded().to_vec();
+        for (offset, len) in &discarded {
+            txn.put(
+                retired_extent_key(generation, *offset),
+                len.to_le_bytes().to_vec(),
+            )
+            .map_err(rejected)?;
+        }
+        let reusable_through = self.reusable_through(generation);
+        let reused = self
+            .settle(&mut txn, cur, generation, reusable_through, below)
+            .map_err(rejected)?;
+        let reuse: Vec<u64> = reused.iter().map(|(page, _)| *page).collect();
+        if below.is_some() && reuse.len() < txn.dirty_pages() {
+            return Ok(None);
+        }
+        // Every change of space ownership the step makes, checked as a whole before anything it
+        // writes can become reachable, exactly as a commit's.
+        #[allow(unused_mut)]
+        let mut journal = SpaceJournal {
+            generation,
+            retired_pages: txn.replaced().to_vec(),
+            reused_pages: reuse.clone(),
+            retired_extents: space.retired.iter().chain(&discarded).copied().collect(),
+            remainders: space.remainders,
+            consumed: space.consumed,
+            reused_records: reused.into_iter().map(|(_, k)| k).collect(),
+            still_reachable: space.still_reachable,
+            bound: space.bound,
+        };
+        #[cfg(test)]
+        {
+            let hook = lock(&self.journal_hook).take();
+            if let Some(hook) = hook {
+                hook(&mut journal, &mut txn);
+            }
+        }
+        // Each content entry a relocation rewrote must name the manifest it copied to.
+        for (k, manifest) in &space.entries {
+            let names = txn
+                .get(k)
+                .map_err(rejected)?
+                .map(|v| ContentEntry::decode(&v))
+                .transpose()
+                .map_err(rejected)?;
+            if !matches!(names, Some(ContentEntry::Live { manifest: m, .. }) if m == *manifest) {
+                return Err(rejected(StorageError::StoreState(format!(
+                    "space check failed: a relocated content entry does not name its new manifest \
+                     at {}",
+                    manifest.offset
+                ))));
+            }
+        }
+        self.seal(&txn, cur.root, &journal).map_err(rejected)?;
+        let mut sink = PageWriter {
+            inner: self,
+            next_page: cur.next_page,
+            generation,
+            reuse,
+        };
+        let root = txn.finish(&mut sink).map_err(rejected)?;
+        if !sink.reuse.is_empty() {
+            return Err(rejected(StorageError::InvalidRequest(format!(
+                "{} pages taken for reuse were not written",
+                sink.reuse.len()
+            ))));
+        }
+        let next_page = sink.next_page;
+        // Data barrier, as for a commit.
+        let content_len = *lock(&self.alloc);
+        if let Err(e) = self
+            .io
+            .sync(FileId::Content)
+            .and_then(|()| self.io.sync(FileId::Meta))
+        {
+            self.fence(Fence {
+                why: format!("data barrier failed: {e}"),
+                uncertain: None,
+            });
+            return Err(rejected(e));
+        }
+        let desc = Descriptor {
+            store: self.store,
+            generation,
+            root,
+            next_page,
+            content_len,
+            history_pos: pos,
+        };
+        let published = self
+            .io
+            .write_at(
+                FileId::Meta,
+                Descriptor::slot(generation) * PAGE_SIZE as u64,
+                &desc.encode(),
+            )
+            .and_then(|()| self.io.sync(FileId::Meta));
+        if let Err(e) = published {
+            // The record may or may not be durable: fence writes until reconciled.
+            let why = format!("publication of generation {generation} uncertain: {e}");
+            self.fence(Fence {
+                why: why.clone(),
+                uncertain: None,
+            });
+            return Err(CommitError::Indeterminate(why));
+        }
+        Ok(Some((desc, discarded)))
     }
 
     fn resolve_content(&self, cs: &ChangeSet) -> Result<Vec<(u64, BoundContent)>, CommitError> {
@@ -1839,9 +2018,6 @@ impl Inner {
                 .take(taken.owner, need, bound, None)
                 .map_err(StorageError::StoreState)?;
             if let Some(r) = took {
-                self.counters
-                    .content_bytes_reused
-                    .fetch_add(need, Ordering::Relaxed);
                 taken.taken.push(r);
                 return Ok(r.offset);
             }
@@ -2026,6 +2202,15 @@ impl Inner {
             }
         }
         Ok(())
+    }
+
+    /// Counts the retired space a publication consumed as reused (reservations returned to the pool
+    /// never count).
+    fn count_reused(&self, consumed: &[Reuse]) {
+        let bytes = consumed.iter().map(|r| r.used).sum::<u64>();
+        self.counters
+            .content_bytes_reused
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Fences writes until reopen. The pool learns of it under its own lock, so no staging
@@ -2467,25 +2652,48 @@ type RetiredRecord = (Vec<u8>, Vec<u8>, u64);
 /// Retired pages a commit reuses, each with the key of the retirement record it consumed.
 type ReusedPages = Vec<(u64, Vec<u8>)>;
 
+/// A published record and the discarded staging extents its publication retired.
+type Published = (Descriptor, Vec<(u64, u64)>);
+
+/// What a maintenance step changes in content space, for its journal (pages are found by the
+/// publication itself).
+#[derive(Default)]
+pub(crate) struct MaintenanceSpace {
+    /// Content extents the step retires at its generation.
+    pub(crate) retired: Vec<(u64, u64)>,
+    /// Unused parts of the retired records it consumes, at their original generation.
+    pub(crate) remainders: Vec<(u64, u64, u64)>,
+    /// Keys of the retirement records it consumes.
+    pub(crate) consumed: Vec<Vec<u8>>,
+    /// Extents the new state reaches that this publication must not free.
+    pub(crate) still_reachable: Vec<(u64, u64)>,
+    /// The reservation serials the step consumes (its own).
+    pub(crate) bound: Vec<u64>,
+    /// Content entries the step rewrites, by key, with the manifest each must name.
+    pub(crate) entries: Vec<(Vec<u8>, ExtentRef)>,
+}
+
 /// Upper bound on rounds of settling a commit's page allocation. Each round's edits touch pages
 /// already being rewritten (or split from them), so replaced pages and page demand stop changing
-/// within a few rounds; a commit that does not settle is rejected. Across the test suites a commit
-/// settles in at most 4 rounds, the last of which changes nothing; the reuse and crash-cut sweep
-/// tests require at most 6.
+/// within a few rounds; a publication that does not settle is rejected. Across the test suites a
+/// commit settles in at most 4 rounds and a maintenance step in at most 3, counting the last round,
+/// which changes nothing; the reuse, crash-cut sweep and relocation tests require at most 6.
 const ALLOCATION_ROUNDS: usize = 16;
 
 /// Records every committed page the transaction replaces as retired at `generation` and takes,
 /// for the pages the transaction will write, retired pages recorded no later than
-/// `reusable_through` (deleting their records). Recording, consuming and returning records all
-/// edit the tree, which can replace further pages and change how many pages it needs, so this
-/// repeats until a round changes nothing. Returns the pages to write first and the number of
-/// rounds taken, counting the last one, which changed nothing.
+/// `reusable_through` (deleting their records), and with `below` only pages numbered below it.
+/// Recording, consuming and returning records all edit the tree, which can replace further pages
+/// and change how many pages it needs, so this repeats until a round changes nothing. Returns the
+/// pages to write first, with their records' keys, and the number of rounds taken, counting the
+/// last one, which changed nothing.
 fn settle_allocation(
     txn: &mut TreeTxn,
     src: &dyn NodeSource,
     cur: &Descriptor,
     generation: u64,
     reusable_through: Option<u64>,
+    below: Option<u64>,
 ) -> Result<(ReusedPages, usize), StorageError> {
     // Candidates in record order (oldest retirement first), from the committed tree.
     let mut candidates = match reusable_through {
@@ -2506,7 +2714,9 @@ fn settle_allocation(
                 Retired::Page {
                     generation, page, ..
                 } => {
-                    if reusable_through.is_some_and(|b| generation <= b) {
+                    if reusable_through.is_some_and(|b| generation <= b)
+                        && below.is_none_or(|b| page < b)
+                    {
                         return Ok(Some((k, v, page)));
                     }
                     generation

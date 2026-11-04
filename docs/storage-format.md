@@ -187,8 +187,11 @@ Content staged but neither committed nor discarded keeps its space for the life 
 After a restart nothing refers to it: staged bytes beyond the committed content length are
 overwritten later, and retired extents a staging was using are still recorded as retired and
 reused. Staged bytes that a later commit's content length came to cover, and the appended space of
-a discarded staging whose retirement no commit published before a crash, are not reclaimed; that
-needs a maintenance pass over the content file, which is not implemented.
+a discarded staging whose retirement no commit published before a crash, are not reclaimed by
+opening or committing. An explicit maintenance step (`NativeStore::maintain` with
+`ReclaimContentHoles`) finds content-file space below the committed length that no published
+structure reaches, no retirement record covers and no staging of the process holds, and retires
+it in a new physical generation (no history is added); staging then reuses it under the rule above.
 
 Tree pages are allocated from retired pages first, then by advancing the next unallocated page. A
 commit producing generation `n` may reuse a page retired at generation `r` only if `r <= n - 2` and
