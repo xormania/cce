@@ -184,6 +184,12 @@ fn the_complete_story_in_order_through_fresh_processes() {
     let now = state(&answered(d.step("dump A,B"), "dump new"));
     assert_eq!(now[0], plain("A", rev_a, b"A v2 b"));
     assert!(now.contains(&"context B absent".to_string()), "{now:?}");
+    // Two more commits: B's space is now past the publication-slot bound, so only the old view
+    // keeps it from being reused.
+    for k in 0..2 {
+        run(&mut d, &["put-context advance any - -"]);
+        committed(&mut d, &format!("pin-advance-{k}"));
+    }
     let reused_before = stat(&mut d, "content_reused");
     let y = gen_bytes(77, LARGE_LEN);
     run(
