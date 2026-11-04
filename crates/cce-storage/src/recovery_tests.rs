@@ -327,7 +327,8 @@ fn every_cut_of_store_creation_opens_the_empty_store_or_refuses_to_initialize() 
             STORE,
             Default::default(),
         );
-        assert_eq!(created.is_ok(), cut == total, "cut {cut}: creation result");
+        let acknowledged = created.is_ok();
+        assert_eq!(acknowledged, cut == total, "cut {cut}: creation result");
         drop(created);
         for p in [Persist::None, Persist::All] {
             let img = sim.after_crash(p);
@@ -347,12 +348,20 @@ fn every_cut_of_store_creation_opens_the_empty_store_or_refuses_to_initialize() 
                     Err(StorageError::StoreState(m))
                         if before.iter().all(Option::is_none) && m.contains("missing") =>
                     {
+                        assert!(
+                            !acknowledged,
+                            "cut {cut} {p:?}: acknowledged store lost its files"
+                        );
                         refused += 1;
                     }
                     Err(StorageError::Integrity(m))
                         if m.contains("initialization never completed")
                             || m.contains("no valid publication record") =>
                     {
+                        assert!(
+                            !acknowledged,
+                            "cut {cut} {p:?}: acknowledged store refused: {m}"
+                        );
                         assert_eq!(
                             images(&img),
                             before,
@@ -902,4 +911,129 @@ fn a_fault_during_recovery_of_any_crashed_commit_leaves_the_image_recoverable() 
         }
     }
     assert_eq!(checked, (total + 1) * 14 * faults.len() as u64);
+}
+
+#[test]
+fn staged_content_is_not_visible_through_any_view_until_committed() {
+    let sim = SimIo::new();
+    let s = create(Box::new(sim.clone()));
+    assert!(commit_step(&s, 1));
+    let state = logical_state(&s);
+    let earlier = s.begin().unwrap();
+    let x = s.stage_content(&mut &payload(2)[..]).expect("stage");
+
+    let assert_invisible = |s: &NativeStore, mut v: crate::NativeView, what: &str| {
+        let r = v.content(&x.content).map(|_| ());
+        assert!(
+            matches!(&r, Err(StorageError::InvalidRequest(m)) if m.contains("not committed")),
+            "{what}: staged content is readable: {r:?}"
+        );
+        let history: Vec<_> = v
+            .history(HistoryPosition(0))
+            .unwrap()
+            .map(|h| h.unwrap())
+            .collect();
+        assert_eq!(history.len(), 1, "{what}: history gained an entry");
+        assert!(
+            history.iter().all(|h| !h.content.contains(&x.content)),
+            "{what}: history references staged content"
+        );
+        assert_eq!(logical_state(s), state, "{what}: records changed");
+    };
+    // Views begun before and after staging, in the staging instance.
+    assert_invisible(&s, earlier, "view begun before staging");
+    assert_invisible(&s, s.begin().unwrap(), "view begun after staging");
+    drop(s);
+    // A later process: after a clean exit and after a power loss.
+    for (img, what) in [
+        (sim.after_process_exit(), "after process exit"),
+        (sim.after_crash(Persist::All), "after power loss"),
+    ] {
+        let s = open(Box::new(img));
+        assert_invisible(&s, s.begin().unwrap(), what);
+    }
+
+    // Positive neighbour: once committed, the same content is readable.
+    let s = open(Box::new(sim.after_process_exit()));
+    assert!(commit_step(&s, 2));
+    let mut bytes = Vec::new();
+    s.begin()
+        .unwrap()
+        .content(&x.content)
+        .expect("committed content")
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, payload(2));
+}
+
+#[test]
+fn a_failed_directory_barrier_fails_creation_and_no_store_appears() {
+    // Find the directory barrier among creation's operations.
+    let probe = SimIo::new();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    drop(create(Box::new(Traced {
+        inner: probe.clone(),
+        trace: trace.clone(),
+    })));
+    let ops = trace.lock().unwrap().clone();
+    let k = ops
+        .iter()
+        .position(|op| *op == Op::SyncDir)
+        .expect("creation syncs the directory") as u64
+        + 1;
+    assert_eq!(
+        ops.iter().filter(|op| **op == Op::SyncDir).count(),
+        1,
+        "creation is expected to issue one directory barrier"
+    );
+
+    let sim = SimIo::new();
+    sim.fail_nth_op(k);
+    let r = Inner::create(Box::new(sim.clone()), STORE, Default::default());
+    assert!(
+        matches!(&r, Err(StorageError::Io(m)) if m.contains("simulated I/O error")),
+        "{:?}",
+        r.as_ref().err()
+    );
+    drop(r);
+    // Nothing after the failed barrier ran: no store file holds any byte.
+    for f in images(&sim) {
+        let (durable, volatile) = f.expect("store file entry exists in the directory cache");
+        assert!(durable.is_empty() && volatile.is_empty());
+    }
+
+    // Power loss: the entries were never made durable, so no store files exist.
+    let lost = sim.after_crash(Persist::All);
+    let e = try_open(Box::new(lost)).err().expect("no store");
+    assert!(
+        matches!(&e, StorageError::StoreState(m) if m.contains("missing")),
+        "{e:?}"
+    );
+    // Process exit, or the entries became durable after all: empty files are an interrupted
+    // initialization, refused and never reinitialized.
+    let exited = sim.after_process_exit();
+    sim.sync_dir().unwrap();
+    let persisted = sim.after_crash(Persist::All);
+    for img in [exited, persisted] {
+        let e = try_open(Box::new(img.clone())).err().expect("no store");
+        assert!(
+            matches!(&e, StorageError::Integrity(m) if m.contains("initialization never completed")),
+            "{e:?}"
+        );
+        assert!(images(&img).iter().all(|f| {
+            f.as_ref()
+                .is_some_and(|(d, v)| d.is_empty() && v.is_empty())
+        }));
+    }
+    // Creating again over the leftover entries is refused rather than silently reused.
+    let again = Inner::create(
+        Box::new(sim.after_process_exit()),
+        STORE,
+        Default::default(),
+    );
+    assert!(
+        matches!(&again, Err(StorageError::StoreState(m)) if m.contains("already contains")),
+        "{:?}",
+        again.as_ref().err()
+    );
 }
