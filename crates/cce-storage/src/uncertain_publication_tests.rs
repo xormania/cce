@@ -32,6 +32,8 @@ struct UncertainRecord {
 struct UncertainState {
     on_record: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     fail_meta_sync: AtomicBool,
+    /// Panic right after the next publication record is written.
+    panic_after_record: AtomicBool,
 }
 
 impl Io for UncertainRecord {
@@ -52,7 +54,14 @@ impl Io for UncertainRecord {
                 self.state.fail_meta_sync.store(true, Ordering::SeqCst);
             }
         }
-        self.sim.write_at(file, offset, data)
+        self.sim.write_at(file, offset, data)?;
+        if file == FileId::Meta
+            && offset < 2 * PAGE_SIZE as u64
+            && self.state.panic_after_record.swap(false, Ordering::SeqCst)
+        {
+            panic!("injected: panic right after a publication record write");
+        }
+        Ok(())
     }
     fn len(&self, file: FileId) -> Result<u64, StorageError> {
         self.sim.len(file)
@@ -238,6 +247,88 @@ fn uncertain_commit_then_staging(discard: bool) -> Vec<String> {
 fn a_staging_never_takes_space_an_uncertain_commit_references_after_a_discard() {
     let lost = uncertain_commit_then_staging(true);
     assert!(lost.is_empty(), "committed content overwritten: {lost:?}");
+}
+
+/// A commit that panics right after writing its publication record has an unknown outcome: the
+/// reused space its staging holds stays owned by that publication, out of reach of a discard and
+/// of reuse, and the store reopens consistently whichever record survives.
+#[test]
+fn a_commit_that_panics_after_its_record_keeps_its_stagings_space() {
+    let len = CONTENT_CHUNK + 300;
+    let sim = SimIo::new();
+    let state = Arc::new(UncertainState::default());
+    let s = create_on(
+        Box::new(UncertainRecord {
+            sim: sim.clone(),
+            state: state.clone(),
+        }),
+        STORE,
+        Default::default(),
+    )
+    .unwrap();
+    let x = bytes_of(1, len);
+    let sx = s.stage_content(&mut &x[..]).unwrap();
+    commit(
+        &s,
+        "x",
+        ChangeSet {
+            changes: vec![put_context("X", Precondition::Any, b"X", Some(0))],
+            content: vec![ContentBinding::from(&sx)],
+            ..ChangeSet::default()
+        },
+    );
+    commit(
+        &s,
+        "x-removed",
+        changes(vec![Change::RemoveContext {
+            id: cid("X"),
+            expect: Precondition::Any,
+        }]),
+    );
+    for k in 0..2 {
+        commit(
+            &s,
+            &format!("advance-{k}"),
+            changes(vec![put_context("advance", Precondition::Any, b"a", None)]),
+        );
+    }
+    let content = bytes_of(7, len);
+    let staged = s.stage_content(&mut &content[..]).unwrap();
+    let free_staged = s.inner.reusable_content_bytes();
+    state.panic_after_record.store(true, Ordering::SeqCst);
+    let r = s.commit(
+        attempt("panics"),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![put_context("E", Precondition::Any, b"e", Some(0))],
+            content: vec![ContentBinding::from(&staged)],
+            ..ChangeSet::default()
+        },
+    );
+    assert!(
+        matches!(r, Err(CommitError::Indeterminate(_))),
+        "a commit that panicked after its record must have an unknown outcome: {r:?}"
+    );
+    assert!(
+        s.discard_staged(staged).is_err(),
+        "discarding the staging of a commit with an unknown outcome was accepted"
+    );
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free_staged,
+        "the panicked commit's reused space was offered for reuse"
+    );
+    drop(s);
+    for (how, img) in [
+        ("process exit", sim.after_process_exit()),
+        ("record lost", sim.after_crash(Persist::None)),
+    ] {
+        let recovered = open_on(Box::new(img.clone()), Default::default()).unwrap();
+        assert_eq!(crate::audit::check_retirement(&img), Ok(()), "{how}");
+        if let Some(got) = read_content(&recovered, "E") {
+            assert_eq!(got, Ok(content.clone()), "{how}");
+        }
+    }
 }
 
 #[test]
