@@ -349,8 +349,13 @@ pub(crate) struct SpaceJournal {
     pub(crate) reused_pages: Vec<u64>,
     /// Content extents retired at `generation`: removed or orphaned content, discarded stagings.
     pub(crate) retired_extents: Vec<(u64, u64)>,
-    /// Unused parts of reused retirement records, which stay retired at their own generation.
-    pub(crate) remainders: Vec<(u64, u64)>,
+    /// Unused parts of reused retirement records, as `(offset, len, retiring generation)`: they
+    /// stay retired at their record's original generation.
+    pub(crate) remainders: Vec<(u64, u64, u64)>,
+    /// Keys of the retirement records of reserved content the commit consumes (deleted).
+    pub(crate) consumed: Vec<Vec<u8>>,
+    /// Keys of the retirement records of the pages it reuses (deleted).
+    pub(crate) reused_records: Vec<Vec<u8>>,
     /// Manifests the new state's entries for the digests this commit touched name.
     pub(crate) live_manifests: Vec<(u64, u64)>,
     /// Serials of the stagings the commit binds (their reservations are its to consume).
@@ -363,14 +368,39 @@ pub(crate) type JournalHook = Box<dyn for<'a> FnOnce(&mut SpaceJournal, &mut Tre
 /// Content-file extents as `(offset, len)`.
 type ExtentList = Vec<(u64, u64)>;
 
+/// A retirement record's key in words, for error messages.
+fn retired_key_label(k: &[u8]) -> String {
+    match decode_retired(k, &[0; 8]) {
+        Ok(Retired::Page {
+            generation, page, ..
+        }) => format!("of page {page} at generation {generation}"),
+        Ok(Retired::Extent {
+            generation, offset, ..
+        }) => format!("of content at offset {offset}, generation {generation}"),
+        Err(_) => format!("{k:?}"),
+    }
+}
+
+/// Remainders of consumed reservations, `(offset, len, retiring generation)`, and the keys of the
+/// consumed records.
+type Consumed = (Vec<(u64, u64, u64)>, Vec<Vec<u8>>);
+
 fn overlap(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 < b.0 + b.1 && b.0 < a.0 + a.1
 }
 
 /// Whether `x` overlaps space the pool accounts for: a free extent, a reservation of a staging
 /// other than those in `except`, or a reservation an uncertain publication owns.
+/// Free extents are found by range query on their offsets (free extents never overlap each other,
+/// so only the one starting before `x` and those starting inside it can overlap it); reservations
+/// are few per staging and are scanned.
 fn pool_overlaps(pool: &ContentPool, x: (u64, u64), except: &[u64]) -> bool {
-    pool.free.iter().any(|(o, (l, _))| overlap(x, (*o, *l)))
+    let end = x.0.saturating_add(x.1);
+    pool.free
+        .range(..x.0)
+        .next_back()
+        .is_some_and(|(o, (l, _))| overlap(x, (*o, *l)))
+        || pool.free.range(x.0..end).next().is_some()
         || pool
             .held
             .iter()
@@ -1360,8 +1390,11 @@ impl Inner {
         };
         let (retired_content, live_manifests) =
             self.settle_content(&mut txn, &stagings, content_refs, generation)?;
-        let remainders = self.consume_reuse(&mut txn, &bound)?;
-        // Discarded stagings' own space becomes retired with this commit.
+        let (remainders, consumed) = self.consume_reuse(&mut txn, &bound)?;
+        // Discarded stagings' own space becomes retired with this commit. The queue is copied
+        // here and only the copied entries are removed from it after publication: a discard
+        // that arrives meanwhile only appends, and publications are serialised by the commit
+        // worker, so no entry is retired twice or lost.
         let discarded: Vec<(u64, u64)> = lock(&self.pool).discarded.clone();
         for (offset, len) in &discarded {
             txn.put(
@@ -1382,8 +1415,9 @@ impl Inner {
                 hook();
             }
         }
-        let reuse = settle_allocation(&mut txn, self, &cur, generation, reusable_through)
+        let reused = settle_allocation(&mut txn, self, &cur, generation, reusable_through)
             .map_err(rejected)?;
+        let reuse: Vec<u64> = reused.iter().map(|(page, _)| *page).collect();
         // Every change of space ownership this commit makes, checked as a whole before anything
         // it writes can become reachable.
         #[allow(unused_mut)]
@@ -1392,7 +1426,9 @@ impl Inner {
             retired_pages: txn.replaced().to_vec(),
             reused_pages: reuse.clone(),
             retired_extents: retired_content.iter().chain(&discarded).copied().collect(),
-            remainders: remainders.iter().map(|(o, l, _)| (*o, *l)).collect(),
+            remainders: remainders.clone(),
+            consumed,
+            reused_records: reused.into_iter().map(|(_, k)| k).collect(),
             live_manifests,
             bound: bound.iter().map(|(serial, _)| *serial).collect(),
         };
@@ -1403,7 +1439,7 @@ impl Inner {
                 hook(&mut journal, &mut txn);
             }
         }
-        self.seal(&txn, &journal).map_err(rejected)?;
+        self.seal(&txn, cur.root, &journal).map_err(rejected)?;
         let mut sink = PageWriter {
             inner: self,
             next_page: cur.next_page,
@@ -1786,7 +1822,12 @@ impl Inner {
     /// exactly the retirements checked, no content retired twice or while a touched digest's live
     /// entry names it, and nothing it frees overlapping space the pool already accounts for. A
     /// violation rejects the commit.
-    fn seal(&self, txn: &TreeTxn, j: &SpaceJournal) -> Result<(), StorageError> {
+    fn seal(
+        &self,
+        txn: &TreeTxn,
+        committed: PageRef,
+        j: &SpaceJournal,
+    ) -> Result<(), StorageError> {
         let fail = |why: String| {
             Err(StorageError::StoreState(format!(
                 "space check failed: {why}"
@@ -1805,40 +1846,11 @@ impl Inner {
         if let Some(p) = j.reused_pages.iter().find(|p| frontier.contains(p)) {
             return fail(format!("reused page {p} is still referenced"));
         }
-        let (mut rec_pages, mut rec_extents) = (HashSet::new(), HashSet::new());
-        for k in txn
-            .touched()
-            .iter()
-            .filter(|k| k.first() == Some(&P_RETIRED))
-        {
-            let Some(v) = txn.get(k)? else { continue };
-            match decode_retired(k, &v)? {
-                Retired::Page {
-                    generation, page, ..
-                } if generation == j.generation => {
-                    rec_pages.insert(page);
-                }
-                Retired::Extent {
-                    generation,
-                    offset,
-                    len,
-                } if generation == j.generation => {
-                    rec_extents.insert((offset, len));
-                }
-                _ => {}
-            }
-        }
-        let extents: HashSet<(u64, u64)> = j.retired_extents.iter().copied().collect();
-        if rec_pages != pages || rec_extents != extents {
-            return fail(
-                "the retirement records written differ from the retirements checked".into(),
-            );
-        }
         let mut freed: Vec<(u64, u64)> = j
             .retired_extents
             .iter()
-            .chain(&j.remainders)
             .copied()
+            .chain(j.remainders.iter().map(|(o, l, _)| (*o, *l)))
             .collect();
         freed.sort_unstable();
         if let Some(w) = freed.windows(2).find(|w| overlap(w[0], w[1])) {
@@ -1853,11 +1865,64 @@ impl Inner {
         {
             return fail(format!("retired content {x:?} is still referenced"));
         }
-        let pool = lock(&self.pool);
-        if let Some(x) = freed.iter().find(|x| pool_overlaps(&pool, **x, &j.bound)) {
-            return fail(format!(
-                "content {x:?} would be freed over space the pool accounts for"
-            ));
+        {
+            let pool = lock(&self.pool);
+            if let Some(x) = freed.iter().find(|x| pool_overlaps(&pool, **x, &j.bound)) {
+                return fail(format!(
+                    "content {x:?} would be freed over space the pool accounts for"
+                ));
+            }
+        }
+        // Every retirement record the commit touched ends exactly as the journal says: new
+        // records at its generation for what it retires, remainder records at their original
+        // generation, consumed and reused records deleted; any other touched record unchanged
+        // from the committed state (taken for reuse, then given back).
+        let mut expected: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
+        let mut expect = |k: Vec<u8>, v: Option<Vec<u8>>| expected.insert(k, v).is_none();
+        let mut distinct = true;
+        for p in &j.retired_pages {
+            distinct &= expect(
+                retired_page_key(j.generation, p.page),
+                Some(p.incarnation.to_le_bytes().to_vec()),
+            );
+        }
+        for (offset, len) in &j.retired_extents {
+            distinct &= expect(
+                retired_extent_key(j.generation, *offset),
+                Some(len.to_le_bytes().to_vec()),
+            );
+        }
+        for (offset, len, retired_at) in &j.remainders {
+            distinct &= expect(
+                retired_extent_key(*retired_at, *offset),
+                Some(len.to_le_bytes().to_vec()),
+            );
+        }
+        for k in j.consumed.iter().chain(&j.reused_records) {
+            distinct &= expect(k.clone(), None);
+        }
+        if !distinct {
+            return fail("one retirement record is changed twice".into());
+        }
+        for (k, want) in &expected {
+            if txn.get(k)? != *want {
+                return fail(format!(
+                    "retirement record {} is not as the journal says",
+                    retired_key_label(k)
+                ));
+            }
+        }
+        for k in txn
+            .touched()
+            .iter()
+            .filter(|k| k.first() == Some(&P_RETIRED) && !expected.contains_key(*k))
+        {
+            if txn.get(k)? != tree::get(self, committed, k)? {
+                return fail(format!(
+                    "retirement record {} changed outside the journal",
+                    retired_key_label(k)
+                ));
+            }
         }
         Ok(())
     }
@@ -1944,12 +2009,13 @@ impl Inner {
 
     /// Consumes, in the transaction, the retirement records of extents held by the stagings this
     /// commit binds; a record longer than what its staging wrote leaves a record for the rest,
-    /// still retired at its original generation. Returns those remainders.
+    /// still retired at its original generation. Returns those remainders and the keys of the
+    /// records it consumed.
     fn consume_reuse(
         &self,
         t: &mut TreeTxn,
         bound: &[(u64, BoundContent)],
-    ) -> Result<Vec<(u64, u64, u64)>, CommitError> {
+    ) -> Result<Consumed, CommitError> {
         let held: Vec<Reuse> = {
             let pool = lock(&self.pool);
             bound
@@ -1957,10 +2023,11 @@ impl Inner {
                 .flat_map(|(serial, _)| pool.held.get(serial).cloned().unwrap_or_default())
                 .collect()
         };
-        let mut remainders = Vec::new();
+        let (mut remainders, mut consumed) = (Vec::new(), Vec::new());
         for r in held {
-            t.delete(&retired_extent_key(r.retired_at, r.offset))
-                .map_err(rejected)?;
+            let k = retired_extent_key(r.retired_at, r.offset);
+            t.delete(&k).map_err(rejected)?;
+            consumed.push(k);
             if r.record_len > r.used {
                 let (offset, len) = (r.offset + r.used, r.record_len - r.used);
                 t.put(
@@ -1971,7 +2038,7 @@ impl Inner {
                 remainders.push((offset, len, r.retired_at));
             }
         }
-        Ok(remainders)
+        Ok((remainders, consumed))
     }
 
     pub fn outcome(self: &Arc<Self>, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
@@ -2309,7 +2376,7 @@ fn settle_allocation(
     cur: &Descriptor,
     generation: u64,
     reusable_through: Option<u64>,
-) -> Result<Vec<u64>, StorageError> {
+) -> Result<Vec<(u64, Vec<u8>)>, StorageError> {
     // Candidates in record order (oldest retirement first), from the committed tree.
     let mut candidates = match reusable_through {
         Some(_) => Some(Cursor::new(
@@ -2377,7 +2444,7 @@ fn settle_allocation(
             changed = true;
         }
         if !changed {
-            return Ok(taken.into_iter().map(|(_, _, page)| page).collect());
+            return Ok(taken.into_iter().map(|(k, _, page)| (page, k)).collect());
         }
     }
     Err(StorageError::InvalidRequest(format!(

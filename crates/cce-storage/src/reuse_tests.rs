@@ -209,12 +209,12 @@ fn put_body(s: &NativeStore, attempt: &str, id: &str, body: &str) {
         }],
         ..ChangeSet::default()
     };
-    s.commit(
+    let r = s.commit(
         AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
         s.begin().unwrap(),
         cs,
-    )
-    .unwrap();
+    );
+    assert!(r.is_ok(), "commit {attempt} was refused: {r:?}");
 }
 
 /// Commits `range` of the churn: commit `i` sets record `K{i % LIVE}` to `v{i}`. Every commit is

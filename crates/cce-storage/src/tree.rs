@@ -723,9 +723,11 @@ impl<'a> TreeTxn<'a> {
 
     /// The committed pages the result refers to directly: the root if nothing changed it,
     /// otherwise every unchanged child of a changed node the result reaches. Every other committed
-    /// page the result reaches lies below one of these, and a page below one of them was never
-    /// copied (copies are only made from a changed node's slot or the root), so a replaced page
-    /// the result still reached would be one of these.
+    /// page the result reaches lies below one of these. Provided every committed page has exactly
+    /// one parent (copy-on-write never shares a subtree; the audit checks that every page is
+    /// reached once, this method does not), a page below one of them was never copied, since
+    /// copies are only made from a changed node's slot or the root; so a replaced page the result
+    /// still reached would be one of these.
     pub fn frontier(&self) -> Vec<PageRef> {
         let mut out = Vec::new();
         let mut stack = vec![self.root];

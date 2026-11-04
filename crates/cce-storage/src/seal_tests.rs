@@ -188,7 +188,7 @@ fn reusing_a_page_the_new_tree_still_refers_to_is_rejected() {
 #[test]
 fn a_retirement_record_the_journal_does_not_hold_is_rejected() {
     rejected_for(
-        "records written differ",
+        "changed outside the journal",
         touch_one(),
         Box::new(|j: &mut SpaceJournal, t: &mut TreeTxn<'_>| {
             let p = referenced(t);
@@ -222,7 +222,7 @@ fn retiring_content_over_other_retired_content_is_rejected() {
         remove_c(),
         Box::new(|j: &mut SpaceJournal, _: &mut TreeTxn<'_>| {
             let x = j.retired_extents[0];
-            j.remainders.push(x);
+            j.remainders.push((x.0, x.1, 0));
         }),
     );
 }
@@ -239,7 +239,7 @@ fn freeing_content_over_space_the_pool_accounts_for_is_rejected() {
         "freed over space the pool accounts for",
         remove_c(),
         Box::new(move |j: &mut SpaceJournal, _: &mut TreeTxn<'_>| {
-            j.remainders.push(free);
+            j.remainders.push((free.0, free.1, 0));
         }),
     );
 }
@@ -266,6 +266,23 @@ fn a_conflict_found_after_publication_fences_writes() {
         "a conflict found after publication did not fence writes: {why:?}"
     );
     assert_eq!(s.begin().unwrap().context(&cid("C")).unwrap(), None);
+}
+
+/// A staging smaller than the retired content it reuses consumes part of a retirement record:
+/// the remainder stays retired at the record's own generation and the check accepts exactly that.
+#[test]
+fn a_commit_consuming_part_of_a_reserved_record_passes_the_check() {
+    let sim = SimIo::new();
+    let s = store(&sim);
+    let free = s.inner.reusable_content_bytes();
+    put_content(&s, "y", "Y", &bytes_of(5, CONTENT_CHUNK + 100));
+    assert!(
+        s.inner.reusable_content_bytes() > 0 && s.inner.reusable_content_bytes() < free,
+        "the staging did not consume part of the retired content"
+    );
+    ok(&s, "next", touch_one());
+    assert_eq!(s.inner.fence_reason(), None);
+    assert_eq!(crate::audit::check_retirement(&sim), Ok(()));
 }
 
 #[test]
