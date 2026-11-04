@@ -894,6 +894,11 @@ fn a_move_whose_content_was_committed_again_during_relocation_is_dropped() {
 /// A tree of many leaves whose low pages were vacated by later commits and are reusable, so that
 /// the newest leaves sit above retired space. Released.
 fn scattered() -> SimIo {
+    scattered_with(400)
+}
+
+/// [`scattered`] with `records` records (at most 400).
+fn scattered_with(records: usize) -> SimIo {
     let sim = SimIo::new();
     let s = create(&sim);
     let body = |i: usize, round: usize| format!("{i:04}-{round}-{}", "x".repeat(400));
@@ -901,7 +906,7 @@ fn scattered() -> SimIo {
         &s,
         "many",
         ChangeSet {
-            changes: (0..400)
+            changes: (0..records)
                 .map(|i| put(&format!("k{i:04}"), &body(i, 0), None))
                 .collect(),
             ..ChangeSet::default()
@@ -912,7 +917,7 @@ fn scattered() -> SimIo {
         &s,
         "rewrite",
         ChangeSet {
-            changes: (0..400)
+            changes: (0..records)
                 .map(|i| put(&format!("k{i:04}"), &body(i, 1), None))
                 .collect(),
             ..ChangeSet::default()
@@ -1086,8 +1091,66 @@ fn page_relocation_without_lower_retired_pages_does_nothing() {
     assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
 }
 
-/// One maintenance step to sweep: its name, the released image it runs on, and its task.
-type Sweep = (&'static str, fn() -> SimIo, MaintenanceTask);
+/// One maintenance step to sweep: its name, the released image it runs on, its task, its budget,
+/// and whether that budget must leave work for a further step.
+type Sweep = (
+    &'static str,
+    fn() -> SimIo,
+    MaintenanceTask,
+    MaintenanceBudget,
+    bool,
+);
+
+const FULL: MaintenanceBudget = MaintenanceBudget {
+    max_pages: 1024,
+    max_content_bytes: 64 << 20,
+};
+
+/// Two contents of 100 000 bytes high in the file above retired space for both. Released.
+fn fragmented_twice() -> SimIo {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    for (attempt, id, seed) in [
+        ("one", "A", 1),
+        ("two", "C", 3),
+        ("three", "B", 2),
+        ("four", "D", 4),
+    ] {
+        let staged = s.stage_content(&mut &bytes_of(seed, 100_000)[..]).unwrap();
+        commit(
+            &s,
+            attempt,
+            ChangeSet {
+                changes: vec![put(id, id, Some(0))],
+                content: vec![ContentBinding::from(&staged)],
+                ..ChangeSet::default()
+            },
+        );
+    }
+    // A and C give up their content; two more commits make its space reusable.
+    for (attempt, changes) in [
+        ("five", vec![put("A", "a", None), put("C", "c", None)]),
+        ("six", vec![put("z", "six", None)]),
+        ("seven", vec![put("z", "seven", None)]),
+    ] {
+        commit(
+            &s,
+            attempt,
+            ChangeSet {
+                changes,
+                ..ChangeSet::default()
+            },
+        );
+    }
+    drop(s);
+    sim.release();
+    sim
+}
+
+/// The page relocation fixture, smaller: still many leaves, and a faster sweep.
+fn scattered_small() -> SimIo {
+    scattered_with(120)
+}
 
 fn holes_image() -> SimIo {
     let (sim, s, _) = leaked(100_000, false);
@@ -1104,19 +1167,66 @@ fn damaged_image() -> SimIo {
     sim
 }
 
-const SWEEPS: [Sweep; 4] = [
+const SWEEPS: [Sweep; 7] = [
     (
         "hole reclaim",
         holes_image,
         MaintenanceTask::ReclaimContentHoles,
+        FULL,
+        false,
     ),
     (
         "index rebuild",
         damaged_image,
         MaintenanceTask::RebuildRelationshipIndexes,
+        FULL,
+        false,
     ),
-    ("content relocation", fragmented, MaintenanceTask::Relocate),
-    ("page relocation", scattered, MaintenanceTask::Relocate),
+    (
+        "content relocation",
+        fragmented,
+        MaintenanceTask::Relocate,
+        FULL,
+        false,
+    ),
+    (
+        "page relocation",
+        scattered_small,
+        MaintenanceTask::Relocate,
+        FULL,
+        false,
+    ),
+    // Budgets that cut the work short: part of the leak, one of two contents, two pages.
+    (
+        "partial hole reclaim",
+        holes_image,
+        MaintenanceTask::ReclaimContentHoles,
+        MaintenanceBudget {
+            max_pages: 1024,
+            max_content_bytes: 40_000,
+        },
+        true,
+    ),
+    (
+        "partial content relocation",
+        fragmented_twice,
+        MaintenanceTask::Relocate,
+        MaintenanceBudget {
+            max_pages: 1024,
+            max_content_bytes: 150_000,
+        },
+        true,
+    ),
+    (
+        "partial page relocation",
+        scattered_small,
+        MaintenanceTask::Relocate,
+        MaintenanceBudget {
+            max_pages: 2,
+            max_content_bytes: 64 << 20,
+        },
+        true,
+    ),
 ];
 
 /// Every cut of every maintenance step, after a process exit and after a power loss, recovers
@@ -1142,7 +1252,7 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
         }
     };
     let (mut checked, mut cases) = (0, 0);
-    for (name, image, task) in SWEEPS {
+    for (name, image, task, budget, partial) in SWEEPS {
         let base = image();
         // The uncut step: what it changes, and how many mutating operations it makes.
         let probe = base.after_process_exit();
@@ -1151,13 +1261,19 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
         let before = logical(&s);
         let generation = s.inner.snapshot().unwrap().desc.generation;
         trace.lock().unwrap().clear();
-        let r = s.maintain(task, MaintenanceBudget::default()).unwrap();
+        let r = s.maintain(task, budget).unwrap();
         let ops = trace.lock().unwrap().clone();
         let total = ops.len() as u64;
         let after = logical(&s);
         assert!(
             r.generation > generation,
             "{name}: the step published nothing to sweep"
+        );
+        // A full step may still leave work (page relocation short of lower pages halves its
+        // count); a budget-limited one must.
+        assert!(
+            !(partial && r.complete),
+            "{name}: a budget-limited step reported itself complete"
         );
         drop(s);
         // A step may publish more than once (relocation: content, then pages); nothing may be
@@ -1175,7 +1291,7 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
             let s = open_traced(&sim, &trace);
             trace.lock().unwrap().clear();
             sim.crash_after(cut);
-            let acknowledged = s.maintain(task, MaintenanceBudget::default()).is_ok();
+            let acknowledged = s.maintain(task, budget).is_ok();
             assert_eq!(
                 acknowledged,
                 cut == total,
@@ -1215,6 +1331,29 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
                         );
                         assert_eq!(got, before, "{label}: visible before its record");
                     }
+                    // Further full steps finish the work, through the same checks.
+                    let mut steps = 0;
+                    while !recovered.maintain(task, FULL).unwrap().complete {
+                        steps += 1;
+                        assert!(steps < 8, "{label}: the work never completed");
+                    }
+                    // Once complete, there is nothing left to move or reclaim.
+                    let idle = recovered.maintain(task, FULL).unwrap();
+                    assert_eq!(
+                        (
+                            idle.content_bytes_moved,
+                            idle.pages_moved,
+                            idle.content_bytes_reclaimed
+                        ),
+                        (0, 0, 0),
+                        "{label}: work remained after a step reported itself complete"
+                    );
+                    audit(&img);
+                    assert_eq!(
+                        logical(&recovered),
+                        after,
+                        "{label}: finishing changed state"
+                    );
                     // The recovered store keeps working: commit, audit, reopen.
                     commit(
                         &recovered,
