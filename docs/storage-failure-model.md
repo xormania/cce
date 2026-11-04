@@ -113,6 +113,9 @@ faults-during-recovery sweep), its crash image (durable bytes, and the bytes sti
 process exit), the operation trace and a label naming the cut and the survival choice (which of the
 sampled subsets, or process exit) are written to a new directory under the system temporary
 directory, named in the failure message. Passing runs write nothing there.
+To re-open a saved case, copy `image.meta.cce.durable` and `image.content.cce.durable` (or the
+`.cached` files, for the state a fresh process would see after a process exit) to `meta.cce` and
+`content.cce` in an empty directory, create an empty `LOCK` file there, and open that directory.
 
 The tests do **not** explore:
 
