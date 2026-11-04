@@ -47,7 +47,7 @@ const MAX_OPS: usize = 80;
 
 const STORE: StoreId = StoreId(*b"model-test-store");
 /// Context identities; "a" and "ab" share a prefix on purpose.
-const CONTEXTS: [&str; 6] = ["a", "ab", "b", "c", "d", "e"];
+const CONTEXTS: [&str; 10] = ["a", "ab", "b", "c", "d", "e", "f", "g", "h", "i"];
 const KINDS: [&str; 3] = ["k", "kk", "x"];
 const RELATIONSHIPS: usize = 8;
 const MAX_HELD: usize = 3;
@@ -66,6 +66,14 @@ fn rel_id(i: u8) -> RelationshipId {
 
 fn kind(i: u8) -> RelationshipKind {
     RelationshipKind::new(KINDS[i as usize % KINDS.len()].as_bytes().to_vec()).unwrap()
+}
+
+/// The content a put binds: freshly staged bytes, or the same staging handle as another binding of
+/// the request (the `n`-th fresh one, which may come before or after it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContentPick {
+    Fresh(ContentSpec),
+    SameStaging(u8),
 }
 
 /// Content bytes for a generated content choice: mostly small, sometimes several KiB, rarely
@@ -113,7 +121,7 @@ enum ChangeSpec {
         ctx: u8,
         expect: ExpectSpec,
         body: u8,
-        content: Option<ContentSpec>,
+        content: Option<ContentPick>,
     },
     RemoveContext {
         ctx: u8,
@@ -277,11 +285,25 @@ struct Request {
     attempt: AttemptId,
     changes: Vec<Change>,
     contents: Vec<Arc<Vec<u8>>>,
+    /// Per binding: `Some(i)` binds the same staging handle as binding `i` (missing: none).
+    aliases: Vec<Option<usize>>,
     evidence: Vec<Evidence>,
     removal: RemovalMode,
 }
 
 impl Request {
+    fn alias(&self, j: usize) -> Option<usize> {
+        self.aliases.get(j).copied().flatten()
+    }
+
+    /// The bytes of each distinct staging the request binds, in binding order.
+    fn stagings(&self) -> Vec<Arc<Vec<u8>>> {
+        (0..self.contents.len())
+            .filter(|j| self.alias(*j).is_none())
+            .map(|j| self.contents[j].clone())
+            .collect()
+    }
+
     fn refs(&self) -> Vec<ContentRef> {
         self.contents.iter().map(|b| content_ref(b)).collect()
     }
@@ -464,7 +486,23 @@ impl Model {
     }
 
     fn resolve(&mut self, spec: &RequestSpec) -> Request {
+        // Fresh stagings in change order; a same-staging pick names one of them.
+        let fresh: Vec<ContentSpec> = spec
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                ChangeSpec::PutContext {
+                    content: Some(ContentPick::Fresh(s)),
+                    ..
+                } => Some(*s),
+                _ => None,
+            })
+            .collect();
         let mut contents = Vec::new();
+        let mut aliases: Vec<Option<usize>> = Vec::new();
+        let mut fresh_at: Vec<Option<usize>> = vec![None; fresh.len()];
+        let mut pending: Vec<(usize, usize)> = Vec::new();
+        let mut next_fresh = 0;
         let changes = spec
             .changes
             .iter()
@@ -479,10 +517,32 @@ impl Model {
                     let cur = self.state.contexts.get(&id).map(|r| r.revision);
                     Change::PutContext {
                         expect: self.resolve_expect(*expect, cur),
-                        body: format!("body {body} of {id:?}").into_bytes(),
-                        content: content.map(|s| {
-                            contents.push(Arc::new(s.bytes()));
-                            contents.len() - 1
+                        body: body_bytes(*body, &id),
+                        content: content.map(|pick| {
+                            let j = contents.len();
+                            match pick {
+                                ContentPick::SameStaging(k) if !fresh.is_empty() => {
+                                    let k = k as usize % fresh.len();
+                                    contents.push(Arc::new(fresh[k].bytes()));
+                                    aliases.push(None);
+                                    pending.push((j, k));
+                                }
+                                ContentPick::SameStaging(k) => {
+                                    let s = ContentSpec {
+                                        seed: k % 12,
+                                        size: 0,
+                                    };
+                                    contents.push(Arc::new(s.bytes()));
+                                    aliases.push(None);
+                                }
+                                ContentPick::Fresh(s) => {
+                                    contents.push(Arc::new(s.bytes()));
+                                    aliases.push(None);
+                                    fresh_at[next_fresh] = Some(j);
+                                    next_fresh += 1;
+                                }
+                            }
+                            j
                         }),
                         id,
                     }
@@ -522,10 +582,14 @@ impl Model {
                 }
             })
             .collect();
+        for (j, k) in pending {
+            aliases[j] = fresh_at[k];
+        }
         Request {
             attempt: self.fresh_attempt(),
             changes,
             contents,
+            aliases,
             evidence: spec
                 .evidence
                 .iter()
@@ -751,11 +815,11 @@ impl Model {
             Expected::Committed(_) => self.apply_commit(&request, written),
             Expected::Failed(_) => {
                 self.uncommitted.insert(request.attempt.clone());
-                self.staged.extend(request.contents.iter().cloned());
+                self.staged.extend(request.stagings());
             }
         }
         if matches!(expected, Expected::Committed(_)) {
-            self.refused += request.contents.len();
+            self.refused += request.stagings().len();
         }
         self.action = Action::Commit {
             reads,
@@ -778,6 +842,26 @@ fn expect_spec() -> impl Strategy<Value = ExpectSpec> {
     ]
 }
 
+/// A record body: mostly short, sometimes large enough that a few records fill a page, so leaves
+/// split and removals shrink a leaf next to a large sibling (the tree's merge paths).
+fn body_bytes(body: u8, id: &ContextId) -> Vec<u8> {
+    let mut b = format!("body {body} of {id:?}").into_bytes();
+    let pad = match body % 4 {
+        3 => 1650,
+        2 => 700,
+        _ => 0,
+    };
+    b.resize(b.len() + pad, b'.');
+    b
+}
+
+fn content_pick() -> impl Strategy<Value = ContentPick> {
+    prop_oneof![
+        4 => content_spec().prop_map(ContentPick::Fresh),
+        1 => any::<u8>().prop_map(ContentPick::SameStaging),
+    ]
+}
+
 fn content_spec() -> impl Strategy<Value = ContentSpec> {
     (0u8..12, any::<u8>()).prop_map(|(seed, size)| ContentSpec { seed, size })
 }
@@ -787,13 +871,83 @@ fn change_spec() -> impl Strategy<Value = ChangeSpec> {
     let r = RELATIONSHIPS as u8;
     let k = KINDS.len() as u8;
     prop_oneof![
-        5 => (0..n, expect_spec(), any::<u8>(), proptest::option::weighted(0.4, content_spec()))
+        5 => (0..n, expect_spec(), any::<u8>(), proptest::option::weighted(0.4, content_pick()))
             .prop_map(|(ctx, expect, body, content)| ChangeSpec::PutContext { ctx, expect, body, content }),
-        1 => (0..n, expect_spec()).prop_map(|(ctx, expect)| ChangeSpec::RemoveContext { ctx, expect }),
+        2 => (0..n, expect_spec()).prop_map(|(ctx, expect)| ChangeSpec::RemoveContext { ctx, expect }),
         4 => (0..r, expect_spec(), 0..k, 0..n, 0..n)
             .prop_map(|(rel, expect, kind, source, target)| ChangeSpec::PutRelationship { rel, expect, kind, source, target }),
         2 => (0..r, expect_spec()).prop_map(|(rel, expect)| ChangeSpec::RemoveRelationship { rel, expect }),
     ]
+}
+
+/// Which transitions the generator draws: the mixed workload, or one that reshapes the tree.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    Mixed,
+    /// Batches of puts with tiny or page-filling bodies and frequent removals: leaves fill, split
+    /// and empty again, so a removal often shrinks a leaf next to a sibling too large to merge
+    /// with (the tree's merge paths), between plain reads and reopens.
+    TreeShapes,
+}
+
+thread_local! {
+    // Set by the test that runs the generator; transitions are drawn on that thread.
+    static PROFILE: std::cell::Cell<Profile> = const { std::cell::Cell::new(Profile::Mixed) };
+}
+
+/// One reshaping request against the current state: distinct contexts (a repeated one would
+/// reject the request), removals only of present ones, puts large, medium or tiny (`body_bytes`:
+/// a body choice ending in 3, 2 or 0), sometimes one relationship change.
+fn shape_request_spec(m: &Model) -> BoxedStrategy<RequestSpec> {
+    let present: BTreeSet<u8> = (0..CONTEXTS.len() as u8)
+        .filter(|i| m.state.contexts.contains_key(&ctx_id(*i)))
+        .collect();
+    let all: Vec<u8> = (0..CONTEXTS.len() as u8).collect();
+    (
+        proptest::sample::subsequence(all, 1..5),
+        proptest::collection::vec((any::<u8>(), 0u8..10, any::<bool>()), 5),
+        proptest::option::weighted(0.2, change_spec()),
+    )
+        .prop_map(move |(ctxs, picks, extra)| {
+            let mut changes: Vec<ChangeSpec> = ctxs
+                .iter()
+                .zip(picks)
+                .map(|(&ctx, (b, size, remove))| {
+                    if remove && present.contains(&ctx) {
+                        ChangeSpec::RemoveContext {
+                            ctx,
+                            expect: ExpectSpec::Any,
+                        }
+                    } else {
+                        ChangeSpec::PutContext {
+                            ctx,
+                            expect: ExpectSpec::Any,
+                            // Large half the time, medium or tiny otherwise.
+                            body: (b & !3)
+                                | match size {
+                                    0..=4 => 3,
+                                    5..=7 => 2,
+                                    _ => 0,
+                                },
+                            content: None,
+                        }
+                    }
+                })
+                .collect();
+            changes.extend(extra.filter(|c| {
+                matches!(
+                    c,
+                    ChangeSpec::PutRelationship { .. } | ChangeSpec::RemoveRelationship { .. }
+                )
+            }));
+            RequestSpec {
+                changes,
+                evidence: Vec::new(),
+                quiesce: false,
+                reads: Vec::new(),
+            }
+        })
+        .boxed()
 }
 
 fn read_spec() -> impl Strategy<Value = ReadSpec> {
@@ -830,7 +984,19 @@ impl ReferenceStateMachine for ModelMachine {
         Just(Model::default()).boxed()
     }
 
-    fn transitions(_: &Model) -> BoxedStrategy<Op> {
+    fn transitions(m: &Model) -> BoxedStrategy<Op> {
+        if PROFILE.with(|p| p.get()) == Profile::TreeShapes {
+            return prop_oneof![
+                10 => shape_request_spec(m).prop_map(Op::Commit),
+                2 => (any::<u8>(), shape_request_spec(m))
+                    .prop_map(|(slot, request)| Op::CommitFromHeld { slot, request }),
+                2 => proptest::collection::vec(read_spec(), 1..3).prop_map(Op::Hold),
+                1 => any::<u8>().prop_map(Op::Release),
+                1 => Just(Op::Check),
+                1 => Just(Op::Reopen),
+            ]
+            .boxed();
+        }
         prop_oneof![
             12 => request_spec().prop_map(Op::Commit),
             5 => (any::<u8>(), request_spec()).prop_map(|(slot, request)| Op::CommitFromHeld { slot, request }),
@@ -1078,10 +1244,21 @@ impl Engine {
     }
 
     fn change_set(&self, req: &Request) -> (ChangeSet, Vec<StagedContent>) {
-        let staged: Vec<StagedContent> = req.contents.iter().map(|b| self.stage(b)).collect();
+        // One handle per distinct staging; an aliased binding binds its target's handle again.
+        let mut handle_of = vec![usize::MAX; req.contents.len()];
+        let mut staged: Vec<StagedContent> = Vec::new();
+        for (j, b) in req.contents.iter().enumerate() {
+            if req.alias(j).is_none() {
+                handle_of[j] = staged.len();
+                staged.push(self.stage(b));
+            }
+        }
+        let content = (0..req.contents.len())
+            .map(|j| ContentBinding::from(&staged[handle_of[req.alias(j).unwrap_or(j)]]))
+            .collect();
         let cs = ChangeSet {
             changes: req.changes.clone(),
-            content: staged.iter().map(ContentBinding::from).collect(),
+            content,
             evidence: req.evidence.clone(),
             removal: req.removal,
         };
@@ -1449,6 +1626,7 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                 e.store = Some(open(&e.backend));
             }
         }
+        audit(&e, &format!("step {}", op_name(&op)));
         e
     }
 
@@ -1486,6 +1664,11 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 
 /// Runs one budget of generated sequences and prints its report.
 fn run_model<const FILES: bool>(backend: &str, cases: u32, seed: u64) {
+    run_profile::<FILES>(backend, Profile::Mixed, cases, seed)
+}
+
+fn run_profile<const FILES: bool>(backend: &str, profile: Profile, cases: u32, seed: u64) {
+    PROFILE.with(|p| p.set(profile));
     let config = Config {
         cases,
         rng_seed: RngSeed::Fixed(seed),
@@ -1514,6 +1697,10 @@ fn run_model<const FILES: bool>(backend: &str, cases: u32, seed: u64) {
     let (sequences, ops) = *attempted.lock().unwrap();
     let report = serde_json::json!({
         "backend": backend,
+        "profile": match profile {
+            Profile::Mixed => "mixed",
+            Profile::TreeShapes => "tree shapes",
+        },
         "seed": format!("{seed:#x}"),
         "cases": cases,
         "operations_per_sequence": [MIN_OPS, MAX_OPS],
@@ -1523,6 +1710,7 @@ fn run_model<const FILES: bool>(backend: &str, cases: u32, seed: u64) {
         "passed": result.is_ok(),
         "observed": STATS.with(|s| s.borrow().clone()),
     });
+    PROFILE.with(|p| p.set(Profile::Mixed));
     println!("model report: {report}");
     if let Err(e) = result {
         panic!("{e}");
@@ -1534,6 +1722,18 @@ fn generated_operation_sequences_match_the_logical_model() {
     run_model::<false>(
         "simulator",
         env_or("CCE_MODEL_CASES", ROUTINE_CASES),
+        env_or("CCE_MODEL_SEED", ROUTINE_SEED),
+    );
+}
+
+/// Routine tier of the tree-reshaping profile; the retirement audit after every step is what
+/// catches space retired while still reachable.
+#[test]
+fn generated_tree_reshaping_sequences_match_the_logical_model() {
+    run_profile::<false>(
+        "simulator",
+        Profile::TreeShapes,
+        env_or("CCE_MODEL_SHAPE_CASES", ROUTINE_CASES),
         env_or("CCE_MODEL_SEED", ROUTINE_SEED),
     );
 }
@@ -1588,6 +1788,21 @@ fn sim_engine(sim: SimIo, store: NativeStore) -> Engine {
     }
 }
 
+/// The retirement audit on the simulator's image: no retired page or content extent is reachable
+/// from the published state, and the newest commit retired exactly what it stopped reaching.
+/// Reads only, so it never changes the operation counts replays compare. (A real-files store holds
+/// its lock, so the audit runs on the simulator.)
+fn audit(e: &Engine, after: &str) {
+    if let Backend::Sim(sim, _) = &e.backend {
+        count("retirement audits");
+        assert_eq!(
+            crate::audit::check_retirement(sim),
+            Ok(()),
+            "retirement audit after {after}"
+        );
+    }
+}
+
 fn sim_of(e: &Engine) -> &SimIo {
     match &e.backend {
         Backend::Sim(sim, _) => sim,
@@ -1630,13 +1845,28 @@ fn submit_tolerant(
         Some(b) => b,
         None => store.begin().ok()?,
     };
-    let fresh = request.contents.len() - usize::from(prestaged.is_some());
-    let mut bindings = Vec::new();
-    for b in &request.contents[..fresh] {
-        let s = store.stage_content(&mut &b[..]).ok()?;
-        bindings.push(ContentBinding::from(&s));
+    // One handle per distinct staging (the last one may be prestaged); aliases bind it again.
+    let n = request.contents.len();
+    let mut prestaged = prestaged;
+    let mut handles: Vec<Option<StagedContent>> = (0..n).map(|_| None).collect();
+    for (j, slot) in handles.iter_mut().enumerate() {
+        if request.alias(j).is_some() {
+            continue;
+        }
+        *slot = Some(match (j + 1 == n, prestaged.take()) {
+            (true, Some(h)) => h,
+            (_, other) => {
+                prestaged = other;
+                store.stage_content(&mut &request.contents[j][..]).ok()?
+            }
+        });
     }
-    bindings.extend(prestaged.as_ref().map(ContentBinding::from));
+    let bindings = (0..n)
+        .map(|j| {
+            let h = handles[request.alias(j).unwrap_or(j)].as_ref();
+            ContentBinding::from(h.expect("an alias names a staged binding"))
+        })
+        .collect();
     let cs = ChangeSet {
         changes: request.changes.clone(),
         content: bindings,
@@ -1772,6 +2002,7 @@ fn check_recovery(img: SimIo, allowed: &Allowed) {
         "recovered without the step"
     });
     main_check(&e, &m.snapshot());
+    audit(&e, "recovery");
     let Some(req) = &allowed.request else {
         return;
     };
@@ -2225,12 +2456,16 @@ fn fail_at(
                     content: Some(0),
                 }],
                 contents: vec![bytes],
+                aliases: Vec::new(),
                 evidence: Vec::new(),
                 removal: RemovalMode::PreserveViews,
             };
             if let Some(got) = submit_tolerant(&mut e, None, &probe, Some(handle)) {
                 count("probe of content staged before the failure");
                 live_result(&mut allowed, &probe, &got, &live);
+                if got.is_ok() {
+                    audit(&e, "the probe commit after the failure");
+                }
             }
         }
         let mut m = after.clone();
@@ -2243,6 +2478,9 @@ fn fail_at(
             };
             if let Some(got) = submit_tolerant(&mut e, None, &req, None) {
                 live_result(&mut allowed, &req, &got, &live);
+                if got.is_ok() {
+                    audit(&e, "a live commit after the failure");
+                }
             }
             steps += 1;
             if steps == LIVE_STEPS {
