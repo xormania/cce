@@ -240,7 +240,10 @@ The structure level checks, for the current publication record:
   points at an entry.
 
 It reads the history entries but no content bytes, and holds every record for the cross-checks, so
-its memory grows with the metadata. It does not check whether a relationship's endpoints exist.
+its memory grows with the metadata. A relationship whose source or target context is absent, never
+created or since removed, is valid and not a finding: storage enforces no referential integrity and
+removes no relationship when a context goes, only the caller's preconditions and the consistency of
+relationship records with both indexes.
 
 The scrub level (`VerifyLevel::Scrub`, `--scrub`) also reads every committed content stream: each
 manifest record's manifest must describe the content its key names, every segment must match its

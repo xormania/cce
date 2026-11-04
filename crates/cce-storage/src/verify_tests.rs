@@ -6,8 +6,8 @@
 use std::collections::BTreeSet;
 
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, ContentBinding, ContextId, Evidence, Precondition,
-    RelationshipId, RelationshipKind, StorageEngine, StorageError,
+    AttemptId, Change, ChangeSet, ContentBinding, ContextId, Direction, Evidence, Precondition,
+    ReadView, RelationshipId, RelationshipKind, RelationshipQuery, StorageEngine, StorageError,
 };
 
 use crate::engine::{Inner, Options, context_key};
@@ -256,6 +256,73 @@ fn a_consistent_store_has_no_findings_and_is_not_changed() {
         "{\"type\":\"result\",\"consistent\":true,\"findings\":0}"
     );
     assert_eq!(verify(&sim).json_lines(), lines, "output is deterministic");
+}
+
+#[test]
+fn relationships_with_absent_endpoints_are_not_findings() {
+    let sim = SimIo::new();
+    let s = NativeStore {
+        inner: Inner::create(Box::new(sim.clone()), STORE, Options::default()).unwrap(),
+    };
+    // Endpoints that never existed, one that exists, and one removed after the relationship
+    // was committed: storage enforces no referential integrity and cascades nothing.
+    commit(
+        &s,
+        "one",
+        ChangeSet {
+            changes: vec![
+                put("A", None),
+                put("B", None),
+                rel("r-ghosts", "ghost-a", "ghost-b"),
+                rel("r-half", "A", "ghost-c"),
+                rel("r-removed", "B", "A"),
+            ],
+            ..ChangeSet::default()
+        },
+    );
+    commit(
+        &s,
+        "two",
+        ChangeSet {
+            changes: vec![Change::RemoveContext {
+                id: cid("A"),
+                expect: Precondition::Any,
+            }],
+            ..ChangeSet::default()
+        },
+    );
+    // The relationships remain, listed from either endpoint, present or not.
+    let mut v = s.begin().unwrap();
+    for (from, direction, id) in [
+        ("ghost-a", Direction::Outgoing, "r-ghosts"),
+        ("ghost-b", Direction::Incoming, "r-ghosts"),
+        ("ghost-c", Direction::Incoming, "r-half"),
+        ("A", Direction::Incoming, "r-removed"),
+    ] {
+        let listed: Vec<_> = v
+            .relationships(&RelationshipQuery {
+                from: cid(from),
+                direction,
+                kind: None,
+                after: None,
+            })
+            .unwrap()
+            .map(|r| r.unwrap().id)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![RelationshipId::new(id.as_bytes().to_vec()).unwrap()],
+            "{from}"
+        );
+    }
+    drop(v);
+    drop(s);
+    sim.release();
+    for level in [VerifyLevel::Structure, VerifyLevel::Scrub] {
+        let r = verify_at(&sim, level);
+        assert!(r.findings.is_empty(), "{level:?}: {:?}", r.findings);
+        assert!(r.is_consistent());
+    }
 }
 
 #[test]
