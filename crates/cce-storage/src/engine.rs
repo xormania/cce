@@ -31,8 +31,8 @@ use crate::format::{
 use crate::io::{FileId, Io};
 use crate::records::{
     AttemptValue, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT, P_HISTORY,
-    P_IN, P_OUT, P_REL, RelValue, decode_history, encode_history, fingerprint, history_key, key,
-    retired_page_key,
+    P_IN, P_OUT, P_REL, P_RETIRED, RelValue, decode_history, decode_retired_page, encode_history,
+    fingerprint, history_key, key, retired_page_key,
 };
 use crate::tree::{self, Cursor, Node, NodeSink, NodeSource, TreeTxn};
 
@@ -147,6 +147,10 @@ pub(crate) struct Inner {
     /// Makes the next commit panic inside the worker (tests of worker robustness only).
     #[cfg(test)]
     panic_next_commit: std::sync::atomic::AtomicBool,
+    /// Runs once inside a commit, after it fixed which retired pages it may reuse and before it
+    /// takes any (tests forcing reader registration against that decision).
+    #[cfg(test)]
+    reuse_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Makes the worker pause after answering each job (tests of shutdown ordering only).
     #[cfg(test)]
     slow_job_release: std::sync::atomic::AtomicBool,
@@ -253,23 +257,30 @@ fn rejected(e: StorageError) -> CommitError {
     CommitError::Rejected(e)
 }
 
-/// Writes new tree nodes at fresh pages for one generation.
+/// Writes new tree nodes for one generation: first into retired pages the commit took for reuse,
+/// then at fresh pages.
 struct PageWriter<'a> {
     inner: &'a Inner,
     next_page: u64,
     generation: u64,
+    reuse: Vec<u64>,
 }
 
 impl NodeSink for PageWriter<'_> {
     fn write(&mut self, node: &Node) -> Result<PageRef, StorageError> {
+        let (page, next) = match self.reuse.pop() {
+            Some(page) => (page, self.next_page),
+            None => (
+                self.next_page,
+                self.next_page
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::InvalidRequest("page counter exhausted".into()))?,
+            ),
+        };
         let at = PageRef {
-            page: self.next_page,
+            page,
             incarnation: self.generation,
         };
-        let next = self
-            .next_page
-            .checked_add(1)
-            .ok_or_else(|| StorageError::InvalidRequest("page counter exhausted".into()))?;
         let offset = at
             .page
             .checked_mul(PAGE_SIZE as u64)
@@ -438,6 +449,8 @@ impl Inner {
             #[cfg(test)]
             panic_next_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            reuse_hook: Mutex::new(None),
+            #[cfg(test)]
             slow_job_release: std::sync::atomic::AtomicBool::new(false),
             conflicts: Mutex::new(ConflictLog {
                 floor: desc.history_pos,
@@ -467,6 +480,16 @@ impl Inner {
     #[cfg(test)]
     pub(crate) fn pause_worker_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
         lock(&self.gate)
+    }
+
+    /// Test hook: installs (or with `None` removes) the callback a commit runs once after fixing
+    /// which retired pages it may reuse. Returns the callback it replaced.
+    #[cfg(test)]
+    pub(crate) fn set_reuse_hook_for_test(
+        &self,
+        hook: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        std::mem::replace(&mut *lock(&self.reuse_hook), hook)
     }
 
     /// Starts the store's commit worker: the single thread that orders publications. The worker
@@ -934,13 +957,36 @@ impl Inner {
                 "generation counter exhausted".into(),
             )));
         };
-        retire_replaced_pages(&mut txn, generation).map_err(rejected)?;
+        // Retired pages this commit may reuse: none that either publication slot can still reach
+        // while this commit is unpublished (retired at most two generations before it), and none
+        // a live reader's generation can reach (retired no later than the oldest pinned one). A
+        // reader registering from now on pins the current generation, which reaches none of them.
+        let oldest_pin = lock(&self.pins).keys().next().copied();
+        let reusable_through = generation
+            .checked_sub(2)
+            .map(|g| oldest_pin.map_or(g, |p| g.min(p)));
+        #[cfg(test)]
+        {
+            let hook = lock(&self.reuse_hook).take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let reuse = settle_allocation(&mut txn, self, &cur, generation, reusable_through)
+            .map_err(rejected)?;
         let mut sink = PageWriter {
             inner: self,
             next_page: cur.next_page,
             generation,
+            reuse,
         };
         let root = txn.finish(&mut sink).map_err(rejected)?;
+        if !sink.reuse.is_empty() {
+            return Err(rejected(StorageError::InvalidRequest(format!(
+                "{} pages taken for reuse were not written",
+                sink.reuse.len()
+            ))));
+        }
         let next_page = sink.next_page;
 
         // Data barrier: every byte the new generation references must be durable first. Capture
@@ -1308,30 +1354,94 @@ impl ConflictLog {
     }
 }
 
-/// Upper bound on rounds of recording retirements: each round's records can only touch pages
-/// already being rewritten or split from them, so the set of replaced pages stops growing quickly.
-const RETIREMENT_ROUNDS: usize = 8;
+/// A retirement record taken from the committed tree: key, value and the retired page.
+type RetiredRecord = (Vec<u8>, Vec<u8>, u64);
 
-/// Records, in the transaction itself, every committed page it replaces as retired at
-/// `generation`. Recording a retirement edits the tree and can replace further committed pages, so
-/// this repeats until no new page is replaced; the records then account for their own pages.
-fn retire_replaced_pages(txn: &mut TreeTxn, generation: u64) -> Result<(), StorageError> {
-    let mut recorded = 0;
-    for _ in 0..RETIREMENT_ROUNDS {
-        let fresh: Vec<PageRef> = txn.replaced()[recorded..].to_vec();
-        if fresh.is_empty() {
-            return Ok(());
+/// Upper bound on rounds of settling a commit's page allocation. Each round's edits touch pages
+/// already being rewritten (or split from them), so replaced pages and page demand stop changing
+/// within a few rounds; a commit that does not settle is rejected.
+const ALLOCATION_ROUNDS: usize = 16;
+
+/// Records every committed page the transaction replaces as retired at `generation` and takes,
+/// for the pages the transaction will write, retired pages recorded no later than
+/// `reusable_through` (deleting their records). Recording, consuming and returning records all
+/// edit the tree, which can replace further pages and change how many pages it needs, so this
+/// repeats until a round changes nothing. Returns the pages to write first.
+fn settle_allocation(
+    txn: &mut TreeTxn,
+    src: &dyn NodeSource,
+    cur: &Descriptor,
+    generation: u64,
+    reusable_through: Option<u64>,
+) -> Result<Vec<u64>, StorageError> {
+    // Candidates in record order (oldest retirement first), from the committed tree.
+    let mut candidates = match reusable_through {
+        Some(_) => Some(Cursor::new(
+            src,
+            cur.root,
+            &[P_RETIRED],
+            None,
+            cur.next_page,
+        )?),
+        None => None,
+    };
+    let next_candidate = |c: &mut Option<Cursor>| -> Result<Option<RetiredRecord>, StorageError> {
+        let Some(cursor) = c else { return Ok(None) };
+        match cursor.next_entry()? {
+            Some((k, v)) => {
+                let (retired_at, page, _) = decode_retired_page(&k, &v)?;
+                if reusable_through.is_some_and(|b| retired_at <= b) {
+                    Ok(Some((k, v, page)))
+                } else {
+                    *c = None;
+                    Ok(None)
+                }
+            }
+            None => {
+                *c = None;
+                Ok(None)
+            }
         }
+    };
+    let mut taken: Vec<RetiredRecord> = Vec::new();
+    let mut returned: Vec<RetiredRecord> = Vec::new();
+    let mut recorded = 0;
+    for _ in 0..ALLOCATION_ROUNDS {
+        let mut changed = false;
+        let fresh: Vec<PageRef> = txn.replaced()[recorded..].to_vec();
         recorded += fresh.len();
         for p in fresh {
+            changed = true;
             txn.put(
                 retired_page_key(generation, p.page),
                 p.incarnation.to_le_bytes().to_vec(),
             )?;
         }
+        let need = txn.dirty_pages();
+        while taken.len() < need {
+            let next = match returned.pop() {
+                Some(x) => Some(x),
+                None => next_candidate(&mut candidates)?,
+            };
+            let Some((k, v, page)) = next else { break };
+            txn.delete(&k)?;
+            taken.push((k, v, page));
+            changed = true;
+        }
+        while taken.len() > need {
+            let Some((k, v, page)) = taken.pop() else {
+                break;
+            };
+            txn.put(k.clone(), v.clone())?;
+            returned.push((k, v, page));
+            changed = true;
+        }
+        if !changed {
+            return Ok(taken.into_iter().map(|(_, _, page)| page).collect());
+        }
     }
     Err(StorageError::InvalidRequest(format!(
-        "retirement records did not settle within {RETIREMENT_ROUNDS} rounds"
+        "page allocation did not settle within {ALLOCATION_ROUNDS} rounds"
     )))
 }
 

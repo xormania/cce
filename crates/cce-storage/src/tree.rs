@@ -635,6 +635,24 @@ impl<'a> TreeTxn<'a> {
     }
 
     /// Keys put or deleted by this transaction.
+    /// Pages `finish` will write: the changed nodes reachable from the root.
+    pub fn dirty_pages(&self) -> usize {
+        fn count(arena: &[Work], c: Child) -> usize {
+            match c {
+                Child::Clean(_) => 0,
+                Child::Dirty(i) => {
+                    1 + match &arena[i] {
+                        Work::Leaf(_) => 0,
+                        Work::Branch { children, .. } => {
+                            children.iter().map(|&ch| count(arena, ch)).sum()
+                        }
+                    }
+                }
+            }
+        }
+        count(&self.arena, self.root)
+    }
+
     /// Committed pages replaced so far (see `replaced`).
     pub fn replaced(&self) -> &[PageRef] {
         &self.replaced

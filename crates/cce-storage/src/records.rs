@@ -56,9 +56,7 @@ pub(crate) fn retired_page_key(generation: u64, page: u64) -> Vec<u8> {
     k
 }
 
-/// Parses a retired-page record: `(retiring generation, page, incarnation)`. Only the audit reads
-/// retirement records so far.
-#[cfg(test)]
+/// Parses a retired-page record: `(retiring generation, page, incarnation)`.
 pub(crate) fn decode_retired_page(
     key: &[u8],
     value: &[u8],

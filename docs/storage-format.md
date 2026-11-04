@@ -128,14 +128,25 @@ original receipt; any difference is rejected as a mismatch.
 
 ## Allocation
 
-Tree pages and content extents are allocated by advancing cursors (`next unallocated page`, the
-content length). Nothing is reused or freed yet. Content staged but not committed lies beyond the
-committed content length and is ignored, and later overwritten, after a restart.
+Content extents are allocated by advancing the content length; content space is not reused yet.
+Content staged but not committed lies beyond the committed content length and is ignored, and later
+overwritten, after a restart.
+
+Tree pages are allocated from retired pages first, then by advancing the next unallocated page. A
+commit producing generation `n` may reuse a page retired at generation `r` only if `r <= n - 2` and
+no live view or content reader pins a generation older than `r`. The first condition keeps the page
+unreachable from both publication slots while the commit is unpublished, so recovery, including a
+fall back to the previous record, never follows a reference into a reused page. The second keeps it
+unreachable from every live reader. A reused page is written with the new generation as its
+incarnation; pages and cached nodes are identified by page and incarnation, so a stale reference
+fails its check instead of reading the new contents. Reusing a page deletes its retirement record
+in the same commit.
 
 Each commit records, in the tree it publishes, every tree page it stopped referencing: the pages it
 copied in order to change them, under prefix `08` with the new generation as the retiring
-generation. Recording those entries changes the tree in turn, so the commit repeats until no
-further committed page is replaced (at most eight rounds, otherwise the commit is rejected). The
+generation. Recording, consuming and returning those records change the tree in turn, which can
+replace further pages and change how many pages the commit writes, so the commit repeats until a
+round changes nothing (at most sixteen rounds, otherwise the commit is rejected). The
 records therefore cover their own pages, and every page below the next unallocated page is either
 reachable from the published root or recorded as retired. The records are part of the published
 state, so recovery always finds the retirement records that match the state it selects.

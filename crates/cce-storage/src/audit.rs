@@ -34,6 +34,8 @@ pub(crate) fn published(io: &dyn Io) -> Result<Vec<Descriptor>, StorageError> {
 pub(crate) struct Reach {
     /// Metadata pages of the tree.
     pub pages: BTreeSet<u64>,
+    /// Incarnation (writing generation) of each reached page.
+    pub incarnations: BTreeMap<u64, u64>,
     /// Content manifests `(offset, len)`, one per committed digest.
     pub manifests: BTreeSet<(u64, u64)>,
     /// Content segments `(offset, len)` named by content manifests.
@@ -88,6 +90,7 @@ pub(crate) fn reach(io: &dyn Io, d: &Descriptor) -> Result<Reach, StorageError> 
     let mut r = Reach::default();
     let mut stack: Vec<PageRef> = vec![d.root];
     while let Some(at) = stack.pop() {
+        r.incarnations.insert(at.page, at.incarnation);
         if !r.pages.insert(at.page) {
             return Err(corrupt(format!(
                 "generation {}: page {} reached twice",
@@ -186,11 +189,41 @@ pub(crate) fn check_retirement(io: &dyn Io) -> Result<(), String> {
             .filter(|(_, (g, _))| *g != cur.generation)
             .map(|(p, v)| (*p, *v))
             .collect();
-        if carried != rp.retired {
+        // Earlier records either carry over unchanged or were consumed by reusing their page.
+        if carried.iter().any(|(p, v)| rp.retired.get(p) != Some(v)) {
             return Err(format!(
-                "generation {}: earlier retirements changed",
+                "generation {}: an earlier retirement record changed or appeared",
                 cur.generation
             ));
+        }
+        let consumed: BTreeMap<u64, (u64, u64)> = rp
+            .retired
+            .iter()
+            .filter(|(p, _)| !carried.contains_key(p))
+            .map(|(p, v)| (*p, *v))
+            .collect();
+        // Pages the newest commit wrote below the previous allocation cursor are reused pages.
+        let reused: BTreeSet<u64> = rc
+            .incarnations
+            .iter()
+            .filter(|(p, inc)| **inc == cur.generation && **p < prev.next_page)
+            .map(|(p, _)| *p)
+            .collect();
+        let consumed_pages: BTreeSet<u64> = consumed.keys().copied().collect();
+        if consumed_pages != reused {
+            return Err(format!(
+                "generation {}: consumed records {consumed_pages:?}, but reused pages {reused:?}",
+                cur.generation
+            ));
+        }
+        for (page, (retired_at, _)) in &consumed {
+            if cur.generation < retired_at + 2 {
+                return Err(format!(
+                    "generation {}: reused page {page} retired at {retired_at}, which the fallback \
+                     publication record can still reach",
+                    cur.generation
+                ));
+            }
         }
     }
     Ok(())
