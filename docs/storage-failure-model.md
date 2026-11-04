@@ -239,5 +239,6 @@ length and is reused by later staging or after a restart.
 
 ## Not implemented yet
 
-Space reuse, removal modes, concurrent commit validation beyond preconditions,
-and recovery from an uncertain outcome without reopening.
+Space reuse, removal modes, and recovery from an uncertain outcome without reopening. (Concurrent
+commit validation against views' observations is implemented; see "Concurrent views and conflict
+validation" above.)
