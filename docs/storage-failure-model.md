@@ -250,6 +250,26 @@ store is closing), then waits until every admitted commit has resolved, so no co
 admitted commit takes: a commit blocked in I/O (for example a filesystem that never completes a
 sync) keeps `close` waiting with it.
 
+## Staging budget
+
+The total content length of a handle's outstanding stagings, those staged and neither committed nor
+discarded, is bounded by `StoreOptions::max_staged_bytes` (64 GiB by default; manifests are not
+counted). A staging that would take the total past it fails with `ResourceExhausted` and changes
+nothing: it is not registered, any retired space it took is returned, and bytes it already wrote
+are not kept (the next staging writes over them). A staging with a declared length is refused before
+its source is read; otherwise the check runs before each segment is written, against the
+outstanding total at that moment, so a commit or discard that finishes meanwhile counts. Reads,
+commits and discards are never refused by the budget, and lowering it never affects what is already
+staged or committed.
+
+A staging's share is released when a commit that binds it publishes, or when it is discarded. A
+commit rejected for a conflict keeps its stagings outstanding, so they can be committed later. The
+stagings of a commit whose publication is uncertain stay outstanding until the store is reopened;
+nothing else releases them. A handle dropped without commit or discard keeps its share for the life
+of the open store. A retry of a committed attempt needs no staging and is never refused by the
+budget; a host that restages the same bytes for a retry is refused, like any staging, until budget
+is released.
+
 ## Ownership
 
 One process owns a store at a time, through an exclusive lock on `LOCK` taken at open and held until

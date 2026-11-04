@@ -165,7 +165,9 @@ fingerprinted. History entries return the bound content references with the chan
 A store's limits (the encoded request limit and the segment quota) bound what an open writes, not
 what it reads: data written under larger limits reads back under smaller ones. The encoded request
 limit is 64 MiB by default and callers set it through `StoreOptions::max_request_len`; a request over
-it is refused whole and never split across history entries. Reads are bounded by the format itself.
+it is refused whole and never split across history entries. The staging budget
+(`StoreOptions::max_staged_bytes`) bounds the content outstanding in stagings at once, likewise only
+for new writes (see the failure model). Reads are bounded by the format itself.
 The format's hard limits are separate from these write limits and change only with the format
 version. When a history entry or content manifest is read, its recorded length is checked against
 the largest the format can hold (a `u32`-prefixed request; a `u32` segment count) and against the
