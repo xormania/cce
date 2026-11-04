@@ -262,7 +262,94 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
     for ev in &changes.evidence {
         e.bytes(&ev.label).bytes(&ev.bytes);
     }
+    debug_assert_eq!(e.buf.len() as u64, encoded_request_len(changes));
     e.buf
+}
+
+/// Exact length of `encode_request(changes)`, computed without encoding (checked in debug builds).
+pub(crate) fn encoded_request_len(changes: &ChangeSet) -> u64 {
+    let field = |len: usize| 4 + len as u64;
+    let expect = |p: &Precondition| match p {
+        Precondition::AtRevision(_) => 9,
+        Precondition::Any | Precondition::Absent => 1,
+    };
+    let mut n: u64 = 1 + 4;
+    for c in &changes.changes {
+        n += 1 + match c {
+            Change::PutContext {
+                id,
+                expect: p,
+                body,
+                content,
+            } => {
+                field(id.as_bytes().len())
+                    + expect(p)
+                    + field(body.len())
+                    + if content.is_some() { 9 } else { 1 }
+            }
+            Change::RemoveContext { id, expect: p } => field(id.as_bytes().len()) + expect(p),
+            Change::PutRelationship {
+                id,
+                expect: p,
+                kind,
+                source,
+                target,
+            } => {
+                field(id.as_bytes().len())
+                    + expect(p)
+                    + field(kind.as_bytes().len())
+                    + field(source.as_bytes().len())
+                    + field(target.as_bytes().len())
+            }
+            Change::RemoveRelationship { id, expect: p } => field(id.as_bytes().len()) + expect(p),
+        };
+    }
+    n += 4 + changes.content.len() as u64 * (32 + 8);
+    n += 4;
+    for ev in &changes.evidence {
+        n += field(ev.label.len()) + field(ev.bytes.len());
+    }
+    n
+}
+
+/// Checks that every variable-length field and list of a request fits the encoding's 32-bit length
+/// prefixes (`limit` is at most `u32::MAX`), so encoding never truncates a length or panics.
+pub(crate) fn check_request_bounds(
+    changes: &ChangeSet,
+    limit: u64,
+    total_limit: u64,
+) -> Result<(), StorageError> {
+    let limit = limit.min(u32::MAX as u64);
+    let total_limit = total_limit.min(u32::MAX as u64);
+    let check = |what: &str, len: usize| {
+        if len as u64 > limit {
+            Err(StorageError::InvalidRequest(format!(
+                "{what} of {len} exceeds the limit of {limit}"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    check("change list", changes.changes.len())?;
+    check("content binding list", changes.content.len())?;
+    check("evidence list", changes.evidence.len())?;
+    for c in &changes.changes {
+        if let Change::PutContext { body, .. } = c {
+            check("record body", body.len())?;
+        }
+    }
+    for ev in &changes.evidence {
+        check("evidence label", ev.label.len())?;
+        check("evidence bytes", ev.bytes.len())?;
+    }
+    // The history entry stores the whole encoded request as one length-prefixed field.
+    let total = encoded_request_len(changes);
+    if total > total_limit {
+        return Err(StorageError::InvalidRequest(format!(
+            "encoded request of {total} bytes exceeds the limit of {total_limit}"
+        )));
+    }
+    Ok(())
 }
 
 /// Fingerprint binding an attempt identity to its exact logical request.

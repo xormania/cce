@@ -119,7 +119,9 @@ fn driver_violations(source: &str) -> Vec<String> {
         if let Some(rest) = line.strip_prefix("use cce_storage::")
             && !matches!(
                 rest.trim_end_matches(';'),
-                "NativeStore" | "{NativeStore, StoreOptions}"
+                "NativeStore"
+                    | "{NativeStore, StoreOptions}"
+                    | "{NativeReadOnly, NativeStore, StoreOptions}"
             )
         {
             v.push(format!("driver imports storage internals: {line}"));

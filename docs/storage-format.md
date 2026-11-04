@@ -8,13 +8,13 @@ older stores without modifying them.
 
 | File | Contents |
 |---|---|
-| `meta.sdb` | Metadata pages: two publication slots, then tree nodes. |
-| `content.sdb` | Content bytes and retained history entries, addressed by offset. |
+| `meta.cce` | Metadata pages: two publication slots, then tree nodes. |
+| `content.cce` | Content bytes and retained history entries, addressed by offset. |
 | `LOCK` | Empty file used for the exclusive ownership lock (`flock`-style, held while open). |
 
 All integers are little-endian unless stated. Rust memory layout is never written directly.
 
-## Pages (`meta.sdb`)
+## Pages (`meta.cce`)
 
 Pages are 4096 bytes. Page `n` starts at byte `n * 4096`. Pages 0 and 1 are publication slots;
 tree nodes start at page 2.
@@ -87,12 +87,12 @@ tuple order of the raw components.
 | `06` | attempt id | history position `u64`, request fingerprint (32 bytes) |
 | `07` | content SHA-256 | extent of the content's manifest |
 
-An extent is `offset: u64, length: u64, sha256: [u8; 32]` into `content.sdb`.
+An extent is `offset: u64, length: u64, sha256: [u8; 32]` into `content.cce`.
 
 ## Content
 
 Content is stored as segments of at most 65536 bytes, each written to its own allocation in
-`content.sdb`, followed by a manifest:
+`content.cce`, followed by a manifest:
 
 | Field | Size |
 |---|---|

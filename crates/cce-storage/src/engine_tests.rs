@@ -658,7 +658,7 @@ fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
     struct StageAfterContentSync {
         sim: SimIo,
         store: Arc<OnceLock<Weak<Inner>>>,
-        fired: AtomicBool,
+        fired: Arc<AtomicBool>,
     }
     impl Io for StageAfterContentSync {
         fn create(&self) -> Result<(), StorageError> {
@@ -693,12 +693,13 @@ fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
 
     let sim = SimIo::new();
     let hook = Arc::new(OnceLock::new());
+    let fired = Arc::new(AtomicBool::new(false));
     let s = NativeStore {
         inner: Inner::create(
             Box::new(StageAfterContentSync {
                 sim: sim.clone(),
                 store: hook.clone(),
-                fired: AtomicBool::new(false),
+                fired: fired.clone(),
             }),
             StoreId([3; 16]),
             Default::default(),
@@ -712,6 +713,10 @@ fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
         changes(vec![put("A", Precondition::Absent, b"a", None)]),
     )
     .expect("commit acknowledged");
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "the staging after the content barrier did not happen"
+    );
     drop(s);
     // Power is lost: unsynced writes vanish. The acknowledged commit must still open.
     let after_power_loss = sim.after_crash(Persist::None);
@@ -779,4 +784,298 @@ fn a_history_extent_that_would_cross_the_content_limit_refuses_the_commit() {
         "{r:?}"
     );
     assert!(revision(&s, "A").is_none());
+}
+
+/// Operations one small content-free commit performs (its last four: content sync, metadata sync,
+/// publication record write, publication sync).
+fn ops_per_small_commit() -> u64 {
+    let probe = SimIo::new();
+    let p = sim_store(&probe);
+    commit(
+        &p,
+        "p1",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let before = probe.ops();
+    commit(
+        &p,
+        "p2",
+        changes(vec![put("B", Precondition::Absent, b"b", None)]),
+    )
+    .unwrap();
+    probe.ops() - before
+}
+
+#[test]
+fn a_fenced_store_still_answers_definitively_for_attempts_it_can_see() {
+    use cce_core::storage::{AttemptOutcome, CommitReceipt};
+    let per_commit = ops_per_small_commit();
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    let a1 = changes(vec![put("A", Precondition::Absent, b"a", None)]);
+    let b = || changes(vec![put("B", Precondition::Absent, b"b", None)]);
+    commit(&s, "a1", a1.clone()).unwrap();
+    sim.fail_nth_op(per_commit);
+    let r = commit(&s, "a2", b());
+    assert!(matches!(r, Err(CommitError::Indeterminate(_))), "{r:?}");
+
+    assert_eq!(
+        s.outcome(&attempt("a1")).unwrap(),
+        AttemptOutcome::Committed(CommitReceipt {
+            attempt: attempt("a1"),
+            position: HistoryPosition(1),
+        }),
+        "a commit published before the fence is still definitive"
+    );
+    assert_eq!(s.outcome(&attempt("a2")).unwrap(), AttemptOutcome::Unknown);
+    assert_eq!(
+        s.outcome(&attempt("never")).unwrap(),
+        AttemptOutcome::Absent
+    );
+
+    // A committed attempt keeps its receipt; a different request under its id is a mismatch.
+    assert_eq!(commit(&s, "a1", a1).unwrap(), 1);
+    let r = commit(
+        &s,
+        "a1",
+        changes(vec![put("A", Precondition::Absent, b"other", None)]),
+    );
+    assert!(matches!(r, Err(CommitError::AttemptMismatch)), "{r:?}");
+    // The uncertain attempt stays uncertain: never reported as rejected.
+    let r = commit(&s, "a2", b());
+    assert!(matches!(r, Err(CommitError::Indeterminate(_))), "{r:?}");
+    // A new attempt is refused without effect while fenced.
+    let r = commit(
+        &s,
+        "a3",
+        changes(vec![put("C", Precondition::Absent, b"c", None)]),
+    );
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.contains("fenced")),
+        "{r:?}"
+    );
+    assert!(revision(&s, "C").is_none());
+}
+
+#[test]
+fn a_failed_data_barrier_fences_writes() {
+    use cce_core::storage::AttemptOutcome;
+    let per_commit = ops_per_small_commit();
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    commit(
+        &s,
+        "a1",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    // Fail the content sync of the next commit's data barrier.
+    sim.fail_nth_op(per_commit - 3);
+    let r = commit(
+        &s,
+        "a2",
+        changes(vec![put("B", Precondition::Absent, b"b", None)]),
+    );
+    assert!(
+        matches!(r, Err(CommitError::Rejected(StorageError::Io(_)))),
+        "{r:?}"
+    );
+    // Nothing was published for it.
+    assert_eq!(s.outcome(&attempt("a2")).unwrap(), AttemptOutcome::Absent);
+    // Bytes the failed barrier covered may be lost: no later write may rely on them.
+    let r = commit(
+        &s,
+        "a3",
+        changes(vec![put("C", Precondition::Absent, b"c", None)]),
+    );
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.contains("fenced")),
+        "{r:?}"
+    );
+    assert!(s.stage_content(&mut &b"x"[..]).is_err());
+    assert!(revision(&s, "A").is_some());
+}
+
+#[test]
+fn request_fields_beyond_the_encodable_limit_are_refused_and_the_store_keeps_committing() {
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(SimIo::new()),
+            StoreId([3; 16]),
+            crate::engine::Options {
+                max_request_field: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    };
+    let evidence = |label: &[u8], bytes: &[u8]| ChangeSet {
+        changes: vec![put("E", Precondition::Any, b"e", None)],
+        evidence: vec![cce_core::storage::Evidence {
+            label: label.to_vec(),
+            bytes: bytes.to_vec(),
+        }],
+        ..ChangeSet::default()
+    };
+    let too_long = [
+        (
+            "body",
+            changes(vec![put("A", Precondition::Absent, &[1; 9], None)]),
+        ),
+        ("label", evidence(&[1; 9], b"ok")),
+        ("evidence bytes", evidence(b"ok", &[1; 9])),
+    ];
+    for (what, cs) in too_long {
+        let r = commit(&s, what, cs);
+        assert!(
+            matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.contains("limit")),
+            "{what}: {r:?}"
+        );
+    }
+    assert!(revision(&s, "A").is_none() && revision(&s, "E").is_none());
+    // Fields at the limit commit, so the commit path is still serving requests.
+    assert_eq!(commit(&s, "fits", evidence(&[1; 8], &[2; 8])).unwrap(), 1);
+}
+
+#[test]
+fn request_lists_beyond_the_limit_are_refused_before_encoding() {
+    use crate::records::check_request_bounds;
+    let ev = || cce_core::storage::Evidence {
+        label: b"l".to_vec(),
+        bytes: b"b".to_vec(),
+    };
+    let three_changes = changes(vec![
+        put("A", Precondition::Any, b"a", None),
+        put("B", Precondition::Any, b"b", None),
+        put("C", Precondition::Any, b"c", None),
+    ]);
+    let three_evidence = ChangeSet {
+        evidence: vec![ev(), ev(), ev()],
+        ..ChangeSet::default()
+    };
+    for (what, cs) in [
+        ("change list", three_changes),
+        ("evidence list", three_evidence),
+    ] {
+        let r = check_request_bounds(&cs, 2, u64::MAX);
+        assert!(
+            matches!(&r, Err(StorageError::InvalidRequest(m)) if m.starts_with(what)),
+            "{what}: {r:?}"
+        );
+        assert!(
+            check_request_bounds(&cs, 3, u64::MAX).is_ok(),
+            "{what} at the limit"
+        );
+    }
+}
+
+#[test]
+fn a_request_whose_fields_fit_but_whose_whole_encoding_does_not_is_refused() {
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(SimIo::new()),
+            StoreId([3; 16]),
+            crate::engine::Options {
+                max_request_len: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    };
+    let with_evidence = |n: usize| ChangeSet {
+        changes: vec![put("E", Precondition::Any, b"e", None)],
+        evidence: (0..n)
+            .map(|_| cce_core::storage::Evidence {
+                label: b"l".to_vec(),
+                bytes: vec![7; 100],
+            })
+            .collect(),
+        ..ChangeSet::default()
+    };
+    // Every field is within the limit, but the encoded request as a whole is not: it is stored
+    // as one length-prefixed field of the history entry.
+    let r = commit(&s, "two", with_evidence(2));
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.starts_with("encoded request")),
+        "{r:?}"
+    );
+    assert!(revision(&s, "E").is_none());
+    // Positive neighbour: one such field keeps the whole request within the limit.
+    assert_eq!(commit(&s, "one", with_evidence(1)).unwrap(), 1);
+}
+
+#[test]
+fn the_computed_request_length_matches_the_encoding_for_every_change_shape() {
+    use crate::records::{encode_request, encoded_request_len};
+    use cce_core::storage::{
+        ContentBinding, ContentDigest, ContentRef, Evidence, Revision, StagingToken,
+    };
+    let id = |n: usize| ContextId::new(vec![b'c'; n]).unwrap();
+    let rid = |n: usize| cce_core::storage::RelationshipId::new(vec![b'r'; n]).unwrap();
+    let kind = cce_core::storage::RelationshipKind::new(b"k".to_vec()).unwrap();
+    let preconditions = [
+        Precondition::Any,
+        Precondition::Absent,
+        Precondition::AtRevision(Revision(u64::MAX)),
+    ];
+    let mut checked = 0;
+    for p in &preconditions {
+        for content in [None, Some(0), Some(usize::MAX)] {
+            for n in [1, 255] {
+                let changes = [
+                    Change::PutContext {
+                        id: id(n),
+                        expect: *p,
+                        body: vec![1; n],
+                        content,
+                    },
+                    Change::RemoveContext {
+                        id: id(n),
+                        expect: *p,
+                    },
+                    Change::PutRelationship {
+                        id: rid(n),
+                        expect: *p,
+                        kind: kind.clone(),
+                        source: id(n),
+                        target: id(1),
+                    },
+                    Change::RemoveRelationship {
+                        id: rid(n),
+                        expect: *p,
+                    },
+                ];
+                for take in 0..=changes.len() {
+                    for evidence in 0..=2 {
+                        let cs = ChangeSet {
+                            changes: changes[..take].to_vec(),
+                            content: (0..evidence)
+                                .map(|i| ContentBinding {
+                                    token: StagingToken(vec![i as u8]),
+                                    content: ContentRef {
+                                        digest: ContentDigest([i as u8; 32]),
+                                        len: i as u64,
+                                    },
+                                })
+                                .collect(),
+                            evidence: (0..evidence)
+                                .map(|i| Evidence {
+                                    label: vec![2; i],
+                                    bytes: vec![3; n],
+                                })
+                                .collect(),
+                        };
+                        assert_eq!(
+                            encoded_request_len(&cs),
+                            encode_request(&cs).len() as u64,
+                            "{cs:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(checked, 3 * 3 * 2 * 5 * 3);
 }

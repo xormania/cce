@@ -7,6 +7,7 @@
 //! so. The engine under test is the production engine; only the I/O adapter differs.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::StorageError;
@@ -64,7 +65,7 @@ struct State {
     files: HashMap<FileId, SimFile>,
     /// Files whose directory entry is durable.
     durable_entries: HashSet<FileId>,
-    locked: bool,
+    lock: SimLock,
     /// Remaining mutating operations before the simulated crash (`None` = no crash planned).
     budget: Option<u64>,
     crashed: bool,
@@ -74,12 +75,38 @@ struct State {
     fail_op: Option<u64>,
     /// Fail the next read with an I/O error.
     fail_next_read: bool,
+    /// An injected `sync` failure discards the file's pending writes (see
+    /// [`SimIo::lossy_sync_failures`]).
+    lossy_sync: bool,
 }
 
-/// A simulated store directory. Clones share the same state.
-#[derive(Clone, Default)]
+/// The simulated ownership lock on the store directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SimLock {
+    #[default]
+    Free,
+    /// One read-write owner.
+    Exclusive,
+    /// This many read-only holders.
+    Shared(u32),
+}
+
+/// A simulated store directory. Clones share the same directory state; each clone is a separate
+/// handle onto it, with its own access mode.
+#[derive(Default)]
 pub(crate) struct SimIo {
     st: Arc<Mutex<State>>,
+    /// This handle was opened read-only: it refuses every mutating operation.
+    read_only: AtomicBool,
+}
+
+impl Clone for SimIo {
+    fn clone(&self) -> Self {
+        Self {
+            st: self.st.clone(),
+            read_only: AtomicBool::new(false),
+        }
+    }
 }
 
 fn xorshift(s: &mut u64) -> u64 {
@@ -108,6 +135,14 @@ impl SimIo {
     /// Makes the next read fail with an I/O error (once).
     pub fn fail_next_read(&self) {
         self.st.lock().expect("sim").fail_next_read = true;
+    }
+
+    /// From now on, an injected failure of `sync(file)` models an operating system that drops
+    /// the dirty data it failed to write back: the file's pending writes are discarded (its
+    /// volatile image reverts to its durable image), so a later successful sync cannot make them
+    /// durable. Without this, a failed sync leaves pending writes pending.
+    pub fn lossy_sync_failures(&self) {
+        self.st.lock().expect("sim").lossy_sync = true;
     }
 
     pub fn ops(&self) -> u64 {
@@ -177,6 +212,7 @@ impl SimIo {
                 files,
                 ..State::default()
             })),
+            read_only: AtomicBool::new(false),
         }
     }
 
@@ -190,6 +226,7 @@ impl SimIo {
                 durable_entries: st.durable_entries.clone(),
                 ..State::default()
             })),
+            read_only: AtomicBool::new(false),
         }
     }
 
@@ -202,12 +239,49 @@ impl SimIo {
         }
     }
 
-    /// Releases the simulated ownership lock (the owning "process" ended).
+    /// A file's durable and volatile images, or `None` if the file does not exist (test checks
+    /// that an operation left the store bytes unchanged, and saving images of a failed test,
+    /// which may run after a panic poisoned the lock).
+    pub fn file_images_for_test(&self, file: FileId) -> Option<(Vec<u8>, Vec<u8>)> {
+        let st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        st.files
+            .get(&file)
+            .map(|f| (f.durable.clone(), f.volatile.clone()))
+    }
+
+    /// Releases the simulated ownership lock, read-write or read-only (the holding "processes"
+    /// ended).
     pub fn release(&self) {
-        self.st.lock().expect("sim").locked = false;
+        self.st.lock().expect("sim").lock = SimLock::Free;
+    }
+
+    fn require_files(st: &State) -> Result<(), StorageError> {
+        for f in [FileId::Meta, FileId::Content] {
+            if !st.files.contains_key(&f) {
+                return Err(StorageError::StoreState(format!(
+                    "required store file {} is missing",
+                    f.name()
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn mutate<T>(&self, f: impl FnOnce(&mut State) -> T) -> Result<T, StorageError> {
+        self.mutate_or(f, |_| {})
+    }
+
+    /// Like `mutate`, but runs `on_injected_failure` when this operation is the injected failure.
+    fn mutate_or<T>(
+        &self,
+        f: impl FnOnce(&mut State) -> T,
+        on_injected_failure: impl FnOnce(&mut State),
+    ) -> Result<T, StorageError> {
+        if self.read_only.load(Ordering::SeqCst) {
+            return Err(StorageError::StoreState(
+                "read-only handle: writes and syncs are refused".into(),
+            ));
+        }
         let mut st = self.st.lock().expect("sim");
         if st.crashed {
             return Err(StorageError::Io("simulated crash".into()));
@@ -221,6 +295,7 @@ impl SimIo {
         }
         st.ops += 1;
         if st.fail_op == Some(st.ops) {
+            on_injected_failure(&mut st);
             return Err(StorageError::Io(format!(
                 "simulated I/O error at op {}",
                 st.ops
@@ -238,10 +313,10 @@ impl Io for SimIo {
                 "simulated directory already contains a store".into(),
             ));
         }
-        if st.locked {
+        if st.lock != SimLock::Free {
             return Err(StorageError::Busy("simulated store is owned".into()));
         }
-        st.locked = true;
+        st.lock = SimLock::Exclusive;
         st.files.insert(FileId::Meta, SimFile::default());
         st.files.insert(FileId::Content, SimFile::default());
         Ok(())
@@ -249,18 +324,25 @@ impl Io for SimIo {
 
     fn open(&self) -> Result<(), StorageError> {
         let mut st = self.st.lock().expect("sim");
-        if st.locked {
+        if st.lock != SimLock::Free {
             return Err(StorageError::Busy("simulated store is owned".into()));
         }
-        for f in [FileId::Meta, FileId::Content] {
-            if !st.files.contains_key(&f) {
-                return Err(StorageError::StoreState(format!(
-                    "required store file {} is missing",
-                    f.name()
-                )));
-            }
+        Self::require_files(&st)?;
+        st.lock = SimLock::Exclusive;
+        Ok(())
+    }
+
+    fn open_read_only(&self) -> Result<(), StorageError> {
+        let mut st = self.st.lock().expect("sim");
+        if st.lock == SimLock::Exclusive {
+            return Err(StorageError::Busy("simulated store is owned".into()));
         }
-        st.locked = true;
+        Self::require_files(&st)?;
+        st.lock = match st.lock {
+            SimLock::Shared(n) => SimLock::Shared(n + 1),
+            _ => SimLock::Shared(1),
+        };
+        self.read_only.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -303,12 +385,22 @@ impl Io for SimIo {
     }
 
     fn sync(&self, file: FileId) -> Result<(), StorageError> {
-        self.mutate(|st| {
-            if let Some(f) = st.files.get_mut(&file) {
-                f.durable = f.volatile.clone();
-                f.pending.clear();
-            }
-        })
+        self.mutate_or(
+            |st| {
+                if let Some(f) = st.files.get_mut(&file) {
+                    f.durable = f.volatile.clone();
+                    f.pending.clear();
+                }
+            },
+            |st| {
+                if st.lossy_sync
+                    && let Some(f) = st.files.get_mut(&file)
+                {
+                    f.volatile = f.durable.clone();
+                    f.pending.clear();
+                }
+            },
+        )
     }
 
     fn sync_dir(&self) -> Result<(), StorageError> {
@@ -391,5 +483,43 @@ mod tests {
         assert!(matches!(io.open(), Err(StorageError::Busy(_))));
         io.release();
         io.open().unwrap();
+    }
+
+    #[test]
+    fn a_failed_sync_keeps_pending_writes_unless_failures_are_lossy() {
+        for lossy in [false, true] {
+            let io = SimIo::new();
+            io.create().unwrap();
+            io.sync_dir().unwrap();
+            io.write_at(FileId::Meta, 0, b"durable").unwrap();
+            io.sync(FileId::Meta).unwrap();
+            if lossy {
+                io.lossy_sync_failures();
+            }
+            io.write_at(FileId::Meta, 0, b"lost").unwrap();
+            io.write_at(FileId::Meta, 7, b"tail").unwrap();
+            io.fail_nth_op(1);
+            assert!(matches!(
+                io.sync(FileId::Meta),
+                Err(StorageError::Io(m)) if m.contains("simulated I/O error")
+            ));
+            // The other file is untouched by a failed sync.
+            io.write_at(FileId::Content, 0, b"side").unwrap();
+            let after_failure = read(&io, 0, io.len(FileId::Meta).unwrap() as usize);
+            io.sync(FileId::Meta).unwrap();
+            io.sync(FileId::Content).unwrap();
+            let survived = io.after_crash(Persist::None);
+            let durable = read(&survived, 0, survived.len(FileId::Meta).unwrap() as usize);
+            if lossy {
+                assert_eq!(after_failure.as_deref(), Some(&b"durable"[..]));
+                assert_eq!(durable.as_deref(), Some(&b"durable"[..]), "resurrected");
+            } else {
+                assert_eq!(after_failure.as_deref(), Some(&b"lostbletail"[..]));
+                assert_eq!(durable.as_deref(), Some(&b"lostbletail"[..]));
+            }
+            let mut m = [0; 4];
+            survived.read_at(FileId::Content, 0, &mut m).unwrap();
+            assert_eq!(&m, b"side");
+        }
     }
 }

@@ -13,7 +13,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
@@ -57,6 +57,11 @@ pub(crate) struct Options {
     pub commit_queue: usize,
     /// Largest number of segments one content stream may have (bounds staging and manifest memory).
     pub max_content_segments: usize,
+    /// Largest length of any variable-length request field (record body, evidence label or bytes)
+    /// and of any request list; bounded by the 32-bit length prefixes of the encoding.
+    pub max_request_field: u64,
+    /// Largest encoded size of a whole request, which history stores as one length-prefixed field.
+    pub max_request_len: u64,
 }
 
 /// Default number of recent commits whose write sets are kept for conflict validation.
@@ -71,6 +76,8 @@ impl Default for Options {
             conflict_window: DEFAULT_CONFLICT_WINDOW,
             commit_queue: DEFAULT_COMMIT_QUEUE,
             max_content_segments: DEFAULT_MAX_CONTENT_SEGMENTS,
+            max_request_field: u32::MAX as u64,
+            max_request_len: u32::MAX as u64,
         }
     }
 }
@@ -97,8 +104,15 @@ struct State {
     staged: HashMap<u64, BoundContent>,
     /// Next staging serial; each staging gets a distinct handle even for zero-length content.
     next_stage: u64,
-    /// Set when a publication outcome is uncertain; further writes are refused.
-    fenced: Option<String>,
+    /// Set when durability became uncertain; further writes are refused until reopen.
+    fenced: Option<Fence>,
+}
+
+/// Why writes are fenced, and which attempt (if any) has an unknown publication outcome.
+#[derive(Clone)]
+struct Fence {
+    why: String,
+    uncertain: Option<AttemptId>,
 }
 
 /// Bounded node cache keyed by location *and* incarnation, evicting in insertion order.
@@ -112,7 +126,7 @@ pub(crate) struct Inner {
     io: Box<dyn Io>,
     store: StoreId,
     instance: u64,
-    state: Mutex<State>,
+    state: Recorded<State>,
     /// Serializes commits (one publication order per store).
     writer: Mutex<()>,
     /// Content-file allocation cursor; held while streaming an allocation.
@@ -124,7 +138,7 @@ pub(crate) struct Inner {
     worker: Mutex<Option<mpsc::SyncSender<Job>>>,
     /// Attempts admitted to the worker and not yet resolved.
     /// Shared with the worker so it can resolve an attempt after releasing its engine reference.
-    pending: Arc<Mutex<HashMap<AttemptId, u32>>>,
+    pending: Arc<Recorded<HashMap<AttemptId, u32>>>,
     /// Set (under the `pending` lock) once `close` began: new commits are refused from then on.
     closing: AtomicBool,
     #[cfg(test)]
@@ -137,14 +151,84 @@ pub(crate) struct Inner {
     slow_job_release: std::sync::atomic::AtomicBool,
     /// Largest number of segments one content stream may have.
     max_segments: usize,
+    /// Largest variable-length request field or list (see `Options::max_request_field`).
+    max_request_field: u64,
+    /// Largest encoded request (see `Options::max_request_len`).
+    max_request_len: u64,
+    /// Opened for inspection only: no commit worker, no staging, no commits, no syncs.
+    read_only: bool,
     pub counters: Counters,
     /// Recovery diagnostics from open (for example an ignored damaged slot).
     pub diagnostics: Vec<String>,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+/// Engine locks. `Recorded` keeps its mutex private to this module, so engine code can reach a
+/// recorded lock only through `lock()` (a bypass would not compile).
+mod locks {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Anything that hands out a mutex guard; a poisoned mutex is still usable (its owner panicked,
+    /// and the commit worker fences writes in that case).
+    pub(super) trait Lockable<T> {
+        fn acquire(&self) -> MutexGuard<'_, T>;
+    }
+
+    impl<T> Lockable<T> for Mutex<T> {
+        fn acquire(&self) -> MutexGuard<'_, T> {
+            self.lock().unwrap_or_else(|p| p.into_inner())
+        }
+    }
+
+    /// A mutex whose acquisitions are recorded per thread in tests, so the order in which an
+    /// operation consults engine state can be checked whatever way the code reaches it.
+    pub(super) struct Recorded<T> {
+        mutex: Mutex<T>,
+        #[cfg_attr(not(test), allow(dead_code))]
+        name: &'static str,
+    }
+
+    impl<T> Recorded<T> {
+        pub(super) fn new(name: &'static str, value: T) -> Self {
+            Self {
+                mutex: Mutex::new(value),
+                name,
+            }
+        }
+    }
+
+    impl<T, L: Lockable<T>> Lockable<T> for std::sync::Arc<L> {
+        fn acquire(&self) -> MutexGuard<'_, T> {
+            (**self).acquire()
+        }
+    }
+
+    impl<T> Lockable<T> for Recorded<T> {
+        fn acquire(&self) -> MutexGuard<'_, T> {
+            #[cfg(test)]
+            LOCK_TRACE.with(|t| t.borrow_mut().push(self.name));
+            self.mutex.acquire()
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static LOCK_TRACE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Test hook: the recorded mutexes this thread acquired since the last call, in order.
+    #[cfg(test)]
+    pub(crate) fn take_lock_trace_for_test() -> Vec<&'static str> {
+        LOCK_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
+    }
+
+    pub(super) fn lock<T>(m: &impl Lockable<T>) -> MutexGuard<'_, T> {
+        m.acquire()
+    }
 }
+
+#[cfg(test)]
+pub(crate) use locks::take_lock_trace_for_test;
+use locks::{Recorded, lock};
 
 fn sha256(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
@@ -156,7 +240,7 @@ fn content_space_exhausted() -> StorageError {
 }
 
 /// Resolves one admission of `attempt`: it stops being pending once every admission resolved.
-fn finish_pending(pending: &Mutex<HashMap<AttemptId, u32>>, attempt: &AttemptId) {
+fn finish_pending(pending: &Recorded<HashMap<AttemptId, u32>>, attempt: &AttemptId) {
     let mut p = lock(pending);
     if let Some(n) = p.get_mut(attempt) {
         *n -= 1;
@@ -294,20 +378,7 @@ impl Inner {
 
     pub fn open(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
         io.open()?;
-        let len = io.len(FileId::Meta)?;
-        if len < 2 * PAGE_SIZE as u64 {
-            return Err(StorageError::Integrity(format!(
-                "metadata file is {len} bytes; store initialization never completed (not reinitializing)"
-            )));
-        }
-        let mut slots = Vec::new();
-        for s in 0..2u64 {
-            let mut buf = vec![0; PAGE_SIZE];
-            io.read_at(FileId::Meta, s * PAGE_SIZE as u64, &mut buf)?;
-            slots.push(decode_slot(&buf));
-        }
-        let (desc, diagnostics) = select(&slots)?;
-        validate_cursors(&*io, &desc)?;
+        let (desc, diagnostics) = read_publication(&*io)?;
         // The selected record and everything it references may still be only in the operating
         // system's cache (the previous owner exited before its barrier). Make them durable before
         // any receipt or new commit can rely on them.
@@ -318,18 +389,41 @@ impl Inner {
         Ok(inner)
     }
 
+    /// Opens an existing store for inspection: the same publication record selection as `open`,
+    /// in memory only. Nothing is written or synced, no commit worker runs, and the handle holds
+    /// the store's lock in shared mode, so owners are refused while it lives.
+    pub fn open_read_only(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
+        io.open_read_only()?;
+        let (desc, diagnostics) = read_publication(&*io)?;
+        let mut inner = Self::new(io, desc, diagnostics, opts);
+        inner.read_only = true;
+        Ok(Arc::new(inner))
+    }
+
+    fn refuse_if_read_only(&self, what: &str) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::StoreState(format!(
+                "{what} refused on a read-only store handle"
+            )));
+        }
+        Ok(())
+    }
+
     fn new(io: Box<dyn Io>, desc: Descriptor, diagnostics: Vec<String>, opts: Options) -> Self {
         Self {
             io,
             store: desc.store,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             alloc: Mutex::new(desc.content_len),
-            state: Mutex::new(State {
-                current: desc,
-                staged: HashMap::new(),
-                next_stage: 1,
-                fenced: None,
-            }),
+            state: Recorded::new(
+                "state",
+                State {
+                    current: desc,
+                    staged: HashMap::new(),
+                    next_stage: 1,
+                    fenced: None,
+                },
+            ),
             writer: Mutex::new(()),
             cache: Mutex::new(NodeCache {
                 map: HashMap::new(),
@@ -337,7 +431,7 @@ impl Inner {
                 capacity: opts.cache_nodes,
             }),
             worker: Mutex::new(None),
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Recorded::new("pending", HashMap::new())),
             closing: AtomicBool::new(false),
             #[cfg(test)]
             gate: Mutex::new(()),
@@ -351,6 +445,9 @@ impl Inner {
                 capacity: opts.conflict_window.max(1),
             }),
             max_segments: opts.max_content_segments,
+            max_request_field: opts.max_request_field,
+            max_request_len: opts.max_request_len,
+            read_only: false,
             counters: Counters::default(),
             diagnostics,
         }
@@ -369,7 +466,7 @@ impl Inner {
 
     /// Test hook: holds the commit worker before its next job until the guard is dropped.
     #[cfg(test)]
-    pub(crate) fn pause_worker_for_test(&self) -> MutexGuard<'_, ()> {
+    pub(crate) fn pause_worker_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
         lock(&self.gate)
     }
 
@@ -403,7 +500,10 @@ impl Inner {
                         // publication: its outcome is unknown, and writes stay fenced until
                         // reopen. Queued jobs keep being answered (refused behind the fence).
                         let why = format!("commit of attempt {attempt:?} failed unexpectedly");
-                        lock(&inner.state).fenced = Some(why.clone());
+                        lock(&inner.state).fenced = Some(Fence {
+                            why: why.clone(),
+                            uncertain: Some(attempt.clone()),
+                        });
                         Err(CommitError::Indeterminate(why))
                     });
                     #[cfg(test)]
@@ -434,6 +534,7 @@ impl Inner {
         observed: Vec<Observation>,
         changes: ChangeSet,
     ) -> Result<mpsc::Receiver<Result<CommitReceipt, CommitError>>, CommitError> {
+        self.refuse_if_read_only("commits are").map_err(rejected)?;
         let (reply, rx) = mpsc::channel();
         let tx = lock(&self.worker).clone().ok_or_else(|| {
             rejected(StorageError::StoreState("commit worker not running".into()))
@@ -540,8 +641,12 @@ impl Inner {
         bytes: &mut dyn Read,
         expected: Option<&ContentRef>,
     ) -> Result<StagedContent, StorageError> {
+        self.refuse_if_read_only("staging is")?;
         if let Some(f) = &lock(&self.state).fenced {
-            return Err(StorageError::StoreState(format!("writes fenced: {f}")));
+            return Err(StorageError::StoreState(format!(
+                "writes fenced: {}",
+                f.why
+            )));
         }
         let mut cursor = lock(&self.alloc);
         let start = *cursor;
@@ -692,20 +797,26 @@ impl Inner {
         observed: &[Observation],
         cs: ChangeSet,
     ) -> Result<CommitReceipt, CommitError> {
+        self.refuse_if_read_only("commits are").map_err(rejected)?;
         let _w = lock(&self.writer);
+        // Before anything is encoded: no field may overflow its length prefix.
+        crate::records::check_request_bounds(&cs, self.max_request_field, self.max_request_len)
+            .map_err(rejected)?;
         #[cfg(test)]
         if self.panic_next_commit.swap(false, Ordering::SeqCst) {
             panic!("injected commit panic");
         }
-        let cur = {
+        let (cur, fence) = {
             let st = lock(&self.state);
-            if let Some(f) = &st.fenced {
-                return Err(rejected(StorageError::StoreState(format!(
-                    "writes fenced: {f}"
-                ))));
-            }
-            st.current
+            (st.current, st.fenced.clone())
         };
+        // The attempt whose publication is uncertain stays uncertain; it is never reported as
+        // rejected. Other attempts are still answered from the last published state below.
+        if let Some(f) = &fence
+            && f.uncertain.as_ref() == Some(&attempt)
+        {
+            return Err(CommitError::Indeterminate(f.why.clone()));
+        }
         let mut txn = TreeTxn::new(self, cur.root);
 
         // Every content index must name a binding before the request is fingerprinted.
@@ -735,6 +846,12 @@ impl Inner {
             } else {
                 Err(CommitError::AttemptMismatch)
             };
+        }
+        if let Some(f) = fence {
+            return Err(rejected(StorageError::StoreState(format!(
+                "writes fenced: {}",
+                f.why
+            ))));
         }
 
         // The basis must still hold: nothing it observed may have been written since.
@@ -807,8 +924,19 @@ impl Inner {
         // the allocation boundary before it: staging may append past it concurrently, and only
         // bytes the barrier covers may be published.
         let content_len = *lock(&self.alloc);
-        self.io.sync(FileId::Content).map_err(rejected)?;
-        self.io.sync(FileId::Meta).map_err(rejected)?;
+        if let Err(e) = self
+            .io
+            .sync(FileId::Content)
+            .and_then(|()| self.io.sync(FileId::Meta))
+        {
+            // Nothing is published, but a failed barrier may have dropped written bytes that
+            // staged content or later commits would reference: fence writes until reopen.
+            lock(&self.state).fenced = Some(Fence {
+                why: format!("data barrier failed: {e}"),
+                uncertain: None,
+            });
+            return Err(rejected(e));
+        }
 
         let desc = Descriptor {
             store: self.store,
@@ -829,7 +957,10 @@ impl Inner {
         if let Err(e) = published {
             // The record may or may not be durable: fence writes until reconciled.
             let why = format!("publication of generation {generation} uncertain: {e}");
-            lock(&self.state).fenced = Some(why.clone());
+            lock(&self.state).fenced = Some(Fence {
+                why: why.clone(),
+                uncertain: Some(attempt.clone()),
+            });
             return Err(CommitError::Indeterminate(why));
         }
 
@@ -853,11 +984,17 @@ impl Inner {
     }
 
     pub fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
+        // Order matters: an attempt leaves `pending` only after its publication, so checking
+        // `pending` first and the published state second can never miss a finishing commit.
         if lock(&self.pending).contains_key(attempt) {
             return Ok(AttemptOutcome::Pending);
         }
         let st = lock(&self.state);
-        if st.fenced.is_some() {
+        if st
+            .fenced
+            .as_ref()
+            .is_some_and(|f| f.uncertain.as_ref() == Some(attempt))
+        {
             return Ok(AttemptOutcome::Unknown);
         }
         let cur = st.current;
@@ -1145,6 +1282,26 @@ impl ConflictLog {
             }
         }
     }
+}
+
+/// Reads both publication slots and selects the record to recover from, checking its cursors
+/// against the files. Reads only.
+fn read_publication(io: &dyn Io) -> Result<(Descriptor, Vec<String>), StorageError> {
+    let len = io.len(FileId::Meta)?;
+    if len < 2 * PAGE_SIZE as u64 {
+        return Err(StorageError::Integrity(format!(
+            "metadata file is {len} bytes; store initialization never completed (not reinitializing)"
+        )));
+    }
+    let mut slots = Vec::new();
+    for s in 0..2u64 {
+        let mut buf = vec![0; PAGE_SIZE];
+        io.read_at(FileId::Meta, s * PAGE_SIZE as u64, &mut buf)?;
+        slots.push(decode_slot(&buf));
+    }
+    let (desc, diagnostics) = select(&slots)?;
+    validate_cursors(io, &desc)?;
+    Ok((desc, diagnostics))
 }
 
 /// Checks the selected record's cursors against the files before anything is written.
