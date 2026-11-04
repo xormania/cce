@@ -57,8 +57,12 @@ jobs:
             target
           key: cargo-clippy-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: cargo-clippy-${{ runner.os }}-
+      # Lint the default build and every feature-gated item (for example harness entry points that
+      # are compiled only with an opt-in feature).
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- --deny warnings
+        run: |
+          cargo clippy --locked --workspace --all-targets -- --deny warnings
+          cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
 
   test:
     name: test
