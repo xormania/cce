@@ -47,11 +47,12 @@ impl Driver {
     }
 
     /// Spawns the driver through `bash` with `setup` run first (for example a resource limit);
-    /// `exec` keeps the driver as the child the harness talks to and kills.
+    /// `exec` keeps the driver as the child the harness talks to and kills. A failing setup
+    /// fails closed: the shell exits and the driver never starts.
     pub fn spawn_with_shell(setup: &str) -> Self {
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
-            .arg(format!("{setup}; exec \"$0\""))
+            .arg(format!("set -e; {setup}; exec \"$0\""))
             .arg(DRIVER);
         Self::spawn_command(cmd)
     }

@@ -398,6 +398,24 @@ fn store_files_are_real_and_damage_yields_explicit_errors() {
 }
 
 #[test]
+fn a_failing_shell_setup_never_starts_the_driver() {
+    // Neighbour: after a setup that succeeds, the driver starts and answers (here, an error).
+    let mut started = Driver::spawn_with_shell("true");
+    let step = started.step("no-such-command");
+    assert!(
+        matches!(&step, Step::Answered(lines) if lines.iter().any(|l| l.starts_with("error "))),
+        "a succeeding setup must start the driver: {step:?}"
+    );
+    // A setup that fails ends the shell before the driver starts: nothing answers.
+    let mut d = Driver::spawn_with_shell("false");
+    let step = d.step("no-such-command");
+    assert!(
+        matches!(&step, Step::Exited { lines, code: Some(c) } if lines.is_empty() && *c != 0),
+        "a failing setup must not start the driver: {step:?}"
+    );
+}
+
+#[test]
 fn a_store_has_one_owning_process_until_every_guard_is_gone() {
     let dir = test_dir("ownership");
     let store = dir.join("store");
