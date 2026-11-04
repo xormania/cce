@@ -89,7 +89,9 @@ The simulator tests run the production engine with a simulated I/O adapter. They
   initializes a store.
 - **Injected I/O errors at chosen operations:** the content and metadata syncs of the data barrier,
   the sync of the publication record, each mutating operation of opening, the first read of
-  opening, and a read while streaming content.
+  opening, a read while streaming content, and each operation of a commit that reuses retired
+  tree pages, retires others and grows the metadata file. An injected error fails the whole
+  operation; a write that stops part-way is provoked only by the file size limit below.
 - **Lossy sync failures:** a failed sync may discard the file's unsynced writes, as an operating
   system may when write-back fails, so a later successful sync cannot make them durable. This is
   injected at the content and metadata syncs of the data barrier and at the publication sync.
@@ -106,10 +108,13 @@ The simulator tests run the production engine with a simulated I/O adapter. They
 Separately, real processes are killed and the store is reopened by a fresh process (process exit,
 not power loss); one scenario run on the filesystem adapter and on the simulator must issue the
 same persistence operations in the same order; and on a real filesystem, a file size limit makes a
-commit's write stop part-way and fail, as on a full disk, which must fail the commit explicitly.
+commit's write stop part-way and fail, as on a full disk, which must fail the commit explicitly:
+once in the history write to the content file, and once in a metadata page write of a commit that
+reuses retired pages but needs more than are retired. After the second, the same process keeps
+committing within the limit, and a fresh process sees the failed commit absent and can retry it.
 
-When a case of a cut sweep fails (the commit sweeps, the store-creation sweep, or the
-faults-during-recovery sweep), its crash image (durable bytes, and the bytes still cached after a
+When a case of a cut sweep fails (the commit sweeps, the space-reuse sweeps, the store-creation
+sweep, or the faults-during-recovery sweep), its crash image (durable bytes, and the bytes still cached after a
 process exit), the operation trace and a label naming the cut and the survival choice (which of the
 sampled subsets, or process exit) are written to a new directory under the system temporary
 directory, named in the failure message. Passing runs write nothing there.

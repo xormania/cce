@@ -731,3 +731,158 @@ fn under_a_file_size_limit_new_content_fits_only_by_reusing_retired_space() {
     assert!(err.contains("Io"), "{err}");
     assert!(std::fs::metadata(&content_file).unwrap().len() <= limit_kib * 1024);
 }
+
+/// A record identifier for the metadata-growth test: long, so few fit on a page.
+fn long_id(prefix: &str, i: usize) -> String {
+    format!("{prefix}{i:03}{}", "x".repeat(150))
+}
+
+/// Adds 60 records with 300-byte bodies in one commit: more tree pages than are retired.
+fn stage_growth(d: &mut Driver) {
+    for i in 0..60 {
+        let cmd = format!("put-context {} any {} -", long_id("G", i), "cd".repeat(300));
+        answered(d.step(&cmd), "put G");
+    }
+}
+
+/// The growth records present, read through the driver's dump.
+fn growth_records(d: &mut Driver) -> usize {
+    let ids: Vec<String> = (0..60).map(|i| long_id("G", i)).collect();
+    let dump = answered(d.step(&format!("dump {}", ids.join(","))), "dump");
+    let absent = dump
+        .iter()
+        .filter(|l| l.starts_with("context G") && l.ends_with(" absent"))
+        .count();
+    60 - absent
+}
+
+fn stat(stats: &[String], name: &str) -> u64 {
+    stats[0]
+        .split(' ')
+        .find_map(|f| f.strip_prefix(&format!("{name}=")))
+        .unwrap_or_else(|| panic!("no {name} in {stats:?}"))
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn a_commit_that_must_grow_the_metadata_at_the_file_size_limit_fails_explicitly() {
+    let dir = test_dir("meta-growth-limit");
+    let store = dir.join("store");
+    let (meta, content) = (store.join("meta.cce"), store.join("content.cce"));
+    let len = |p: &std::path::Path| std::fs::metadata(p).unwrap().len();
+
+    // Forty records, each in its own commit, then all removed: their tree pages are retired and
+    // reusable. Commits carry no content, so the metadata file outgrows the content file.
+    let mut setup = Driver::spawn();
+    answered(setup.step(&format!("create {}", store.display())), "create");
+    for i in 0..40 {
+        let cmd = format!("put-context {} any {} -", long_id("K", i), "ab".repeat(300));
+        answered(setup.step(&cmd), "put K");
+        answered(setup.step(&format!("commit k{i}")), "commit K");
+    }
+    for i in 0..40 {
+        answered(
+            setup.step(&format!("remove-context {} any", long_id("K", i))),
+            "remove",
+        );
+    }
+    answered(setup.step("commit rm"), "commit rm");
+    for i in 0..3 {
+        answered(
+            setup.step(&format!("put-context adv{i} any - -")),
+            "advance",
+        );
+        answered(setup.step(&format!("commit adv{i}")), "commit advance");
+    }
+    answered(setup.step("close"), "close");
+    assert_eq!(setup.finish().and_then(|s| s.code()), Some(0));
+
+    // A limit half a page past the metadata file: the growth commit's first page beyond the file
+    // is written partly, then the kernel refuses the rest. The content file, with the growth
+    // commit's history entry (about 28 KB), stays below the limit, so only the metadata hits it.
+    let meta_before = len(&meta);
+    let limit_kib = meta_before / 1024 + 2;
+    let limit = limit_kib * 1024;
+    assert_eq!(meta_before % 4096, 0);
+    assert!(
+        len(&content) + 40 * 1024 < limit,
+        "content ({} bytes) must stay well below the limit ({limit})",
+        len(&content)
+    );
+    let mut limited = Driver::spawn_with_shell(&format!("trap '' XFSZ; ulimit -f {limit_kib}"));
+    answered(limited.step(&format!("open {}", store.display())), "open");
+    stage_growth(&mut limited);
+    let r = answered(limited.step("commit grow"), "commit grow");
+    assert!(
+        r.len() == 1 && r[0].starts_with("commit-error Rejected(Io("),
+        "a commit that cannot grow the metadata must fail explicitly: {r:?}"
+    );
+    assert_eq!(
+        len(&meta),
+        limit,
+        "the metadata page write did not stop part-way at the limit"
+    );
+    assert!(len(&content) < limit);
+    assert_eq!(
+        answered(limited.step("outcome grow"), "outcome"),
+        ["outcome absent"]
+    );
+    assert_eq!(growth_records(&mut limited), 0);
+    // Within the limit, the same process keeps committing into retired pages.
+    let before = answered(limited.step("stats"), "stats");
+    answered(limited.step("put-context small any 01 -"), "put small");
+    assert_eq!(
+        answered(limited.step("commit small"), "commit small")[0]
+            .split(' ')
+            .next(),
+        Some("committed")
+    );
+    let after = answered(limited.step("stats"), "stats");
+    assert!(
+        stat(&after, "pages_reused") > stat(&before, "pages_reused"),
+        "{before:?} -> {after:?}"
+    );
+    answered(limited.step("close"), "close");
+    assert_eq!(limited.finish().and_then(|s| s.code()), Some(0));
+
+    // A fresh process without the limit: the failed commit is absent, the small one present, and
+    // the growth commit, retried, both reuses retired pages and grows the metadata file.
+    let mut fresh = Driver::spawn();
+    answered(fresh.step(&format!("open {}", store.display())), "open");
+    assert_eq!(
+        answered(fresh.step("outcome grow"), "outcome"),
+        ["outcome absent"]
+    );
+    assert_eq!(growth_records(&mut fresh), 0);
+    let dump = answered(fresh.step("dump small"), "dump");
+    assert!(
+        dump.iter()
+            .any(|l| l.starts_with("context small ") && !l.ends_with(" absent")),
+        "{dump:?}"
+    );
+    let before = answered(fresh.step("stats"), "stats");
+    stage_growth(&mut fresh);
+    assert_eq!(
+        answered(fresh.step("commit grow"), "retry")[0]
+            .split(' ')
+            .next(),
+        Some("committed")
+    );
+    let after = answered(fresh.step("stats"), "stats");
+    assert!(
+        stat(&after, "pages_reused") > stat(&before, "pages_reused"),
+        "the growth commit reused no page: {before:?} -> {after:?}"
+    );
+    assert!(
+        len(&meta) > limit,
+        "the growth commit did not grow the metadata"
+    );
+    answered(fresh.step("close"), "close");
+    assert_eq!(fresh.finish().and_then(|s| s.code()), Some(0));
+
+    let mut reopened = Driver::spawn();
+    answered(reopened.step(&format!("open {}", store.display())), "open");
+    assert_eq!(growth_records(&mut reopened), 60);
+    answered(reopened.step("close"), "close");
+}
