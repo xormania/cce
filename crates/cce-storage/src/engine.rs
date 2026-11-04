@@ -34,7 +34,7 @@ use crate::records::{
     P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, decode_history, decode_retired,
     encode_history, fingerprint, history_key, key, retired_extent_key, retired_page_key,
 };
-use crate::tree::{self, Cursor, Node, NodeSink, NodeSource, TreeTxn};
+use crate::tree::{self, Cursor, MAX_KEY, Node, NodeSink, NodeSource, TreeTxn};
 
 /// Content streaming buffer. Payloads of any length stream through a buffer of this size.
 pub(crate) const CONTENT_CHUNK: usize = 64 * 1024;
@@ -2120,9 +2120,11 @@ fn select(slots: &[Slot]) -> Result<(Descriptor, Vec<String>), StorageError> {
             )),
             Slot::Empty => {}
             Slot::Invalid(why) => diags.push(format!("slot {i}: damaged or torn ({why}); ignored")),
-            Slot::Unsupported(v) => {
+            // Never the other slot instead: an older record does not make a store this build cannot
+            // read readable.
+            Slot::Unsupported(why) => {
                 return Err(StorageError::Unsupported(format!(
-                    "publication record format version {v}"
+                    "publication record of {why}"
                 )));
             }
         }
@@ -2168,6 +2170,35 @@ fn apply(
             return Err(invalid(format!(
                 "change set names the same identity twice: {c:?}"
             )));
+        }
+        // A relationship's index keys hold all four of its identifiers; refuse one whose keys
+        // would exceed the key limit before anything is applied.
+        if let Change::PutRelationship {
+            id,
+            kind,
+            source,
+            target,
+            ..
+        } = c
+        {
+            let len = key(
+                P_OUT,
+                &[
+                    source.as_bytes(),
+                    kind.as_bytes(),
+                    target.as_bytes(),
+                    id.as_bytes(),
+                ],
+            )
+            .len();
+            if len > MAX_KEY {
+                return Err(invalid(format!(
+                    "relationship {id:?}: its index keys would be {len} bytes, over the \
+                     {MAX_KEY}-byte key limit (source, kind, target and id may total at most {} \
+                     bytes, each zero byte counting twice)",
+                    MAX_KEY - 9
+                )));
+            }
         }
     }
     let check =
