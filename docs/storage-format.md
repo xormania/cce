@@ -132,7 +132,10 @@ refused, and so are key plus value longer than 1800 bytes.
 ## Content
 
 Content is stored as segments of at most 65536 bytes, each written to its own allocation in
-`content.cce`, followed by a manifest:
+`content.cce`, followed by a manifest. A stream has at most 2^20 segments, 64 GiB, by default; a
+staging that would need more is refused. This quota bounds what is written: a manifest is read up
+to the format's own maximum, a `u32` segment count, so content written under a larger quota reads
+back. The manifest:
 
 | Field | Size |
 |---|---|
@@ -159,14 +162,15 @@ Staging tokens and physical locations are not part of it. Every content index mu
 binding of the same request; a request with an out-of-range index is rejected before it is
 fingerprinted. History entries return the bound content references with the changes.
 
-A store's limits (`max_request_len`, `max_content_segments`) bound what an open writes, not what it
-reads: data written under larger limits reads back under smaller ones. The encoded request limit is
-64 MiB by default and callers set it through `StoreOptions::max_request_len`; a request over it is
-refused whole and never split across history entries. Reads are bounded by the format itself. The
-format's hard limits are separate from these write limits and change only with the format version. When a history entry or content manifest is read, its recorded length is checked
-against the largest the format can hold (a `u32`-prefixed request; a `u32` segment count) and
-against the committed content before anything is allocated or read, and decoders never reserve
-more elements than the remaining input can hold.
+A store's limits (the encoded request limit and the segment quota) bound what an open writes, not
+what it reads: data written under larger limits reads back under smaller ones. The encoded request
+limit is 64 MiB by default and callers set it through `StoreOptions::max_request_len`; a request over
+it is refused whole and never split across history entries. Reads are bounded by the format itself.
+The format's hard limits are separate from these write limits and change only with the format
+version. When a history entry or content manifest is read, its recorded length is checked against
+the largest the format can hold (a `u32`-prefixed request; a `u32` segment count) and against the
+committed content before anything is allocated or read, and decoders never reserve more elements
+than the remaining input can hold.
 
 Before an extent's digest is verified, at most one 65536-byte chunk of it is held: an extent longer
 than that is first read through one reused chunk buffer and hashed, and nothing from that pass is

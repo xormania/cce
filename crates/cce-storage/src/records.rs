@@ -381,7 +381,8 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
         RemovalMode::PreserveViews => 0,
         RemovalMode::RequireQuiescence => 1,
     });
-    debug_assert_eq!(e.buf.len() as u64, encoded_request_len(changes));
+    // The request limit is checked against `encoded_request_len`: it must be exact.
+    assert_eq!(e.buf.len() as u64, encoded_request_len(changes));
     e.buf
 }
 
@@ -685,7 +686,8 @@ impl Manifest {
         for x in &self.segments {
             x.enc(&mut e);
         }
-        debug_assert_eq!(e.buf.len() as u64, Self::encoded_len(self.segments.len()));
+        // Manifest read limits are computed from `encoded_len`: it must be exact.
+        assert_eq!(e.buf.len() as u64, Self::encoded_len(self.segments.len()));
         e.buf
     }
 

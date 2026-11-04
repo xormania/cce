@@ -763,6 +763,32 @@ fn data_written_under_larger_limits_reads_back_under_smaller_ones() {
 }
 
 #[test]
+fn the_computed_manifest_length_matches_the_encoding() {
+    use crate::records::{ExtentRef, Manifest};
+    // Read limits are computed from `encoded_len`, so it must be exact for every segment count.
+    for n in [0usize, 1, 2, 1000] {
+        let m = Manifest {
+            content: cce_core::storage::ContentRef {
+                digest: cce_core::storage::ContentDigest([7; 32]),
+                len: n as u64,
+            },
+            segments: (0..n)
+                .map(|i| ExtentRef {
+                    offset: i as u64,
+                    len: 1,
+                    digest: [i as u8; 32],
+                })
+                .collect(),
+        };
+        assert_eq!(
+            m.encode().len() as u64,
+            Manifest::encoded_len(n),
+            "{n} segments"
+        );
+    }
+}
+
+#[test]
 fn an_extent_beyond_the_format_maximum_is_refused_before_it_is_read() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
