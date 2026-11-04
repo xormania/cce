@@ -32,7 +32,9 @@ fn create(sim: &SimIo) -> NativeStore {
 fn open(sim: &SimIo) -> NativeStore {
     sim.release();
     NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Options::default()).unwrap(),
+        inner: Inner::open(Box::new(sim.clone()), Options::default()).unwrap_or_else(|e| {
+            panic!("the store must open (after a step or its recovery): {e:?}")
+        }),
     }
 }
 
@@ -70,7 +72,9 @@ struct Logical {
 }
 
 fn logical(s: &NativeStore) -> Logical {
-    let mut v = s.begin().unwrap();
+    let mut v = s
+        .begin()
+        .unwrap_or_else(|e| panic!("a view of the store must open: {e:?}"));
     let mut out = Logical {
         contexts: BTreeMap::new(),
         outgoing: BTreeMap::new(),
@@ -87,10 +91,16 @@ fn logical(s: &NativeStore) -> Logical {
     for name in names {
         let name = name.as_str();
         let id = cid(name);
-        if let Some(r) = v.context(&id).unwrap() {
+        let record = v
+            .context(&id)
+            .unwrap_or_else(|e| panic!("context {name} must be readable: {e:?}"));
+        if let Some(r) = record {
             let bytes = r.content.map(|c| {
                 let mut b = Vec::new();
-                v.content(&c).unwrap().read_to_end(&mut b).unwrap();
+                v.content(&c)
+                    .unwrap_or_else(|e| panic!("content of {name} must open: {e:?}"))
+                    .read_to_end(&mut b)
+                    .unwrap_or_else(|e| panic!("content of {name} must read whole: {e:?}"));
                 b
             });
             out.contexts
@@ -106,7 +116,10 @@ fn logical(s: &NativeStore) -> Logical {
                 kind: None,
                 after: None,
             };
-            for r in v.relationships(&q).unwrap() {
+            let listed = v
+                .relationships(&q)
+                .unwrap_or_else(|e| panic!("relationships of {name} must list: {e:?}"));
+            for r in listed {
                 match r {
                     Ok(r) => {
                         into.insert((name.into(), r.id.as_bytes().to_vec()), r);
@@ -118,8 +131,8 @@ fn logical(s: &NativeStore) -> Logical {
     }
     out.history = v
         .history(HistoryPosition(0))
-        .unwrap()
-        .map(|h| h.unwrap())
+        .unwrap_or_else(|e| panic!("history must list: {e:?}"))
+        .map(|h| h.unwrap_or_else(|e| panic!("every history entry must be readable: {e:?}")))
         .collect();
     out
 }
@@ -180,9 +193,18 @@ fn leaked(payload: usize, discard: bool) -> (SimIo, NativeStore, u64) {
 /// The published state's audit: reachable structures are disjoint, nothing is retired twice, and no
 /// retired extent overlaps a reachable one.
 fn audit(sim: &SimIo) {
-    crate::audit::check_retirement(sim).expect("retirement records");
-    let d = crate::audit::published(sim).unwrap().pop().unwrap();
-    let r = crate::audit::reach(sim, &d).expect("audit");
+    assert_eq!(
+        crate::audit::check_retirement(sim),
+        Ok(()),
+        "retirement records must cover only unreachable space, once each"
+    );
+    let d = crate::audit::published(sim)
+        .unwrap_or_else(|e| panic!("the publication records must decode: {e:?}"))
+        .pop()
+        .unwrap_or_else(|| panic!("a publication record must be valid"));
+    let r = crate::audit::reach(sim, &d).unwrap_or_else(|e| {
+        panic!("every structure the published state reaches must decode: {e:?}")
+    });
     assert!(r.disjoint(), "reachable extents overlap");
     let reachable: Vec<(u64, u64)> = r
         .manifests
@@ -265,7 +287,10 @@ fn reclaiming_content_holes_retires_exactly_the_leaked_bytes_and_changes_no_reco
         drop(s);
         let s = open(&sim);
         audit(&sim);
-        assert_eq!(logical(&s).contexts["D"].2.as_deref(), Some(&reuse[..]));
+        assert_eq!(
+            logical(&s).contexts.get("D").and_then(|c| c.2.as_deref()),
+            Some(&reuse[..])
+        );
     }
 }
 
@@ -327,7 +352,10 @@ fn a_pending_staging_of_this_process_is_not_reclaimed() {
             ..ChangeSet::default()
         },
     );
-    assert_eq!(logical(&s).contexts["A"].2.as_deref(), Some(&pending[..]));
+    assert_eq!(
+        logical(&s).contexts.get("A").and_then(|c| c.2.as_deref()),
+        Some(&pending[..])
+    );
     audit(&sim);
 }
 
@@ -748,7 +776,7 @@ fn relocation_moves_content_into_lower_retired_space_and_changes_no_record() {
     let s = open(&sim);
     assert_eq!(logical(&s), before, "the move did not survive reopening");
     assert_eq!(
-        logical(&s).contexts["B"].2.as_deref(),
+        logical(&s).contexts.get("B").and_then(|c| c.2.as_deref()),
         Some(&bytes_of(2, 100_000)[..])
     );
 }
@@ -927,7 +955,8 @@ fn a_commit_during_relocation_is_preserved_and_the_move_follows_it() {
     assert_eq!(r.content_bytes_moved, 100_000 + Manifest::encoded_len(2));
     let after = logical(&s);
     assert_eq!(
-        after.contexts["D"].1, b"d",
+        after.contexts.get("D").map(|c| c.1.as_slice()),
+        Some(&b"d"[..]),
         "the commit made during relocation was lost"
     );
     assert_eq!(
@@ -936,7 +965,7 @@ fn a_commit_during_relocation_is_preserved_and_the_move_follows_it() {
         "history positions: four commits and the injected one"
     );
     assert_eq!(
-        after.contexts["B"].2.as_deref(),
+        after.contexts.get("B").and_then(|c| c.2.as_deref()),
         Some(&bytes_of(2, 100_000)[..])
     );
     audit(&sim);
@@ -961,7 +990,7 @@ fn a_move_whose_source_changed_during_relocation_is_dropped() {
     });
     assert_eq!(r.content_bytes_moved, 0, "a stale move was published");
     assert_eq!(
-        logical(&s).contexts["B"].2.as_deref(),
+        logical(&s).contexts.get("B").and_then(|c| c.2.as_deref()),
         Some(&bytes_of(9, 20_000)[..])
     );
     audit(&sim);
@@ -969,7 +998,7 @@ fn a_move_whose_source_changed_during_relocation_is_dropped() {
     let s = open(&sim);
     audit(&sim);
     assert_eq!(
-        logical(&s).contexts["B"].2.as_deref(),
+        logical(&s).contexts.get("B").and_then(|c| c.2.as_deref()),
         Some(&bytes_of(9, 20_000)[..])
     );
 }
@@ -1005,7 +1034,7 @@ fn a_move_whose_content_was_committed_again_during_relocation_is_dropped() {
         "a move of a superseded manifest was published"
     );
     assert_eq!(
-        logical(&s).contexts["D"].2.as_deref(),
+        logical(&s).contexts.get("D").and_then(|c| c.2.as_deref()),
         Some(&bytes_of(2, 100_000)[..])
     );
     audit(&sim);
@@ -1013,7 +1042,7 @@ fn a_move_whose_content_was_committed_again_during_relocation_is_dropped() {
     let s = open(&sim);
     audit(&sim);
     assert_eq!(
-        logical(&s).contexts["D"].2.as_deref(),
+        logical(&s).contexts.get("D").and_then(|c| c.2.as_deref()),
         Some(&bytes_of(2, 100_000)[..])
     );
 }
