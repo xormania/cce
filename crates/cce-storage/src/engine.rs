@@ -629,6 +629,34 @@ impl Inner {
         (log.floor, log.entries.iter().cloned().collect())
     }
 
+    /// What the engine would reuse right now under its own rules: retired tree pages the next
+    /// commit may take, and retired content extents a staging may take (tests auditing reuse
+    /// against every retained root and pin).
+    #[cfg(test)]
+    pub(crate) fn reusable_for_test(&self) -> Result<Reusable, StorageError> {
+        let cur = lock(&self.state).current;
+        let bound = self.reusable_through(cur.generation.saturating_add(1));
+        let (page_bound, content_bound) = (bound, bound);
+        let mut pages = Vec::new();
+        let mut c = Cursor::new(self, cur.root, &[P_RETIRED], None, cur.next_page)?;
+        while let Some((k, v)) = c.next_entry()? {
+            if let Retired::Page {
+                generation, page, ..
+            } = decode_retired(&k, &v)?
+                && page_bound.is_some_and(|b| generation <= b)
+            {
+                pages.push(page);
+            }
+        }
+        let extents = lock(&self.pool)
+            .free
+            .iter()
+            .filter(|(_, (_, retired_at))| content_bound.is_some_and(|b| *retired_at <= b))
+            .map(|(offset, (len, _))| (*offset, *len))
+            .collect();
+        Ok((pages, extents))
+    }
+
     /// The content-file extents `(offset, len)` of a staging issued by this instance: its
     /// manifest and segments (tests of space reuse only).
     #[cfg(test)]
@@ -889,10 +917,7 @@ impl Inner {
         // most one generation before the current one) and no live reader's generation does.
         let reusable_through = {
             let current = lock(&self.state).current.generation;
-            let oldest_pin = lock(&self.pins).keys().next().copied();
-            current
-                .checked_sub(1)
-                .map(|g| oldest_pin.map_or(g, |p| g.min(p)))
+            self.reusable_through(current.saturating_add(1))
         };
         let mut taken = Taken {
             pool: &self.pool,
@@ -1190,10 +1215,7 @@ impl Inner {
         // while this commit is unpublished (retired at most two generations before it), and none
         // a live reader's generation can reach (retired no later than the oldest pinned one). A
         // reader registering from now on pins the current generation, which reaches none of them.
-        let oldest_pin = lock(&self.pins).keys().next().copied();
-        let reusable_through = generation
-            .checked_sub(2)
-            .map(|g| oldest_pin.map_or(g, |p| g.min(p)));
+        let reusable_through = self.reusable_through(generation);
         #[cfg(test)]
         {
             let hook = lock(&self.reuse_hook).take();
@@ -1465,6 +1487,17 @@ impl Inner {
         let offset = *at;
         *at = at.checked_add(need).ok_or_else(content_space_exhausted)?;
         Ok(offset)
+    }
+
+    /// The newest retiring generation whose space may be overwritten by writes that become
+    /// visible no earlier than generation `next` (a commit producing it, or staging while the
+    /// current generation is `next - 1`): retired at most two generations before `next`, so
+    /// neither publication slot reaches it, and no later than the oldest generation a live view
+    /// or content reader pins. `None`: nothing may be reused.
+    fn reusable_through(&self, next: u64) -> Option<u64> {
+        let oldest_pin = lock(&self.pins).keys().next().copied();
+        next.checked_sub(2)
+            .map(|g| oldest_pin.map_or(g, |p| g.min(p)))
     }
 
     /// Loads the retired content extents of the current state into the reuse pool (at open).
@@ -1829,6 +1862,10 @@ pub(crate) fn relationship_range(q: &RelationshipQuery) -> Vec<u8> {
 
 /// Logical write sets of recent commits. `floor` is the newest history position whose successors'
 /// writes are all retained; a basis older than that cannot be validated.
+/// Reusable space as (tree pages, content extents `(offset, len)`) (tests only).
+#[cfg(test)]
+pub(crate) type Reusable = (Vec<u64>, Vec<(u64, u64)>);
+
 /// One recorded commit: its history position and the logical keys it wrote.
 type ConflictEntry = (u64, Vec<Vec<u8>>);
 

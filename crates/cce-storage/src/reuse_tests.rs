@@ -1411,3 +1411,63 @@ fn outcome_and_stats_walk_their_own_state_while_commits_reuse_pages() {
     );
     assert!(matches!(height, Ok(h) if h >= 1), "{height:?}");
 }
+
+#[test]
+fn reusable_space_never_overlaps_a_published_or_pinned_state() {
+    let sim = SimIo::new();
+    let s = sim_create(&sim);
+    let mut held: Vec<crate::NativeView> = Vec::new();
+    let (mut max_pages, mut max_extents) = (0, 0);
+    for i in 0..80u32 {
+        let id = format!("R{}", i % 4);
+        if i % 7 == 6 && s.begin().unwrap().context(&cid(&id)).unwrap().is_some() {
+            remove(&s, &format!("t{i}"), &id);
+        } else {
+            put(
+                &s,
+                &format!("t{i}"),
+                &id,
+                &payload(i as u8, 3000 + (i as usize % 3) * 1000),
+            );
+        }
+        if i % 11 == 3 {
+            held.push(s.begin().unwrap());
+        }
+        if i % 17 == 9 && !held.is_empty() {
+            held.remove(0);
+        }
+
+        // Independently: nothing the engine would reuse now is reached by either publication
+        // slot or by any live view's state.
+        let (pages, extents) = s.inner.reusable_for_test().unwrap();
+        let reusable: Extents = extents.iter().copied().collect();
+        let mut states = published(&sim).unwrap();
+        states.extend(held.iter().map(|v| v.snap.desc));
+        for d in &states {
+            let r = reach(&sim, d).unwrap();
+            for p in &pages {
+                assert!(
+                    !r.pages.contains(p),
+                    "commit {i}: reusable page {p} is reached by generation {}",
+                    d.generation
+                );
+            }
+            let reached: Extents = content_extents(&r)
+                .union(&r.history_extents)
+                .copied()
+                .collect();
+            assert!(
+                !overlaps(&reusable, &reached),
+                "commit {i}: reusable content overlaps generation {}",
+                d.generation
+            );
+        }
+        crate::audit::check_retirement(&sim).unwrap_or_else(|e| panic!("commit {i}: {e}"));
+        max_pages = max_pages.max(pages.len());
+        max_extents = max_extents.max(extents.len());
+    }
+    assert!(
+        max_pages > 0 && max_extents > 0,
+        "nothing was ever reusable"
+    );
+}
