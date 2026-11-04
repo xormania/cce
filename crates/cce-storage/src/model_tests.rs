@@ -323,6 +323,16 @@ fn case_counts(runner: &TestRunner, persisted: u64, runs: &CaseRuns, failed: boo
     let ran = runs.before_failure();
     let replayed = ran.min(persisted);
     let generated_failed = failed && ran > persisted;
+    // The first failing case panicked: the harness count stopped exactly at it, one past the new
+    // cases that passed. (Had it returned an error, the count would have run on into the shrink
+    // steps until one panicked.)
+    if let (true, Some(accepted)) = (generated_failed, field("successes:")) {
+        assert_eq!(
+            accepted + 1,
+            ran - replayed,
+            "the first failing case did not panic: the case count includes shrink steps"
+        );
+    }
     CaseCounts {
         attempted: rejected.map(|r| ran - replayed + r),
         accepted: field("successes:"),
@@ -1568,6 +1578,37 @@ fn case_counting_refuses_a_failure_that_did_not_panic() {
         ))
     });
     let failed = matches!(result, Err(TestError::Fail(..)));
+    let _ = case_counts(&runner, persisted, &ran, failed);
+}
+
+/// The counting refuses a run whose first failing case returned an error even though a later
+/// shrink step panicked.
+#[test]
+#[should_panic(expected = "the first failing case did not panic")]
+fn case_counting_refuses_a_first_failure_that_did_not_panic() {
+    let config = Config {
+        cases: 64,
+        rng_seed: RngSeed::Fixed(7),
+        failure_persistence: None,
+        ..Config::default()
+    };
+    let mut runner = TestRunner::new(config.clone());
+    let ran = CaseRuns::default();
+    let runs = ran.clone();
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let persisted = counting_start(&config);
+    let result = runner.run(&(0u8..=255), move |x| {
+        let _case = runs.start();
+        if x >= 100 {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(proptest::test_runner::TestCaseError::fail("returned"));
+            }
+            panic!("a shrink step panics");
+        }
+        Ok(())
+    });
+    let failed = matches!(result, Err(TestError::Fail(..)));
+    assert!(failed, "the planted failure did not fail the run");
     let _ = case_counts(&runner, persisted, &ran, failed);
 }
 
