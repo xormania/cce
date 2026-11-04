@@ -290,7 +290,10 @@ space, which is proportional to the metadata (as for the integrity check).
   then moves tree pages: under the writer lock, like a commit, it rewrites the highest pages (at
   most the page budget) and their paths from the root into retired pages numbered below all of
   them. If there are too few such pages it tries half as many, so it never writes a fresh page and
-  never extends the metadata file. Each part publishes only if it moved something.
+  never extends the metadata file. Each part publishes only if it moved something. The page part
+  holds the writer lock throughout because it writes only metadata and at most the page budget,
+  about what a commit writes; the content part copies up to the content budget of stream bytes,
+  which is why it copies without the lock.
 
 ## Not implemented yet
 
