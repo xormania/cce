@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, ContentBinding, ContextId, Precondition, ReadView, StorageEngine,
-    StorageError,
+    AttemptId, Change, ChangeSet, CommitError, ContentBinding, ContextId, Precondition, ReadView,
+    StorageEngine, StorageError,
 };
 
 use crate::audit::{published, reach};
@@ -1614,4 +1614,110 @@ fn every_cut_of_every_retiring_or_reusing_step_recovers_and_continues() {
         }
     }
     assert_eq!(checked, ops.iter().map(|n| (n + 1) * 5).sum::<u64>());
+}
+
+/// A store whose next commit both reuses retired tree pages and needs more pages than are
+/// retired: the fixed live set churned, then one commit adding many large records.
+fn growing_fixture(sim: &SimIo) -> NativeStore {
+    let s = sim_create(sim);
+    churn(&s, None, 0..LIVE * 6);
+    s
+}
+
+fn growing_commit(s: &NativeStore) -> Result<cce_core::storage::CommitReceipt, CommitError> {
+    let changes = (0..24)
+        .map(|i| Change::PutContext {
+            id: cid(&format!("G{i:02}")),
+            expect: Precondition::Any,
+            body: vec![i as u8; 900],
+            content: None,
+        })
+        .collect();
+    s.commit(
+        AttemptId::new(*b"grow").unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes,
+            ..ChangeSet::default()
+        },
+    )
+}
+
+fn grown_records(s: &NativeStore) -> usize {
+    let mut v = s.begin().unwrap();
+    (0..24)
+        .filter(|i| v.context(&cid(&format!("G{i:02}"))).unwrap().is_some())
+        .count()
+}
+
+#[test]
+fn a_failure_at_any_operation_of_a_commit_that_grows_metadata_and_reuses_pages_is_harmless() {
+    // Probe: the commit reuses retired pages, extends the page cursor and retires pages.
+    let probe = SimIo::new();
+    let s = growing_fixture(&probe);
+    let (before, reused) = (desc(&s), pages_reused(&s));
+    let start = probe.ops();
+    growing_commit(&s).unwrap();
+    let total = probe.ops() - start;
+    let after = desc(&s);
+    assert!(
+        pages_reused(&s) > reused,
+        "the commit reused no retired page"
+    );
+    assert!(
+        after.next_page > before.next_page,
+        "the commit did not grow the metadata"
+    );
+    assert!(
+        reach(&probe, &after)
+            .unwrap()
+            .retired
+            .values()
+            .any(|(g, _)| *g == after.generation),
+        "the commit retired no page"
+    );
+    drop(s);
+
+    let mut outcomes = std::collections::BTreeMap::new();
+    for n in 1..=total {
+        let sim = SimIo::new();
+        let s = growing_fixture(&sim);
+        sim.fail_nth_op(n);
+        let r = growing_commit(&s);
+        let kind = match &r {
+            Ok(_) => panic!("op {n}: a commit with a failed operation succeeded"),
+            Err(CommitError::Indeterminate(_)) => "indeterminate",
+            Err(CommitError::Rejected(_)) => "rejected",
+            Err(e) => panic!("op {n}: unexpected {e:?}"),
+        };
+        *outcomes.entry(kind).or_insert(0) += 1;
+        drop(s);
+        // A fresh process (the failed write may or may not have reached the files).
+        for (what, img) in [
+            ("process exit", sim.after_process_exit()),
+            ("power loss", sim.after_crash(crate::sim::Persist::None)),
+        ] {
+            let rec = NativeStore {
+                inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
+            };
+            crate::audit::check_retirement(&img).unwrap_or_else(|e| panic!("op {n} {what}: {e}"));
+            let grown = grown_records(&rec);
+            assert!(
+                grown == 0 || (grown == 24 && kind == "indeterminate"),
+                "op {n} {what}: {grown} of 24 records after a {kind} commit"
+            );
+            // Reuse keeps working on the recovered store.
+            let reused = pages_reused(&rec);
+            churn(&rec, Some(&img), LIVE * 6..LIVE * 9);
+            assert!(
+                pages_reused(&rec) > reused,
+                "op {n} {what}: no reuse after recovery"
+            );
+        }
+    }
+    // Both kinds of failure were exercised: before the publication record (rejected) and at it.
+    assert!(
+        outcomes.contains_key("rejected") && outcomes.contains_key("indeterminate"),
+        "{outcomes:?}"
+    );
 }
