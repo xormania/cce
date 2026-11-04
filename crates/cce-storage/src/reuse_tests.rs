@@ -2120,7 +2120,17 @@ fn a_rejected_commits_written_history_is_retired_by_the_next_publication() {
         free_before,
         "{label}: the rejected commit's bytes were offered for reuse without a record"
     );
+    assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "{label}: queued bytes and records"
+    );
     put_body(&s, "next", "N", "next");
+    assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "{label}: after the next publication"
+    );
     let retired = retired_content(&sim, &s);
     let covered: u64 = retired
         .iter()
@@ -2182,12 +2192,18 @@ fn a_staging_whose_commit_was_rejected_commits_later_exactly_once() {
         "the rejected commit changed what the staging holds"
     );
 
+    assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "after the rejection"
+    );
     assert_eq!(commit_y(&s, &sy), Ok(()));
     assert_eq!(
         s.inner.reserved_bytes_for_test(),
         (0, 0),
         "the staging's reservations were not consumed"
     );
+    assert_eq!(s.inner.ledger_check_for_test(), Ok(()), "after the commit");
     assert_eq!(
         s.inner.reusable_content_bytes(),
         free,

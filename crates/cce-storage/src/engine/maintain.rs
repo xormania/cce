@@ -4,9 +4,9 @@
 
 use cce_core::storage::{AttemptId, CommitError, StorageError};
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use super::{ContentPool, Inner, Reuse, Taken, lock, rejected, sha256, take_from};
+use super::{Inner, Reuse, Taken, lock, rejected, sha256};
 use crate::codec::{corrupt, key_components};
 use crate::format::Descriptor;
 use crate::format::PageRef;
@@ -96,7 +96,7 @@ impl Inner {
                 used.push((s.offset, s.len));
             }
         }
-        used.extend(lock(&self.pool).discarded.iter().copied());
+        used.extend(lock(&self.pool).discarded().iter().copied());
         used.sort_unstable();
         Ok(used)
     }
@@ -243,8 +243,12 @@ impl Inner {
         }
         candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
 
+        // This step's own taker id: the pool accepts back, or reserves, only what it took.
         let mut taken = Taken {
-            pool: &self.pool,
+            inner: self,
+            owner: self
+                .next_taker
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             taken: Vec::new(),
         };
         let mut moves = Vec::new();
@@ -258,35 +262,34 @@ impl Inner {
             // stream with nowhere lower to go is not work left to do.
             let mut placed = Vec::new();
             for s in m.segments.iter().chain(std::iter::once(&old)) {
-                // Under the pool lock, like staging: nothing is taken once writes are fenced.
-                let got = {
-                    let mut pool = lock(&self.pool);
-                    if pool.fenced {
-                        None
-                    } else {
-                        take_from(&mut pool, s.len, bound, Some(s.offset), &mut taken)
-                    }
-                };
+                // A checked take, refused once writes are fenced (then nothing moves).
+                let got = lock(&self.pool)
+                    .take(taken.owner, s.len, bound, Some(s.offset))
+                    .ok()
+                    .flatten();
                 match got {
-                    Some(at) => placed.push(at),
+                    Some(r) => {
+                        taken.taken.push(r);
+                        placed.push(r.offset);
+                    }
                     None => break,
                 }
             }
             if placed.len() != m.segments.len() + 1 {
-                give_back(&self.pool, &mut taken, mark);
+                give_back(&mut taken, mark);
                 continue;
             }
             // A movable stream that does not fit is skipped, never a reason to stop: smaller
             // streams below it may still fit. One larger than the whole budget can only move with
             // a larger one; one that only exceeds what remains moves on a later call.
             if total > budget.max_content_bytes {
-                give_back(&self.pool, &mut taken, mark);
+                give_back(&mut taken, mark);
                 over_budget += 1;
                 complete = false;
                 continue;
             }
             if bytes + total > budget.max_content_bytes {
-                give_back(&self.pool, &mut taken, mark);
+                give_back(&mut taken, mark);
                 complete = false;
                 continue;
             }
@@ -371,10 +374,10 @@ impl Inner {
         }
         // Reservations of dropped moves go back to the pool; their copies stay in retired space.
         for mv in dropped.iter().rev() {
-            for r in taken.taken.drain(mv.takes.clone()) {
-                lock(&self.pool)
-                    .free
-                    .insert(r.offset, (r.record_len, r.retired_at));
+            let back: Vec<Reuse> = taken.taken.drain(mv.takes.clone()).collect();
+            let given = lock(&self.pool).give_back(taken.owner, &back);
+            if let Err(why) = given {
+                self.fault(&why);
             }
         }
         if applied.is_empty() {
@@ -407,7 +410,14 @@ impl Inner {
             s
         };
         let held: Vec<Reuse> = std::mem::take(&mut taken.taken);
-        lock(&self.pool).held.insert(serial, held);
+        let reserved = lock(&self.pool).hold(taken.owner, serial, held);
+        if let Err(back) = reserved {
+            // Not this step's to reserve: give it back and refuse the step.
+            taken.taken = back;
+            return Err(rejected(StorageError::StoreState(format!(
+                "space check failed: relocation could not reserve its space as {serial}"
+            ))));
+        }
         let unbound = (
             ExtentRef {
                 offset: 0,
@@ -438,21 +448,25 @@ impl Inner {
             Err(e) => {
                 // Definitely not published: the reservations return to the pool at their
                 // original generation.
-                let mut pool = lock(&self.pool);
-                for r in pool.held.remove(&serial).unwrap_or_default() {
-                    pool.free.insert(r.offset, (r.record_len, r.retired_at));
+                let released = lock(&self.pool).release(serial);
+                if let Err(why) = released {
+                    self.fault(&why);
                 }
                 return Err(e);
             }
         };
         self.adopt(desc, &retired, &discarded);
-        let mut pool = lock(&self.pool);
-        let held = pool.held.remove(&serial).unwrap_or_default();
-        self.count_reused(&held);
-        for (offset, len, retired_at) in remainders {
-            pool.free.insert(offset, (len, retired_at));
+        // The reservations are consumed; the unused parts of their records stay free at their
+        // original generation.
+        let freed = {
+            let mut pool = lock(&self.pool);
+            let held = pool.consume(serial);
+            self.count_reused(&held);
+            pool.insert_free(&remainders)
+        };
+        if let Err(why) = freed {
+            self.fault(&why);
         }
-        drop(pool);
         let moved = applied.iter().map(|m| m.bytes).sum();
         Ok(MaintenanceReport {
             content_bytes_moved: moved,
@@ -539,11 +553,21 @@ impl Inner {
     fn adopt(&self, desc: Descriptor, retired: &[(u64, u64)], discarded: &[(u64, u64)]) {
         let generation = desc.generation;
         lock(&self.state).current = desc;
-        let mut pool = lock(&self.pool);
-        for &(offset, len) in retired.iter().chain(discarded) {
-            pool.free.insert(offset, (len, generation));
+        let freed: Vec<(u64, u64, u64)> = retired
+            .iter()
+            .chain(discarded)
+            .map(|&(offset, len)| (offset, len, generation))
+            .collect();
+        let inserted = {
+            let mut pool = lock(&self.pool);
+            pool.trim_discarded(discarded);
+            pool.insert_free(&freed)
+        };
+        // Sealed before publication, so this cannot fail; if it does, the record is durable and
+        // nothing can be rejected any more: record the fault and fence writes.
+        if let Err(why) = inserted {
+            self.fault(&why);
         }
-        pool.discarded.retain(|x| !discarded.contains(x));
     }
 
     /// Installs a callback run once by the next relocation step between its copy and its
@@ -616,10 +640,12 @@ fn relocation_owner() -> AttemptId {
     AttemptId::new(*b"maintenance: relocation").expect("a valid attempt identifier")
 }
 
-fn give_back(pool: &Mutex<ContentPool>, taken: &mut Taken, mark: usize) {
-    let mut pool = lock(pool);
-    for r in taken.taken.drain(mark..) {
-        pool.free.insert(r.offset, (r.record_len, r.retired_at));
+/// Gives back what `taken` took since `mark` (a stream that will not move).
+fn give_back(taken: &mut Taken, mark: usize) {
+    let back: Vec<Reuse> = taken.taken.drain(mark..).collect();
+    let given = lock(&taken.inner.pool).give_back(taken.owner, &back);
+    if let Err(why) = given {
+        taken.inner.fault(&why);
     }
 }
 

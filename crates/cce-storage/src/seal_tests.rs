@@ -105,6 +105,11 @@ fn rejected_for(why: &str, cs: ChangeSet, plant: JournalHook) {
         "{why}: the rejected commit published"
     );
     assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "{why}: the pool after the rejection"
+    );
+    assert_eq!(
         s.begin().unwrap().context(&cid("C")).unwrap(),
         body_c,
         "{why}: committed state changed"
@@ -210,7 +215,7 @@ fn retiring_content_a_touched_live_entry_names_is_rejected() {
         remove_c(),
         Box::new(|j: &mut SpaceJournal, _: &mut TreeTxn<'_>| {
             let m = *j.retired_extents.first().expect("C's content is retired");
-            j.live_manifests.push(m);
+            j.still_reachable.push(m);
         }),
     );
 }
