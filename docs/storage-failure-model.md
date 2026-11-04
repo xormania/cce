@@ -218,8 +218,8 @@ filesystems. Network filesystems may not provide it.
 
 ## Integrity inspection
 
-`NativeReadOnly::verify(VerifyLevel::Structure)` and the `cce-verify <store-dir> [--json]` command
-inspect a store through the read-only open. They never write, sync or repair; the store files are
+`NativeReadOnly::verify` and the `cce-verify <store-dir> [--json] [--scrub]` command inspect a store
+through the read-only open. They never write, sync or repair; the store files are
 byte-identical afterwards. Because the read-only open is refused while another process owns the
 store, inspection cannot run against a live owner.
 
@@ -241,6 +241,12 @@ The structure level checks, for the current publication record:
 
 It reads the history entries but no content bytes, and holds every record for the cross-checks, so
 its memory grows with the metadata. It does not check whether a relationship's endpoints exist.
+
+The scrub level (`VerifyLevel::Scrub`, `--scrub`) also reads every committed content stream: each
+manifest record's manifest must describe the content its key names, every segment must match its
+SHA-256, the whole stream must match the content's digest and length, and every context's binding
+must match its content's manifest. Manifests and segments are read through the verified read, one at
+a time; the report counts the content bytes read.
 
 `--json` prints one JSON object per line in a deterministic order: a summary, both slots, the
 recovery diagnostics, each finding (`check`, `location`, `detail`), and a result line. Findings name

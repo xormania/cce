@@ -125,3 +125,64 @@ fn a_store_that_cannot_be_inspected_exits_two() {
         "two store arguments"
     );
 }
+
+#[test]
+fn a_scrub_reads_content_and_exits_one_on_a_damaged_segment() {
+    use cce_core::storage::ContentBinding;
+    let dir = common::test_dir("verify-scrub").join("store");
+    let s = NativeStore::create(&dir, *b"verify-cli-store").unwrap();
+    let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    let staged = s.stage_content(&mut &payload[..]).unwrap();
+    s.commit(
+        AttemptId::new(*b"with-content").unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![Change::PutContext {
+                id: ContextId::new(*b"A").unwrap(),
+                expect: Precondition::Any,
+                body: b"a".to_vec(),
+                content: Some(0),
+            }],
+            content: vec![ContentBinding::from(&staged)],
+            ..ChangeSet::default()
+        },
+    )
+    .unwrap();
+    s.close().unwrap();
+    let ok = run(&[dir.to_str().unwrap(), "--scrub", "--json"]);
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_str(
+        String::from_utf8(ok.stdout)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(summary["content_bytes"], 70_000);
+
+    // The stream's first segment starts the content file.
+    let content = dir.join("content.cce");
+    let mut bytes = std::fs::read(&content).unwrap();
+    bytes[10] ^= 0xff;
+    std::fs::write(&content, &bytes).unwrap();
+    assert_eq!(
+        run(&[dir.to_str().unwrap()]).status.code(),
+        Some(0),
+        "structure reads no content"
+    );
+    let bad = run(&[dir.to_str().unwrap(), "--scrub", "--json"]);
+    assert_eq!(bad.status.code(), Some(1));
+    let text = String::from_utf8(bad.stdout).unwrap();
+    assert!(text.contains("\"check\":\"content\""), "{text}");
+    assert_eq!(
+        std::fs::read(&content).unwrap(),
+        bytes,
+        "a scrub changed the store"
+    );
+}

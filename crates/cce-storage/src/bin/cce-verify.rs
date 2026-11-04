@@ -1,4 +1,5 @@
-//! `cce-verify <store-dir> [--json]`: inspects a store's structure without changing it.
+//! `cce-verify <store-dir> [--json] [--scrub]`: inspects a store without changing it; `--scrub` also
+//! reads and verifies every committed content stream.
 //!
 //! Opens the store read-only, which is refused while another process owns it, so it never runs
 //! against a live owner. Prints a summary, the publication slots, recovery diagnostics and every
@@ -13,14 +14,17 @@ use std::process::ExitCode;
 
 use cce_storage::{NativeStore, VerifyLevel};
 
-const USAGE: &str = "usage: cce-verify <store-dir> [--json]";
+const USAGE: &str = "usage: cce-verify <store-dir> [--json] [--scrub]";
 
 fn main() -> ExitCode {
     let mut dir = None;
     let mut json = false;
+    let mut level = VerifyLevel::Structure;
     for arg in std::env::args().skip(1) {
         if arg == "--json" {
             json = true;
+        } else if arg == "--scrub" {
+            level = VerifyLevel::Scrub;
         } else if dir.is_none() && !arg.starts_with('-') {
             dir = Some(PathBuf::from(arg));
         } else {
@@ -32,22 +36,25 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let report =
-        match NativeStore::open_read_only(&dir).and_then(|s| s.verify(VerifyLevel::Structure)) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("cce-verify: cannot inspect {}: {e}", dir.display());
-                return ExitCode::from(2);
-            }
-        };
+    let report = match NativeStore::open_read_only(&dir).and_then(|s| s.verify(level)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cce-verify: cannot inspect {}: {e}", dir.display());
+            return ExitCode::from(2);
+        }
+    };
     if json {
         for line in report.json_lines() {
             println!("{line}");
         }
     } else {
         println!(
-            "generation {} at history position {}: {} pages, {} records",
-            report.generation, report.history_position, report.pages, report.records
+            "generation {} at history position {}: {} pages, {} records, {} content bytes",
+            report.generation,
+            report.history_position,
+            report.pages,
+            report.records,
+            report.content_bytes
         );
         for (i, s) in report.slots.iter().enumerate() {
             println!("slot {i}: {s}");

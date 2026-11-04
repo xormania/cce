@@ -171,6 +171,10 @@ pub enum VerifyLevel {
     /// every record in the tree and the relations between records, and the history entries with
     /// their attempt records. Content bytes are not read.
     Structure,
+    /// Everything [`VerifyLevel::Structure`] checks, and every committed content stream: each
+    /// manifest is read and matches its record, every segment matches its digest, the stream
+    /// matches the content's digest and length, and each context's binding matches its manifest.
+    Scrub,
 }
 
 /// One inconsistency found by [`NativeReadOnly::verify`].
@@ -198,6 +202,8 @@ pub struct Report {
     /// Metadata pages and tree records visited.
     pub pages: u64,
     pub records: u64,
+    /// Content bytes read and verified (zero at the structure level).
+    pub content_bytes: u64,
     /// Inconsistencies, in a deterministic order.
     pub findings: Vec<Finding>,
 }
@@ -213,8 +219,8 @@ impl Report {
     pub fn json_lines(&self) -> Vec<String> {
         let q = |s: &str| verify::json_string(s);
         let mut out = vec![format!(
-            "{{\"type\":\"summary\",\"generation\":{},\"history_position\":{},\"pages\":{},\"records\":{}}}",
-            self.generation, self.history_position, self.pages, self.records
+            "{{\"type\":\"summary\",\"generation\":{},\"history_position\":{},\"pages\":{},\"records\":{},\"content_bytes\":{}}}",
+            self.generation, self.history_position, self.pages, self.records, self.content_bytes
         )];
         for (i, s) in self.slots.iter().enumerate() {
             out.push(format!(

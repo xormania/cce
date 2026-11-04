@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use cce_core::storage::{
-    AttemptId, ChangeSet, ContentBinding, ContextId, RelationshipId, RelationshipKind,
+    AttemptId, ChangeSet, ContentBinding, ContentRef, ContextId, RelationshipId, RelationshipKind,
     StagingToken, StorageError,
 };
 use sha2::{Digest, Sha256};
@@ -18,13 +18,13 @@ use crate::codec::key_components;
 use crate::engine::{HISTORY_ENTRY_MAX, Inner};
 use crate::format::{Descriptor, PageRef, Slot};
 use crate::records::{
-    AttemptValue, ContextValue, ExtentRef, P_ATTEMPT, P_CONTENT, P_CONTEXT, P_HISTORY, P_IN, P_OUT,
-    P_REL, RelValue, decode_history, fingerprint, history_key, key,
+    AttemptValue, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT, P_HISTORY,
+    P_IN, P_OUT, P_REL, RelValue, SEGMENT_MAX, decode_history, fingerprint, history_key, key,
 };
 use crate::tree::{MAX_HEIGHT, Node, NodeSource};
 use crate::{Finding, Report, VerifyLevel};
 
-pub(crate) fn run(inner: &Inner, _level: VerifyLevel) -> Result<Report, StorageError> {
+pub(crate) fn run(inner: &Inner, level: VerifyLevel) -> Result<Report, StorageError> {
     let d = inner.snapshot()?.desc;
     let mut v = Verifier {
         inner,
@@ -33,11 +33,15 @@ pub(crate) fn run(inner: &Inner, _level: VerifyLevel) -> Result<Report, StorageE
         visited: HashSet::new(),
         leaf_depth: None,
         records: BTreeMap::new(),
+        content_bytes: 0,
     };
     let slots = v.slots()?;
     v.visit(d.root, 1, None, None);
     v.records_and_relations();
     v.history_and_attempts();
+    if level == VerifyLevel::Scrub {
+        v.content();
+    }
     let mut findings = std::mem::take(&mut v.findings);
     findings.sort();
     findings.dedup();
@@ -48,6 +52,7 @@ pub(crate) fn run(inner: &Inner, _level: VerifyLevel) -> Result<Report, StorageE
         diagnostics: inner.diagnostics.clone(),
         pages: v.visited.len() as u64,
         records: v.records.len() as u64,
+        content_bytes: v.content_bytes,
         findings,
     })
 }
@@ -59,6 +64,7 @@ struct Verifier<'a> {
     visited: HashSet<u64>,
     leaf_depth: Option<usize>,
     records: BTreeMap<Vec<u8>, Vec<u8>>,
+    content_bytes: u64,
 }
 
 /// A record's location: its key family and the first 8 bytes of the SHA-256 of its key.
@@ -429,6 +435,112 @@ impl Verifier<'_> {
                     "attempt",
                     locate(&k),
                     format!("points at missing history position {p}"),
+                );
+            }
+        }
+    }
+}
+
+impl Verifier<'_> {
+    /// Every committed content stream: its manifest matches its record, every segment matches its
+    /// digest, the stream matches the content's digest and length, and every context binding
+    /// matches its manifest. Each manifest and segment goes through the verified read.
+    fn content(&mut self) {
+        let committed = self.desc.content_len;
+        let mut manifests: BTreeMap<Vec<u8>, ContentRef> = BTreeMap::new();
+        let records: Vec<(Vec<u8>, Vec<u8>)> = self
+            .records
+            .iter()
+            .filter(|(k, _)| k.first() == Some(&P_CONTENT))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (k, val) in records {
+            let at = locate(&k);
+            let Some(digest) = key_components(&k[1..])
+                .ok()
+                .and_then(|p| p.into_iter().next())
+            else {
+                continue; // reported as a key finding
+            };
+            let Some(x) = ExtentRef::decode(&val).ok() else {
+                continue; // reported as a value finding
+            };
+            let m = match self
+                .inner
+                .read_extent(
+                    &x,
+                    Manifest::encoded_len(u32::MAX as usize),
+                    "content manifest",
+                )
+                .and_then(|b| Manifest::decode(&b))
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    self.find("content", at, e.to_string());
+                    continue;
+                }
+            };
+            if m.content.digest.0.as_slice() != digest.as_slice() {
+                self.find("content", at, "manifest describes other content");
+                continue;
+            }
+            let mut stream = Sha256::new();
+            let mut intact = true;
+            for (i, seg) in m.segments.iter().enumerate() {
+                if seg
+                    .offset
+                    .checked_add(seg.len)
+                    .is_none_or(|end| end > committed)
+                {
+                    self.find(
+                        "content",
+                        at.clone(),
+                        format!("segment {i} lies outside committed content"),
+                    );
+                    intact = false;
+                    break;
+                }
+                match self.inner.read_extent(seg, SEGMENT_MAX, "content segment") {
+                    Ok(bytes) => {
+                        stream.update(&bytes);
+                        self.content_bytes += bytes.len() as u64;
+                    }
+                    Err(e) => {
+                        self.find("content", at.clone(), format!("segment {i}: {e}"));
+                        intact = false;
+                        break;
+                    }
+                }
+            }
+            if intact && <[u8; 32]>::from(stream.finalize()) != m.content.digest.0 {
+                self.find(
+                    "content",
+                    at,
+                    "stream digest differs from the content's digest",
+                );
+                continue;
+            }
+            manifests.insert(digest, m.content);
+        }
+        let bindings: Vec<(Vec<u8>, ContentRef)> = self
+            .records
+            .iter()
+            .filter(|(k, _)| k.first() == Some(&P_CONTEXT))
+            .filter_map(|(k, v)| {
+                ContextValue::decode(v)
+                    .ok()
+                    .and_then(|cv| cv.content)
+                    .map(|c| (k.clone(), c))
+            })
+            .collect();
+        for (k, c) in bindings {
+            if let Some(m) = manifests.get(c.digest.0.as_slice())
+                && *m != c
+            {
+                self.find(
+                    "content",
+                    locate(&k),
+                    "binding differs from its content's manifest",
                 );
             }
         }

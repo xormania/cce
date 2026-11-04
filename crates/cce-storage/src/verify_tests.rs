@@ -63,6 +63,7 @@ fn rich() -> SimIo {
     };
     let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 249) as u8).collect();
     let staged = s.stage_content(&mut &payload[..]).unwrap();
+    let small = s.stage_content(&mut &[5u8; 1_000][..]).unwrap();
     commit(
         &s,
         "one",
@@ -70,10 +71,11 @@ fn rich() -> SimIo {
             changes: vec![
                 put("A", Some(0)),
                 put("B", None),
+                put("C", Some(1)),
                 rel("r1", "A", "B"),
                 rel("r2", "B", "A"),
             ],
-            content: vec![ContentBinding::from(&staged)],
+            content: vec![ContentBinding::from(&staged), ContentBinding::from(&small)],
             evidence: vec![Evidence {
                 label: b"why".to_vec(),
                 bytes: b"because".to_vec(),
@@ -116,10 +118,14 @@ fn empty() -> SimIo {
 }
 
 fn verify(sim: &SimIo) -> Report {
+    verify_at(sim, VerifyLevel::Structure)
+}
+
+fn verify_at(sim: &SimIo, level: VerifyLevel) -> Report {
     let ro = NativeReadOnly {
         inner: Inner::open_read_only(Box::new(sim.clone()), Options::default()).unwrap(),
     };
-    let r = ro.verify(VerifyLevel::Structure).unwrap();
+    let r = ro.verify(level).unwrap();
     drop(ro);
     sim.release();
     r
@@ -467,4 +473,90 @@ fn inspection_reports_no_stored_bytes_and_changes_nothing() {
             "inspection output contains stored bytes: {text}"
         );
     }
+}
+
+/// Context `id`'s bound content and its segments, read through the engine.
+fn bound(
+    sim: &SimIo,
+    id: &str,
+) -> (
+    cce_core::storage::ContentRef,
+    Vec<crate::records::ExtentRef>,
+) {
+    let inner = Inner::open_read_only(Box::new(sim.clone()), Options::default()).unwrap();
+    let snap = inner.snapshot().unwrap();
+    let v = crate::tree::get(&*inner, snap.desc.root, &context_key(&cid(id)))
+        .unwrap()
+        .unwrap();
+    let c = ContextValue::decode(&v).unwrap().content.unwrap();
+    let segments = inner.content_segments(&snap, &c).unwrap();
+    drop(inner);
+    sim.release();
+    (c, segments)
+}
+
+#[test]
+fn a_scrub_of_a_consistent_store_reads_every_content_byte() {
+    let sim = rich();
+    let before = images(&sim);
+    let structure = verify(&sim);
+    assert_eq!(structure.content_bytes, 0);
+    let scrub = verify_at(&sim, VerifyLevel::Scrub);
+    assert!(scrub.is_consistent(), "{:#?}", scrub.findings);
+    assert_eq!(scrub.content_bytes, 70_000 + 1_000, "both bound contents");
+    assert_eq!(images(&sim), before, "a scrub changed the store");
+}
+
+#[test]
+fn a_damaged_content_segment_is_found_only_by_a_scrub() {
+    let sim = rich();
+    let (_, segments) = bound(&sim, "A");
+    assert!(segments.len() >= 2);
+    let at = segments[1].offset + 5;
+    let mut b = [0u8];
+    sim.read_at(FileId::Content, at, &mut b).unwrap();
+    sim.write_at(FileId::Content, at, &[b[0] ^ 0xff]).unwrap();
+    sim.sync(FileId::Content).unwrap();
+    assert!(
+        verify(&sim).is_consistent(),
+        "content bytes are not read at the structure level"
+    );
+    assert_only(&verify_at(&sim, VerifyLevel::Scrub), "content");
+}
+
+#[test]
+fn a_manifest_record_naming_other_content_is_found_by_a_scrub() {
+    let sim = rich();
+    let (a, _) = bound(&sim, "A");
+    let (c, _) = bound(&sim, "C");
+    publish(&sim, |inner, cur, sink| {
+        let (ka, kc) = (
+            key(P_CONTENT, &[&a.digest.0]),
+            key(P_CONTENT, &[&c.digest.0]),
+        );
+        let va = crate::tree::get(inner, cur.root, &ka).unwrap().unwrap();
+        let vc = crate::tree::get(inner, cur.root, &kc).unwrap().unwrap();
+        let mut t = TreeTxn::new(inner, cur.root);
+        t.put(ka, vc).unwrap();
+        t.put(kc, va).unwrap();
+        t.finish(sink).unwrap()
+    });
+    assert!(verify(&sim).is_consistent());
+    assert_only(&verify_at(&sim, VerifyLevel::Scrub), "content");
+}
+
+#[test]
+fn a_binding_whose_length_differs_from_its_manifest_is_found_by_a_scrub() {
+    let sim = rich();
+    publish(&sim, |inner, cur, sink| {
+        let k = context_key(&cid("C"));
+        let mut v =
+            ContextValue::decode(&crate::tree::get(inner, cur.root, &k).unwrap().unwrap()).unwrap();
+        v.content.as_mut().unwrap().len += 1;
+        let mut t = TreeTxn::new(inner, cur.root);
+        t.put(k, v.encode()).unwrap();
+        t.finish(sink).unwrap()
+    });
+    assert!(verify(&sim).is_consistent());
+    assert_only(&verify_at(&sim, VerifyLevel::Scrub), "content");
 }
