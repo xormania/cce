@@ -13,6 +13,7 @@ use crate::audit::{published, reach};
 use crate::engine::{CONTENT_CHUNK, Inner};
 use crate::format::{PAGE_SIZE, StoreId};
 use crate::sim::SimIo;
+use crate::test_support::SETTLE_ROUNDS_BOUND;
 use crate::{NativeReadOnly, NativeStore};
 
 const STORE: StoreId = StoreId(*b"reuse-test-store");
@@ -220,6 +221,7 @@ fn put_body(s: &NativeStore, attempt: &str, id: &str, body: &str) {
 /// Commits `range` of the churn: commit `i` sets record `K{i % LIVE}` to `v{i}`. Every commit is
 /// audited when `sim` is given.
 fn churn(s: &NativeStore, sim: Option<&SimIo>, range: std::ops::Range<usize>) {
+    let what = format!("churn {range:?}");
     for i in range {
         put_body(
             s,
@@ -231,6 +233,12 @@ fn churn(s: &NativeStore, sim: Option<&SimIo>, range: std::ops::Range<usize>) {
             crate::audit::check_retirement(sim).unwrap_or_else(|e| panic!("after churn {i}: {e}"));
         }
     }
+    let rounds = s.inner.allocation_rounds_max();
+    assert!(
+        (1..=SETTLE_ROUNDS_BOUND).contains(&rounds),
+        "{what}: a commit took {rounds} rounds to settle its page allocation \
+         (expected 1 to {SETTLE_ROUNDS_BOUND})"
+    );
 }
 
 /// The live set's bodies after the first `commits` churn commits (an independent model).

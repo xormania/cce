@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use cce_core::storage::{
@@ -147,6 +147,8 @@ pub(crate) struct Inner {
     faults: Mutex<Vec<String>>,
     /// Next taker id for the reuse pool (one per staging call).
     next_taker: AtomicU64,
+    /// Most rounds any commit of this instance took to settle its page allocation.
+    allocation_rounds_max: AtomicUsize,
     cache: Mutex<NodeCache>,
     /// Logical write sets of recent commits, for validating older read bases.
     conflicts: Mutex<ConflictLog>,
@@ -596,6 +598,7 @@ impl Inner {
             pool: Mutex::new(ContentPool::default()),
             faults: Mutex::new(Vec::new()),
             next_taker: AtomicU64::new(0),
+            allocation_rounds_max: AtomicUsize::new(0),
             state: Recorded::new(
                 "state",
                 State {
@@ -654,6 +657,13 @@ impl Inner {
     #[cfg(test)]
     pub(crate) fn slow_job_release_for_test(&self) {
         self.slow_job_release.store(true, Ordering::SeqCst);
+    }
+
+    /// Most rounds any commit of this instance took to settle its page allocation (0 before the
+    /// first commit).
+    #[cfg(test)]
+    pub(crate) fn allocation_rounds_max(&self) -> usize {
+        self.allocation_rounds_max.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1524,8 +1534,11 @@ impl Inner {
                 hook();
             }
         }
-        let reused = settle_allocation(&mut txn, self, &cur, generation, reusable_through)
-            .map_err(rejected)?;
+        let (reused, rounds) =
+            settle_allocation(&mut txn, self, &cur, generation, reusable_through)
+                .map_err(rejected)?;
+        self.allocation_rounds_max
+            .fetch_max(rounds, Ordering::Relaxed);
         let reuse: Vec<u64> = reused.iter().map(|(page, _)| *page).collect();
         // Every change of space ownership this commit makes, checked as a whole before anything
         // it writes can become reachable.
@@ -2451,23 +2464,29 @@ impl ConflictLog {
 /// A retirement record taken from the committed tree: key, value and the retired page.
 type RetiredRecord = (Vec<u8>, Vec<u8>, u64);
 
+/// Retired pages a commit reuses, each with the key of the retirement record it consumed.
+type ReusedPages = Vec<(u64, Vec<u8>)>;
+
 /// Upper bound on rounds of settling a commit's page allocation. Each round's edits touch pages
 /// already being rewritten (or split from them), so replaced pages and page demand stop changing
-/// within a few rounds; a commit that does not settle is rejected.
+/// within a few rounds; a commit that does not settle is rejected. Across the test suites a commit
+/// settles in at most 4 rounds, the last of which changes nothing; the reuse and crash-cut sweep
+/// tests require at most 6.
 const ALLOCATION_ROUNDS: usize = 16;
 
 /// Records every committed page the transaction replaces as retired at `generation` and takes,
 /// for the pages the transaction will write, retired pages recorded no later than
 /// `reusable_through` (deleting their records). Recording, consuming and returning records all
 /// edit the tree, which can replace further pages and change how many pages it needs, so this
-/// repeats until a round changes nothing. Returns the pages to write first.
+/// repeats until a round changes nothing. Returns the pages to write first and the number of
+/// rounds taken, counting the last one, which changed nothing.
 fn settle_allocation(
     txn: &mut TreeTxn,
     src: &dyn NodeSource,
     cur: &Descriptor,
     generation: u64,
     reusable_through: Option<u64>,
-) -> Result<Vec<(u64, Vec<u8>)>, StorageError> {
+) -> Result<(ReusedPages, usize), StorageError> {
     // Candidates in record order (oldest retirement first), from the committed tree.
     let mut candidates = match reusable_through {
         Some(_) => Some(Cursor::new(
@@ -2504,7 +2523,7 @@ fn settle_allocation(
     let mut taken: Vec<RetiredRecord> = Vec::new();
     let mut returned: Vec<RetiredRecord> = Vec::new();
     let mut recorded = 0;
-    for _ in 0..ALLOCATION_ROUNDS {
+    for round in 1..=ALLOCATION_ROUNDS {
         let mut changed = false;
         let fresh: Vec<PageRef> = txn.replaced()[recorded..].to_vec();
         recorded += fresh.len();
@@ -2535,7 +2554,8 @@ fn settle_allocation(
             changed = true;
         }
         if !changed {
-            return Ok(taken.into_iter().map(|(k, _, page)| (page, k)).collect());
+            let pages = taken.into_iter().map(|(k, _, page)| (page, k)).collect();
+            return Ok((pages, round));
         }
     }
     Err(StorageError::InvalidRequest(format!(
