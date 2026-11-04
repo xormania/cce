@@ -77,6 +77,27 @@ pub(crate) fn encode_page(
     Ok(e.buf)
 }
 
+/// Where the zero padding of a stored page begins: after the payload of a node page whose header
+/// claims a payload that fits, or after the record of a publication slot.
+pub(crate) fn padding_start(page: &[u8], slot: bool) -> Option<usize> {
+    if slot {
+        return Some(DESC_LEN);
+    }
+    let len = u32::from_le_bytes(page.get(40..44)?.try_into().ok()?) as usize;
+    (len <= PAGE_PAYLOAD_MAX).then_some(PAGE_HEADER_LEN + len)
+}
+
+/// Offset in `page` of the first non-zero byte of its padding, if any. This build zero-fills the rest
+/// of every page it writes; the padding is outside the checksum, so readers ignore it and only the
+/// integrity check reports a non-zero byte there (as damage or foreign bytes near the page).
+pub(crate) fn first_padding_byte(page: &[u8], slot: bool) -> Option<usize> {
+    let from = padding_start(page, slot)?;
+    page.get(from..)?
+        .iter()
+        .position(|&b| b != 0)
+        .map(|i| from + i)
+}
+
 /// Decodes and validates a node page read from `at`.
 pub(crate) fn decode_page(
     store: StoreId,

@@ -11,7 +11,10 @@ use cce_core::storage::{
 };
 
 use crate::engine::{Inner, Options, context_key};
-use crate::format::{Descriptor, PAGE_SIZE, PageKind, PageRef, StoreId, encode_page};
+use crate::format::{
+    DESC_LEN, Descriptor, PAGE_HEADER_LEN, PAGE_PAYLOAD_MAX, PAGE_SIZE, PageKind, PageRef, StoreId,
+    encode_page,
+};
 use crate::io::{FileId, Io};
 use crate::records::{
     AttemptValue, ContentEntry, ContextValue, P_ATTEMPT, P_CONTENT, P_IN, P_OUT, P_RETIRED,
@@ -672,6 +675,88 @@ fn a_record_in_the_wrong_slot_is_a_slot_finding() {
     .unwrap();
     sim.sync(FileId::Meta).unwrap();
     assert_only(&verify(&sim), "slot");
+}
+
+/// Sets one byte of the metadata file, leaving every checksum as it was.
+fn poke_meta(sim: &SimIo, offset: u64, byte: u8) {
+    sim.write_at(FileId::Meta, offset, &[byte]).unwrap();
+    sim.sync(FileId::Meta).unwrap();
+}
+
+/// Writers zero-fill a node page after its payload. The padding is outside the checksum and
+/// readers ignore it, so the page still reads; but a byte there means damage or foreign bytes
+/// nearby, reported under its own check naming the page and the offset.
+#[test]
+fn a_non_zero_byte_in_a_node_pages_padding_is_a_padding_finding_and_the_page_still_reads() {
+    let sim = rich();
+    let at = leftmost_leaf(&sim);
+    let base = at.page * PAGE_SIZE as u64;
+    let mut header = [0; PAGE_HEADER_LEN];
+    sim.read_at(FileId::Meta, base, &mut header).unwrap();
+    let len = u32::from_le_bytes(header[40..44].try_into().unwrap()) as usize;
+    assert!(len < PAGE_PAYLOAD_MAX, "the leaf fills its page");
+    let first = PAGE_HEADER_LEN + len;
+    poke_meta(&sim, base + (first + 3) as u64, 0x5a);
+    poke_meta(&sim, base + PAGE_SIZE as u64 - 1, 0x01);
+    let r = verify(&sim);
+    assert_only(&r, "padding");
+    assert_eq!(r.findings.len(), 1, "{:#?}", r.findings);
+    assert_eq!(r.findings[0].location, format!("page {}", at.page));
+    assert!(
+        r.findings[0]
+            .detail
+            .contains(&format!("offset {}", first + 3)),
+        "{:#?}",
+        r.findings
+    );
+}
+
+/// The same for a publication record: the slot still holds its valid record, and the padding
+/// after the record is a finding naming the slot.
+#[test]
+fn a_non_zero_byte_in_a_publication_slots_padding_is_a_padding_finding_and_the_slot_stays_valid() {
+    let sim = rich();
+    let generation = verify(&sim).generation;
+    let slot = Descriptor::slot(generation);
+    poke_meta(&sim, slot * PAGE_SIZE as u64 + DESC_LEN as u64 + 7, 0xff);
+    let r = verify(&sim);
+    assert_eq!(
+        r.generation, generation,
+        "recovery fell back to the older record"
+    );
+    assert!(r.slots[slot as usize].starts_with("valid"), "{:?}", r.slots);
+    assert_only(&r, "padding");
+    assert_eq!(r.findings.len(), 1, "{:#?}", r.findings);
+    assert_eq!(r.findings[0].location, format!("slot {slot}"));
+    assert!(
+        r.findings[0]
+            .detail
+            .contains(&format!("offset {}", DESC_LEN + 7)),
+        "{:#?}",
+        r.findings
+    );
+}
+
+/// A slot never written is all zeros: a non-zero byte after where its record would end is a
+/// padding finding too, and the slot still counts as empty.
+#[test]
+fn a_non_zero_byte_in_an_empty_slot_is_a_padding_finding() {
+    let sim = empty();
+    let r = verify(&sim);
+    let slot = r
+        .slots
+        .iter()
+        .position(|s| s == "empty")
+        .expect("an empty slot");
+    poke_meta(
+        &sim,
+        slot as u64 * PAGE_SIZE as u64 + PAGE_SIZE as u64 - 2,
+        0x10,
+    );
+    let r = verify(&sim);
+    assert_eq!(r.slots[slot], "empty");
+    assert_only(&r, "padding");
+    assert_eq!(r.findings[0].location, format!("slot {slot}"));
 }
 
 #[test]
