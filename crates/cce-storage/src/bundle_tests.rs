@@ -116,17 +116,18 @@ fn assert_atomic(failing: Change, expected: impl Fn(&CommitError) -> bool) {
     let mut cs = valid_head(&staged);
     cs.changes.push(failing);
     let r = s.commit(attempt.clone(), s.begin().unwrap(), cs);
+    // The state first: whatever the commit answered, nothing of the bundle may be visible.
+    assert_eq!(
+        observe(&s, &staged.content),
+        before,
+        "the failed bundle published part of itself ({r:?})"
+    );
+    assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
+    assert_eq!(s.outcome(&attempt).unwrap(), AttemptOutcome::Absent);
     match &r {
         Err(e) if expected(e) => {}
         other => panic!("unexpected result: {other:?}"),
     }
-    assert_eq!(
-        observe(&s, &staged.content),
-        before,
-        "the failed bundle published part of itself"
-    );
-    assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
-    assert_eq!(s.outcome(&attempt).unwrap(), AttemptOutcome::Absent);
 
     // A fresh process sees the same.
     let content = staged.content;
