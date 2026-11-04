@@ -154,6 +154,9 @@ pub(crate) struct Inner {
     /// Live reader pins: committed generation -> number of views and content readers reading it.
     /// Space a pinned generation can reach must not be reused.
     pins: Mutex<BTreeMap<u64, u32>>,
+    /// Pins held by views and content readers (not by the engine's own short walks): what a
+    /// commit requiring quiescence counts as live readers.
+    readers: AtomicU64,
     /// Signalled when a quiescent commit ends.
     quiesced: Condvar,
     #[cfg(test)]
@@ -544,6 +547,7 @@ impl Inner {
             pending: Arc::new(Recorded::new("pending", HashMap::new())),
             closing: AtomicBool::new(false),
             pins: Mutex::new(BTreeMap::new()),
+            readers: AtomicU64::new(0),
             quiesced: Condvar::new(),
             #[cfg(test)]
             gate: Mutex::new(()),
@@ -837,13 +841,20 @@ impl Inner {
 
     /// The current committed state, pinned: the pin is registered under the same lock that reads
     /// the current state, so no publication can slip between choosing the generation and pinning it.
+    /// The pin belongs to a reader (a view and the content readers it opens).
     pub(crate) fn pin_current(self: &Arc<Self>) -> Result<(Snapshot, Pin), StorageError> {
-        let (snap, pin, ()) = self.pin_current_then(|_| ());
+        let (snap, pin, ()) = self.pin_current_then(true, |_| ());
         Ok((snap, pin))
     }
 
-    /// Like `pin_current`, also reading `read` from the same state, under the same lock.
-    fn pin_current_then<R>(self: &Arc<Self>, read: impl FnOnce(&State) -> R) -> (Snapshot, Pin, R) {
+    /// Like `pin_current`, also reading `read` from the same state, under the same lock. A pin
+    /// that is not a `reader`'s (the engine's own walk) protects reuse like any other, but a
+    /// commit requiring quiescence does not count it as a live reader.
+    fn pin_current_then<R>(
+        self: &Arc<Self>,
+        reader: bool,
+        read: impl FnOnce(&State) -> R,
+    ) -> (Snapshot, Pin, R) {
         let mut st = lock(&self.state);
         // Never register on a state a quiescent commit is about to replace.
         while st.quiescing {
@@ -858,6 +869,9 @@ impl Inner {
         }
         let desc = st.current;
         *lock(&self.pins).entry(desc.generation).or_default() += 1;
+        if reader {
+            self.readers.fetch_add(1, Ordering::SeqCst);
+        }
         let r = read(&st);
         drop(st);
         (
@@ -865,6 +879,7 @@ impl Inner {
             Pin {
                 inner: self.clone(),
                 generation: desc.generation,
+                reader,
             },
             r,
         )
@@ -888,7 +903,7 @@ impl Inner {
     }
 
     pub fn height(self: &Arc<Self>) -> Result<usize, StorageError> {
-        let (snap, _pin) = self.pin_current()?;
+        let (snap, _pin, ()) = self.pin_current_then(false, |_| ());
         let root = snap.desc.root;
         self.run_walk_hook();
         tree::height(&**self, root)
@@ -1159,7 +1174,7 @@ impl Inner {
         // Otherwise keep new views from registering until this commit ends.
         let _quiescing = if cs.removal == RemovalMode::RequireQuiescence {
             let mut st = lock(&self.state);
-            let live: u64 = lock(&self.pins).values().map(|n| u64::from(*n)).sum();
+            let live = self.readers.load(Ordering::SeqCst);
             if live > 0 {
                 return Err(CommitError::ReadersActive(format!(
                     "{live} view or content reader{} live",
@@ -1651,7 +1666,7 @@ impl Inner {
         }
         // The walk reads a pinned state: commits meanwhile cannot reuse its pages. Like any new
         // view, this waits while a commit requiring quiescence runs.
-        let (snap, _pin, uncertain) = self.pin_current_then(|st| {
+        let (snap, _pin, uncertain) = self.pin_current_then(false, |st| {
             st.fenced
                 .as_ref()
                 .is_some_and(|f| f.uncertain.as_ref() == Some(attempt))
@@ -2329,20 +2344,29 @@ impl SegmentReader {
 pub(crate) struct Pin {
     inner: Arc<Inner>,
     generation: u64,
+    /// Held by a view or content reader rather than by one of the engine's own walks.
+    reader: bool,
 }
 
 impl Clone for Pin {
     fn clone(&self) -> Self {
         *lock(&self.inner.pins).entry(self.generation).or_default() += 1;
+        if self.reader {
+            self.inner.readers.fetch_add(1, Ordering::SeqCst);
+        }
         Self {
             inner: self.inner.clone(),
             generation: self.generation,
+            reader: self.reader,
         }
     }
 }
 
 impl Drop for Pin {
     fn drop(&mut self) {
+        if self.reader {
+            self.inner.readers.fetch_sub(1, Ordering::SeqCst);
+        }
         let mut pins = lock(&self.inner.pins);
         if let Some(n) = pins.get_mut(&self.generation) {
             *n -= 1;

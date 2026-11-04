@@ -331,3 +331,55 @@ fn the_requests_own_basis_view_is_released_before_its_commit_runs() {
     );
     assert_eq!(state(&s), (false, Some(b"bee".to_vec())));
 }
+
+/// Runs `walk` with a quiescent commit submitted from inside its tree walk; returns the commit's
+/// result and the walk's own answer.
+fn quiescent_commit_during_walk<T>(
+    s: &NativeStore,
+    walk: impl FnOnce(&NativeStore) -> T,
+) -> (Result<cce_core::storage::CommitReceipt, CommitError>, T) {
+    let staged = s.stage_content(&mut &b"bee"[..]).unwrap();
+    let copy = StagedContent {
+        content: staged.content,
+        token: staged.token.clone(),
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let inner = s.inner.clone();
+    assert!(
+        s.inner
+            .set_walk_hook_for_test(Some(Box::new(move || {
+                let s = NativeStore { inner };
+                tx.send(commit_quiescent(&s, &copy)).unwrap();
+            })))
+            .is_none()
+    );
+    let answer = walk(s);
+    let committed = rx.try_recv().expect("the walk did not reach its hook");
+    (committed, answer)
+}
+
+#[test]
+fn an_outcome_walk_in_progress_does_not_block_a_quiescent_commit() {
+    let s = with_target(&SimIo::new(), b"target bytes");
+    let (committed, answer) = quiescent_commit_during_walk(&s, |s| s.outcome(&attempt("seed")));
+    assert!(
+        committed.is_ok(),
+        "an internal outcome walk counted as a live reader: {committed:?}"
+    );
+    assert!(
+        matches!(answer, Ok(AttemptOutcome::Committed(_))),
+        "{answer:?}"
+    );
+}
+
+#[test]
+fn a_statistics_walk_in_progress_does_not_block_a_quiescent_commit() {
+    let s = with_target(&SimIo::new(), b"target bytes");
+    let (committed, answer) =
+        quiescent_commit_during_walk(&s, |s| s.stats().map(|st| st.tree_height));
+    assert!(
+        committed.is_ok(),
+        "an internal statistics walk counted as a live reader: {committed:?}"
+    );
+    assert!(matches!(answer, Ok(h) if h >= 1), "{answer:?}");
+}
