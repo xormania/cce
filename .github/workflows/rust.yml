@@ -1,7 +1,7 @@
 name: rust
 
-# Every push to a branch runs the checks, so a branch is green before its PR opens; pull_request
-# runs only for forks, whose pushes do not reach this repository. A combined candidate is tested
+# Every push to a branch runs the checks (documentation-only pushes too, so the `ci` result always
+# exists for a branch head), so a branch is green before its PR opens; pull_request runs only for forks, whose pushes do not reach this repository. A combined candidate is tested
 # against its merge target by pushing it (the target merged into the branch) before promotion.
 # fmt, clippy and test are independent jobs, so one failing does not hide the others' results; the
 # `ci` job is the single gate result and fails unless all three succeeded. Superseded runs are
@@ -9,7 +9,6 @@ name: rust
 on:
   push:
     branches: ['**']
-    paths-ignore: ['**.md']
   pull_request:
     paths-ignore: ['**.md']
   workflow_dispatch:
@@ -103,7 +102,9 @@ jobs:
           retention-days: 7
 
   ci:
-    name: ci
+    # Same-repository pull_request runs skip every job (the branch push run supplies the result for
+    # that commit). Their skipped gate gets a different name so it can never satisfy a required `ci`.
+    name: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'ci (same-repository PR, see the push run)' || 'ci' }}
     # Runs whenever the checks were meant to run (pushes, fork PRs), even if one of them failed.
     if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     needs: [fmt, clippy, test]
