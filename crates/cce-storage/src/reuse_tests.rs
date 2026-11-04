@@ -1781,3 +1781,161 @@ fn a_failure_at_any_operation_of_a_commit_that_grows_metadata_and_reuses_pages_i
         "{outcomes:?}"
     );
 }
+
+// ----- one staging bound more than once --------------------------------------------------------
+
+/// Retired content extents recorded in the current state.
+fn retired_content(sim: &SimIo, s: &NativeStore) -> Extents {
+    reach(sim, &desc(s))
+        .unwrap()
+        .retired_extents
+        .iter()
+        .map(|(offset, (_, len))| (*offset, *len))
+        .collect()
+}
+
+/// Commits `bindings` with one record per entry of `users`: record `U{k}` uses binding
+/// `users[k]`.
+fn commit_bindings(
+    s: &NativeStore,
+    attempt: &str,
+    bindings: Vec<ContentBinding>,
+    users: &[usize],
+) -> Result<(), CommitError> {
+    let changes = users
+        .iter()
+        .enumerate()
+        .map(|(k, b)| Change::PutContext {
+            id: cid(&format!("U{k}")),
+            expect: Precondition::Any,
+            body: format!("U{k}").into_bytes(),
+            content: Some(*b),
+        })
+        .collect();
+    s.commit(
+        AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes,
+            content: bindings,
+            ..ChangeSet::default()
+        },
+    )
+    .map(|_| ())
+}
+
+/// After two more generations every retired extent is reusable; staging content of the same
+/// size then takes any space retired so far.
+fn force_reuse(s: &NativeStore, tag: &str, len: usize) {
+    for k in 0..2 {
+        put_body(s, &format!("{tag}-advance-{k}"), "advance", tag);
+    }
+    for k in 0..3u8 {
+        let other = payload(100 + k, len);
+        let staged = s.stage_content(&mut &other[..]).unwrap();
+        commit_staged(s, &format!("{tag}-other-{k}"), &format!("O{k}"), &staged);
+    }
+}
+
+#[test]
+fn a_staging_bound_twice_in_one_commit_is_installed_once_and_never_retired() {
+    let len = CONTENT_CHUNK + 300;
+    for users in [&[0][..], &[1], &[0, 1], &[1, 0]] {
+        let label = format!("records using bindings {users:?}");
+        let sim = SimIo::new();
+        let s = sim_create(&sim);
+        let bytes = payload(5, len);
+        let staged = s.stage_content(&mut &bytes[..]).unwrap();
+        let mine = staged_extents(&s, &staged);
+        let bindings = vec![ContentBinding::from(&staged), ContentBinding::from(&staged)];
+        assert_eq!(
+            commit_bindings(&s, "twice", bindings, users),
+            Ok(()),
+            "{label}"
+        );
+
+        let live = content_extents(&reach(&sim, &desc(&s)).unwrap());
+        assert!(mine.is_subset(&live), "{label}: the staging is not live");
+        assert!(
+            !overlaps(&retired_content(&sim, &s), &mine),
+            "{label}: live content space was retired"
+        );
+        assert_eq!(crate::audit::check_retirement(&sim), Ok(()), "{label}");
+
+        force_reuse(&s, "twice", len);
+        assert_eq!(crate::audit::check_retirement(&sim), Ok(()), "{label}");
+        for k in 0..users.len() {
+            let c = content_of(&s, &format!("U{k}"));
+            assert_eq!(
+                read_all(&mut s.begin().unwrap(), &c),
+                Ok(bytes.clone()),
+                "{label}: record U{k} after reuse"
+            );
+        }
+        drop(s);
+        sim.release();
+        let s = NativeStore {
+            inner: Inner::open(Box::new(sim.clone()), Default::default()).unwrap(),
+        };
+        for k in 0..users.len() {
+            let c = content_of(&s, &format!("U{k}"));
+            assert_eq!(
+                read_all(&mut s.begin().unwrap(), &c),
+                Ok(bytes.clone()),
+                "{label}: record U{k} after reopen"
+            );
+        }
+    }
+}
+
+#[test]
+fn two_stagings_of_the_same_bytes_in_one_commit_keep_one_and_retire_the_other() {
+    let len = CONTENT_CHUNK + 300;
+    for users in [&[0][..], &[1], &[0, 1]] {
+        let label = format!("records using bindings {users:?}");
+        let sim = SimIo::new();
+        let s = sim_create(&sim);
+        let bytes = payload(6, len);
+        let first = s.stage_content(&mut &bytes[..]).unwrap();
+        let second = s.stage_content(&mut &bytes[..]).unwrap();
+        let (kept, spare) = (staged_extents(&s, &first), staged_extents(&s, &second));
+        let bindings = vec![ContentBinding::from(&first), ContentBinding::from(&second)];
+        assert_eq!(
+            commit_bindings(&s, "same", bindings, users),
+            Ok(()),
+            "{label}"
+        );
+
+        // The index takes the first binding of the digest; the second staging is unreachable.
+        let live = content_extents(&reach(&sim, &desc(&s)).unwrap());
+        let retired = retired_content(&sim, &s);
+        assert!(
+            kept.is_subset(&live),
+            "{label}: the first staging is not live"
+        );
+        assert!(
+            !overlaps(&live, &spare),
+            "{label}: the second staging is live"
+        );
+        assert!(
+            !overlaps(&retired, &kept),
+            "{label}: live content space was retired"
+        );
+        assert!(
+            spare.is_subset(&retired),
+            "{label}: the second staging was not retired"
+        );
+        assert_eq!(crate::audit::check_retirement(&sim), Ok(()), "{label}");
+
+        force_reuse(&s, "same", len);
+        assert_eq!(crate::audit::check_retirement(&sim), Ok(()), "{label}");
+        for k in 0..users.len() {
+            let c = content_of(&s, &format!("U{k}"));
+            assert_eq!(
+                read_all(&mut s.begin().unwrap(), &c),
+                Ok(bytes.clone()),
+                "{label}: record U{k} after reuse"
+            );
+        }
+    }
+}
