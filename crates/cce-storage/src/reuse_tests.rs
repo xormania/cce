@@ -1668,8 +1668,7 @@ fn every_cut_of_every_retiring_or_reusing_step_recovers_and_continues() {
 
 /// A store whose next commit both reuses retired tree pages and needs more pages than are
 /// retired: the fixed live set churned, then one commit adding many large records.
-fn growing_fixture(sim: &SimIo) -> NativeStore {
-    let s = sim_create(sim);
+fn growing_fixture(s: NativeStore) -> NativeStore {
     churn(&s, None, 0..LIVE * 6);
     s
 }
@@ -1704,7 +1703,7 @@ fn grown_records(s: &NativeStore) -> usize {
 fn a_failure_at_any_operation_of_a_commit_that_grows_metadata_and_reuses_pages_is_harmless() {
     // Probe: the commit reuses retired pages, extends the page cursor and retires pages.
     let probe = SimIo::new();
-    let s = growing_fixture(&probe);
+    let s = growing_fixture(sim_create(&probe));
     let (before, reused) = (desc(&s), pages_reused(&s));
     let start = probe.ops();
     growing_commit(&s).unwrap();
@@ -1731,7 +1730,9 @@ fn a_failure_at_any_operation_of_a_commit_that_grows_metadata_and_reuses_pages_i
     let mut outcomes = std::collections::BTreeMap::new();
     for n in 1..=total {
         let sim = SimIo::new();
-        let s = growing_fixture(&sim);
+        let trace = Trace::default();
+        let s = growing_fixture(traced_create(&sim, &trace));
+        trace.lock().unwrap().clear();
         sim.fail_nth_op(n);
         let r = growing_commit(&s);
         let kind = match &r {
@@ -1743,26 +1744,35 @@ fn a_failure_at_any_operation_of_a_commit_that_grows_metadata_and_reuses_pages_i
         *outcomes.entry(kind).or_insert(0) += 1;
         drop(s);
         // A fresh process (the failed write may or may not have reached the files).
-        for (what, img) in [
-            ("process exit", sim.after_process_exit()),
-            ("power loss", sim.after_crash(crate::sim::Persist::None)),
+        for (survived, img) in [
+            (
+                crate::repro_tests::PROCESS_EXIT.to_string(),
+                sim.after_process_exit(),
+            ),
+            (
+                crate::repro_tests::survival(crate::sim::Persist::None),
+                sim.after_crash(crate::sim::Persist::None),
+            ),
         ] {
-            let rec = NativeStore {
-                inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
-            };
-            crate::audit::check_retirement(&img).unwrap_or_else(|e| panic!("op {n} {what}: {e}"));
-            let grown = grown_records(&rec);
-            assert!(
-                grown == 0 || (grown == 24 && kind == "indeterminate"),
-                "op {n} {what}: {grown} of 24 records after a {kind} commit"
-            );
-            // Reuse keeps working on the recovered store.
-            let reused = pages_reused(&rec);
-            churn(&rec, Some(&img), LIVE * 6..LIVE * 9);
-            assert!(
-                pages_reused(&rec) > reused,
-                "op {n} {what}: no reuse after recovery"
-            );
+            let what = format!("metadata growth, failed op {n}, {survived}");
+            repro_case(&what, &img, &trace, || {
+                let rec = NativeStore {
+                    inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
+                };
+                crate::audit::check_retirement(&img).unwrap_or_else(|e| panic!("{what}: {e}"));
+                let grown = grown_records(&rec);
+                assert!(
+                    grown == 0 || (grown == 24 && kind == "indeterminate"),
+                    "{what}: {grown} of 24 records after a {kind} commit"
+                );
+                // Reuse keeps working on the recovered store.
+                let reused = pages_reused(&rec);
+                churn(&rec, Some(&img), LIVE * 6..LIVE * 9);
+                assert!(
+                    pages_reused(&rec) > reused,
+                    "{what}: no reuse after recovery"
+                );
+            });
         }
     }
     // Both kinds of failure were exercised: before the publication record (rejected) and at it.
