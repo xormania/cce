@@ -48,5 +48,5 @@ jobs:
           PULLS: ${{ toJSON(github.event.workflow_run.pull_requests) }}
           MARKERS: ${{ secrets.PRIVATE_MARKERS }}
           SERVER: ${{ github.server_url }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
         run: bash trusted/tools/ci/leak_scan_trusted.sh

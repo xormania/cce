@@ -23,11 +23,12 @@ SCAN_FILES = (".github/workflows/leak-scan.yml", "tools/ci/leak_scan_trusted.sh"
 CLEAN = "no private markers in PR text, commit messages, added lines or file names"
 
 
-def scan_check(conclusion="success", summary="PR #9 at " + HEAD + "\n\n" + CLEAN + "\n", run_id=13, number=501,
+def scan_check(conclusion="success", body=CLEAN, run_id=13, number=501,
                started="2026-11-04T10:00:00Z", app=15368, status="completed"):
+    # GitHub replaces details_url on checks created by GitHub Actions; the summary names the run.
     return {"id": number, "app": {"id": app}, "status": status, "conclusion": conclusion, "started_at": started,
-            "details_url": "https://github.com/" + REPO + "/actions/runs/" + str(run_id),
-            "output": {"summary": summary}}
+            "details_url": "https://github.com/" + REPO + "/runs/" + str(number),
+            "output": {"summary": "leak-scan run " + str(run_id) + "\nPR #9 at " + HEAD + "\n\n" + body + "\n"}}
 
 
 def scan_run(number=13, path=".github/workflows/leak-scan.yml", event="workflow_run"):
@@ -299,7 +300,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual([row["workflow_ref"] for row in checks if row["id"] == "Test"], [MERGE])
 
     def test_scan_that_reports_it_could_not_run_is_not_executed(self):
-        for conclusion, summary in (("success", "PR #9\n\nsomething else"),
+        for conclusion, summary in (("success", "something else"),
                                     ("failure", "::error::PRIVATE_MARKERS secret is not available; nothing was scanned"),
                                     ("failure", "::error::the pull request head moved during the scan")):
             with self.subTest(summary=summary):
@@ -329,8 +330,10 @@ class ExecutionTests(unittest.TestCase):
     def test_scan_from_another_app_or_an_untrusted_producer_cannot_certify(self):
         cases = {
             "other app": lambda: self.api.responses.__setitem__(SCANS, {"check_runs": [scan_check(app=1)]}),
-            "job link": lambda: self.api.responses[SCANS]["check_runs"][0].__setitem__(
-                "details_url", "https://github.com/" + REPO + "/actions/runs/13/job/9"),
+            "no run named": lambda: self.api.responses[SCANS]["check_runs"][0]["output"].__setitem__(
+                "summary", CLEAN),
+            "run named later": lambda: self.api.responses[SCANS]["check_runs"][0]["output"].__setitem__(
+                "summary", CLEAN + "\nleak-scan run 13\n"),
             "other workflow": lambda: self.api.responses.__setitem__("/actions/runs/13", scan_run(path=".github/workflows/leak-guard.yml")),
             "pull request event": lambda: self.api.responses.__setitem__("/actions/runs/13", scan_run(event="pull_request")),
             "changed definition": lambda: self.api.files.__setitem__((".github/workflows/leak-scan.yml", MAIN), "name: leak-scan\n"),

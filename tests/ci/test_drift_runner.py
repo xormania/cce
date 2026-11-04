@@ -244,8 +244,8 @@ class ExecutionEvidenceTests(unittest.TestCase):
             '/commits/' + HEAD + '/check-runs?check_name=scan&per_page=100': {'check_runs': [{
                 'id': 501, 'app': {'id': 15368}, 'status': 'completed', 'conclusion': 'success',
                 'started_at': '2026-11-04T10:00:00Z',
-                'details_url': 'https://github.com/' + REPOSITORY + '/actions/runs/13',
-                'output': {'summary': 'no private markers in PR text, commit messages, added lines or file names'}}]},
+                'details_url': 'https://github.com/' + REPOSITORY + '/runs/501',
+                'output': {'summary': 'leak-scan run 13\nno private markers in PR text, commit messages, added lines or file names'}}]},
             '/actions/runs/13': {'id': 13, 'name': 'leak-scan', 'path': '.github/workflows/leak-scan.yml',
                                  'event': 'workflow_run', 'head_sha': TRUSTED,
                                  'head_repository': {'full_name': REPOSITORY}, 'status': 'completed',

@@ -149,7 +149,7 @@ class TrustedRunnerTests(unittest.TestCase):
         (self.stub / "calls.jsonl").write_text("")
         env = dict(ENV, PATH=str(self.stub) + os.pathsep + ENV["PATH"], STUB_DIR=str(self.stub), GH_TOKEN="t",
                    REPO="own/cce", PULLS=pulls, MARKERS=markers, SERVER="https://example.invalid",
-                   RUN_URL="https://example.invalid/run", LEAK_SCAN_REMOTE=str(self.remote))
+                   RUN_ID="4242", LEAK_SCAN_REMOTE=str(self.remote))
         done = subprocess.run(["bash", str(TRUSTED)], capture_output=True, text=True, env=env)
         calls = [json.loads(line) for line in (self.stub / "calls.jsonl").read_text().splitlines()]
         return done.returncode, done.stdout + done.stderr, calls
@@ -172,7 +172,9 @@ class TrustedRunnerTests(unittest.TestCase):
         self.publish(head)
         rc, out, calls = self.run_trusted()
         self.assertEqual(rc, 0, out)
-        self.assertEqual(self.verdict(calls)[:2], (head, "success"))
+        sha, conclusion, summary = self.verdict(calls)
+        self.assertEqual((sha, conclusion), (head, "success"))
+        self.assertTrue(summary.startswith("leak-scan run 4242\nPR #5 at " + head + "\n"), summary)
 
     def test_marker_fails_the_scan_without_revealing_it(self):
         head = self.repo.change({"b.txt": "zq-hidden-name\n"})

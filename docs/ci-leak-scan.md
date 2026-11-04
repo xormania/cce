@@ -47,15 +47,17 @@ the next run.
 The drift observer treats the latest `scan` check from GitHub Actions on the
 candidate head as the leak scan's evidence. The check must:
 
-- link to a completed `leak-scan` `workflow_run` in this repository;
+- name, on the first line of its summary (`leak-scan run <id>`), a completed
+  `leak-scan` `workflow_run` in this repository (GitHub replaces the details link
+  of checks created by GitHub Actions, so the summary carries it);
 - come from a run whose workflow definition and scan scripts, at the commit it
   ran, equal the trusted ones.
 
 A pass counts as executed only when the check reports a clean scan, and a failure
 only when it reports a match. An observer run that starts before the scan has
 finished waits for a later recheck. The Checks API cannot tie a check to the run
-that created it, so a check from the same app that copies a genuine run link is
-not detected.
+that created it, so a check from the same app that copies a genuine run's summary
+is not detected.
 
 ## Tests
 

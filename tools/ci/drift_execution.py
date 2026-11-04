@@ -27,8 +27,9 @@ _KINDS = {
              "test": r"cargo\s+test\b"},
 }
 # The required leak scan for a pull request is the `scan` check that the trusted leak-scan workflow
-# (workflow_run, default-branch code) publishes on the candidate head. Its producer is identified by
-# the check's run link; the definition and scripts at that run's commit must equal the trusted ones.
+# (workflow_run, default-branch code) publishes on the candidate head. Its producer is named on the
+# first line of the check summary ("leak-scan run <id>"; GitHub replaces the details link of checks
+# created by GitHub Actions); the definition and scripts at that run's commit must equal the trusted ones.
 SCAN_CHECK = "scan"
 SCAN_TITLE = "Trusted leak scan"
 SCAN_PATH = ".github/workflows/leak-scan.yml"
@@ -224,12 +225,12 @@ def _emitted_lines(logs):
 def _trusted_scan(api, source, root):
     """Return (check rows, limits, waiting) for the trusted leak scan of a pull request candidate.
 
-    The latest `scan` check from GitHub Actions on the candidate head is evidence only when its run
-    link names a completed leak-scan workflow_run in this repository whose definition and scripts,
+    The latest `scan` check from GitHub Actions on the candidate head is evidence only when its
+    summary names a completed leak-scan workflow_run in this repository whose definition and scripts,
     at the commit it ran, equal the trusted ones. A pass counts as executed only when the check
     reports a clean scan; a failure only when it reports a match. Anything else did not scan.
     Binding a check to the run that created it is not possible through the Checks API, so a
-    same-app check that copies a genuine run link is not detected here.
+    same-app check that copies a genuine run's summary is not detected here.
     """
     head = source["head_sha"]
     try:
@@ -245,8 +246,8 @@ def _trusted_scan(api, source, root):
     check = max(runs, key=lambda row: (str(row.get("started_at") or ""), row.get("id") or 0))
     if check.get("status") != "completed":
         return [], [], True
-    link = re.fullmatch(r"https://[^/]+/" + re.escape(api.repository) + r"/actions/runs/(\d+)",
-                        str(check.get("details_url") or ""))
+    summary = str((check.get("output") or {}).get("summary") or "")
+    link = re.match(r"leak-scan run (\d{1,20})\n", summary)
     trusted = (root / SCAN_PATH).read_text()
     try:
         if not link:
@@ -264,7 +265,6 @@ def _trusted_scan(api, source, root):
         return ([_row("leak-scan:trusted-producer", source_sha=head, reason="leak_scan_producer_unverified",
                       check_run_id=check.get("id"))],
                 ["producer_definition_unverified", "leak_scan_producer_unverified"], False)
-    summary = str((check.get("output") or {}).get("summary") or "")
     conclusion = check.get("conclusion")
     executed = ((conclusion == "success" and SCAN_CLEAN in summary)
                 or (conclusion == "failure" and SCAN_MATCH in summary))
