@@ -350,7 +350,7 @@ moved and its pages not; that is a whole state too.
 
 ## Not implemented yet
 
-Recovery from an uncertain outcome without reopening, and a maintenance pass over the content
-file that would reclaim the content space reuse does not reach (see the storage format document).
+Recovery from an uncertain outcome without reopening, and shrinking the store files: maintenance
+moves data into retired space nearer the start of each file but never truncates a file.
 (Concurrent commit validation against views' observations is implemented; see "Concurrent views and
 conflict validation" above.)

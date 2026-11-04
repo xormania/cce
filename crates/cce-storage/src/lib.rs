@@ -91,9 +91,14 @@ pub enum MaintenanceTask {
 }
 
 /// How much one [`NativeStore::maintain`] call may do before it publishes and returns.
+/// [`MaintenanceTask::RebuildRelationshipIndexes`] is not bounded by it: it rebuilds both indexes
+/// in one publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaintenanceBudget {
+    /// Most tree pages a [`MaintenanceTask::Relocate`] step moves.
     pub max_pages: u64,
+    /// Most content bytes a step moves ([`MaintenanceTask::Relocate`]) or retires
+    /// ([`MaintenanceTask::ReclaimContentHoles`]).
     pub max_content_bytes: u64,
 }
 
@@ -112,9 +117,13 @@ impl Default for MaintenanceBudget {
 pub struct MaintenanceReport {
     /// The generation current after the call (unchanged if there was nothing to do).
     pub generation: u64,
+    /// Tree pages rewritten into retired pages.
     pub pages_moved: u64,
+    /// Committed content bytes copied into retired space (manifests and segments).
     pub content_bytes_moved: u64,
+    /// Content-file bytes retired as unreachable.
     pub content_bytes_reclaimed: u64,
+    /// Relationship index entries written by an index rebuild.
     pub index_entries_written: u64,
     /// False if the budget ran out before the task was done; call again to continue.
     pub complete: bool,
@@ -124,6 +133,11 @@ impl NativeStore {
     /// Runs one bounded step of physical maintenance and publishes its result as a new physical
     /// generation, ordered with commits. Returns at once with nothing done if there is nothing to do.
     /// Never run implicitly: opening a store does no maintenance.
+    ///
+    /// Refused with [`CommitError::Rejected`], writing nothing, while writes are fenced. A step
+    /// publishes through the same data barrier as a commit, and a failure there is reported and
+    /// fences writes as it does for a commit; a crash at any point recovers the state before or
+    /// after the step.
     pub fn maintain(
         &self,
         task: MaintenanceTask,
