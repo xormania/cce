@@ -1,4 +1,4 @@
-"""Behavioral controls for the comparative runner; Cargo outcomes use protocol fixtures."""
+"""Exercise comparison orchestration with simulated Cargo outcomes."""
 from contextlib import redirect_stdout
 import io
 import json
@@ -58,7 +58,7 @@ class ComparisonTests(unittest.TestCase):
 
     def fake_cargo(self, command, cwd, log, timeout, env):
         if command[0] == "rustc" or "-V" in command:
-            text, code = "protocol fixture version\n", 0
+            text, code = "test compiler version\n", 0
         elif "--list" in command:
             text, code = "fixture: test\n", 0
         elif "--exact" in command and "broken" in (cwd / self.fault["path"]).read_text():
@@ -143,9 +143,17 @@ class ComparisonTests(unittest.TestCase):
         for output, code, expected in cases:
             with self.subTest(expected=expected, output=output):
                 self.assertEqual(s.classify(self.result(output, code), self.fault, self.repo)[0], expected)
-        (self.repo / "tests/witness.rs").write_text("setup().unwrap();\n")
+        (self.repo / "tests/witness.rs").write_text("setup().unwrap();\nassert!(observed);\n")
         output = "test fixture ... FAILED\nthread 'fixture' panicked at tests/witness.rs:1:1:\nassertion failed"
         self.assertEqual(s.classify(self.result(output, 101), self.fault, self.repo)[0], "build/setup error")
+        (self.repo / "tests/witness.rs").write_text('let label = "assert!(not executed)"; setup().unwrap();\n')
+        self.assertEqual(s.classify(self.result(output, 101), self.fault, self.repo)[0], "build/setup error")
+
+    def test_io_module_normalization_preserves_trailing_production_and_masks_literals(self):
+        original = 'use std::io;\n#[cfg(test)]\nmod tests { let x = r#"}"#; /* } */ }\npub fn tail() {}\n'
+        normalized = s.without_io_tests(original)
+        self.assertEqual(normalized, 'use std::io;\npub fn tail() {}\n')
+        self.assertNotEqual(normalized, s.without_io_tests(original.replace('fn tail()', 'fn changed()')))
 
     def test_catalog_anchors_match_current_sources_and_have_explicit_witnesses(self):
         catalog = json.loads((ROOT / "tools/testkit/faults.json").read_text())

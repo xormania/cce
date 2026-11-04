@@ -81,4 +81,3 @@ The `testkit` workflow runs this bounded campaign on `test-support/**` branches
 and supports manual dispatch with an original-suite ref. It uploads the report,
 logs and test images on success or failure. Routine formatting, Clippy, workspace
 tests and deterministic drift validation keep their existing independent jobs.
-

@@ -15,6 +15,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
+from drift_relationships import _rust_code
+
 
 @dataclass
 class Run:
@@ -97,9 +100,28 @@ def production_inputs(root):
         if name.endswith("/src/lib.rs"):
             text = re.sub(r"#\[cfg\(test\)\]\s*\nmod [a-z_]+;\n", "", text)
         if name.endswith("/src/io.rs"):
-            text = text.split("#[cfg(test)]\nmod tests {", 1)[0]
+            text = without_io_tests(text)
         result[name] = hashlib.sha256(text.encode()).hexdigest()
     return result
+
+
+def without_io_tests(text):
+    code = _rust_code(text)
+    match = re.search(r"#\[cfg\(test\)\]\s*mod tests\s*\{", code)
+    if not match:
+        return text
+    depth = 1
+    for end in range(match.end(), len(code)):
+        if code[end] == "{":
+            depth += 1
+        elif code[end] == "}":
+            depth -= 1
+            if depth == 0:
+                end += 1
+                if text[end:end+1] == "\n":
+                    end += 1
+                return text[:match.start()] + text[end:]
+    raise ValueError("unterminated I/O test module")
 
 
 def digest(value):
@@ -149,10 +171,12 @@ def classify(result, fault, root):
                 continue
             source = (root / fault["witness"]).read_text().splitlines()
             context = "\n".join(source[max(0, line-1):line+4])
+            code_lines = _rust_code("\n".join(source)).splitlines()
+            observed_line = code_lines[line-1] if 0 < line <= len(code_lines) else ""
             # Ordinary unwrap failures are setup errors. Explicit error expectations
             # and an intentional refusal panic can be behavioral witnesses.
-            assertion = re.search(r"\bassert(?:_eq|_ne)?!|\.unwrap_err\(|\.expect_err\(", context)
-            refusal = fault.get("refusal") and fault["refusal"] in context and "panic!" in context
+            assertion = re.search(r"\bassert(?:_eq|_ne)?!|\.unwrap_err\(|\.expect_err\(", observed_line)
+            refusal = fault.get("refusal") and fault["refusal"] in observed_line and "panic!" in observed_line
             if assertion or refusal:
                 return "detected", {"path": fault["witness"], "line": line, "context": context}
     if "running 0 tests" in result.output:
@@ -244,6 +268,7 @@ def compare(args):
                                             "command": result.command, "exit": result.code}
                 if not healthy(result):
                     raise ValueError(role + " healthy suite did not pass")
+                print(role + ": healthy suite passed; " + str(len(cases)) + " discovered cases", flush=True)
                 for fault in faults:
                     row = next((r for r in report["faults"] if r["id"] == fault["id"]), None)
                     if row is None:
@@ -259,6 +284,7 @@ def compare(args):
                                      "exit": result.code, "timed_out": result.timed_out}
                     finally:
                         path.write_text(before)
+                    print(role + ": " + fault["id"] + " -> " + row[role]["result"], flush=True)
                     publish(out, report)
         report["status"] = "passed" if all(
             row.get(role, {}).get("result") == "detected"
