@@ -11,8 +11,8 @@ use crate::codec::corrupt;
 use crate::format::{Descriptor, PAGE_SIZE, PageKind, PageRef, Slot, decode_page, decode_slot};
 use crate::io::{FileId, Io};
 use crate::records::{
-    ContentEntry, ContextValue, ExtentRef, Manifest, P_CONTENT, P_CONTEXT, P_HISTORY, P_RETIRED,
-    Retired, decode_retired, key,
+    AttemptValue, ContentEntry, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT,
+    P_HISTORY, P_HISTORY_REMOVED, P_RETIRED, Retired, decode_history, decode_retired, key,
 };
 use crate::tree::Node;
 
@@ -55,6 +55,12 @@ pub(crate) struct Reach {
     pub content_refs: BTreeMap<Vec<u8>, u64>,
     /// Number of records using each content (by index key), counted from the records themselves.
     pub record_refs: BTreeMap<Vec<u8>, u64>,
+    /// Attempt records: attempt index key -> history position.
+    pub attempts: BTreeMap<Vec<u8>, u64>,
+    /// Retained history entries: position -> attempt index key of the attempt the entry records.
+    pub history_attempts: BTreeMap<u64, Vec<u8>>,
+    /// Markers of removed history entries: position -> attempt index key the marker names.
+    pub removed_history: BTreeMap<u64, Vec<u8>>,
 }
 
 impl Reach {
@@ -94,6 +100,36 @@ fn read_extent(io: &dyn Io, d: &Descriptor, x: &ExtentRef) -> Result<Vec<u8>, St
         )));
     }
     Ok(buf)
+}
+
+/// Every attempt record points at a position whose retained entry, or whose removal marker, names
+/// that attempt, and every entry and marker is pointed at by its attempt's record. A position is
+/// either retained or removed, never both.
+pub(crate) fn check_attempt_pairing(r: &Reach) -> Result<(), String> {
+    for (a, p) in &r.attempts {
+        let named = r.history_attempts.get(p).or(r.removed_history.get(p));
+        if named != Some(a) {
+            return Err(format!(
+                "attempt record {a:?} points at position {p}, which names {named:?}"
+            ));
+        }
+    }
+    for (p, a) in r.history_attempts.iter().chain(&r.removed_history) {
+        if r.attempts.get(a) != Some(p) {
+            return Err(format!(
+                "history position {p} names attempt {a:?}, whose record points at {:?}",
+                r.attempts.get(a)
+            ));
+        }
+    }
+    if let Some(p) = r
+        .history_attempts
+        .keys()
+        .find(|p| r.removed_history.contains_key(p))
+    {
+        return Err(format!("history position {p} is both retained and removed"));
+    }
+    Ok(())
 }
 
 /// Walks the tree of `d` from its root, decoding every page.
@@ -141,6 +177,21 @@ pub(crate) fn reach(io: &dyn Io, d: &Descriptor) -> Result<Reach, StorageError> 
                         Some(&P_HISTORY) => {
                             let x = ExtentRef::decode(&v)?;
                             r.history_extents.insert((x.offset, x.len));
+                            let h = decode_history(&read_extent(io, d, &x)?)?;
+                            r.history_attempts
+                                .insert(h.position.0, key(P_ATTEMPT, &[h.attempt.as_bytes()]));
+                        }
+                        Some(&P_HISTORY_REMOVED) => {
+                            let pos = u64::from_be_bytes(
+                                k[1..]
+                                    .try_into()
+                                    .map_err(|_| corrupt("history marker key"))?,
+                            );
+                            r.removed_history.insert(pos, key(P_ATTEMPT, &[&v]));
+                        }
+                        Some(&P_ATTEMPT) => {
+                            r.attempts
+                                .insert(k.clone(), AttemptValue::decode(&v)?.position);
                         }
                         Some(&P_RETIRED) => match decode_retired(&k, &v)? {
                             Retired::Page {
@@ -192,6 +243,7 @@ pub(crate) fn check_retirement(io: &dyn Io) -> Result<(), String> {
             cur.generation
         ));
     }
+    check_attempt_pairing(&rc).map_err(|m| format!("generation {}: {m}", cur.generation))?;
     let reached: Vec<(u64, u64)> = rc
         .manifests
         .iter()
