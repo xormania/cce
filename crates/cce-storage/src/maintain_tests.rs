@@ -64,6 +64,8 @@ struct Logical {
     contexts: BTreeMap<String, Record>,
     outgoing: BTreeMap<(String, Vec<u8>), Relationship>,
     incoming: BTreeMap<(String, Vec<u8>), Relationship>,
+    /// Listings that failed (a damaged index): context and the error.
+    broken: Vec<(String, String)>,
     history: Vec<HistoryEntry>,
 }
 
@@ -73,9 +75,17 @@ fn logical(s: &NativeStore) -> Logical {
         contexts: BTreeMap::new(),
         outgoing: BTreeMap::new(),
         incoming: BTreeMap::new(),
+        broken: Vec::new(),
         history: Vec::new(),
     };
-    for name in IDS {
+    // The named contexts, and the many records of the page relocation fixture.
+    let names = IDS
+        .iter()
+        .map(|n| n.to_string())
+        .chain((0..400).map(|i| format!("k{i:04}")))
+        .chain(["z".to_string()]);
+    for name in names {
+        let name = name.as_str();
         let id = cid(name);
         if let Some(r) = v.context(&id).unwrap() {
             let bytes = r.content.map(|c| {
@@ -97,8 +107,12 @@ fn logical(s: &NativeStore) -> Logical {
                 after: None,
             };
             for r in v.relationships(&q).unwrap() {
-                let r = r.unwrap();
-                into.insert((name.into(), r.id.as_bytes().to_vec()), r);
+                match r {
+                    Ok(r) => {
+                        into.insert((name.into(), r.id.as_bytes().to_vec()), r);
+                    }
+                    Err(e) => out.broken.push((name.into(), e.to_string())),
+                }
             }
         }
     }
@@ -1070,4 +1084,159 @@ fn page_relocation_without_lower_retired_pages_does_nothing() {
         "a step with nothing to move published"
     );
     assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
+}
+
+/// One maintenance step to sweep: its name, the released image it runs on, and its task.
+type Sweep = (&'static str, fn() -> SimIo, MaintenanceTask);
+
+fn holes_image() -> SimIo {
+    let (sim, s, _) = leaked(100_000, false);
+    drop(s);
+    sim.release();
+    sim
+}
+
+fn damaged_image() -> SimIo {
+    let (sim, s) = related();
+    damage(&s);
+    drop(s);
+    sim.release();
+    sim
+}
+
+const SWEEPS: [Sweep; 4] = [
+    (
+        "hole reclaim",
+        holes_image,
+        MaintenanceTask::ReclaimContentHoles,
+    ),
+    (
+        "index rebuild",
+        damaged_image,
+        MaintenanceTask::RebuildRelationshipIndexes,
+    ),
+    ("content relocation", fragmented, MaintenanceTask::Relocate),
+    ("page relocation", scattered, MaintenanceTask::Relocate),
+];
+
+/// Every cut of every maintenance step, after a process exit and after a power loss, recovers
+/// either the state before the step or the state after it, passes the audit, and keeps working.
+#[test]
+fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
+    use crate::format::PAGE_SIZE;
+    use crate::io::{FileId, Op, Traced};
+    use crate::repro_tests::{PROCESS_EXIT, survival, with_repro};
+    use crate::sim::Persist;
+    use std::sync::{Arc, Mutex};
+    let open_traced = |sim: &SimIo, trace: &Arc<Mutex<Vec<Op>>>| {
+        sim.release();
+        NativeStore {
+            inner: Inner::open(
+                Box::new(Traced {
+                    inner: sim.clone(),
+                    trace: trace.clone(),
+                }),
+                Options::default(),
+            )
+            .unwrap(),
+        }
+    };
+    let (mut checked, mut cases) = (0, 0);
+    for (name, image, task) in SWEEPS {
+        let base = image();
+        // The uncut step: what it changes, and how many mutating operations it makes.
+        let probe = base.after_process_exit();
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let s = open_traced(&probe, &trace);
+        let before = logical(&s);
+        let generation = s.inner.snapshot().unwrap().desc.generation;
+        trace.lock().unwrap().clear();
+        let r = s.maintain(task, MaintenanceBudget::default()).unwrap();
+        let ops = trace.lock().unwrap().clone();
+        let total = ops.len() as u64;
+        let after = logical(&s);
+        assert!(
+            r.generation > generation,
+            "{name}: the step published nothing to sweep"
+        );
+        drop(s);
+        // A step may publish more than once (relocation: content, then pages); nothing may be
+        // published before the first publication record write.
+        let publication = ops
+            .iter()
+            .position(|op| {
+                matches!(op, Op::Write { file: FileId::Meta, offset, .. } if *offset < 2 * PAGE_SIZE as u64)
+            })
+            .expect("a publication record write") as u64;
+        cases += (total + 1) * 7;
+        for cut in 0..=total {
+            let sim = base.after_process_exit();
+            let trace = Arc::new(Mutex::new(Vec::new()));
+            let s = open_traced(&sim, &trace);
+            trace.lock().unwrap().clear();
+            sim.crash_after(cut);
+            let acknowledged = s.maintain(task, MaintenanceBudget::default()).is_ok();
+            assert_eq!(
+                acknowledged,
+                cut == total,
+                "{name} cut {cut}: acknowledgment"
+            );
+            drop(s);
+            let trace = trace.lock().unwrap().clone();
+            let images = [(PROCESS_EXIT.to_string(), sim.after_process_exit())]
+                .into_iter()
+                .chain(
+                    [Persist::None, Persist::All]
+                        .into_iter()
+                        .chain((1..=4).map(Persist::Seeded))
+                        .map(|p| (survival(p), sim.after_crash(p))),
+                );
+            for (how, img) in images {
+                let label = format!("{name} cut {cut} of {total}, {how}");
+                let pristine = img.after_process_exit();
+                with_repro(&label, &[("image", &pristine)], &trace, || {
+                    let recovered = open(&img);
+                    audit(&img);
+                    let got = logical(&recovered);
+                    assert!(
+                        got == before || got == after,
+                        "{label}: a state between the two"
+                    );
+                    let published = recovered.inner.snapshot().unwrap().desc.generation;
+                    assert!(published <= r.generation, "{label}: published {published}");
+                    if acknowledged {
+                        assert_eq!(got, after, "{label}: acknowledged step lost");
+                        assert_eq!(published, r.generation, "{label}: acknowledged step lost");
+                    }
+                    if cut <= publication {
+                        assert_eq!(
+                            published, generation,
+                            "{label}: published before its record"
+                        );
+                        assert_eq!(got, before, "{label}: visible before its record");
+                    }
+                    // The recovered store keeps working: commit, audit, reopen.
+                    commit(
+                        &recovered,
+                        "after-recovery",
+                        ChangeSet {
+                            changes: vec![put("D", "after", None)],
+                            ..ChangeSet::default()
+                        },
+                    );
+                    audit(&img);
+                    let next = logical(&recovered);
+                    drop(recovered);
+                    assert_eq!(
+                        logical(&open(&img)),
+                        next,
+                        "{label}: reopening changed state"
+                    );
+                });
+                checked += 1;
+            }
+        }
+    }
+    // Every cut of every step, after a process exit and after six power losses.
+    assert_eq!(checked, cases);
 }

@@ -295,6 +295,11 @@ space, which is proportional to the metadata (as for the integrity check).
   about what a commit writes; the content part copies up to the content budget of stream bytes,
   which is why it copies without the lock.
 
+Every maintenance publication passes the same data barrier as a commit, so a crash at any point of a
+step, whether the process exits or power is lost, recovers either the state before the step or the
+state after it. A relocation that publishes both parts may also stop between them, with its content
+moved and its pages not; that is a whole state too.
+
 ## Not implemented yet
 
 Space reuse, removal modes, concurrent commit validation beyond preconditions,
