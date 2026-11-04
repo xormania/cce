@@ -12,8 +12,8 @@ use cce_core::storage::{
 
 use crate::engine::{Inner, Options, context_key};
 use crate::format::{
-    DESC_LEN, Descriptor, PAGE_HEADER_LEN, PAGE_PAYLOAD_MAX, PAGE_SIZE, PageKind, PageRef, StoreId,
-    encode_page,
+    DESC_LEN, Descriptor, FORMAT_VERSION, PAGE_HEADER_LEN, PAGE_PAYLOAD_MAX, PAGE_SIZE, PageKind,
+    PageRef, Slot, StoreId, decode_slot, encode_page,
 };
 use crate::io::{FileId, Io};
 use crate::records::{
@@ -735,6 +735,58 @@ fn a_non_zero_byte_in_a_publication_slots_padding_is_a_padding_finding_and_the_s
         "{:#?}",
         r.findings
     );
+}
+
+/// A later format version may extend its record after this one's: an intact record of another
+/// version followed by non-zero bytes is unsupported, never a padding finding. (A store holding one is
+/// refused at open, so this checks the slot rule itself.)
+#[test]
+fn bytes_after_an_intact_record_of_a_later_version_are_not_padding() {
+    let d = Descriptor {
+        store: STORE,
+        generation: 2,
+        root: PageRef {
+            page: 2,
+            incarnation: 2,
+        },
+        next_page: 3,
+        content_len: 0,
+        history_pos: 0,
+    };
+    let mut page = d.encode();
+    page[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+    let crc = crc32fast::hash(&page[..DESC_LEN - 4]);
+    page[DESC_LEN - 4..DESC_LEN].copy_from_slice(&crc.to_le_bytes());
+    page[DESC_LEN..DESC_LEN + 8].copy_from_slice(b"extended");
+    let slot = decode_slot(&page);
+    assert!(matches!(slot, Slot::Unsupported(_)), "{slot:?}");
+    assert_eq!(crate::verify::slot_padding(&page, &slot), None);
+    // The same bytes after a record of this version are padding.
+    let mut ours = d.encode();
+    ours[DESC_LEN..DESC_LEN + 8].copy_from_slice(b"extended");
+    let slot = decode_slot(&ours);
+    assert!(matches!(slot, Slot::Valid(_)), "{slot:?}");
+    assert_eq!(crate::verify::slot_padding(&ours, &slot), Some(DESC_LEN));
+}
+
+/// A damaged record says nothing about what follows it: the older slot torn, with non-zero bytes
+/// after its record, is reported as invalid and is not a padding finding.
+#[test]
+fn bytes_after_a_damaged_record_are_not_padding() {
+    let sim = rich();
+    let generation = verify(&sim).generation;
+    let older = 1 - Descriptor::slot(generation);
+    let base = older * PAGE_SIZE as u64;
+    poke_meta(&sim, base + 30, 0xa5);
+    poke_meta(&sim, base + DESC_LEN as u64 + 1, 0x77);
+    let r = verify(&sim);
+    assert_eq!(r.generation, generation);
+    assert!(
+        r.slots[older as usize].starts_with("invalid"),
+        "{:?}",
+        r.slots
+    );
+    assert!(r.is_consistent(), "{:#?}", r.findings);
 }
 
 /// A slot never written is all zeros: a non-zero byte after where its record would end is a
