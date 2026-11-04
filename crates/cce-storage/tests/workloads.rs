@@ -360,15 +360,21 @@ fn scaled_store(dir: &std::path::Path, n: usize) -> std::path::PathBuf {
     store
 }
 
-/// Opens `store` in a fresh process and measures opening, one point read and one range read.
-fn measure(store: &std::path::Path) -> BTreeMap<String, u64> {
+/// Opens `store` (of `n` records) in a fresh process and measures opening, one point read of a
+/// record far from the tree's leftmost path (which opening and statistics have cached), and one
+/// range read.
+fn measure(store: &std::path::Path, n: usize) -> BTreeMap<String, u64> {
     let mut d = open(store);
     let s0 = stats(&mut d);
     // A second statistics call: the height walk is cached now, so it reads nothing more.
     let s1 = stats(&mut d);
     assert_eq!(s1["pages_read"], s0["pages_read"]);
-    let got = answered(d.step("get R000007"), "get");
-    assert!(got[0].starts_with("context R000007 rev:"), "{got:?}");
+    let far = format!("R{:06}", n - 7);
+    let got = answered(d.step(&format!("get {far}")), "get");
+    assert!(
+        got[0].starts_with(&format!("context {far} rev:")),
+        "{got:?}"
+    );
     let s2 = stats(&mut d);
     let rels = answered(d.step("rels F out - 100"), "rels");
     assert_eq!(rels.len(), 20);
@@ -402,8 +408,8 @@ fn opening_and_point_and_range_reads_do_not_grow_with_the_store() {
     let t0 = Instant::now();
     let dir = test_dir("workload-scale");
     const N: usize = 2_000;
-    let small = measure(&scaled_store(&dir, N));
-    let large = measure(&scaled_store(&dir, 8 * N));
+    let small = measure(&scaled_store(&dir, N), N);
+    let large = measure(&scaled_store(&dir, 8 * N), 8 * N);
     // Work bounded by the tree's height and the result size, not by the number of records.
     let extra_levels = large["height"] - small["height"];
     assert!(
@@ -414,6 +420,10 @@ fn opening_and_point_and_range_reads_do_not_grow_with_the_store() {
     );
     assert_eq!(small["point_entries"], 1);
     assert_eq!(large["point_entries"], 1);
+    assert!(
+        large["point_pages_read"] >= 1,
+        "the point read loaded no page"
+    );
     assert!(large["point_pages_read"] <= large["height"]);
     // Each relationship: its index entry and its record.
     assert_eq!(small["range_entries"], 40);
