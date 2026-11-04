@@ -6,6 +6,8 @@
 
 #[cfg(test)]
 mod attempt_tests;
+#[cfg(test)]
+mod audit;
 mod codec;
 #[cfg(test)]
 mod content_tests;
@@ -23,6 +25,8 @@ mod readonly_tests;
 mod records;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod reuse_tests;
 #[cfg(test)]
 mod sim;
 mod tree;
@@ -43,7 +47,7 @@ use cce_core::storage::{
     RelationshipQuery, StagedContent, StorageEngine, StorageError,
 };
 
-use engine::{Inner, Observation, Options, Snapshot};
+use engine::{Inner, Observation, Options, Pin, Snapshot};
 
 /// A native store owned by this process.
 ///
@@ -147,11 +151,7 @@ pub struct NativeReadOnly {
 impl NativeReadOnly {
     /// A consistent view of the selected committed state.
     pub fn begin(&self) -> Result<NativeView, StorageError> {
-        Ok(NativeView {
-            inner: self.inner.clone(),
-            snap: self.inner.snapshot()?,
-            observed: Vec::new(),
-        })
+        NativeView::new(&self.inner)
     }
 
     /// Recovery diagnostics from opening, such as an ignored damaged publication slot.
@@ -240,6 +240,20 @@ pub struct NativeView {
     snap: Snapshot,
     /// Logical reads made through this view; a commit from it is validated against them.
     observed: Vec<Observation>,
+    /// Keeps the generation this view reads from being reused while the view lives.
+    pin: Pin,
+}
+
+impl NativeView {
+    fn new(inner: &Arc<Inner>) -> Result<Self, StorageError> {
+        let (snap, pin) = inner.pin_current()?;
+        Ok(Self {
+            inner: inner.clone(),
+            snap,
+            observed: Vec::new(),
+            pin,
+        })
+    }
 }
 
 impl ReadView for NativeView {
@@ -269,7 +283,11 @@ impl ReadView for NativeView {
     }
 
     fn content(&mut self, content: &ContentRef) -> Result<Box<dyn ContentReader>, StorageError> {
-        Ok(Box::new(self.inner.content(&self.snap, content)?))
+        Ok(Box::new(
+            self.inner
+                .content(&self.snap, content)?
+                .pinned(self.pin.clone()),
+        ))
     }
 }
 
@@ -277,11 +295,7 @@ impl StorageEngine for NativeStore {
     type View = NativeView;
 
     fn begin(&self) -> Result<NativeView, StorageError> {
-        Ok(NativeView {
-            inner: self.inner.clone(),
-            snap: self.inner.snapshot()?,
-            observed: Vec::new(),
-        })
+        NativeView::new(&self.inner)
     }
 
     fn stage_content(&self, bytes: &mut dyn Read) -> Result<StagedContent, StorageError> {

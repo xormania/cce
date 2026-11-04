@@ -10,7 +10,7 @@
 //! 5. publication barrier: sync the metadata file;
 //! 6. expose the new generation to new views and acknowledge.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
@@ -135,6 +135,9 @@ pub(crate) struct Inner {
     worker: Mutex<Option<mpsc::SyncSender<Job>>>,
     /// Attempts admitted to the worker and not yet resolved.
     pending: Mutex<HashMap<AttemptId, u32>>,
+    /// Live reader pins: committed generation -> number of views and content readers reading it.
+    /// Space a pinned generation can reach must not be reused.
+    pins: Mutex<BTreeMap<u64, u32>>,
     #[cfg(test)]
     gate: Mutex<()>,
     /// Makes the next commit panic inside the worker (tests of worker robustness only).
@@ -346,6 +349,7 @@ impl Inner {
             }),
             worker: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            pins: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             gate: Mutex::new(()),
             #[cfg(test)]
@@ -469,10 +473,35 @@ impl Inner {
         }
     }
 
+    /// The current committed state without a pin (tests only: production reads go through
+    /// `pin_current`, so nothing they can reach is reused under them).
+    #[cfg(test)]
     pub fn snapshot(&self) -> Result<Snapshot, StorageError> {
         Ok(Snapshot {
             desc: lock(&self.state).current,
         })
+    }
+
+    /// The current committed state, pinned: the pin is registered under the same lock that reads
+    /// the current state, so no publication can slip between choosing the generation and pinning it.
+    pub(crate) fn pin_current(self: &Arc<Self>) -> Result<(Snapshot, Pin), StorageError> {
+        let st = lock(&self.state);
+        let desc = st.current;
+        *lock(&self.pins).entry(desc.generation).or_default() += 1;
+        drop(st);
+        Ok((
+            Snapshot { desc },
+            Pin {
+                inner: self.clone(),
+                generation: desc.generation,
+            },
+        ))
+    }
+
+    /// Live pins by generation.
+    #[cfg(test)]
+    pub(crate) fn pinned_generations(&self) -> BTreeMap<u64, u32> {
+        lock(&self.pins).clone()
     }
 
     /// Moves the page and content allocation cursors (boundary tests only).
@@ -1056,6 +1085,7 @@ impl Inner {
             pos: 0,
             total: Sha256::new(),
             failed: None,
+            _pin: None,
         })
     }
 }
@@ -1422,6 +1452,45 @@ pub(crate) struct SegmentReader {
     pos: usize,
     total: Sha256,
     failed: Option<String>,
+    /// Keeps the generation this reader's content was found in pinned for the reader's life.
+    _pin: Option<Pin>,
+}
+
+impl SegmentReader {
+    /// Holds `pin` (normally a clone of the issuing view's pin) for the reader's life.
+    pub(crate) fn pinned(mut self, pin: Pin) -> Self {
+        self._pin = Some(pin);
+        self
+    }
+}
+
+/// One live reader's hold on a committed generation. Cloning pins the same generation again;
+/// dropping releases it.
+pub(crate) struct Pin {
+    inner: Arc<Inner>,
+    generation: u64,
+}
+
+impl Clone for Pin {
+    fn clone(&self) -> Self {
+        *lock(&self.inner.pins).entry(self.generation).or_default() += 1;
+        Self {
+            inner: self.inner.clone(),
+            generation: self.generation,
+        }
+    }
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let mut pins = lock(&self.inner.pins);
+        if let Some(n) = pins.get_mut(&self.generation) {
+            *n -= 1;
+            if *n == 0 {
+                pins.remove(&self.generation);
+            }
+        }
+    }
 }
 
 impl Read for SegmentReader {
