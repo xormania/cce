@@ -20,7 +20,7 @@ pub(crate) const FIRST_NODE_PAGE: u64 = 2;
 /// magic 4 + version 2 + kind 1 + reserved 1 + store 16 + page 8 + incarnation 8 + len 4 + crc 4.
 pub(crate) const PAGE_HEADER_LEN: usize = 48;
 pub(crate) const PAGE_PAYLOAD_MAX: usize = PAGE_SIZE - PAGE_HEADER_LEN;
-const DESC_LEN: usize = 4 + 2 + 16 + 8 * 6 + 4;
+pub(crate) const DESC_LEN: usize = 4 + 2 + 16 + 8 * 6 + 4;
 
 /// Identity of one store; recorded in every page and publication record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

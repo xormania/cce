@@ -1,8 +1,9 @@
-# Storage format (version 1)
+# Storage format (version 5)
 
-This describes the bytes the `cce-storage` engine writes today. It changes with the code; a
-change that alters how existing bytes are read must change the version and either migrate or refuse
-older stores without modifying them.
+This describes the bytes the `cce-storage` engine writes today, in the format version of the title,
+which pages and publication records carry as their "format version". It changes with the code; a change that alters how
+existing bytes are read must change the version and either migrate or refuse older stores without
+modifying them. A test checks the version and layout lengths stated here against the code.
 
 ## Store directory
 
@@ -24,7 +25,7 @@ Node page header (48 bytes), followed by the payload and zero padding:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `CCEP` |
-| 4 | 2 | format version (5) |
+| 4 | 2 | format version |
 | 6 | 1 | page kind (1 = leaf) |
 | 7 | 1 | reserved (0) |
 | 8 | 16 | store identity |
@@ -59,7 +60,7 @@ as it reaches them; trees deeper than 32 levels are rejected as damaged.
 ## Publication records (slots 0 and 1)
 
 Generation `g` is written to slot `g mod 2`, so the previous generation's record is never
-overwritten by the next commit. Record layout (76 bytes, rest of the page zero):
+overwritten by the next commit. Record layout (74 bytes, rest of the page zero):
 
 | Field | Size |
 |---|---|
