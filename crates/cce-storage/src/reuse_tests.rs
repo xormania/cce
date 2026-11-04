@@ -786,19 +786,24 @@ fn a_reader_from_before_a_removal_keeps_its_content_space_until_released() {
     remove(&s, "x-remove", "X");
     put_body(&s, "x-advance", "advance", "x");
 
-    // Held: new content reuses W's space but not X's, and the reader reads X whole.
+    // Held: the reader reads X whole (never the bytes of later content), X's space is not reused,
+    // and W's space is.
     let sy = s.stage_content(&mut &payload(5, size)[..]).unwrap();
     let y_ext = staged_extents(&s, &sy);
-    assert!(
-        overlaps(&y_ext, &w_ext),
-        "nothing was reused while the reader was held"
+    commit_staged(&s, "y", "Y", &sy);
+    assert_eq!(
+        read_all(&mut old, &cx),
+        Ok(x.clone()),
+        "the held reader did not read its content"
     );
     assert!(
         !overlaps(&y_ext, &x_ext),
         "space the held reader can reach was reused"
     );
-    commit_staged(&s, "y", "Y", &sy);
-    assert_eq!(read_all(&mut old, &cx).unwrap(), x);
+    assert!(
+        overlaps(&y_ext, &w_ext),
+        "nothing was reused while the reader was held"
+    );
 
     // Released: X's space is reused.
     drop(old);
