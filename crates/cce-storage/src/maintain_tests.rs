@@ -753,6 +753,125 @@ fn relocation_moves_content_into_lower_retired_space_and_changes_no_record() {
     );
 }
 
+/// What `v` reads of the content `id` binds: its bytes, or the error that stopped the read.
+fn read_bound(v: &mut crate::NativeView, id: &str) -> Result<Vec<u8>, String> {
+    let c = v
+        .context(&cid(id))
+        .map_err(|e| e.to_string())?
+        .and_then(|r| r.content)
+        .ok_or("no content bound")?;
+    let mut b = Vec::new();
+    v.content(&c)
+        .map_err(|e| e.to_string())?
+        .read_to_end(&mut b)
+        .map_err(|e| e.to_string())?;
+    Ok(b)
+}
+
+/// Commits `id` binding fresh content of `n` bytes from `seed`.
+fn commit_content(s: &NativeStore, attempt: &str, id: &str, seed: u32, n: u32) {
+    let staged = s.stage_content(&mut &bytes_of(seed, n)[..]).unwrap();
+    commit(
+        s,
+        attempt,
+        ChangeSet {
+            changes: vec![put(id, id, Some(0))],
+            content: vec![ContentBinding::from(&staged)],
+            ..ChangeSet::default()
+        },
+    );
+}
+
+fn commit_plain(s: &NativeStore, attempt: &str, id: &str) {
+    commit(
+        s,
+        attempt,
+        ChangeSet {
+            changes: vec![put(id, id, None)],
+            ..ChangeSet::default()
+        },
+    );
+}
+
+#[test]
+fn relocation_never_moves_content_into_space_a_pinned_view_still_reads() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    commit_content(&s, "one", "A", 1, 100_000);
+    commit_content(&s, "two", "B", 2, 100_000);
+    // The view reads A; then A's content is retired, and two more commits pass the two-generation
+    // rule, so only the view keeps that space from reuse.
+    let mut v = s.begin().unwrap();
+    commit_plain(&s, "three", "A");
+    commit_plain(&s, "four", "C");
+    commit_plain(&s, "five", "D");
+    let r = s
+        .maintain(MaintenanceTask::Relocate, MaintenanceBudget::default())
+        .unwrap();
+    assert_eq!(
+        read_bound(&mut v, "A"),
+        Ok(bytes_of(1, 100_000)),
+        "the pinned view lost content it reads"
+    );
+    assert_eq!(
+        r.content_bytes_moved, 0,
+        "relocation moved content into space a pinned view reads"
+    );
+    drop(v);
+    // Without the view, the same space takes B: the setup can move content there.
+    let r = s
+        .maintain(MaintenanceTask::Relocate, MaintenanceBudget::default())
+        .unwrap();
+    assert_eq!(r.content_bytes_moved, 100_000 + Manifest::encoded_len(2));
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "B"),
+        Ok(bytes_of(2, 100_000))
+    );
+    audit(&sim);
+}
+
+#[test]
+fn space_relocation_moves_out_of_is_not_reused_while_a_pinned_view_reads_it() {
+    let sim = fragmented();
+    let s = open(&sim);
+    // The view reads B where it is now; relocation then moves B down and retires that space.
+    let mut v = s.begin().unwrap();
+    let r = s
+        .maintain(MaintenanceTask::Relocate, MaintenanceBudget::default())
+        .unwrap();
+    assert_eq!(r.content_bytes_moved, 100_000 + Manifest::encoded_len(2));
+    // Two commits pass the two-generation rule; then content as large as B is staged and committed.
+    commit_plain(&s, "five", "D");
+    commit_plain(&s, "six", "E");
+    let reused = s.stats().unwrap().content_bytes_reused;
+    commit_content(&s, "seven", "F", 7, 100_000);
+    assert_eq!(
+        read_bound(&mut v, "B"),
+        Ok(bytes_of(2, 100_000)),
+        "the pinned view lost content it reads"
+    );
+    assert_eq!(
+        s.stats().unwrap().content_bytes_reused,
+        reused,
+        "staging reused space a pinned view reads"
+    );
+    drop(v);
+    // Without the view, that space is reused.
+    commit_plain(&s, "eight", "G");
+    commit_plain(&s, "nine", "H");
+    commit_content(&s, "ten", "I", 10, 100_000);
+    assert!(
+        s.stats().unwrap().content_bytes_reused > reused,
+        "the vacated space was never reusable"
+    );
+    let mut now = s.begin().unwrap();
+    assert_eq!(read_bound(&mut now, "B"), Ok(bytes_of(2, 100_000)));
+    assert_eq!(read_bound(&mut now, "F"), Ok(bytes_of(7, 100_000)));
+    assert_eq!(read_bound(&mut now, "I"), Ok(bytes_of(10, 100_000)));
+    drop(now);
+    audit(&sim);
+}
+
 /// Runs `maintain(Relocate)` on another thread and `between` on this one once the copy is done
 /// and before the step publishes.
 fn relocate_around(s: &NativeStore, between: impl FnOnce()) -> crate::MaintenanceReport {
