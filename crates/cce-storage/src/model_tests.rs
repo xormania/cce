@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 
 use crate::engine::Inner;
 use crate::format::StoreId;
-use crate::io::{FsIo, Io};
+use crate::io::{FileId, FsIo, Io};
 use crate::sim::{Persist, SimIo};
 use crate::{NativeStore, NativeView};
 
@@ -978,9 +978,57 @@ fn op_name(op: &Op) -> &'static str {
     }
 }
 
+/// The kind of mutating operation ("write" or "sync") an injected simulator failure hit.
+type FailedOp = Arc<Mutex<Option<&'static str>>>;
+
+/// The simulator as the store sees it, recording which kind of operation an injected failure hit
+/// (the commit itself runs on the store's worker thread).
+struct Watched {
+    sim: SimIo,
+    failed: FailedOp,
+}
+
+impl Watched {
+    fn note<T>(&self, kind: &'static str, r: Result<T, StorageError>) -> Result<T, StorageError> {
+        if let Err(StorageError::Io(m)) = &r
+            && m.starts_with("simulated I/O error")
+        {
+            *self.failed.lock().unwrap() = Some(kind);
+        }
+        r
+    }
+}
+
+impl Io for Watched {
+    fn create(&self) -> Result<(), StorageError> {
+        self.sim.create()
+    }
+    fn open(&self) -> Result<(), StorageError> {
+        self.sim.open()
+    }
+    fn open_read_only(&self) -> Result<(), StorageError> {
+        self.sim.open_read_only()
+    }
+    fn read_at(&self, file: FileId, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+        self.sim.read_at(file, offset, buf)
+    }
+    fn write_at(&self, file: FileId, offset: u64, data: &[u8]) -> Result<(), StorageError> {
+        self.note("write", self.sim.write_at(file, offset, data))
+    }
+    fn len(&self, file: FileId) -> Result<u64, StorageError> {
+        self.sim.len(file)
+    }
+    fn sync(&self, file: FileId) -> Result<(), StorageError> {
+        self.note("sync", self.sim.sync(file))
+    }
+    fn sync_dir(&self) -> Result<(), StorageError> {
+        self.note("sync", self.sim.sync_dir())
+    }
+}
+
 /// Where the store under test lives.
 enum Backend {
-    Sim(SimIo),
+    Sim(SimIo, FailedOp),
     /// A fresh directory on the real filesystem, removed after a passing sequence.
     Files(PathBuf),
 }
@@ -997,7 +1045,7 @@ impl Backend {
             let _ = std::fs::remove_dir_all(&dir);
             Backend::Files(dir)
         } else {
-            Backend::Sim(SimIo::new())
+            Backend::Sim(SimIo::new(), FailedOp::default())
         }
     }
 
@@ -1005,9 +1053,12 @@ impl Backend {
     /// ends first (its "process" exited); on real files closing the handle released it.
     fn io(&self) -> Box<dyn Io> {
         match self {
-            Backend::Sim(sim) => {
+            Backend::Sim(sim, failed) => {
                 sim.release();
-                Box::new(sim.clone())
+                Box::new(Watched {
+                    sim: sim.clone(),
+                    failed: failed.clone(),
+                })
             }
             Backend::Files(dir) => Box::new(FsIo::new(dir)),
         }
@@ -1491,7 +1542,7 @@ const LIVE_STEPS: usize = 6;
 
 fn sim_engine(sim: SimIo, store: NativeStore) -> Engine {
     Engine {
-        backend: Backend::Sim(sim),
+        backend: Backend::Sim(sim, FailedOp::default()),
         store: Some(store),
         held: Vec::new(),
         staged: Vec::new(),
@@ -1501,8 +1552,16 @@ fn sim_engine(sim: SimIo, store: NativeStore) -> Engine {
 
 fn sim_of(e: &Engine) -> &SimIo {
     match &e.backend {
-        Backend::Sim(sim) => sim,
+        Backend::Sim(sim, _) => sim,
         Backend::Files(_) => unreachable!("crash campaigns run on the simulator"),
+    }
+}
+
+/// The kind of operation the injected failure hit so far, if any.
+fn failed_op(e: &Engine) -> Option<&'static str> {
+    match &e.backend {
+        Backend::Sim(_, failed) => *failed.lock().unwrap(),
+        Backend::Files(_) => None,
     }
 }
 
@@ -1791,11 +1850,17 @@ fn replay_until(transitions: &[Op], bounds: &[u64], i: usize, e: &mut Option<Eng
 
 /// A fresh store whose simulator counts operations from zero after creation.
 fn fresh_engine() -> Engine {
-    let sim = SimIo::new();
+    let backend = Backend::Sim(SimIo::new(), FailedOp::default());
     let store = NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), STORE, Default::default()).expect("create"),
+        inner: Inner::create(backend.io(), STORE, Default::default()).expect("create"),
     };
-    let e = sim_engine(sim, store);
+    let e = Engine {
+        backend,
+        store: Some(store),
+        held: Vec::new(),
+        staged: Vec::new(),
+        refused: Vec::new(),
+    };
     // Normalize so that replays compare operation counts directly.
     let ops = sim_of(&e).ops();
     assert_eq!(
@@ -2006,7 +2071,14 @@ fn fail_at(
     }
     let mut allowed = Allowed::around(&before, &after, request.clone());
 
-    // Only a failure the store reported from a commit may fence later writes.
+    // Only a commit that reported a failed sync (its data barrier) or an uncertain publication
+    // may fence later writes. A failed page or data write rejects that commit, and the store
+    // keeps committing.
+    let failed = failed_op(&e);
+    count(&format!(
+        "failed operation: {}",
+        failed.unwrap_or("none reached")
+    ));
     let mut live = Live::default();
     if let (Some(req), Some(Err(err))) = (&request, &got) {
         match err {
@@ -2014,7 +2086,13 @@ fn fail_at(
                 live.fence_allowed = true;
                 live.uncertain = Some(req.attempt.clone());
             }
-            CommitError::Rejected(StorageError::Io(_)) => live.fence_allowed = true,
+            CommitError::Rejected(StorageError::Io(m)) => {
+                assert!(
+                    failed.is_some(),
+                    "the step was refused with an I/O error ({m}), but no injected failure was hit"
+                );
+                live.fence_allowed = failed == Some("sync");
+            }
             _ => {}
         }
     }
@@ -2037,8 +2115,12 @@ fn fail_at(
             Err(CommitError::Indeterminate(_)) => {}
             Err(err) => {
                 // A definitive refusal: the I/O error of the failure itself, or one the model
-                // predicts. Nothing of the attempt may ever appear.
-                let (expected, _) = branch_expect(&before, req);
+                // predicts for this action (from its held basis, when it had one). Nothing of the
+                // attempt may ever appear.
+                let expected = match &after.action {
+                    Action::Commit { expected, .. } => expected.clone(),
+                    _ => branch_expect(&before, req).0,
+                };
                 assert!(
                     matches!(err, CommitError::Rejected(StorageError::Io(_)))
                         || refusal_fits(err, &expected, false, req, &Live::default()),
@@ -2332,6 +2414,12 @@ fn sampled_cuts_of_long_generated_sequences_recover_a_model_state() {
     );
 }
 
+// Budget floor for the failure tiers: each requires an acknowledged failed step, a committed live
+// outcome and a live acknowledgement (`run_crash_campaign`), so a budget can be too small to pass
+// even when the store is right. The defaults (3 short sequences; 2 long sequences with 12 sampled
+// cuts) are the minimum: they pass at the default seed and at seeds 1 to 4, while one sequence
+// per tier passes at the default seed but not at seed 1. Overrides may raise the budget; below
+// the defaults those assertions can fail without a fault.
 #[test]
 fn an_io_failure_at_every_cut_of_short_generated_sequences_is_reported_and_recovered() {
     run_crash_campaign(
