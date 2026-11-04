@@ -1808,7 +1808,7 @@ impl Inner {
             // ownership is made under: a staging that passed its entry check takes nothing once
             // writes are fenced.
             let took = lock(&self.pool)
-                .take(need, bound)
+                .take(need, bound, None)
                 .map_err(StorageError::StoreState)?;
             if let Some(r) = took {
                 self.counters

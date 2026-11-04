@@ -155,15 +155,26 @@ impl ContentPool {
     }
 
     /// Takes the smallest free extent of at least `need` bytes retired no later than `bound`, if
-    /// any, for a staging to write into. Refused while writes are fenced.
-    pub(crate) fn take(&mut self, need: u64, bound: u64) -> Result<Option<Reuse>, String> {
+    /// any, for a staging to write into. With `below`, only an extent whose first `need` bytes
+    /// end at or below that offset qualifies (moving content towards the start of the file).
+    /// Refused while writes are fenced.
+    pub(crate) fn take(
+        &mut self,
+        need: u64,
+        bound: u64,
+        below: Option<u64>,
+    ) -> Result<Option<Reuse>, String> {
         if self.fenced {
             return Err("writes fenced while staging".into());
         }
         let best = self
             .free
             .iter()
-            .filter(|(_, (len, retired_at))| *len >= need && *retired_at <= bound)
+            .filter(|(offset, (len, retired_at))| {
+                *len >= need
+                    && *retired_at <= bound
+                    && below.is_none_or(|b| offset.checked_add(need).is_some_and(|end| end <= b))
+            })
             .min_by_key(|(offset, (len, _))| (*len, **offset))
             .map(|(offset, (len, retired_at))| (*offset, *len, *retired_at));
         Ok(best.map(|(offset, record_len, retired_at)| {
@@ -290,6 +301,29 @@ impl ContentPool {
         self.discarded.retain(|x| !sealed.contains(x));
     }
 
+    /// A definite rejection before publication of work that reserved space for staging
+    /// `serial` (a relocation step, say): its reservations become free again at their original
+    /// retiring generation, all or none. Refused for a serial that reserves nothing or whose
+    /// reservations an uncertain publication owns. (Used by maintenance steps that reserve space.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn release(&mut self, serial: u64) -> Result<(), String> {
+        if self.uncertain.contains_key(&serial) {
+            return Err(format!(
+                "staging {serial}'s reservations belong to an uncertain publication"
+            ));
+        }
+        let Some(held) = self.held.remove(&serial) else {
+            return Err(format!("staging {serial} reserves nothing"));
+        };
+        let extents: Vec<(u64, u64, u64)> = held
+            .iter()
+            .map(|r| (r.offset, r.record_len, r.retired_at))
+            .collect();
+        self.insert_free(&extents).inspect_err(|_| {
+            self.held.insert(serial, held);
+        })
+    }
+
     /// The reservations of staging `serial`, consumed by the publication of a commit binding it.
     pub(crate) fn consume(&mut self, serial: u64) -> Vec<Reuse> {
         self.held.remove(&serial).unwrap_or_default()
@@ -408,7 +442,7 @@ mod tests {
             .iter()
             .map(|&(o, l, g)| {
                 assert_eq!(p.insert_free(&[(o, l, g)]), Ok(()));
-                let r = p.take(l, g).unwrap().unwrap();
+                let r = p.take(l, g, None).unwrap().unwrap();
                 assert_eq!(r.offset, o);
                 r
             })
@@ -462,7 +496,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            p.take(50, 4),
+            p.take(50, 4, None),
             Ok(Some(Reuse {
                 offset: 200,
                 used: 50,
@@ -470,9 +504,33 @@ mod tests {
                 retired_at: 1
             }))
         );
-        assert_eq!(p.take(500, 4), Ok(None));
+        assert_eq!(p.take(500, 4, None), Ok(None));
         p.fence();
-        refused(&mut p, |p| assert!(p.take(10, 9).is_err()));
+        refused(&mut p, |p| assert!(p.take(10, 9, None).is_err()));
+    }
+
+    #[test]
+    fn taking_below_a_limit_only_uses_space_that_ends_at_or_below_it() {
+        let mut p = ContentPool::default();
+        assert_eq!(
+            p.insert_free(&[(0, 100, 1), (200, 30, 1), (400, 20, 1)]),
+            Ok(())
+        );
+        // The smallest fit (400) ends past the limit; the next smallest that fits below it wins.
+        assert_eq!(
+            p.take(20, 9, Some(230)).map(|r| r.map(|r| r.offset)),
+            Ok(Some(200))
+        );
+        // Exactly at the limit qualifies; one byte past does not.
+        assert_eq!(
+            p.take(20, 9, Some(20)).map(|r| r.map(|r| r.offset)),
+            Ok(Some(0))
+        );
+        assert_eq!(p.take(20, 9, Some(419)), Ok(None));
+        assert_eq!(
+            p.take(20, 9, Some(420)).map(|r| r.map(|r| r.offset)),
+            Ok(Some(400))
+        );
     }
 
     #[test]
@@ -520,7 +578,9 @@ mod tests {
             2
         );
         refused(&mut p, |p| assert!(p.discard(3, &[]).is_err()));
-        refused(&mut p, |p| assert!(p.take(1, 9).is_err()));
+        refused(&mut p, |p| assert!(p.release(3).is_err()));
+        refused(&mut p, |p| assert!(p.release(99).is_err()));
+        refused(&mut p, |p| assert!(p.take(1, 9, None).is_err()));
     }
 
     /// Random sequences of every operation: free, reserved and queued space never overlaps, and
@@ -542,16 +602,51 @@ mod tests {
                 let at = rng(&mut s) % 64 * 16;
                 let len = 1 + rng(&mut s) % 40;
                 let serial = rng(&mut s) % 6;
-                let ok = match rng(&mut s) % 11 {
-                    0 | 1 => p.insert_free(&[(at, len, rng(&mut s) % 5)]).is_ok(),
-                    2 => match p.take(len, rng(&mut s) % 6) {
-                        Ok(Some(r)) => {
-                            taken.push(r);
-                            true
+                let ok = match rng(&mut s) % 12 {
+                    11 => {
+                        let mine: Vec<Reuse> = p.held_by(serial).to_vec();
+                        match p.release(serial) {
+                            Ok(()) => {
+                                // Exactly that serial's reservations, at their own generation.
+                                let mut want = before.0.clone();
+                                want.extend(
+                                    mine.iter().map(|r| (r.offset, r.record_len, r.retired_at)),
+                                );
+                                want.sort_unstable();
+                                let mut got = snapshot(&p).0;
+                                got.sort_unstable();
+                                assert_eq!(got, want, "seed {seed} step {step}: release");
+                                assert!(p.held_by(serial).is_empty());
+                                true
+                            }
+                            Err(why) => {
+                                // Reserved space came out of free, so it always fits back: only
+                                // an unknown or uncertain-owned serial is refused.
+                                let reserved = before.1.iter().any(|(s, _)| *s == serial);
+                                assert!(
+                                    !reserved || p.is_uncertain(serial),
+                                    "seed {seed} step {step}: release refused: {why}"
+                                );
+                                false
+                            }
                         }
-                        Ok(None) => true,
-                        Err(_) => false,
-                    },
+                    }
+                    0 | 1 => p.insert_free(&[(at, len, rng(&mut s) % 5)]).is_ok(),
+                    2 => {
+                        let below = rng(&mut s).is_multiple_of(2).then(|| rng(&mut s) % 1100);
+                        match p.take(len, rng(&mut s) % 6, below) {
+                            Ok(Some(r)) => {
+                                assert!(
+                                    below.is_none_or(|b| r.offset + len <= b),
+                                    "seed {seed} step {step}: {r:?} for {len} bytes, below {below:?}"
+                                );
+                                taken.push(r);
+                                true
+                            }
+                            Ok(None) => true,
+                            Err(_) => false,
+                        }
+                    }
                     3 => {
                         let back: Vec<Reuse> = std::mem::take(&mut taken);
                         match p.give_back(&back) {
