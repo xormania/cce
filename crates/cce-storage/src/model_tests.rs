@@ -1340,6 +1340,10 @@ struct Engine {
     held: Vec<NativeView>,
     staged: Vec<Staged>,
     refused: Vec<StagedContent>,
+    /// Stagings whose handles the harness dropped without discarding or committing them (a
+    /// retry answered from its first commit stages content it never consumes): they own their
+    /// space until the store is reopened.
+    abandoned: Vec<Staged>,
 }
 
 /// A live staging handle and the content-file bytes its staging wrote (observed through the tap,
@@ -1350,6 +1354,9 @@ struct Staged {
     owns: Vec<(u64, Vec<u8>)>,
     /// Commits that bound this handle and were rejected.
     rejected: u32,
+    /// Bound by a commit whose publication is uncertain: its space belongs to that commit until
+    /// reopen (it cannot be discarded).
+    uncertain: bool,
 }
 
 impl Staged {
@@ -1392,6 +1399,7 @@ impl Engine {
             handle,
             owns: self.take_writes(),
             rejected: 0,
+            uncertain: false,
         }
     }
 
@@ -1635,6 +1643,7 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
             held: Vec::new(),
             staged: Vec::new(),
             refused: Vec::new(),
+            abandoned: Vec::new(),
         }
     }
 
@@ -1747,7 +1756,7 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                 }
             }
             Action::Retry { request, expected } => {
-                let (cs, _staged) = e.change_set(request);
+                let (cs, staged) = e.change_set(request);
                 let basis = e
                     .store()
                     .begin()
@@ -1764,6 +1773,8 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                     }
                     (got, expected) => panic!("retry {got:?}, model expected {expected:?}"),
                 }
+                // Answered from the first commit: the content it staged is not consumed.
+                e.abandoned.extend(staged);
             }
             Action::Hold(reads) => {
                 count("hold view");
@@ -1832,6 +1843,7 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                 // Handles of the closed instance: discarding them must be refused; they own
                 // nothing any more.
                 e.refused.extend(e.staged.drain(..).map(|s| s.handle));
+                e.abandoned.clear();
                 e.store
                     .take()
                     .expect("store")
@@ -2107,6 +2119,7 @@ fn sim_engine(sim: SimIo, store: NativeStore) -> Engine {
         held: Vec::new(),
         staged: Vec::new(),
         refused: Vec::new(),
+        abandoned: Vec::new(),
     }
 }
 
@@ -2115,6 +2128,17 @@ fn sim_engine(sim: SimIo, store: NativeStore) -> Engine {
 /// Reads only, so it never changes the operation counts replays compare. (A real-files store holds
 /// its lock, so the audit runs on the simulator.)
 fn audit(e: &Engine, after: &str) {
+    // The store's own pool-versus-records oracle (only meaningful while nothing is in flight,
+    // which holds between model steps). Its view is compared with the independent ownership
+    // model in `ownership_check`.
+    if let Some(store) = &e.store {
+        count("ledger oracle checks");
+        assert_eq!(
+            store.inner.ledger_check_for_test(),
+            Ok(()),
+            "ledger oracle after {after}"
+        );
+    }
     if let Backend::Sim(sim, _) = &e.backend {
         count("retirement audits");
         assert_eq!(
@@ -2167,6 +2191,7 @@ fn ownership_check(e: &Engine, after: &str) {
     let live: Vec<(usize, (u64, u64))> = e
         .staged
         .iter()
+        .chain(&e.abandoned)
         .enumerate()
         .flat_map(|(i, s)| s.ranges().map(move |x| (i, x)))
         .collect();
@@ -2190,6 +2215,52 @@ fn ownership_check(e: &Engine, after: &str) {
         {
             count("staging owns space with a retirement record");
         }
+    }
+    // The store's view of the same space, compared with this model: no extent it offers for
+    // reuse touches owned space, and the reservations it says stagings hold are exactly the
+    // retirement records live stagings' bytes lie in.
+    if let Some(store) = &e.store {
+        let (_, free) = store
+            .inner
+            .reusable_for_test()
+            .unwrap_or_else(|x| panic!("ownership after {after}: reusable space: {x:?}"));
+        for f in &free {
+            if let Some((i, a)) = live.iter().find(|(_, a)| overlaps(*a, *f)) {
+                panic!(
+                    "ownership after {after}: the store offers {f:?} for reuse, but live staging \
+                     {i} owns {a:?}"
+                );
+            }
+        }
+        let owners: Vec<&Staged> = e.staged.iter().chain(&e.abandoned).collect();
+        let in_records = |uncertain: bool| -> u64 {
+            r.retired_extents
+                .iter()
+                .filter(|(o, (_, l))| {
+                    owners
+                        .iter()
+                        .filter(|s| s.uncertain == uncertain)
+                        .any(|s| s.ranges().any(|a| overlaps(a, (**o, *l))))
+                })
+                .map(|(_, (_, l))| *l)
+                .sum()
+        };
+        let (held, uncertain) = store.inner.reserved_bytes_for_test();
+        assert_eq!(
+            held,
+            in_records(false),
+            "ownership after {after}: the store holds {held} bytes of reservations for stagings; \
+             the stagings it issued own bytes in retirement records of {} bytes",
+            in_records(false)
+        );
+        assert_eq!(
+            uncertain,
+            in_records(true),
+            "ownership after {after}: an uncertain publication owns {uncertain} bytes of \
+             reservations; the stagings it bound own bytes in records of {} bytes",
+            in_records(true)
+        );
+        count("ownership model agrees with the ledger");
     }
     for (i, st) in e.staged.iter().enumerate() {
         for (o, bytes) in &st.owns {
@@ -2252,20 +2323,28 @@ fn recovered_ownership_check(e: &Engine, prior: &[(u64, u64)]) {
     count("recovered ownership checks");
 }
 
-/// Space owned by live stagings that the step `action` does not bind.
-fn unbound_staged_space(e: &Engine, action: &Action) -> Vec<(u64, u64)> {
-    let bound: BTreeSet<usize> = match action {
+/// The live stagings (by index) the step `action` binds.
+fn bound_stagings(e: &Engine, action: &Action) -> BTreeSet<usize> {
+    match action {
         Action::Commit { request, .. } | Action::Retry { request, .. } => {
             (0..request.contents.len())
                 .filter_map(|j| e.earlier(request, j))
                 .collect()
         }
-        Action::Discard {
-            index,
-            refused: false,
-        } => [*index].into(),
         _ => BTreeSet::new(),
-    };
+    }
+}
+
+/// Space owned by live stagings that the step `action` does not bind or discard.
+fn unbound_staged_space(e: &Engine, action: &Action) -> Vec<(u64, u64)> {
+    let mut bound = bound_stagings(e, action);
+    if let Action::Discard {
+        index,
+        refused: false,
+    } = action
+    {
+        bound.insert(*index);
+    }
     e.staged
         .iter()
         .enumerate()
@@ -2376,6 +2455,7 @@ fn in_flight(
                     handle,
                     owns,
                     rejected: 0,
+                    uncertain: false,
                 });
             }
             (None, None)
@@ -2624,6 +2704,7 @@ fn fresh_engine() -> Engine {
         held: Vec::new(),
         staged: Vec::new(),
         refused: Vec::new(),
+        abandoned: Vec::new(),
     };
     // Normalize so that replays compare operation counts directly.
     let ops = sim_of(&e).ops();
@@ -2822,7 +2903,13 @@ fn fail_at(
         op_name(&transitions[i])
     ));
     let prior = unbound_staged_space(&e, &after.action);
+    let bound = bound_stagings(&e, &after.action);
     let (request, got) = in_flight(&mut e, &after.action);
+    // The stagings the step bound are consumed, owned by an uncertain publication or still
+    // staged; nothing after the failure may bind them again.
+    for k in bound.into_iter().rev() {
+        e.staged.remove(k);
+    }
     if post {
         let staged = e
             .store
@@ -2969,7 +3056,13 @@ fn fail_at(
                 Action::Commit { request, .. } | Action::Retry { request, .. } => request.clone(),
                 _ => continue,
             };
+            let bound = bound_stagings(&e, &m.action);
             if let Some(got) = submit_tolerant(&mut e, None, &req, None) {
+                if got.is_ok() {
+                    for k in bound.into_iter().rev() {
+                        e.staged.remove(k);
+                    }
+                }
                 live_result(&mut allowed, &req, &got, &live);
                 if got.is_ok() {
                     audit(&e, "a live commit after the failure");
@@ -3407,6 +3500,7 @@ fn staging_and_discard_across_a_commits_seal_publication_and_application_make_le
                         handle,
                         owns,
                         rejected: 0,
+                        uncertain: false,
                     }),
                     discard,
                 )
@@ -3552,6 +3646,7 @@ fn a_failed_publication_with_a_staging_across_it_recovers_on_the_selected_public
                 handle,
                 owns,
                 rejected: 0,
+                uncertain: false,
             })
         },
     );
@@ -3579,6 +3674,8 @@ fn a_failed_publication_with_a_staging_across_it_recovers_on_the_selected_public
         e.store().discard_staged(y_again).is_err(),
         "a staging bound by an uncertain publication was discarded"
     );
+    let mut y = y;
+    y.uncertain = true;
     e.staged.push(y);
     e.staged.push(z);
     ownership_check(&e, "a failed publication");
@@ -3724,6 +3821,7 @@ fn a_staging_in_progress_across_an_uncertain_publication_takes_none_of_its_space
                 handle,
                 owns: w_owns,
                 rejected: 0,
+                uncertain: false,
             };
             // Only its first take preceded the fence.
             for a in w.ranges().skip(1) {
@@ -3750,6 +3848,8 @@ fn a_staging_in_progress_across_an_uncertain_publication_takes_none_of_its_space
             );
         }
     }
+    let mut y = y;
+    y.uncertain = true;
     e.staged.push(y);
     ownership_check(&e, "a staging across an uncertain publication");
     let prior: Vec<(u64, u64)> = e.staged.iter().flat_map(Staged::ranges).collect();
