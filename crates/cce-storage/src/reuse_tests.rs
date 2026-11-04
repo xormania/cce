@@ -1174,3 +1174,42 @@ fn a_partly_used_retired_extent_keeps_its_remainder_reusable() {
     commit_staged(&s, "z", "Z", &sz);
     crate::audit::check_retirement(&sim).unwrap();
 }
+
+#[test]
+fn stats_account_for_reused_pages_and_content() {
+    let sim = SimIo::new();
+    let s = sim_create(&sim);
+    let (st0, d0) = (s.stats().unwrap(), desc(&s));
+    churn(&s, Some(&sim), 0..LIVE * 6);
+    let size = CONTENT_CHUNK + 300;
+    committed_then_removed(&s, &sim, "X", &payload(40, size));
+    let sy = s.stage_content(&mut &payload(41, size)[..]).unwrap();
+    commit_staged(&s, "y", "Y", &sy);
+    let (st, d) = (s.stats().unwrap(), desc(&s));
+
+    assert!(st.pages_reused > st0.pages_reused, "no page was reused");
+    assert!(
+        st.content_bytes_reused > st0.content_bytes_reused,
+        "no content was reused"
+    );
+    // Everything written either reused retired space or extended the files.
+    assert_eq!(
+        (st.pages_written - st0.pages_written) - (st.pages_reused - st0.pages_reused),
+        d.next_page - d0.next_page,
+        "page accounting"
+    );
+    assert_eq!(
+        (st.content_bytes_written - st0.content_bytes_written)
+            - (st.content_bytes_reused - st0.content_bytes_reused),
+        d.content_len - d0.content_len,
+        "content accounting"
+    );
+    // With no staging outstanding, everything retired is available for reuse.
+    let retired: u64 = reach(&sim, &d)
+        .unwrap()
+        .retired_extents
+        .values()
+        .map(|(_, len)| len)
+        .sum();
+    assert_eq!(st.reusable_content_bytes, retired);
+}

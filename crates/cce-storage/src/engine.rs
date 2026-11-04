@@ -91,6 +91,10 @@ pub(crate) struct Counters {
     pub content_bytes_written: AtomicU64,
     pub cache_misses: AtomicU64,
     pub cache_evictions: AtomicU64,
+    /// Tree pages written over retired pages.
+    pub pages_reused: AtomicU64,
+    /// Staged content bytes written into retired content extents.
+    pub content_bytes_reused: AtomicU64,
 }
 
 /// The committed state a view reads.
@@ -343,7 +347,13 @@ struct PageWriter<'a> {
 impl NodeSink for PageWriter<'_> {
     fn write(&mut self, node: &Node) -> Result<PageRef, StorageError> {
         let (page, next) = match self.reuse.pop() {
-            Some(page) => (page, self.next_page),
+            Some(page) => {
+                self.inner
+                    .counters
+                    .pages_reused
+                    .fetch_add(1, Ordering::Relaxed);
+                (page, self.next_page)
+            }
             None => (
                 self.next_page,
                 self.next_page
@@ -577,6 +587,14 @@ impl Inner {
     #[cfg(test)]
     pub(crate) fn waiting_registrations_for_test(&self) -> &std::sync::atomic::AtomicUsize {
         &self.waiting_registrations
+    }
+
+    /// The conflict log as (floor, every recorded position with its written keys) (tests that a
+    /// refused commit leaves it unchanged).
+    #[cfg(test)]
+    pub(crate) fn conflict_log_for_test(&self) -> (u64, Vec<ConflictEntry>) {
+        let log = lock(&self.conflicts);
+        (log.floor, log.entries.iter().cloned().collect())
     }
 
     /// The content-file extents `(offset, len)` of a staging issued by this instance: its
@@ -1361,6 +1379,9 @@ impl Inner {
                 .map(|(offset, (len, retired_at))| (*offset, *len, *retired_at));
             if let Some((offset, record_len, retired_at)) = best {
                 pool.free.remove(&offset);
+                self.counters
+                    .content_bytes_reused
+                    .fetch_add(need, Ordering::Relaxed);
                 taken.taken.push(Reuse {
                     offset,
                     used: need,
@@ -1391,6 +1412,11 @@ impl Inner {
             }
         }
         Ok(())
+    }
+
+    /// Total length of retired content extents no staging holds.
+    pub fn reusable_content_bytes(&self) -> u64 {
+        lock(&self.pool).free.values().map(|(len, _)| len).sum()
     }
 
     /// Consumes, in the transaction, the retirement records of extents held by the stagings this
@@ -1670,9 +1696,12 @@ pub(crate) fn relationship_range(q: &RelationshipQuery) -> Vec<u8> {
 
 /// Logical write sets of recent commits. `floor` is the newest history position whose successors'
 /// writes are all retained; a basis older than that cannot be validated.
+/// One recorded commit: its history position and the logical keys it wrote.
+type ConflictEntry = (u64, Vec<Vec<u8>>);
+
 struct ConflictLog {
     floor: u64,
-    entries: VecDeque<(u64, Vec<Vec<u8>>)>,
+    entries: VecDeque<ConflictEntry>,
     capacity: usize,
 }
 

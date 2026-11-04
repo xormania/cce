@@ -180,6 +180,9 @@ fn stats_of(inner: &Inner) -> Result<StoreStats, StorageError> {
         node_cache_evictions: get(&c.cache_evictions),
         node_cache_capacity: inner.cache_capacity(),
         tree_height: inner.height()?,
+        pages_reused: get(&c.pages_reused),
+        content_bytes_reused: get(&c.content_bytes_reused),
+        reusable_content_bytes: inner.reusable_content_bytes(),
     })
 }
 
@@ -236,6 +239,12 @@ pub struct StoreStats {
     pub node_cache_capacity: usize,
     /// Height of the current metadata tree (1 = a single leaf).
     pub tree_height: usize,
+    /// Tree pages written over retired pages instead of at new pages.
+    pub pages_reused: u64,
+    /// Staged content bytes written into retired content extents instead of at the end.
+    pub content_bytes_reused: u64,
+    /// Retired content bytes currently available for reuse (not held by a staging).
+    pub reusable_content_bytes: u64,
 }
 
 /// A consistent view of one committed state of a [`NativeStore`].

@@ -123,6 +123,7 @@ fn a_quiescent_commit_is_refused_while_another_view_lives_and_commits_once_it_is
     let staged = s.stage_content(&mut &b"bee"[..]).unwrap();
     let other = s.begin().unwrap();
     let ops = sim.ops();
+    let log = s.inner.conflict_log_for_test();
 
     let m = readers_active(commit_quiescent(&s, &staged));
     assert!(
@@ -131,6 +132,11 @@ fn a_quiescent_commit_is_refused_while_another_view_lives_and_commits_once_it_is
     );
     // Nothing happened: no write or sync, no outcome, no change, consistent retirement.
     assert_eq!(sim.ops(), ops, "the refused commit wrote or synced");
+    assert_eq!(
+        s.inner.conflict_log_for_test(),
+        log,
+        "the refused commit changed the conflict log"
+    );
     assert_eq!(s.outcome(&attempt("q")).unwrap(), AttemptOutcome::Absent);
     assert_eq!(state(&s), (true, None));
     crate::audit::check_retirement(&sim).unwrap();
