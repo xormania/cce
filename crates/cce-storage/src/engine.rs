@@ -1669,19 +1669,19 @@ impl Inner {
 
     /// Publishes a maintenance step's `txn` as generation `generation` at history position `pos`
     /// (unchanged: maintenance adds no history): retires the space of discarded stagings, settles
-    /// page retirement and reuse, writes the tree, and runs the data and publication barriers.
+    /// page retirement and reuse, checks every change of space ownership against the step's
+    /// journal (as a commit does), writes the tree, and runs the data and publication barriers.
     /// Returns the published record and the discarded extents it retired; the caller makes the
-    /// record current. `uncertain` names the attempt whose outcome a failed publication barrier
-    /// leaves unknown (none for maintenance).
+    /// record current.
     fn publish(
         &self,
         cur: &Descriptor,
         txn: TreeTxn<'_>,
         generation: u64,
         pos: u64,
-        uncertain: Option<&AttemptId>,
+        space: MaintenanceSpace,
     ) -> Result<Published, CommitError> {
-        self.publish_below(cur, txn, generation, pos, uncertain, None)?
+        self.publish_below(cur, txn, generation, pos, space, None)?
             .ok_or_else(|| {
                 rejected(StorageError::InvalidRequest(
                     "an unrestricted publication found no pages to write".into(),
@@ -1697,7 +1697,7 @@ impl Inner {
         mut txn: TreeTxn<'_>,
         generation: u64,
         pos: u64,
-        uncertain: Option<&AttemptId>,
+        space: MaintenanceSpace,
         below: Option<u64>,
     ) -> Result<Option<Published>, CommitError> {
         // Discarded stagings' own space becomes retired with this publication; only the copied
@@ -1717,6 +1717,44 @@ impl Inner {
         if below.is_some() && reuse.len() < txn.dirty_pages() {
             return Ok(None);
         }
+        // Every change of space ownership the step makes, checked as a whole before anything it
+        // writes can become reachable, exactly as a commit's.
+        #[allow(unused_mut)]
+        let mut journal = SpaceJournal {
+            generation,
+            retired_pages: txn.replaced().to_vec(),
+            reused_pages: reuse.clone(),
+            retired_extents: space.retired.iter().chain(&discarded).copied().collect(),
+            remainders: space.remainders,
+            consumed: space.consumed,
+            reused_records: reused.into_iter().map(|(_, k)| k).collect(),
+            still_reachable: space.still_reachable,
+            bound: space.bound,
+        };
+        #[cfg(test)]
+        {
+            let hook = lock(&self.journal_hook).take();
+            if let Some(hook) = hook {
+                hook(&mut journal, &mut txn);
+            }
+        }
+        // Each content entry a relocation rewrote must name the manifest it copied to.
+        for (k, manifest) in &space.entries {
+            let names = txn
+                .get(k)
+                .map_err(rejected)?
+                .map(|v| ContentEntry::decode(&v))
+                .transpose()
+                .map_err(rejected)?;
+            if !matches!(names, Some(ContentEntry::Live { manifest: m, .. }) if m == *manifest) {
+                return Err(rejected(StorageError::StoreState(format!(
+                    "space check failed: a relocated content entry does not name its new manifest \
+                     at {}",
+                    manifest.offset
+                ))));
+            }
+        }
+        self.seal(&txn, cur.root, &journal).map_err(rejected)?;
         let mut sink = PageWriter {
             inner: self,
             next_page: cur.next_page,
@@ -1765,7 +1803,7 @@ impl Inner {
             let why = format!("publication of generation {generation} uncertain: {e}");
             self.fence(Fence {
                 why: why.clone(),
-                uncertain: uncertain.cloned(),
+                uncertain: None,
             });
             return Err(CommitError::Indeterminate(why));
         }
@@ -2566,6 +2604,24 @@ type RetiredRecord = (Vec<u8>, Vec<u8>, u64);
 
 /// A published record and the discarded staging extents its publication retired.
 type Published = (Descriptor, Vec<(u64, u64)>);
+
+/// What a maintenance step changes in content space, for its journal (pages are found by the
+/// publication itself).
+#[derive(Default)]
+pub(crate) struct MaintenanceSpace {
+    /// Content extents the step retires at its generation.
+    pub(crate) retired: Vec<(u64, u64)>,
+    /// Unused parts of the retired records it consumes, at their original generation.
+    pub(crate) remainders: Vec<(u64, u64, u64)>,
+    /// Keys of the retirement records it consumes.
+    pub(crate) consumed: Vec<Vec<u8>>,
+    /// Extents the new state reaches that this publication must not free.
+    pub(crate) still_reachable: Vec<(u64, u64)>,
+    /// The reservation serials the step consumes (its own).
+    pub(crate) bound: Vec<u64>,
+    /// Content entries the step rewrites, by key, with the manifest each must name.
+    pub(crate) entries: Vec<(Vec<u8>, ExtentRef)>,
+}
 
 /// Upper bound on rounds of settling a commit's page allocation. Each round's edits touch pages
 /// already being rewritten (or split from them), so replaced pages and page demand stop changing

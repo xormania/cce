@@ -6,7 +6,7 @@ use cce_core::storage::{AttemptId, CommitError, StorageError};
 
 use std::sync::Arc;
 
-use super::{Inner, Reuse, Taken, lock, rejected, sha256};
+use super::{Inner, MaintenanceSpace, Reuse, Taken, lock, rejected, sha256};
 use crate::codec::{corrupt, key_components};
 use crate::format::Descriptor;
 use crate::format::PageRef;
@@ -46,6 +46,32 @@ impl Inner {
                 "maintenance task {other:?} is not implemented yet"
             )))),
         }
+    }
+
+    /// Every content extent the published state `cur` reaches: each live entry's manifest and its
+    /// segments, and each history entry. One walk over the whole tree, by record family, sharing
+    /// nothing with how hole reclaim chooses its holes ([`Inner::content_in_use`]), so a hole that
+    /// choice got wrong is still found reachable here.
+    fn full_reach(&self, cur: &Descriptor) -> Result<Vec<(u64, u64)>, StorageError> {
+        let mut reach = Vec::new();
+        let mut c = Cursor::new(self, cur.root, &[], None, cur.next_page)?;
+        while let Some((k, v)) = c.next_entry()? {
+            match k.first() {
+                Some(&P_CONTENT) => {
+                    if let ContentEntry::Live { manifest, .. } = ContentEntry::decode(&v)? {
+                        let m = Manifest::decode(&self.read_extent(&manifest)?)?;
+                        reach.push((manifest.offset, manifest.len));
+                        reach.extend(m.segments.iter().map(|s| (s.offset, s.len)));
+                    }
+                }
+                Some(&P_HISTORY) => {
+                    let x = ExtentRef::decode(&v)?;
+                    reach.push((x.offset, x.len));
+                }
+                _ => {}
+            }
+        }
+        Ok(reach)
     }
 
     /// Content-file space below the committed length that is in use: reachable from the published
@@ -147,8 +173,15 @@ impl Inner {
             )
             .map_err(rejected)?;
         }
+        // Sealed against everything the published state reaches, found independently of how
+        // the holes were chosen: a hole over reachable content is refused.
+        let space = MaintenanceSpace {
+            retired: taken.clone(),
+            still_reachable: self.full_reach(cur).map_err(rejected)?,
+            ..MaintenanceSpace::default()
+        };
         // A physical generation: the history position does not move.
-        let (desc, discarded) = self.publish(cur, txn, generation, cur.history_pos, None)?;
+        let (desc, discarded) = self.publish(cur, txn, generation, cur.history_pos, space)?;
         self.adopt(desc, &taken, &discarded);
         Ok(report(generation, bytes, complete))
     }
@@ -188,7 +221,13 @@ impl Inner {
         for k in &fresh {
             txn.put(k.clone(), Vec::new()).map_err(rejected)?;
         }
-        let (desc, discarded) = self.publish(cur, txn, generation, cur.history_pos, None)?;
+        let (desc, discarded) = self.publish(
+            cur,
+            txn,
+            generation,
+            cur.history_pos,
+            MaintenanceSpace::default(),
+        )?;
         self.adopt(desc, &[], &discarded);
         Ok(MaintenanceReport {
             index_entries_written: fresh.len() as u64,
@@ -304,9 +343,10 @@ impl Inner {
             }
             let encoded = Manifest {
                 content: m.content,
-                segments,
+                segments: segments.clone(),
             }
             .encode();
+            let new_segments = segments;
             let at = placed[placed.len() - 1];
             self.io
                 .write_at(FileId::Content, at, &encoded)
@@ -321,6 +361,7 @@ impl Inner {
                 old,
                 old_segments: m.segments,
                 new,
+                new_segments,
                 takes: mark..taken.taken.len(),
                 bytes: total,
             });
@@ -429,11 +470,23 @@ impl Inner {
                 len: 0,
             },
         );
-        let remainders = self
-            .consume_reuse(&mut txn, &[(serial, unbound)])
-            .map(|(remainders, _consumed)| remainders);
-        let published = remainders.and_then(|rem| {
-            self.publish(&cur, txn, generation, cur.history_pos, None)
+        let consumed = self.consume_reuse(&mut txn, &[(serial, unbound)]);
+        let published = consumed.and_then(|(rem, consumed)| {
+            // Old manifests and segments are retired; the copies must stay reachable, so the
+            // seal's overlap check compares the two, and each entry must name its new manifest.
+            let space = MaintenanceSpace {
+                retired: retired.clone(),
+                remainders: rem.clone(),
+                consumed,
+                still_reachable: applied
+                    .iter()
+                    .flat_map(|mv| std::iter::once(mv.new).chain(mv.new_segments.iter().copied()))
+                    .map(|x| (x.offset, x.len))
+                    .collect(),
+                bound: vec![serial],
+                entries: applied.iter().map(|mv| (mv.key.clone(), mv.new)).collect(),
+            };
+            self.publish(&cur, txn, generation, cur.history_pos, space)
                 .map(|p| (p, rem))
         });
         let ((desc, discarded), remainders) = match published {
@@ -529,9 +582,14 @@ impl Inner {
                     .ok_or_else(|| rejected(corrupt("a tree page's first key is missing")))?;
                 txn.put(key.clone(), value).map_err(rejected)?;
             }
-            if let Some((desc, discarded)) =
-                self.publish_below(&cur, txn, generation, cur.history_pos, None, Some(below))?
-            {
+            if let Some((desc, discarded)) = self.publish_below(
+                &cur,
+                txn,
+                generation,
+                cur.history_pos,
+                MaintenanceSpace::default(),
+                Some(below),
+            )? {
                 self.adopt(desc, &[], &discarded);
                 return Ok(MaintenanceReport {
                     pages_moved: n as u64,
@@ -588,8 +646,13 @@ impl Inner {
         let cur = lock(&self.state).current;
         let mut txn = TreeTxn::new(self, cur.root);
         edit(&mut txn);
-        let (desc, discarded) =
-            self.publish(&cur, txn, cur.generation + 1, cur.history_pos, None)?;
+        let (desc, discarded) = self.publish(
+            &cur,
+            txn,
+            cur.generation + 1,
+            cur.history_pos,
+            MaintenanceSpace::default(),
+        )?;
         self.adopt(desc, &[], &discarded);
         Ok(())
     }
@@ -601,6 +664,7 @@ struct Move {
     old: ExtentRef,
     old_segments: Vec<ExtentRef>,
     new: ExtentRef,
+    new_segments: Vec<ExtentRef>,
     /// Its reservations, as positions in the step's reservation list.
     takes: std::ops::Range<usize>,
     bytes: u64,

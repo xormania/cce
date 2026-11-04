@@ -334,7 +334,9 @@ What a step holds in memory, and what it reads:
 
 - Every step reads and writes at most one tree page or one content segment per operation, and in all
   reads no more metadata than the file's tree pages once over.
-- `ReclaimContentHoles` reads no content but manifests. It scans the whole published state whatever
+- `ReclaimContentHoles` reads no content but manifests, each twice: once to choose the holes and once
+  in an independent walk of everything the published state reaches, which the step is checked
+  against before it publishes. It scans the whole published state whatever
   its budget, holding every extent in use (manifests, segments, history entries, retirement records,
   stagings), so its memory grows with that count.
 - `RebuildRelationshipIndexes` reads no content. It holds every index key it removes and every entry
@@ -351,6 +353,16 @@ Every maintenance publication passes the same data barrier as a commit, so a cra
 step, whether the process exits or power is lost, recovers either the state before the step or the
 state after it. A relocation that publishes both parts may also stop between them, with its content
 moved and its pages not; that is a whole state too.
+
+Every maintenance publication also passes the same space check as a commit before it writes
+anything: the pages it retires and reuses, the content it retires and the retirement records it
+touches must be exactly what its journal says, and nothing it frees may overlap space still in use.
+A relocation retires each moved stream's old manifest and segments and must keep the copies
+reachable, and every content entry it rewrites must name the new manifest. Hole reclaim is checked
+against everything the published state reaches, found independently of how it chose the holes. A
+failed check rejects the step definitely: what it reserved returns to the pool and nothing is
+published. If a step's publication record may be durable but its sync failed, the space its moves
+took stays owned by that uncertain publication, out of reach of staging, until reopen decides.
 
 ## Not implemented yet
 

@@ -1235,6 +1235,136 @@ fn a_relocation_rejected_before_publication_returns_its_space() {
     );
 }
 
+/// Expects a maintenance step refused by the space check, with nothing published.
+fn refused_by_space_check(
+    s: &NativeStore,
+    r: Result<crate::MaintenanceReport, CommitError>,
+    generation: u64,
+    what: &str,
+) {
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.contains("space check failed")),
+        "{what}: the space check must refuse the step: {r:?}"
+    );
+    assert_eq!(
+        s.inner.snapshot().unwrap().desc.generation,
+        generation,
+        "{what}: a refused step published"
+    );
+    assert_eq!(
+        s.inner.reserved_bytes_for_test(),
+        (0, 0),
+        "{what}: a refused step keeps no reservations"
+    );
+}
+
+const CONTENT_ONLY: MaintenanceBudget = MaintenanceBudget {
+    max_pages: 0,
+    max_content_bytes: 64 << 20,
+};
+
+#[test]
+fn a_relocation_retiring_its_own_copy_is_refused_by_the_space_check() {
+    let sim = fragmented();
+    let s = open(&sim);
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let free_before = s.inner.reusable_content_bytes();
+    // The journal retires one of the new segments, with its record.
+    s.inner.set_journal_hook_for_test(Box::new(|j, txn| {
+        let x = j.still_reachable[1];
+        j.retired_extents.push(x);
+        txn.put(
+            crate::records::retired_extent_key(j.generation, x.0),
+            x.1.to_le_bytes().to_vec(),
+        )
+        .unwrap();
+    }));
+    let r = s.maintain(MaintenanceTask::Relocate, CONTENT_ONLY);
+    refused_by_space_check(&s, r, generation, "retired copy");
+    assert_eq!(s.inner.reusable_content_bytes(), free_before);
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "B"),
+        Ok(bytes_of(2, 100_000))
+    );
+}
+
+#[test]
+fn a_relocation_whose_entry_does_not_name_the_copy_is_refused() {
+    use crate::records::{ContentEntry, P_CONTENT, key};
+    let sim = fragmented();
+    let s = open(&sim);
+    let cur = s.inner.snapshot().unwrap().desc;
+    let mut v = s.begin().unwrap();
+    let digest = v
+        .context(&cid("B"))
+        .unwrap()
+        .unwrap()
+        .content
+        .unwrap()
+        .digest;
+    drop(v);
+    let k = key(P_CONTENT, &[&digest.0]);
+    let before = crate::tree::get(&*s.inner, cur.root, &k).unwrap().unwrap();
+    assert!(matches!(
+        ContentEntry::decode(&before),
+        Ok(ContentEntry::Live { .. })
+    ));
+    // The entry is put back as it was, naming the old manifest.
+    s.inner.set_journal_hook_for_test(Box::new(move |_, txn| {
+        txn.put(k, before).unwrap();
+    }));
+    let r = s.maintain(MaintenanceTask::Relocate, CONTENT_ONLY);
+    refused_by_space_check(&s, r, cur.generation, "entry naming the old manifest");
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "B"),
+        Ok(bytes_of(2, 100_000))
+    );
+}
+
+#[test]
+fn a_hole_over_reachable_content_is_refused_by_the_full_reach() {
+    let (sim, s, _) = leaked(100_000, false);
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let before = logical(&s);
+    let live = {
+        let d = crate::audit::published(&sim).unwrap().pop().unwrap();
+        *crate::audit::reach(&sim, &d)
+            .unwrap()
+            .content_segments
+            .iter()
+            .next()
+            .unwrap()
+    };
+    // The journal claims a live segment as one more hole, with its record.
+    s.inner.set_journal_hook_for_test(Box::new(move |j, txn| {
+        j.retired_extents.push(live);
+        txn.put(
+            crate::records::retired_extent_key(j.generation, live.0),
+            live.1.to_le_bytes().to_vec(),
+        )
+        .unwrap();
+    }));
+    let r = s.maintain(MaintenanceTask::ReclaimContentHoles, FULL);
+    refused_by_space_check(&s, r, generation, "hole over live content");
+    assert_eq!(logical(&s), before, "a refused reclaim changed records");
+}
+
+#[test]
+fn a_page_relocation_reusing_a_referenced_page_is_refused() {
+    let sim = scattered_small();
+    let s = open(&sim);
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let before = logical(&s);
+    // The journal claims to reuse a page the new tree still refers to.
+    s.inner.set_journal_hook_for_test(Box::new(|j, txn| {
+        let referenced = txn.frontier()[0].page;
+        j.reused_pages.push(referenced);
+    }));
+    let r = s.maintain(MaintenanceTask::Relocate, FULL);
+    refused_by_space_check(&s, r, generation, "reused referenced page");
+    assert_eq!(logical(&s), before);
+}
+
 /// Hole reclaim whose publication is uncertain, with a staging paused past its fence check
 /// meanwhile: reclaim holds no reservations and frees nothing before it is published, so every
 /// recovered image holds the same records as before the step.
@@ -2094,8 +2224,10 @@ fn maintenance_steps_hold_one_page_or_segment_and_read_only_what_they_need() {
             "{name}: held {read} / {written} bytes at once"
         );
         match task {
+            // Each manifest twice: once to choose the holes, once for the independent reach
+            // the step is sealed against.
             MaintenanceTask::ReclaimContentHoles => assert!(
-                content.1 <= manifests,
+                content.1 <= 2 * manifests,
                 "{name}: read {} content bytes, the manifests are {manifests}",
                 content.1
             ),
