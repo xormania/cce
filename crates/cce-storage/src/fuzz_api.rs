@@ -4,9 +4,17 @@
 //! with or without an error — and never panic, hang or allocate beyond what its input bounds.
 //! Decoders that accept an input must also re-encode the decoded value to exactly the input
 //! bytes: an accepted input is the canonical encoding of what it decoded to, so a decoder that
-//! ignores a field, a trailing byte or a reserved bit fails its harness. The one exception is a
-//! history entry whose request uses encoding version 1 (see [`history`]). Two targets repair the
-//! checksums of their input before decoding, so mutations reach the checks behind them.
+//! ignores a field, a trailing byte or a reserved bit fails its harness. Documented exceptions:
+//!
+//! - The zero padding after a node page's payload and after a publication record: writers
+//!   zero-fill it (the harness checks that the encoders do), but it is outside the checksum and
+//!   carries no information, so readers ignore it rather than turn damage there into a read error
+//!   or a fall-back to the older record. The integrity check reports a non-zero byte there. Only
+//!   the checksummed bytes are compared.
+//! - A history entry whose request uses encoding version 1 (see [`history`]).
+//!
+//! Two targets repair the checksums of their input before decoding, so mutations reach the checks
+//! behind them.
 //!
 //! The fuzz targets in `fuzz/` call these functions, and a stable test replays the saved seeds and
 //! regression inputs through the same functions, so every past finding stays covered without a
@@ -95,6 +103,21 @@ fn assert_canonical(what: &str, input: &[u8], canonical: &[u8]) {
     );
 }
 
+/// Fails unless the encoder wrote a whole page of zeros after the first `from` bytes.
+fn assert_zero_padding(what: &str, encoded: &[u8], from: usize) {
+    assert_eq!(
+        encoded.len(),
+        PAGE_SIZE,
+        "{what}: the encoder wrote a partial page"
+    );
+    if let Some(at) = encoded[from..].iter().position(|&b| b != 0) {
+        panic!(
+            "{what}: the encoder left a non-zero padding byte at offset {}",
+            from + at
+        );
+    }
+}
+
 /// The payload length a page header claims, if it fits a page.
 fn page_payload_len(page: &[u8]) -> Option<usize> {
     let len = u32::from_le_bytes(page.get(40..44)?.try_into().ok()?) as usize;
@@ -141,6 +164,7 @@ fn page_payload(data: &[u8]) -> Option<Vec<u8>> {
     let canonical = encode_page(store, PageKind::Node, at, &payload).expect("accepted payload");
     let checked = PAGE_HEADER_LEN + payload.len();
     assert_canonical("page", &data[..checked], &canonical[..checked]);
+    assert_zero_padding("page", &canonical, checked);
     Some(payload)
 }
 
@@ -169,7 +193,9 @@ pub fn slots(data: &[u8]) -> bool {
     let mut valid = false;
     for half in [a, b] {
         if let Slot::Valid(desc) = decode_slot(half) {
-            assert_canonical("slot", &half[..DESC_LEN], &desc.encode()[..DESC_LEN]);
+            let canonical = desc.encode();
+            assert_canonical("slot", &half[..DESC_LEN], &canonical[..DESC_LEN]);
+            assert_zero_padding("slot", &canonical, DESC_LEN);
             valid = true;
         }
     }

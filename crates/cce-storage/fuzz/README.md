@@ -10,8 +10,11 @@ against the logical model of the model tests, completely or interrupted once by 
 failure, with the same checks after every step and every recovery). Every entry point must return
 for any input: a panic, a hang or an allocation beyond its limit is a finding. Decoders that accept
 an input must re-encode the decoded value to exactly the input bytes, so a decoder that ignores a
-field, a reserved byte or trailing bytes is a finding too. A page whose checksum does not match must
-be reported as damage, whatever else its header claims.
+field, a reserved byte or trailing bytes is a finding too. The documented exceptions are listed in
+the harness: the zero padding of pages and publication records, which is outside the checksum and
+ignored by readers (the harness checks that the encoders zero it), and history requests in encoding
+version 1. A page whose checksum does not match must be reported as damage, whatever else its header
+claims.
 
 This package is outside the repository workspace and needs a nightly toolchain and
 [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). From `crates/cce-storage`:
