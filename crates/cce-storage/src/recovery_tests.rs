@@ -5,8 +5,6 @@
 //! recovery chose.
 
 use std::io::Read;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -20,6 +18,7 @@ use crate::NativeStore;
 use crate::engine::Inner;
 use crate::format::{PAGE_SIZE, StoreId};
 use crate::io::{FileId, Io, Op, Traced};
+use crate::repro_tests::{PROCESS_EXIT, survival, with_repro};
 use crate::sim::{Persist, SimIo};
 
 const STORE: StoreId = StoreId(*b"recovery-store-1");
@@ -166,57 +165,6 @@ fn logical_state(store: &NativeStore) -> Vec<String> {
     out
 }
 
-/// Runs one case of a cut loop. If it fails, the durable images of `images` and the operation
-/// trace are written to a new directory under the system temporary directory and the failure is
-/// re-raised naming that directory, so the failing case can be reproduced offline. Nothing is
-/// written when the case passes.
-fn with_repro(label: &str, images: &[(&str, &SimIo)], trace: &[Op], case: impl FnOnce()) {
-    let Err(panic) = catch_unwind(AssertUnwindSafe(case)) else {
-        return;
-    };
-    let why = panic
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_else(|| "non-string panic".into());
-    match save_repro(label, images, trace) {
-        Ok(dir) => panic!(
-            "{label}: {why}\nreproduction images and trace: {}",
-            dir.display()
-        ),
-        Err(e) => {
-            eprintln!("{label}: could not save reproduction images: {e}");
-            resume_unwind(panic)
-        }
-    }
-}
-
-fn save_repro(label: &str, images: &[(&str, &SimIo)], trace: &[Op]) -> std::io::Result<PathBuf> {
-    let safe: String = label
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let dir = std::env::temp_dir().join(format!(
-        "cce-repro-{}-{safe}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos())
-    ));
-    std::fs::create_dir_all(&dir)?;
-    for (name, sim) in images {
-        for file in [FileId::Meta, FileId::Content] {
-            if let Some((durable, _)) = sim.file_images_for_test(file) {
-                std::fs::write(dir.join(format!("{name}.{}.durable", file.name())), durable)?;
-            }
-        }
-    }
-    let ops: String = trace.iter().map(|op| format!("{op:?}\n")).collect();
-    std::fs::write(dir.join("trace.txt"), ops)?;
-    std::fs::write(dir.join("case.txt"), format!("{label}\n"))?;
-    Ok(dir)
-}
-
 /// Independent expected states after each committed step, from an uninterrupted run.
 fn reference_states(steps: u32) -> Vec<Vec<String>> {
     let s = create(Box::new(SimIo::new()));
@@ -333,7 +281,7 @@ fn every_cut_of_store_creation_opens_the_empty_store_or_refuses_to_initialize() 
         for p in [Persist::None, Persist::All] {
             let img = sim.after_crash(p);
             let before = images(&img);
-            let label = format!("create cut {cut} {p:?}");
+            let label = format!("create cut {cut}, {}", survival(p));
             let pristine = img.after_process_exit();
             let ops = trace.lock().unwrap().clone();
             with_repro(&label, &[("image", &pristine)], &ops, || {
@@ -862,9 +810,9 @@ fn a_fault_during_recovery_of_any_crashed_commit_leaves_the_image_recoverable() 
         let mut crashed: Vec<(String, SimIo)> = [Persist::None, Persist::All]
             .into_iter()
             .chain((1..=12).map(Persist::Seeded))
-            .map(|p| (format!("{p:?}"), sim.after_crash(p)))
+            .map(|p| (survival(p), sim.after_crash(p)))
             .collect();
-        crashed.push(("process exit".into(), sim.after_process_exit()));
+        crashed.push((PROCESS_EXIT.into(), sim.after_process_exit()));
         for (what, img) in &crashed {
             // What an uninterrupted recovery of this image gives.
             let expected = logical_state(&open(Box::new(img.after_process_exit())));
@@ -876,7 +824,7 @@ fn a_fault_during_recovery_of_any_crashed_commit_leaves_the_image_recoverable() 
                 assert_eq!(&expected, new, "cut {cut} {what}: acknowledged commit lost");
             }
             for fault in &faults {
-                let label = format!("commit cut {cut} {what} open fault {fault:?}");
+                let label = format!("commit cut {cut}, {what}, open fault {fault:?}");
                 with_repro(&label, &[("image", img)], &trace, || {
                     let work = img.after_process_exit();
                     let before = images(&work);
