@@ -335,6 +335,10 @@ impl NodeSource for Inner {
     }
 }
 
+/// Largest buffer held for a committed extent before its digest is verified. The same size as a
+/// content segment today, but a separate bound: it governs read buffering, not segment layout.
+const VERIFY_CHUNK: usize = 64 * 1024;
+
 /// Largest history entry the format can hold: its position, the length-prefixed attempt identifier
 /// and the length-prefixed encoded request. Reads are bounded by this, not by the open's options,
 /// which bound only what the open writes.
@@ -634,13 +638,32 @@ impl Inner {
             )));
         }
         let len = usize::try_from(x.len).map_err(|_| corrupt("extent too large"))?;
+        let mismatch = || corrupt(format!("content extent at {}: digest mismatch", x.offset));
+        // A recorded length can be damaged while still in bounds. Before holding more than one
+        // chunk, verify the extent's digest by streaming it through one reused chunk buffer;
+        // nothing read in this pass is kept or interpreted.
+        if len > VERIFY_CHUNK {
+            let mut chunk = vec![0; VERIFY_CHUNK];
+            let mut hash = Sha256::new();
+            let mut at = x.offset;
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(VERIFY_CHUNK);
+                self.io.read_at(FileId::Content, at, &mut chunk[..n])?;
+                hash.update(&chunk[..n]);
+                at += n as u64;
+                left -= n;
+            }
+            let got: [u8; 32] = hash.finalize().into();
+            if got != x.digest {
+                return Err(mismatch());
+            }
+        }
+        // The length is now authentic: hold the extent whole and check it again as decoded.
         let mut buf = vec![0; len];
         self.io.read_at(FileId::Content, x.offset, &mut buf)?;
         if sha256(&buf) != x.digest {
-            return Err(corrupt(format!(
-                "content extent at {}: digest mismatch",
-                x.offset
-            )));
+            return Err(mismatch());
         }
         Ok(buf)
     }

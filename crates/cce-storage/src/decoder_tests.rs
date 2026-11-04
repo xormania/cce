@@ -776,3 +776,269 @@ fn an_extent_beyond_the_format_maximum_is_refused_before_it_is_read() {
         "a refused extent was read"
     );
 }
+
+/// Records the size of every read of the content file. The verified read allocates exactly its
+/// read buffers, so the largest read is the largest allocation for an extent.
+struct ContentReads {
+    sim: crate::sim::SimIo,
+    sizes: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+}
+
+impl crate::io::Io for ContentReads {
+    fn create(&self) -> Result<(), StorageError> {
+        self.sim.create()
+    }
+    fn open(&self) -> Result<(), StorageError> {
+        self.sim.open()
+    }
+    fn open_read_only(&self) -> Result<(), StorageError> {
+        self.sim.open_read_only()
+    }
+    fn read_at(
+        &self,
+        file: crate::io::FileId,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<(), StorageError> {
+        if file == crate::io::FileId::Content {
+            self.sizes.lock().unwrap().push(buf.len());
+        }
+        self.sim.read_at(file, offset, buf)
+    }
+    fn write_at(
+        &self,
+        file: crate::io::FileId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), StorageError> {
+        self.sim.write_at(file, offset, data)
+    }
+    fn len(&self, file: crate::io::FileId) -> Result<u64, StorageError> {
+        self.sim.len(file)
+    }
+    fn sync(&self, file: crate::io::FileId) -> Result<(), StorageError> {
+        self.sim.sync(file)
+    }
+    fn sync_dir(&self) -> Result<(), StorageError> {
+        self.sim.sync_dir()
+    }
+}
+
+/// Largest buffer held for an extent before its digest is verified (the documented bound).
+const VERIFY_CHUNK_BOUND: usize = 64 * 1024;
+
+/// A store whose newest state has one tree entry replaced by a crafted, checksum-valid value: an
+/// extent reference to `filler.len()` bytes of real committed content with a wrong digest. Returns
+/// the reopened store, its read recorder, and the staged content of the one commit.
+fn forged(
+    entry_key: impl FnOnce(&cce_core::storage::StagedContent) -> Vec<u8>,
+) -> (
+    crate::NativeStore,
+    std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    cce_core::storage::StagedContent,
+) {
+    use cce_core::storage::{
+        AttemptId, Change, ChangeSet, ContentBinding, ContextId, Precondition, StorageEngine,
+    };
+
+    use crate::NativeStore;
+    use crate::engine::{Inner, Options};
+    use crate::format::{Descriptor, PAGE_SIZE, encode_page};
+    use crate::io::{FileId, Io};
+    use crate::records::ExtentRef;
+    use crate::sim::SimIo;
+    use crate::tree::{Node, NodeSink, TreeTxn};
+
+    let sim = SimIo::new();
+    let s = NativeStore {
+        inner: Inner::create(Box::new(sim.clone()), STORE, Options::default()).unwrap(),
+    };
+    let staged = s.stage_content(&mut &b"bytes"[..]).unwrap();
+    let cs = ChangeSet {
+        changes: vec![Change::PutContext {
+            id: ContextId::new(*b"B").unwrap(),
+            expect: Precondition::Absent,
+            body: b"b".to_vec(),
+            content: Some(0),
+        }],
+        content: vec![ContentBinding::from(&staged)],
+        ..ChangeSet::default()
+    };
+    s.commit(AttemptId::new(*b"x").unwrap(), s.begin().unwrap(), cs)
+        .unwrap();
+    let cur = s.inner.snapshot().unwrap().desc;
+    // 3 MB of real bytes, committed: the crafted reference lies within committed content.
+    let filler = vec![7u8; 3 << 20];
+    sim.write_at(FileId::Content, cur.content_len, &filler)
+        .unwrap();
+    sim.sync(FileId::Content).unwrap();
+    let crafted = ExtentRef {
+        offset: cur.content_len,
+        len: filler.len() as u64,
+        digest: [0; 32],
+    };
+    let mut t = TreeTxn::new(&*s.inner, cur.root);
+    t.put(entry_key(&staged), crafted.encode()).unwrap();
+    struct Sink<'a>(&'a SimIo, u64, u64);
+    impl NodeSink for Sink<'_> {
+        fn write(&mut self, n: &Node) -> Result<PageRef, StorageError> {
+            let at = PageRef {
+                page: self.1,
+                incarnation: self.2,
+            };
+            self.0.write_at(
+                FileId::Meta,
+                at.page * PAGE_SIZE as u64,
+                &encode_page(STORE, PageKind::Node, at, &n.encode())?,
+            )?;
+            self.1 += 1;
+            Ok(at)
+        }
+    }
+    let mut sink = Sink(&sim, cur.next_page, cur.generation + 1);
+    let root = t.finish(&mut sink).unwrap();
+    let d = Descriptor {
+        generation: cur.generation + 1,
+        root,
+        next_page: sink.1,
+        content_len: cur.content_len + filler.len() as u64,
+        ..cur
+    };
+    sim.write_at(
+        FileId::Meta,
+        Descriptor::slot(d.generation) * PAGE_SIZE as u64,
+        &d.encode(),
+    )
+    .unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    drop(s);
+    sim.release();
+    let sizes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let s = NativeStore {
+        inner: Inner::open(
+            Box::new(ContentReads {
+                sim,
+                sizes: sizes.clone(),
+            }),
+            Options::default(),
+        )
+        .unwrap(),
+    };
+    sizes.lock().unwrap().clear();
+    (s, sizes, staged)
+}
+
+fn assert_digest_refused_within_chunk<T: std::fmt::Debug>(
+    r: Result<T, StorageError>,
+    sizes: &std::sync::Mutex<Vec<usize>>,
+    what: &str,
+) {
+    match r {
+        Err(StorageError::Integrity(m)) => assert!(m.contains("digest mismatch"), "{what}: {m}"),
+        other => panic!("{what}: expected a digest mismatch, got {other:?}"),
+    }
+    let sizes = sizes.lock().unwrap();
+    let longest = sizes.iter().copied().max().unwrap_or(0);
+    assert!(
+        longest <= VERIFY_CHUNK_BOUND,
+        "{what}: {longest} bytes held before the digest was verified"
+    );
+    assert!(
+        !sizes.is_empty(),
+        "{what}: the crafted extent was never read"
+    );
+}
+
+#[test]
+fn a_crafted_history_extent_is_refused_before_more_than_a_chunk_is_held() {
+    use cce_core::storage::{HistoryPosition, ReadView, StorageEngine};
+    let (s, sizes, _) = forged(|_| crate::records::history_key(1));
+    let mut v = s.begin().unwrap();
+    let entry = v.history(HistoryPosition(0)).unwrap().next().unwrap();
+    assert_digest_refused_within_chunk(entry, &sizes, "history entry");
+}
+
+#[test]
+fn a_crafted_manifest_extent_is_refused_before_more_than_a_chunk_is_held() {
+    use crate::records::{P_CONTENT, key};
+    use cce_core::storage::{ReadView, StorageEngine};
+    let (s, sizes, staged) = forged(|c| key(P_CONTENT, &[&c.content.digest.0]));
+    let r = s.begin().unwrap().content(&staged.content).map(|_| ());
+    assert_digest_refused_within_chunk(r, &sizes, "content manifest");
+}
+
+#[test]
+fn verified_extents_read_back_whole_and_small_ones_in_one_read() {
+    use std::sync::{Arc, Mutex};
+
+    use cce_core::storage::{AttemptId, ChangeSet, Evidence, StorageEngine};
+
+    use crate::NativeStore;
+    use crate::engine::{Inner, Options};
+    use crate::records::{ExtentRef, decode_history, history_key};
+    use crate::sim::SimIo;
+
+    let sizes = Arc::new(Mutex::new(Vec::new()));
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(ContentReads {
+                sim: SimIo::new(),
+                sizes: sizes.clone(),
+            }),
+            STORE,
+            Options::default(),
+        )
+        .unwrap(),
+    };
+    let mut seen_small = false;
+    let mut seen_large = false;
+    for (pos, evidence) in [(1u64, 0usize), (2, 70_000), (3, 1 << 20)] {
+        let cs = ChangeSet {
+            evidence: vec![Evidence {
+                label: b"e".to_vec(),
+                bytes: vec![9; evidence],
+            }],
+            ..ChangeSet::default()
+        };
+        s.commit(
+            AttemptId::new(format!("a{pos}").into_bytes()).unwrap(),
+            s.begin().unwrap(),
+            cs,
+        )
+        .unwrap();
+        let root = s.inner.snapshot().unwrap().desc.root;
+        let x = ExtentRef::decode(
+            &crate::tree::get(&*s.inner, root, &history_key(pos))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        sizes.lock().unwrap().clear();
+        let got = s.inner.read_extent(&x, u64::MAX, "history entry").unwrap();
+        assert_eq!(
+            decode_history(&got).unwrap().evidence[0].bytes.len(),
+            evidence
+        );
+        let len = x.len as usize;
+        let sizes = sizes.lock().unwrap().clone();
+        if len <= VERIFY_CHUNK_BOUND {
+            seen_small = true;
+            assert_eq!(sizes, vec![len], "a small extent is read once");
+        } else {
+            seen_large = true;
+            // Verified in chunks first, then read whole exactly once.
+            let (whole, chunks) = sizes.split_last().unwrap();
+            assert_eq!(*whole, len);
+            assert!(
+                chunks.iter().all(|&c| c <= VERIFY_CHUNK_BOUND),
+                "{chunks:?}"
+            );
+            assert_eq!(
+                chunks.iter().sum::<usize>(),
+                len,
+                "the verifying pass covers the extent"
+            );
+        }
+    }
+    assert!(seen_small && seen_large);
+}

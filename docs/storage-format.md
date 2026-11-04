@@ -128,6 +128,12 @@ against the largest the format can hold (a `u32`-prefixed request; a `u32` segme
 against the committed content before anything is allocated or read, and decoders never reserve
 more elements than the remaining input can hold.
 
+Before an extent's digest is verified, at most one 65536-byte chunk of it is held: an extent longer
+than that is first read through one reused chunk buffer and hashed, and nothing from that pass is
+kept or interpreted. A verified history entry or manifest is then held whole, so its size is bounded
+by what was actually written: within committed content and the format maximum. The verification
+chunk and the 65536-byte segment limit are separate bounds that happen to be equal today.
+
 The attempt fingerprint is SHA-256 over `"cce.attempt.v1\0"`, the attempt id (length-prefixed),
 and that canonical encoding. Retrying an attempt with an identical logical request returns the
 original receipt; any difference is rejected as a mismatch.
