@@ -44,6 +44,43 @@ mod view_gap_tests;
 #[cfg(test)]
 mod view_tests;
 
+/// Compile-time probes of the public surface, run as doctests. The listed items are reachable from
+/// outside the crate:
+///
+/// ```
+/// use cce_storage::{
+///     CommitTicket, Finding, NativeReadOnly, NativeStore, NativeView, Report, StoreOptions,
+///     StoreStats, VerifyLevel,
+/// };
+/// ```
+///
+/// and no physical module is. Each probe names the module itself, so it compiles exactly when the
+/// module is public (an item probe would also fail on the item's own visibility):
+///
+/// ```compile_fail
+/// use cce_storage::tree as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::format as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::records as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::engine as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::io as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::codec as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::verify as _;
+/// ```
+#[cfg(doctest)]
+mod surface_probes {}
+
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
