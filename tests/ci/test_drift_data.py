@@ -312,6 +312,8 @@ class DecisionDataTests(unittest.TestCase):
         self.assertEqual(evaluate({"source": SOURCE, "semantic": packets})["violations"], [])
         published = json.dumps(evaluate({"source": SOURCE, "semantic": packets})["packets"])
         self.assertNotIn("DO_NOT_PUBLISH", published)
+        self.assertNotIn("Q1", packets[0]["id"])                 # keyed, not a guessable tuple
+        self.assertNotIn('"path"', packets[0]["excerpts"][-1])   # no private path in the finding
 
     def test_unanswered_question_raised_as_open_is_not_a_finding(self):
         _, semantic, limits, _ = self.collect(self.api("Q2 is still awaiting the owner.\n"))

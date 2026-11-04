@@ -131,6 +131,22 @@ class ReplayTests(unittest.TestCase):
         marked = text.replace("**Options.**", "**Decided:** see the ledger.\n**Options.**", 1)
         self.assertEqual(view(BASE, {"q.md": marked})[1], [])
 
+    def test_each_reference_is_judged_on_its_own_clause(self):
+        _, findings = view(BASE, {"s.md": "Q4 decided; Q1 pending.\nQ1 decided; Q4 pending.\n"})
+        self.assertEqual([(f["question"], f["line"]) for f in findings], [("Q1", 1)])
+
+    def test_supersession_must_share_a_question(self):
+        text = BASE + '[[answer]]\nid="D9"\nquestions=["Q5"]\nauthority="owner"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\nsupersedes=["D1"]\n'
+        with self.assertRaises(ledger.LedgerError) as raised:
+            ledger.load(text)
+        self.assertTrue(str(raised.exception).startswith("supersession_across_questions"))
+
+    def test_adoption_must_come_from_an_answer_to_that_question(self):
+        text = BASE + '[[proposal]]\nid="P4"\nquestions=["Q4"]\nby="a"\nsummary="s"\nstate="adopted"\nadopted_by=["D1"]\n'
+        current, findings = view(text)
+        self.assertIn("proposal_adopted_without_answer", codes(findings))
+        self.assertIn("Q4", questions(current["missing"]))
+
     def test_healthy_list_marks_sections_as_history_and_points_at_the_ledger(self):
         healthy = OBSOLETE_LIST.replace("## 1. Read-only mode\n",
             "## 1. Read-only mode\n\n> Original question as asked (history). Current status: ledger `Q1`.\n")
@@ -272,8 +288,8 @@ class StructureTests(unittest.TestCase):
     def test_structural_defects_are_refused(self):
         cases = {
             "unknown_question": BASE + '[[answer]]\nid="X"\nquestions=["Q9"]\nauthority="owner"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\n',
-            "supersession_cycle": BASE.replace('summary = "Accept read-only mode"', 'summary = "Accept read-only mode"\nsupersedes = ["D5"]')
-                                  .replace('summary = "Run CI on every push"', 'summary = "Run CI on every push"\nsupersedes = ["D1"]'),
+            "supersession_cycle": BASE + '[[answer]]\nid="D5c"\nquestions=["Q5"]\nauthority="owner"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\nsupersedes=["D5d"]\n'
+                                  '[[answer]]\nid="D5d"\nquestions=["Q5"]\nauthority="owner"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\nsupersedes=["D5c"]\n',
             "invalid_answer": BASE.replace('authority = "owner"\noutcome = "decided"\ngiven = "day 1"\nsource = "decisions/one.md #1"',
                                            'authority = "owner"\noutcome = "required"\ngiven = "day 1"\nsource = "decisions/one.md #1"'),
             "duplicate_identity": BASE + '[[question]]\nid="Q1"\ntitle="t"\nasked="a"\n',

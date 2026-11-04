@@ -160,7 +160,9 @@ def decision_packets(api, ref, ledger_path, documents):
     from drift_ledger import LedgerError, load, resolve, scan
     limits = []
     try:
-        model = load(_read(api, ledger_path, ref))
+        ledger_text = _read(api, ledger_path, ref)
+        ledger_key = hashlib.sha256(ledger_text.encode()).digest()
+        model = load(ledger_text)
     except LedgerError:
         return [], ["decision_ledger_invalid"]
     except (ValueError, KeyError, TypeError, OSError, urllib.error.URLError):
@@ -204,9 +206,10 @@ def decision_packets(api, ref, ledger_path, documents):
         if "answer" in finding and not question:
             excerpts.append(_excerpt(_answer_record(dict(model["answers"][finding["answer"]],
                                                          answer=finding["answer"]))))
-        excerpts.append(_excerpt(json.dumps(finding, sort_keys=True)))
-        packets.append({"id": "decision:" + finding["code"] + ":" + ":".join(
-                            str(finding.get(k, "")) for k in ("question", "answer", "proposal", "work", "path", "line")),
+        excerpts.append(_excerpt(json.dumps({k: v for k, v in finding.items() if k != "path"}, sort_keys=True)))
+        plain = ":".join(str(finding.get(k, "")) for k in ("code", "question", "answer", "proposal", "work", "path", "line"))
+        # Keyed by the private ledger's content so a public reference cannot confirm a guessed finding.
+        packets.append({"id": "decision:" + hashlib.sha256(ledger_key + b"\0" + plain.encode()).hexdigest()[:32],
                         "excerpts": excerpts[:6], "questions": ["resolution", "deferral"]})
     return packets, limits
 

@@ -56,25 +56,42 @@ def _steps(text, producer):
     return found
 
 
+REVIEW_PAGES = 10
+
+
 def _owner_acceptance(api, source):
     """Return the repository owner's approving review of exactly this head, if any.
 
     Candidate output can never certify a changed producer. Only the repository owner's latest
-    review of the candidate's own head commit can accept it; a later push needs a new review.
+    review of the candidate's own head commit, on an open PR whose base is the evaluated base,
+    can accept it; a later push needs a new review. Every review page is read; an unreadable or
+    unbounded review list fails closed.
     """
     owner = api.repository.split("/", 1)[0]
     for number in source.get("pulls", []):
-        reviews = api.api("/pulls/" + str(int(number)) + "/reviews?per_page=100")
-        if not isinstance(reviews, list):
+        pull = api.api("/pulls/" + str(int(number)))
+        if (pull.get("state") != "open" or (pull.get("head") or {}).get("sha") != source["head_sha"]
+                or (pull.get("base") or {}).get("sha") != source["base_sha"]):
+            continue
+        reviews = []
+        for page in range(1, REVIEW_PAGES + 1):
+            rows = api.api("/pulls/" + str(int(number)) + "/reviews?per_page=100&page=" + str(page))
+            if not isinstance(rows, list):
+                raise ValueError("producer_acceptance_unavailable")
+            reviews += rows
+            if len(rows) < 100:
+                break
+        else:
             raise ValueError("producer_acceptance_unavailable")
-        latest = None
-        for review in reviews:
-            if (isinstance(review, dict) and (review.get("user") or {}).get("login") == owner
-                    and review.get("commit_id") == source["head_sha"]
-                    and review.get("state") in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}):
-                latest = review
-        if latest is not None and latest["state"] == "APPROVED":
-            return {"pull": int(number), "review": latest.get("id")}
+        decisive = [r for r in reviews
+                    if isinstance(r, dict) and (r.get("user") or {}).get("login") == owner
+                    and r.get("commit_id") == source["head_sha"]
+                    and r.get("state") in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
+                    and type(r.get("id")) is int]
+        if decisive:
+            latest = max(decisive, key=lambda r: (str(r.get("submitted_at") or ""), r["id"]))
+            if latest["state"] == "APPROVED":
+                return {"pull": int(number), "review": latest["id"]}
     return None
 
 
@@ -230,7 +247,7 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
             limits += ["producer_definition_unverified", reason]
             continue
         if acceptance is not None:
-            limits.append("producer_definition_owner_accepted")
+            limits.append("producer_definition_owner_accepted_" + producer.replace("-", "_"))
         candidates = [r for r in runs if _candidate_run(r, source, api, producer)
                       and (r.get("event") == "pull_request"
                            if producer == "leak-guard" or producer == "rust" and rust_pr_required else True)]

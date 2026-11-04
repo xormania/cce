@@ -153,10 +153,11 @@ class ExecutionTests(unittest.TestCase):
         self.assertNotEqual(changed, self.api.files[path, HEAD])
         for ref in (HEAD, MERGE):
             self.api.files[path, ref] = changed
-        self.api.responses["/pulls/9/reviews?per_page=100"] = []
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = []
 
     def review(self, login, state="APPROVED", commit=HEAD, number=1):
-        return {"id": number, "user": {"login": login}, "state": state, "commit_id": commit}
+        return {"id": number, "user": {"login": login}, "state": state, "commit_id": commit,
+                "submitted_at": "2026-11-04T10:%02d:00Z" % number}
 
     def test_changed_producer_without_owner_acceptance_is_refused_as_unaccepted(self):
         self.change_rust()
@@ -168,11 +169,11 @@ class ExecutionTests(unittest.TestCase):
 
     def test_owner_acceptance_of_this_head_lets_the_changed_producer_certify(self):
         self.change_rust()
-        self.api.responses["/pulls/9/reviews?per_page=100"] = [self.review(self.OWNER)]
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
         checks, limits, waiting = self.collect()
         self.assertEqual(self.violations(checks), [])
         self.assertFalse(waiting)
-        self.assertIn("producer_definition_owner_accepted", limits)
+        self.assertIn("producer_definition_owner_accepted_rust", limits)
         rust = [row for row in checks if row["id"] in {"Format", "Clippy", "Test"}]
         self.assertEqual(len(rust), 3)
         self.assertTrue(all(row["producer_acceptance"] == {"pull": 9, "review": 1} for row in rust))
@@ -184,19 +185,45 @@ class ExecutionTests(unittest.TestCase):
                         [self.review(self.OWNER, "COMMENTED")]):
             with self.subTest(reviews=reviews):
                 self.change_rust()
-                self.api.responses["/pulls/9/reviews?per_page=100"] = reviews
+                self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = reviews
                 checks, limits, _ = self.collect()
                 self.assertIn("producer_definition_unaccepted", limits)
                 self.assertTrue(self.violations(checks))
 
+    def test_a_later_change_request_on_a_second_page_is_not_missed(self):
+        self.change_rust()
+        first = [self.review(self.OWNER, number=1)] + [self.review("helper-bot", "COMMENTED", number=n)
+                                                        for n in range(2, 101)]
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = first
+        self.api.responses["/pulls/9/reviews?per_page=100&page=2"] = [
+            self.review(self.OWNER, "CHANGES_REQUESTED", number=101)]
+        self.assertIn("producer_definition_unaccepted", self.collect()[1])
+
+    def test_unbounded_reviews_or_a_moved_base_fail_closed(self):
+        self.change_rust()
+        full = [self.review(self.OWNER)] * 100
+        for page in range(1, 11):
+            self.api.responses["/pulls/9/reviews?per_page=100&page=" + str(page)] = full
+        self.assertIn("producer_acceptance_unavailable", self.collect()[1])
+        self.change_rust()
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
+        self.api.responses["/pulls/9"]["base"]["sha"] = OLD
+        self.assertNotIn("producer_definition_owner_accepted_rust", self.collect()[1])
+
+    def test_latest_review_is_ordered_by_time_not_list_position(self):
+        self.change_rust()
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [
+            self.review(self.OWNER, "CHANGES_REQUESTED", number=5), self.review(self.OWNER, number=2)]
+        self.assertIn("producer_definition_unaccepted", self.collect()[1])
+
     def test_accepted_producer_still_fails_on_failed_or_missing_execution(self):
         self.change_rust()
-        self.api.responses["/pulls/9/reviews?per_page=100"] = [self.review(self.OWNER)]
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
         self.api.responses["/actions/runs/12/jobs?per_page=50"]["jobs"][0]["steps"][2]["conclusion"] = "failure"
         checks, _, _ = self.collect()
         self.assertIn("required_check_failed", [v["code"] for v in self.violations(checks)])
         self.change_rust()
-        self.api.responses["/pulls/9/reviews?per_page=100"] = [self.review(self.OWNER)]
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
         self.api.responses[RUNS]["workflow_runs"] = [run("drift-input", 11), run("leak-guard", 13, event="pull_request")]
         _, limits, waiting = self.collect()
         self.assertTrue(waiting)

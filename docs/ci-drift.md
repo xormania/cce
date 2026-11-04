@@ -38,7 +38,10 @@ Changing a producer definition cannot certify that definition through its own
 output. A changed definition is accepted only when the repository owner's latest
 review of the pull request's exact head commit approves it; a later push needs a
 new review, and an approval from any other account, of an older head, or followed
-by a change request does not count. Accepted rows record the review. After the
+by a change request does not count. Every review page is read, and an
+unreadable or unbounded review list fails closed. Accepted rows record the review,
+and the coverage line names each accepted producer
+(`producer_definition_owner_accepted_<producer>`). After the
 change merges, the default branch's copy is the trusted definition again.
 
 Execution findings are reported separately, each with its remedy:
@@ -210,11 +213,19 @@ is flagged, and an unanswered question must name the operation it blocks. The
 same module prints the current view for agents (`drift_ledger.py view`).
 
 Each finding (for example a document line presenting a settled question as still
-waiting for the owner) becomes one private packet that contains only the claim's
-surrounding lines, the applicable answer's fields (identity, outcome, summary,
-date given, source path, excluded restrictions) and any answer it superseded.
-Jev's answer is advisory; findings never fail a candidate. Public output keeps
-only opaque codes such as `decision_record_findings`.
+waiting for the owner) becomes one private packet. It contains only:
+
+- the claim's surrounding document lines (not the document's path);
+- the applicable answer's fields: identity, question, authority, outcome, date
+  given, summary, excluded restrictions, superseded answers and source path;
+- any answer it superseded (identity, questions, summary, superseded by);
+- for a proposal or work finding, that record's identity, questions, answer,
+  summary, state and restrictions;
+- the finding itself: code, question, answer, proposal or work identity and line.
+
+Packet identities are keyed with the ledger's content, so a public reference
+cannot confirm a guessed finding. Jev's answer is advisory; findings never fail a
+candidate. Public output keeps only opaque codes such as `decision_record_findings`.
 
 Without decision data the summary states that private owner-decision consistency
 was not checked. A data-only correction is evaluated by the next run (or a

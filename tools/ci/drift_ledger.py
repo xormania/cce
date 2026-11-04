@@ -109,6 +109,8 @@ def load(text):
         for old in _ids(a, "supersedes"):
             if old not in model["answers"] or old == a["id"]:
                 raise LedgerError("unknown_superseded_answer:" + old)
+            if not set(model["answers"][old]["questions"]) & set(a["questions"]):
+                raise LedgerError("supersession_across_questions:" + a["id"])
     _acyclic(model["answers"])
     for w in model["work"].values():
         if w.get("answer") not in model["answers"] or w.get("state") not in WORK_STATES:
@@ -200,7 +202,12 @@ def resolve(model):
         if p["state"] == "adopted" and not adopted_by:
             # Only a recorded owner or requirement answer can adopt a proposal.
             findings.append({"code": "proposal_adopted_without_answer", "proposal": p["id"]})
-        if p["state"] == "adopted" and adopted_by:
+        uncovered = [q for q in p.get("questions", [])
+                     if not any(q in answers[aid]["questions"] for aid in adopted_by)]
+        if p["state"] == "adopted" and adopted_by and uncovered:
+            findings.append({"code": "proposal_adopted_without_answer", "proposal": p["id"],
+                             "questions": uncovered})
+        if p["state"] == "adopted" and adopted_by and not uncovered:
             continue
         conflicts = []
         for qid in p.get("questions", []):
@@ -246,10 +253,16 @@ def scan(model, view, documents):
         for number, line in enumerate(lines, 1):
             if ASKED_HEADING.match(line):
                 continue
-            if not OPEN_WORDS.search(line) or RESOLVED_WORDS.search(line):
+            refs = [m for m in QUESTION_REF.finditer(line) if int(m[1]) in numbers]
+            if not refs:
                 continue
-            refs = {numbers[int(n)] for n in QUESTION_REF.findall(line) if int(n) in numbers}
-            for qid in sorted(refs):
+            prefix_open = bool(OPEN_WORDS.search(line[:refs[0].start()]))
+            for k, m in enumerate(refs):
+                # Each reference is judged on its own clause: from it to the next reference.
+                clause = line[m.start():refs[k + 1].start() if k + 1 < len(refs) else len(line)]
+                if RESOLVED_WORDS.search(clause) or not (OPEN_WORDS.search(clause) or prefix_open):
+                    continue
+                qid = numbers[int(m[1])]
                 if qid in settled:
                     findings.append({"code": "settled_question_presented_open", "question": qid,
                                      "answer": settled[qid], "path": path, "line": number})
