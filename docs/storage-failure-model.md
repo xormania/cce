@@ -36,8 +36,10 @@ receipt — survives a crash, and no part of it appears without the rest.
 Opening reads both slots. A slot is usable if its checksum, magic, version and slot position are
 valid. Recovery selects the usable record with the highest generation; damaged slots are ignored and
 reported through `NativeStore::recovery_diagnostics`. If neither slot is usable, opening fails and
-the store is left untouched; the engine never initializes a new store over existing files. An
-unsupported format version is refused without modification.
+the store is left untouched; the engine never initializes a new store over existing files. A record
+of an unsupported format version, or one that requires features this build does not implement, is
+refused without modification, whatever the other slot holds: an older record does not make a store
+this build cannot read readable.
 
 Before the recovered state is used, its cursors are checked against the files (the root lies below
 the next unallocated page, the metadata file holds every allocated page, the content file holds the
@@ -113,6 +115,21 @@ once in the history write to the content file, and once in a metadata page write
 reuses retired pages but needs more than are retired. After the second, the same process keeps
 committing within the limit, and a fresh process sees the failed commit absent and can retry it.
 
+The filesystem adapter repeats a positional read or write interrupted by a signal and continues a
+short one where it stopped. A read that reaches the end of the file early is reported as an
+integrity error, and a write that makes no progress as an I/O error, rather than repeated. Any other
+error, such as a full disk or a device error, is reported without retrying; bytes written before it
+stay written. A failed sync is never retried, an interrupted one included: an incomplete sync is
+exactly the uncertain case the engine fences on (a failed data barrier rejects the commit, a failed
+publication sync leaves its outcome unknown, and both fence writes until reopen), and retrying it
+could turn an unknown outcome into an apparent success. Tests exercise this
+through a test-only seam under the adapter's file handles, on real files: every read and write
+interrupted or cut to a few bytes, at the adapter and through a store that stages, commits, reads
+and is reopened; a full disk after a short write, at the adapter and in a commit's metadata page
+write (the commit is rejected, its attempt absent, and the store keeps committing); a device error
+on read; transfers that make no progress; and an interrupted sync, at the adapter and at each sync
+of a commit (each fails the commit and fences writes; a fresh open settles the outcome).
+
 When a case of a cut sweep fails (the commit sweeps, the space-reuse sweeps, the store-creation
 sweep, or the faults-during-recovery sweep), its crash image (durable bytes, and the bytes still cached after a
 process exit), the operation trace and a label naming the cut and the survival choice (which of the
@@ -128,13 +145,18 @@ The tests do **not** explore:
   single owner; a second owner is refused);
 - survival subsets beyond the 14 per cut: the seeded subsets are a sample, not an enumeration, and
   a surviving write is never cut except after a whole number of its 512-byte sectors;
-- cut sweeps of larger stores: every sweep starts from at most one committed transaction (deeper
-  trees are tested for reopening after power loss, but not cut at every operation);
+- cut sweeps of larger stores: the general sweeps start from at most one committed transaction.
+  Three more sweeps cut commits that reshape the tree, from small fixtures just before the change:
+  one that splits a leaf below the root, one that splits the root branch (the tree grows a level,
+  from a store of a few dozen commits) and one whose deletions shrink the root to a leaf. Deeper
+  trees and larger stores are tested for reopening after power loss, but not cut at every
+  operation;
 - damage to durable bytes beyond the cases listed, such as random or multiple-location corruption,
   damaged interior tree nodes, or writes that are lost or misdirected after a successful sync;
-- other errors of a real filesystem: `EINTR` inside the filesystem adapter, `ENOSPC` from a full
-  disk, and a failed `fsync` are not provoked through the filesystem adapter; apart from the file
-  size limit above, I/O errors are injected only in the simulator;
+- errors produced by a real filesystem: apart from the file size limit above, interruptions, short
+  transfers, a full disk and device errors are injected by the test seam under the adapter's file
+  handles, not provoked in the filesystem, and a real `fsync` failure is not provoked at all.
+  Opening files, file metadata and directory syncs are not under the seam;
 - a lossy failure of a directory sync: lossy failures are modelled for file syncs only.
 
 ## Store files on disk
@@ -152,6 +174,15 @@ extent bounds and content digests are checked; every node reference must lie ins
 metadata with an incarnation no newer than the current generation; and a traversal may load at most
 as many nodes as the store has pages, so a shared or cyclic subtree fails instead of looping. Full
 structural validation of hostile stores is not implemented yet.
+
+## Requests the format cannot hold
+
+Identifiers are at most 255 bytes, but a relationship's index keys hold four of them, and records
+are limited in size (see the format document's key and record limits). A request containing a
+relationship whose index keys would be too long, or a record too large for metadata, is refused
+with `InvalidRequest` that names the limit exceeded and nothing of the request is applied. For a
+relationship this happens before any change of the request is applied, so it is the answer even
+when an earlier change would fail too.
 
 ## Concurrent views and conflict validation
 

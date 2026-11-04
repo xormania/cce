@@ -8,6 +8,8 @@
 mod attempt_tests;
 #[cfg(test)]
 mod audit;
+#[cfg(test)]
+mod bundle_tests;
 mod codec;
 #[cfg(test)]
 mod content_tests;
@@ -20,8 +22,12 @@ mod engine;
 mod engine_tests;
 mod format;
 #[cfg(test)]
+mod fs_seam_tests;
+#[cfg(test)]
 mod instrumentation_tests;
 mod io;
+#[cfg(test)]
+mod key_bounds_tests;
 #[cfg(test)]
 mod quiescence_tests;
 #[cfg(test)]
@@ -37,6 +43,8 @@ mod repro_tests;
 mod reuse_tests;
 #[cfg(test)]
 mod sim;
+#[cfg(test)]
+mod split_sweep_tests;
 mod tree;
 #[cfg(test)]
 mod tree_reopen_tests;
