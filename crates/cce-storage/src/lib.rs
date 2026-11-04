@@ -204,10 +204,16 @@ pub struct MaintenanceReport {
     /// the budget's `max_content_bytes`: no call with this budget can move them, a call with a
     /// larger one can.
     pub content_streams_over_budget: u64,
-    /// False if work remains: something that could move was left because the budget ran out, so
-    /// another call continues, or a stream is over the budget (see `content_streams_over_budget`),
-    /// which only a larger budget moves; false for that reason alone, it stays false across
-    /// identical calls. Streams with no retired space below them are not work left to do.
+    /// True if this step finished all the work it found, within its budget. False if some of it
+    /// remains: something that could move was left because the budget ran out, so another call
+    /// continues, or a stream is over the budget (see `content_streams_over_budget`), which only a
+    /// larger budget moves; false for that reason alone, it stays false across identical calls.
+    /// Streams with no retired space below them are not work left to do.
+    ///
+    /// Only for `ReclaimContentHoles` does a complete step mean that an identical call finds
+    /// nothing, as long as nothing is committed or discarded in between. A further `Relocate` step
+    /// can still move data after a complete one: the space a step retires, and space retired while
+    /// a view was pinned once that view is gone, can lie below data a later step then moves.
     pub complete: bool,
 }
 

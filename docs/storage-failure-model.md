@@ -394,7 +394,8 @@ space, which is proportional to the metadata (as for the integrity check).
 
 - `ReclaimContentHoles` retires content-file space below the committed length that no published
   structure reaches, no retirement record covers, and no staging of this process holds or has
-  discarded, within the budget.
+  discarded, within the budget. After a complete step an identical call finds nothing, unless
+  something is committed or discarded in between.
 - `RebuildRelationshipIndexes` removes every relationship index entry and writes both entries of
   each relationship record again, in one publication; the old index is not consulted. It runs only
   when asked, for example after an integrity check reports index findings. Its memory grows with the
@@ -417,7 +418,9 @@ space, which is proportional to the metadata (as for the integrity check).
   never extends the metadata file. Each part publishes only if it moved something. The page part
   holds the writer lock throughout because it writes only metadata and at most the page budget,
   about what a commit writes; the content part copies up to the content budget of stream bytes,
-  which is why it copies without the lock.
+  which is why it copies without the lock. A complete report means the step finished what it found
+  within its budget, not that a further step finds nothing: the space a step retires, and space
+  retired while a view was pinned once that view is gone, can lie below data a later step moves.
 
 What a step holds in memory, and what it reads:
 
