@@ -29,8 +29,18 @@ struct SimFile {
     pending: Vec<Pending>,
 }
 
+/// Largest simulated file. The simulation keeps files as dense buffers, so a write far beyond this
+/// is a test bug (or an engine bug) and must fail loudly instead of exhausting host memory.
+const SIM_FILE_LIMIT: u64 = 1 << 30;
+
 fn put(buf: &mut Vec<u8>, offset: u64, data: &[u8]) {
-    let end = offset as usize + data.len();
+    let end = offset.checked_add(data.len() as u64);
+    assert!(
+        end.is_some_and(|e| e <= SIM_FILE_LIMIT),
+        "simulated write at {offset}+{} exceeds the {SIM_FILE_LIMIT}-byte simulation limit",
+        data.len()
+    );
+    let end = end.unwrap_or_default() as usize;
     if buf.len() < end {
         buf.resize(end, 0);
     }

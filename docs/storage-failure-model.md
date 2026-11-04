@@ -89,6 +89,41 @@ metadata with an incarnation no newer than the current generation; and a travers
 as many nodes as the store has pages, so a shared or cyclic subtree fails instead of looping. Full
 structural validation of hostile stores is not implemented yet.
 
+## Concurrent views and conflict validation
+
+A view records what it reads: each context read (including one that finds nothing) protects that
+record, and each relationship query protects its whole queried range: one node, one direction and,
+if given, one kind. The protection covers the whole range however much of it the caller consumed, and
+it is registered before the first result is produced. Reads of retained history register no
+protection: history is append-only, so a commit never changes an entry a view has read.
+
+A commit from a view is validated against every logical write committed after the view began. If any
+of them touched a protected record or range, the commit returns `Conflict`, naming the record, and
+nothing is written. Writes that touch nothing the view observed do not conflict: two disjoint changes
+prepared from the same basis both commit, and the later one is applied to the newest state, so
+nothing the first commit wrote is lost. Preconditions on revisions and absence are
+checked against the newest state as well.
+
+The write sets of the most recent commits (4096 by default) are kept in memory for validation; the
+window is bounded by number of commits, so its memory grows with the size of those commits' write sets. A view
+older than that window is refused with an explicit `Conflict` saying the basis is too old; it is never
+validated against incomplete history. Physical maintenance writes no logical keys and so never causes
+a conflict.
+
+## Commit ordering, admission and outcomes
+
+Each store has one commit worker that validates, writes and publishes commits in order. `commit`
+submits to it and waits; `submit` returns a ticket instead. An admitted commit runs to completion even
+if its ticket or caller goes away, and until it resolves `outcome` reports `Pending` for its attempt.
+The queue in front of the worker is bounded (64 by default); when it is full, `submit` and `commit`
+fail with `Busy` without admitting anything, and reads continue normally.
+
+`close` stops admission first (later `submit`/`commit` calls fail with a store-state error saying the
+store is closing), then waits until every admitted commit has resolved, so no commit publishes after
+`close` has returned, and no admitted commit still keeps the store owned. `close` waits as long as an
+admitted commit takes: a commit blocked in I/O (for example a filesystem that never completes a
+sync) keeps `close` waiting with it.
+
 ## Ownership
 
 One process owns a store at a time, through an exclusive lock on `LOCK` taken at open and held until

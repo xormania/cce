@@ -527,6 +527,48 @@ fn node_references_outside_committed_metadata_are_refused_before_reading() {
 }
 
 #[test]
+fn history_position_exhaustion_is_rejected_without_wrapping() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    commit(
+        &s,
+        "x",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    let mut d = s.inner.snapshot().unwrap().desc;
+    drop(s);
+    // The next generation's record claims the last representable history position.
+    d.generation += 1;
+    d.history_pos = u64::MAX;
+    sim.write_at(
+        FileId::Meta,
+        Descriptor::slot(d.generation) * PAGE_SIZE as u64,
+        &d.encode(),
+    )
+    .unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    sim.release();
+    let s = reopen(&sim);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        commit(
+            &s,
+            "y",
+            changes(vec![put("B", Precondition::Absent, b"b", None)]),
+        )
+    }))
+    .expect("commit panicked at history exhaustion");
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.contains("overflow")),
+        "{r:?}"
+    );
+    assert!(
+        revision(&s, "A").is_some(),
+        "existing state must stay readable"
+    );
+}
+
+#[test]
 fn an_oversized_manifest_reference_is_refused_before_allocation() {
     // A small segment quota keeps the largest valid manifest small, so a crafted reference only a
     // little beyond it (backed by real bytes, within committed content) shows the size bound.
@@ -675,4 +717,66 @@ fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
     let after_power_loss = sim.after_crash(Persist::None);
     let s = reopen(&after_power_loss);
     assert!(revision(&s, "A").is_some());
+}
+
+#[test]
+fn a_page_counter_whose_byte_offset_is_unrepresentable_refuses_the_commit() {
+    let s = store();
+    commit(
+        &s,
+        "a",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    )
+    .unwrap();
+    // The next node page would lie beyond the largest representable file offset.
+    s.inner
+        .set_cursors_for_test(Some(u64::MAX / PAGE_SIZE as u64 + 1), None);
+    let r = commit(
+        &s,
+        "b",
+        changes(vec![put("B", Precondition::Absent, b"b", None)]),
+    );
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.contains("exhausted")),
+        "{r:?}"
+    );
+    assert!(revision(&s, "A").is_some(), "existing state stays readable");
+    assert!(
+        revision(&s, "B").is_none(),
+        "nothing from the refused commit is visible"
+    );
+}
+
+#[test]
+fn a_content_cursor_near_its_limit_refuses_staging_without_wrapping() {
+    let s = store();
+    s.inner.set_cursors_for_test(None, Some(u64::MAX - 50));
+    let r = s.stage_content(&mut &[1u8; 100][..]).map(|_| ());
+    assert!(
+        matches!(&r, Err(StorageError::InvalidRequest(m)) if m.contains("exhausted")),
+        "{r:?}"
+    );
+    // A manifest that would cross the limit is refused too (an empty stream writes only a manifest).
+    s.inner.set_cursors_for_test(None, Some(u64::MAX - 20));
+    let r = s.stage_content(&mut &[][..]).map(|_| ());
+    assert!(
+        matches!(&r, Err(StorageError::InvalidRequest(m)) if m.contains("exhausted")),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn a_history_extent_that_would_cross_the_content_limit_refuses_the_commit() {
+    let s = store();
+    s.inner.set_cursors_for_test(None, Some(u64::MAX - 8));
+    let r = commit(
+        &s,
+        "a",
+        changes(vec![put("A", Precondition::Absent, b"a", None)]),
+    );
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.contains("exhausted")),
+        "{r:?}"
+    );
+    assert!(revision(&s, "A").is_none());
 }

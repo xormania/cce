@@ -1,7 +1,10 @@
 name: leak-guard
 # Fails a PR if its title, body, commit messages or added lines match private markers.
-# The marker regex lives in a repo variable (Settings > Secrets and variables > Actions >
-# Variables > PRIVATE_MARKERS), so the list itself is never committed.
+# The marker regex lives in a repository secret (Settings > Secrets and variables > Actions >
+# Secrets > PRIVATE_MARKERS), so the list itself is never committed or shown in logs.
+# A missing secret or an invalid pattern fails the check: an unscanned PR must never look clean.
+# Limits: PRs from forks and Dependabot get no secrets, so this check fails on them by design;
+# PR comments and review comments are not scanned.
 # Re-runs when the PR body is edited.
 
 on:
@@ -11,30 +14,42 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: leak-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     env:
-      MARKERS: ${{ vars.PRIVATE_MARKERS }}
+      MARKERS: ${{ secrets.PRIVATE_MARKERS }}
       BASE: ${{ github.event.pull_request.base.sha }}
       HEAD: ${{ github.event.pull_request.head.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Scan PR text, commits and diff
         run: |
           set -euo pipefail
-          if [ -z "${MARKERS}" ]; then echo "PRIVATE_MARKERS not set; skipping"; exit 0; fi
+          if [ -z "${MARKERS}" ]; then echo "::error::PRIVATE_MARKERS secret is not available; nothing was scanned"; exit 1; fi
+          # grep exits 2 on an invalid pattern; never treat that as "no match".
+          rc=0; grep -Ei -- "$MARKERS" /dev/null || rc=$?
+          if [ "$rc" -ge 2 ]; then echo "::error::PRIVATE_MARKERS is not a valid extended regex; nothing was scanned"; exit 1; fi
           jq -r '.pull_request.title, (.pull_request.body // "")' "$GITHUB_EVENT_PATH" > /tmp/pr.txt
           git log --format='%B' "$BASE..$HEAD" > /tmp/commits.txt
           git diff "$BASE...$HEAD" -U0 | grep '^+' | grep -v '^+++' > /tmp/added.txt || true
           git diff --name-only "$BASE...$HEAD" > /tmp/files.txt
           fail=0
           for f in pr commits added files; do
-            if grep -nEi -- "$MARKERS" "/tmp/$f.txt" > "/tmp/$f.hits"; then
+            rc=0; grep -nEi -- "$MARKERS" "/tmp/$f.txt" > "/tmp/$f.hits" || rc=$?
+            if [ "$rc" -eq 0 ]; then
               echo "::error::private marker found in PR $f (rewrite it; matches not echoed)"
               wc -l < "/tmp/$f.hits"
+              fail=1
+            elif [ "$rc" -ge 2 ]; then
+              echo "::error::scan of PR $f failed (grep exit $rc)"
               fail=1
             fi
           done

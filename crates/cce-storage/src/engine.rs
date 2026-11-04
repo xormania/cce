@@ -12,8 +12,8 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
@@ -51,14 +51,25 @@ static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Options {
     pub cache_nodes: usize,
+    /// Commits whose write sets are retained for validating older read bases.
+    pub conflict_window: usize,
+    /// Admitted commits that may wait for the commit worker before admission is refused.
+    pub commit_queue: usize,
     /// Largest number of segments one content stream may have (bounds staging and manifest memory).
     pub max_content_segments: usize,
 }
+
+/// Default number of recent commits whose write sets are kept for conflict validation.
+pub(crate) const DEFAULT_CONFLICT_WINDOW: usize = 4096;
+/// Default number of admitted commits that may wait for the commit worker.
+pub(crate) const DEFAULT_COMMIT_QUEUE: usize = 64;
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             cache_nodes: DEFAULT_CACHE_NODES,
+            conflict_window: DEFAULT_CONFLICT_WINDOW,
+            commit_queue: DEFAULT_COMMIT_QUEUE,
             max_content_segments: DEFAULT_MAX_CONTENT_SEGMENTS,
         }
     }
@@ -107,6 +118,23 @@ pub(crate) struct Inner {
     /// Content-file allocation cursor; held while streaming an allocation.
     alloc: Mutex<u64>,
     cache: Mutex<NodeCache>,
+    /// Logical write sets of recent commits, for validating older read bases.
+    conflicts: Mutex<ConflictLog>,
+    /// Sender to the commit worker.
+    worker: Mutex<Option<mpsc::SyncSender<Job>>>,
+    /// Attempts admitted to the worker and not yet resolved.
+    /// Shared with the worker so it can resolve an attempt after releasing its engine reference.
+    pending: Arc<Mutex<HashMap<AttemptId, u32>>>,
+    /// Set (under the `pending` lock) once `close` began: new commits are refused from then on.
+    closing: AtomicBool,
+    #[cfg(test)]
+    gate: Mutex<()>,
+    /// Makes the next commit panic inside the worker (tests of worker robustness only).
+    #[cfg(test)]
+    panic_next_commit: std::sync::atomic::AtomicBool,
+    /// Makes the worker pause after answering each job (tests of shutdown ordering only).
+    #[cfg(test)]
+    slow_job_release: std::sync::atomic::AtomicBool,
     /// Largest number of segments one content stream may have.
     max_segments: usize,
     pub counters: Counters,
@@ -120,6 +148,22 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn sha256(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
+}
+
+/// The content file cannot grow further without wrapping its byte offsets.
+fn content_space_exhausted() -> StorageError {
+    StorageError::InvalidRequest("content space exhausted".into())
+}
+
+/// Resolves one admission of `attempt`: it stops being pending once every admission resolved.
+fn finish_pending(pending: &Mutex<HashMap<AttemptId, u32>>, attempt: &AttemptId) {
+    let mut p = lock(pending);
+    if let Some(n) = p.get_mut(attempt) {
+        *n -= 1;
+        if *n == 0 {
+            p.remove(attempt);
+        }
+    }
 }
 
 fn rejected(e: StorageError) -> CommitError {
@@ -143,10 +187,12 @@ impl NodeSink for PageWriter<'_> {
             .next_page
             .checked_add(1)
             .ok_or_else(|| StorageError::InvalidRequest("page counter exhausted".into()))?;
+        let offset = at
+            .page
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| StorageError::InvalidRequest("page counter exhausted".into()))?;
         let page = encode_page(self.inner.store, PageKind::Node, at, &node.encode())?;
-        self.inner
-            .io
-            .write_at(FileId::Meta, at.page * PAGE_SIZE as u64, &page)?;
+        self.inner.io.write_at(FileId::Meta, offset, &page)?;
         self.next_page = next;
         self.inner
             .counters
@@ -241,7 +287,9 @@ impl Inner {
             &desc.encode(),
         )?;
         io.sync(FileId::Meta)?;
-        Ok(Arc::new(Self::new(io, desc, Vec::new(), opts)))
+        let inner = Arc::new(Self::new(io, desc, Vec::new(), opts));
+        inner.start_worker(opts.commit_queue)?;
+        Ok(inner)
     }
 
     pub fn open(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
@@ -265,7 +313,9 @@ impl Inner {
         // any receipt or new commit can rely on them.
         io.sync(FileId::Content)?;
         io.sync(FileId::Meta)?;
-        Ok(Arc::new(Self::new(io, desc, diagnostics, opts)))
+        let inner = Arc::new(Self::new(io, desc, diagnostics, opts));
+        inner.start_worker(opts.commit_queue)?;
+        Ok(inner)
     }
 
     fn new(io: Box<dyn Io>, desc: Descriptor, diagnostics: Vec<String>, opts: Options) -> Self {
@@ -286,16 +336,162 @@ impl Inner {
                 order: VecDeque::new(),
                 capacity: opts.cache_nodes,
             }),
+            worker: Mutex::new(None),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            closing: AtomicBool::new(false),
+            #[cfg(test)]
+            gate: Mutex::new(()),
+            #[cfg(test)]
+            panic_next_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            slow_job_release: std::sync::atomic::AtomicBool::new(false),
+            conflicts: Mutex::new(ConflictLog {
+                floor: desc.history_pos,
+                entries: VecDeque::new(),
+                capacity: opts.conflict_window.max(1),
+            }),
             max_segments: opts.max_content_segments,
             counters: Counters::default(),
             diagnostics,
         }
     }
 
+    /// Test hook: makes the next commit panic inside the worker.
+    #[cfg(test)]
+    pub(crate) fn slow_job_release_for_test(&self) {
+        self.slow_job_release.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_next_commit_for_test(&self) {
+        self.panic_next_commit.store(true, Ordering::SeqCst);
+    }
+
+    /// Test hook: holds the commit worker before its next job until the guard is dropped.
+    #[cfg(test)]
+    pub(crate) fn pause_worker_for_test(&self) -> MutexGuard<'_, ()> {
+        lock(&self.gate)
+    }
+
+    /// Starts the store's commit worker: the single thread that orders publications. The worker
+    /// holds no reference to the engine; each queued job holds a strong one, so admitted work
+    /// completes even if every caller handle is dropped, and an idle worker never keeps the store
+    /// owned. A job's engine reference is released before its attempt stops being pending. The
+    /// worker exits when the engine (and with it the queue's sender) is dropped.
+    fn start_worker(self: &Arc<Self>, capacity: usize) -> Result<(), StorageError> {
+        let (tx, rx) = mpsc::sync_channel::<Job>(capacity.max(1));
+        *lock(&self.worker) = Some(tx);
+        std::thread::Builder::new()
+            .name("cce-commit".into())
+            .spawn(move || {
+                for job in rx {
+                    let Job {
+                        inner,
+                        attempt,
+                        basis,
+                        observed,
+                        changes,
+                        reply,
+                    } = job;
+                    #[cfg(test)]
+                    drop(lock(&inner.gate));
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        inner.commit(attempt.clone(), basis, &observed, changes)
+                    }))
+                    .unwrap_or_else(|_| {
+                        // A commit that panicked may have written anything up to its
+                        // publication: its outcome is unknown, and writes stay fenced until
+                        // reopen. Queued jobs keep being answered (refused behind the fence).
+                        let why = format!("commit of attempt {attempt:?} failed unexpectedly");
+                        lock(&inner.state).fenced = Some(why.clone());
+                        Err(CommitError::Indeterminate(why))
+                    });
+                    #[cfg(test)]
+                    let slow = inner.slow_job_release.load(Ordering::SeqCst);
+                    // Release this job's hold on the engine before its attempt stops being
+                    // pending: once nothing is pending (what `close` waits for), no job keeps the
+                    // store owned.
+                    let pending = inner.pending.clone();
+                    drop(inner);
+                    finish_pending(&pending, &attempt);
+                    // The caller may have gone away; the commit stands either way.
+                    let _ = reply.send(r);
+                    #[cfg(test)]
+                    if slow {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            })
+            .map_err(|e| StorageError::Io(format!("start commit worker: {e}")))?;
+        Ok(())
+    }
+
+    /// Admits a commit to the worker's queue, or refuses it explicitly when the queue is full.
+    pub fn submit(
+        self: &Arc<Self>,
+        attempt: AttemptId,
+        basis: Snapshot,
+        observed: Vec<Observation>,
+        changes: ChangeSet,
+    ) -> Result<mpsc::Receiver<Result<CommitReceipt, CommitError>>, CommitError> {
+        let (reply, rx) = mpsc::channel();
+        let tx = lock(&self.worker).clone().ok_or_else(|| {
+            rejected(StorageError::StoreState("commit worker not running".into()))
+        })?;
+        {
+            // Checked under the same lock `close` sets it under, so `close` never misses an
+            // admission that raced with it.
+            let mut pending = lock(&self.pending);
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(rejected(StorageError::StoreState(
+                    "store is closing; no new commits are admitted".into(),
+                )));
+            }
+            *pending.entry(attempt.clone()).or_default() += 1;
+        }
+        let job = Job {
+            inner: self.clone(),
+            attempt: attempt.clone(),
+            basis,
+            observed,
+            changes,
+            reply,
+        };
+        match tx.try_send(job) {
+            Ok(()) => Ok(rx),
+            Err(e) => {
+                self.finish_pending(&attempt);
+                Err(rejected(match e {
+                    mpsc::TrySendError::Full(_) => {
+                        StorageError::Busy("commit queue is full; retry later".into())
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        StorageError::StoreState("commit worker stopped".into())
+                    }
+                }))
+            }
+        }
+    }
+
+    fn finish_pending(&self, attempt: &AttemptId) {
+        finish_pending(&self.pending, attempt);
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot, StorageError> {
         Ok(Snapshot {
             desc: lock(&self.state).current,
         })
+    }
+
+    /// Moves the page and content allocation cursors (boundary tests only).
+    #[cfg(test)]
+    pub(crate) fn set_cursors_for_test(&self, next_page: Option<u64>, content: Option<u64>) {
+        if let Some(p) = next_page {
+            lock(&self.state).current.next_page = p;
+        }
+        if let Some(c) = content {
+            *lock(&self.alloc) = c;
+        }
     }
 
     pub fn height(&self) -> Result<usize, StorageError> {
@@ -393,6 +589,9 @@ impl Inner {
                 )));
             }
             let seg = &buf[..filled];
+            let end = at
+                .checked_add(filled as u64)
+                .ok_or_else(content_space_exhausted)?;
             self.io.write_at(FileId::Content, at, seg)?;
             self.counters
                 .content_bytes_written
@@ -403,7 +602,7 @@ impl Inner {
                 digest: sha256(seg),
             });
             total.update(seg);
-            at += filled as u64;
+            at = end;
             len += filled as u64;
             if filled < buf.len() {
                 break;
@@ -422,6 +621,9 @@ impl Inner {
             )));
         }
         let manifest = Manifest { content, segments }.encode();
+        let end = at
+            .checked_add(manifest.len() as u64)
+            .ok_or_else(content_space_exhausted)?;
         self.io.write_at(FileId::Content, at, &manifest)?;
         self.counters
             .content_bytes_written
@@ -431,7 +633,7 @@ impl Inner {
             len: manifest.len() as u64,
             digest: sha256(&manifest),
         };
-        *cursor = at + mref.len;
+        *cursor = end;
         let serial = {
             let mut st = lock(&self.state);
             let serial = st.next_stage;
@@ -486,10 +688,15 @@ impl Inner {
     pub fn commit(
         &self,
         attempt: AttemptId,
-        _basis: Snapshot,
+        basis: Snapshot,
+        observed: &[Observation],
         cs: ChangeSet,
     ) -> Result<CommitReceipt, CommitError> {
         let _w = lock(&self.writer);
+        #[cfg(test)]
+        if self.panic_next_commit.swap(false, Ordering::SeqCst) {
+            panic!("injected commit panic");
+        }
         let cur = {
             let st = lock(&self.state);
             if let Some(f) = &st.fenced {
@@ -530,6 +737,9 @@ impl Inner {
             };
         }
 
+        // The basis must still hold: nothing it observed may have been written since.
+        lock(&self.conflicts).validate(basis.desc.history_pos, observed)?;
+
         let pos = cur.history_pos.checked_add(1).ok_or_else(|| {
             rejected(StorageError::InvalidRequest(
                 "history position overflow".into(),
@@ -538,6 +748,12 @@ impl Inner {
         let bound = self.resolve_content(&cs)?;
         let extents: Vec<BoundContent> = bound.iter().map(|(_, x)| *x).collect();
         apply(&mut txn, &cs, &extents, pos)?;
+        let written: Vec<Vec<u8>> = txn
+            .touched()
+            .iter()
+            .filter(|k| matches!(k.first(), Some(&P_CONTEXT | &P_REL | &P_OUT | &P_IN)))
+            .cloned()
+            .collect();
 
         // History entry → content file; then touched tree nodes → fresh metadata pages.
         let hist = encode_history(pos, &attempt, &cs);
@@ -548,13 +764,18 @@ impl Inner {
                 len: hist.len() as u64,
                 digest: sha256(&hist),
             };
+            let end = x
+                .offset
+                .checked_add(x.len)
+                .ok_or_else(content_space_exhausted)
+                .map_err(rejected)?;
             self.io
                 .write_at(FileId::Content, x.offset, &hist)
                 .map_err(rejected)?;
             self.counters
                 .content_bytes_written
                 .fetch_add(x.len, Ordering::Relaxed);
-            *cursor += x.len;
+            *cursor = end;
             x
         };
         txn.put(history_key(pos), hist_ref.encode())
@@ -612,6 +833,7 @@ impl Inner {
             return Err(CommitError::Indeterminate(why));
         }
 
+        lock(&self.conflicts).record(pos, written);
         let mut st = lock(&self.state);
         st.current = desc;
         for (serial, _) in &bound {
@@ -631,6 +853,9 @@ impl Inner {
     }
 
     pub fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
+        if lock(&self.pending).contains_key(attempt) {
+            return Ok(AttemptOutcome::Pending);
+        }
         let st = lock(&self.state);
         if st.fenced.is_some() {
             return Ok(AttemptOutcome::Unknown);
@@ -648,7 +873,16 @@ impl Inner {
         )
     }
 
+    /// Stops admitting commits, waits until every admitted commit has resolved (published,
+    /// refused or failed), then returns. Reads stay available on existing handles.
     pub fn close(&self) -> Result<(), StorageError> {
+        {
+            let _pending = lock(&self.pending);
+            self.closing.store(true, Ordering::SeqCst);
+        }
+        while !lock(&self.pending).is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let _w = lock(&self.writer);
         Ok(())
     }
@@ -682,11 +916,7 @@ impl Inner {
             Direction::Outgoing => P_OUT,
             Direction::Incoming => P_IN,
         };
-        let mut prefix = vec![p];
-        key_component(&mut prefix, q.from.as_bytes());
-        if let Some(k) = &q.kind {
-            key_component(&mut prefix, k.as_bytes());
-        }
+        let prefix = relationship_range(q);
         let start = match &q.after {
             None => None,
             Some(a) => {
@@ -805,6 +1035,115 @@ impl Inner {
             total: Sha256::new(),
             failed: None,
         })
+    }
+}
+
+/// One admitted commit waiting for the worker.
+pub(crate) struct Job {
+    inner: Arc<Inner>,
+    attempt: AttemptId,
+    basis: Snapshot,
+    observed: Vec<Observation>,
+    changes: ChangeSet,
+    reply: mpsc::Sender<Result<CommitReceipt, CommitError>>,
+}
+
+/// A logical read a view made, protected until the view's commit is validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Observation {
+    /// A point read of one record key, including a read that found nothing.
+    Point(Vec<u8>),
+    /// A range read: every key with this prefix. The whole queried domain is protected, however
+    /// much of the range the caller consumed.
+    Range(Vec<u8>),
+}
+
+impl Observation {
+    fn covers(&self, key: &[u8]) -> bool {
+        match self {
+            Observation::Point(k) => k.as_slice() == key,
+            Observation::Range(p) => key.starts_with(p),
+        }
+    }
+}
+
+/// The key a context point read observes.
+pub(crate) fn context_key(id: &ContextId) -> Vec<u8> {
+    key(P_CONTEXT, &[id.as_bytes()])
+}
+
+/// The key range a relationship query observes: one direction, one node, optionally one kind.
+pub(crate) fn relationship_range(q: &RelationshipQuery) -> Vec<u8> {
+    let mut prefix = vec![match q.direction {
+        Direction::Outgoing => P_OUT,
+        Direction::Incoming => P_IN,
+    }];
+    key_component(&mut prefix, q.from.as_bytes());
+    if let Some(k) = &q.kind {
+        key_component(&mut prefix, k.as_bytes());
+    }
+    prefix
+}
+
+/// Logical write sets of recent commits. `floor` is the newest history position whose successors'
+/// writes are all retained; a basis older than that cannot be validated.
+struct ConflictLog {
+    floor: u64,
+    entries: VecDeque<(u64, Vec<Vec<u8>>)>,
+    capacity: usize,
+}
+
+fn describe(key: &[u8]) -> String {
+    let family = match key.first() {
+        Some(&P_CONTEXT) => "context",
+        Some(&P_REL) => "relationship",
+        Some(&P_OUT) => "outgoing relationship index",
+        Some(&P_IN) => "incoming relationship index",
+        _ => "record",
+    };
+    let parts = key_components(key.get(1..).unwrap_or_default()).unwrap_or_default();
+    let parts: Vec<String> = parts
+        .iter()
+        .map(|p| format!("{:?}", String::from_utf8_lossy(p)))
+        .collect();
+    format!("{family} {}", parts.join("/"))
+}
+
+impl ConflictLog {
+    fn validate(&self, basis: u64, observed: &[Observation]) -> Result<(), CommitError> {
+        if observed.is_empty() {
+            return Ok(());
+        }
+        if basis < self.floor {
+            return Err(CommitError::Conflict(format!(
+                "read basis at history position {basis} is older than the retained conflict history (from {}); prepare again",
+                self.floor
+            )));
+        }
+        for (pos, keys) in self.entries.iter().filter(|(pos, _)| *pos > basis) {
+            for k in keys {
+                if let Some(o) = observed.iter().find(|o| o.covers(k)) {
+                    let what = match o {
+                        Observation::Point(_) => "a record read",
+                        Observation::Range(_) => "a range read",
+                    };
+                    return Err(CommitError::Conflict(format!(
+                        "{} was written at history position {pos}, after {what} at {basis}",
+                        describe(k)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, pos: u64, keys: Vec<Vec<u8>>) {
+        self.entries.push_back((pos, keys));
+        while self.entries.len() > self.capacity {
+            if let Some((old, _)) = self.entries.pop_front() {
+                self.floor = old;
+            }
+        }
     }
 }
 
