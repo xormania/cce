@@ -8,7 +8,9 @@
 # Anything that stops a verdict leaves the check failed or in progress, which blocks a merge: an
 # unscanned pull request never looks clean.
 # Env: GH_TOKEN, REPO (owner/name), PULLS (JSON array of {number} from the triggering run),
-#      MARKERS, SERVER (e.g. https://github.com), RUN_URL (shown on the check).
+#      MARKERS, SERVER (e.g. https://github.com), RUN_ID (this workflow run).
+# The check summary starts with "leak-scan run <RUN_ID>": GitHub replaces a details link on checks
+# created by GitHub Actions, so the summary is where the producing run is named.
 #      LEAK_SCAN_REMOTE: fetch URL override, used by the tests.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -42,15 +44,14 @@ for pr in $numbers; do
   fi
   head="$(jq -r .head.sha <<<"$info")"; base="$(jq -r .base.sha <<<"$info")"
   jq -r '.title, (.body // "")' <<<"$info" > "$work/pr-$pr.txt"
-  check="$(gh api -X POST "repos/$REPO/check-runs" -f name=scan -f head_sha="$head" -f status=in_progress \
-           -f details_url="$RUN_URL" -q .id)"
+  check="$(gh api -X POST "repos/$REPO/check-runs" -f name=scan -f head_sha="$head" -f status=in_progress -q .id)"
   set +e; out="$(scan_one "$pr" "$base" "$head" 2>&1)"; rc=$?; set -e
   printf '%s\n' "$out"
   if [ "$rc" -eq 0 ]; then conclusion=success; title="No private markers"
   else conclusion=failure; title="Private marker found or scan incomplete"; status=1; fi
   # Lines are fixed messages and counts from leak_scan.sh; matching text is never printed.
   gh api -X PATCH "repos/$REPO/check-runs/$check" -f status=completed -f conclusion="$conclusion" \
-     -f "output[title]=$title" -f "output[summary]=$(printf 'PR #%s at %s\n\n%s\n' "$pr" "$head" "$out" | head -c 4000)" > /dev/null
+     -f "output[title]=$title" -f "output[summary]=$(printf 'leak-scan run %s\nPR #%s at %s\n\n%s\n' "$RUN_ID" "$pr" "$head" "$out" | head -c 4000)" > /dev/null
   echo "PR #$pr: $conclusion"
 done
 exit $status
