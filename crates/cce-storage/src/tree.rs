@@ -149,6 +149,8 @@ fn child_index(seps: &[Vec<u8>], key: &[u8]) -> usize {
 /// Reads committed nodes (through the engine's cache).
 pub(crate) trait NodeSource {
     fn load(&self, at: PageRef) -> Result<Arc<Node>, StorageError>;
+    /// Notes one index entry visited: a point lookup, or an entry a cursor yields.
+    fn entry_visited(&self) {}
 }
 
 /// Allocates and writes new node pages.
@@ -165,7 +167,10 @@ pub(crate) fn get(
     let mut at = root;
     for _ in 0..MAX_HEIGHT {
         match &*src.load(at)? {
-            Node::Leaf(e) => return Ok(e.get(key).cloned()),
+            Node::Leaf(e) => {
+                src.entry_visited();
+                return Ok(e.get(key).cloned());
+            }
             Node::Branch { seps, children } => at = children[child_index(seps, key)],
         }
     }
@@ -298,6 +303,7 @@ impl<'a> Cursor<'a> {
                 let mut after = k.clone();
                 after.push(0);
                 self.next = after;
+                self.src.entry_visited();
                 return Ok(Some((k.clone(), v.clone())));
             }
             if !self.advance_leaf()? {
