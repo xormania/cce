@@ -30,7 +30,12 @@ fn sim_create(sim: &SimIo) -> NativeStore {
 
 /// Puts record `id` with `payload` as its content.
 fn put(s: &NativeStore, attempt: &str, id: &str, payload: &[u8]) -> u64 {
-    let staged = s.stage_content(&mut &payload[..]).unwrap();
+    let staged = s.stage_content(&mut &payload[..]);
+    assert!(
+        staged.is_ok(),
+        "staging for {attempt} was refused: {staged:?}"
+    );
+    let staged = staged.unwrap();
     let cs = ChangeSet {
         changes: vec![Change::PutContext {
             id: cid(id),
@@ -41,14 +46,13 @@ fn put(s: &NativeStore, attempt: &str, id: &str, payload: &[u8]) -> u64 {
         content: vec![ContentBinding::from(&staged)],
         ..ChangeSet::default()
     };
-    s.commit(
+    let r = s.commit(
         AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
         s.begin().unwrap(),
         cs,
-    )
-    .unwrap()
-    .position
-    .0
+    );
+    assert!(r.is_ok(), "commit {attempt} was refused: {r:?}");
+    r.unwrap().position.0
 }
 
 fn pins(inner: &Inner) -> BTreeMap<u64, u32> {
@@ -536,7 +540,7 @@ fn a_fixed_live_set_keeps_idle_metadata_space_constant() {
 // ----- logical content removal -----------------------------------------------------------------
 
 fn remove(s: &NativeStore, attempt: &str, id: &str) {
-    s.commit(
+    let r = s.commit(
         AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
         s.begin().unwrap(),
         ChangeSet {
@@ -546,8 +550,8 @@ fn remove(s: &NativeStore, attempt: &str, id: &str) {
             }],
             ..ChangeSet::default()
         },
-    )
-    .unwrap();
+    );
+    assert!(r.is_ok(), "removal {attempt} was refused: {r:?}");
 }
 
 fn read_all(
@@ -710,12 +714,12 @@ fn commit_staged(
         content: vec![ContentBinding::from(staged)],
         ..ChangeSet::default()
     };
-    s.commit(
+    let r = s.commit(
         AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
         s.begin().unwrap(),
         cs,
-    )
-    .unwrap();
+    );
+    assert!(r.is_ok(), "commit {attempt} was refused: {r:?}");
 }
 
 fn content_of(s: &NativeStore, id: &str) -> cce_core::storage::ContentRef {
