@@ -223,19 +223,30 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
         if jobs_inventory.get("total_count", len(jobs)) > MAX_JOBS:
             limits.append("execution_jobs_truncated")
             waiting = True
-        logs, job_logs, log_available = "", {}, True
-        try:
-            job_logs = {job["id"]: api.log(job["id"]) for job in jobs if job.get("conclusion") != "skipped"}
-            values = list(job_logs.values())
-            if any(not isinstance(log, str) or len(log.encode("utf-8")) > MAX_LOG_BYTES for log in values):
-                raise ValueError("execution_log_bound")
-            logs = "\n".join(values)
-            if not logs.strip() or len(logs.encode("utf-8")) > MAX_LOG_BYTES:
-                raise ValueError("execution_log_bound")
-        except (ValueError, KeyError, OSError, urllib.error.URLError):
-            limits.append("execution_log_unavailable")
-            waiting = True
-            log_available = False
+        # The jobs endpoint can include synthetic Checks API entries with no
+        # runner steps or log endpoint. Only jobs containing expected steps from
+        # the authenticated producer definition can supply required witnesses.
+        job_logs, log_bytes = {}, 0
+        for job in jobs:
+            if (job.get("conclusion") == "skipped"
+                    or not any(step.get("name") in expected.values() for step in job.get("steps", []))):
+                continue
+            try:
+                job_id = job["id"]
+                if job_id in job_logs:
+                    continue
+                log = api.log(job_id)
+                if not isinstance(log, str) or not log.strip():
+                    raise ValueError("execution_log_unavailable")
+                size = len(log.encode("utf-8")) + bool(job_logs)
+                if log_bytes + size > MAX_LOG_BYTES:
+                    raise ValueError("execution_log_bound")
+                job_logs[job_id] = log
+                log_bytes += size
+            except (ValueError, KeyError, OSError, urllib.error.URLError):
+                limits.append("execution_log_unavailable")
+                waiting = True
+        logs = "\n".join(job_logs.values())
         try:
             workflow_ref = _workflow_ref(api, source, run, path, trusted, logs)
         except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError):
@@ -252,8 +263,8 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
             status = actual[0][1].get("conclusion") if len(actual) == 1 else None
             job_id = actual[0][0]["id"] if len(actual) == 1 else None
             witness = job_logs.get(job_id, "")
-            ran = status in {"success", "failure"} and log_available and bool(witness.strip())
-            if status == "success" and log_available:
+            ran = status in {"success", "failure"} and bool(witness.strip())
+            if status == "success" and ran:
                 if kind == "test":
                     ran = any(int(n) > 0 for n in re.findall(r"test result: ok\. (\d+) passed", witness))
                 elif kind == "unittest":
