@@ -22,9 +22,11 @@ fn files(store: &Path) -> Vec<Vec<u8>> {
         .to_vec()
 }
 
-/// A store with one commit of `n` contexts, closed.
-fn store(name: &str, n: usize) -> std::path::PathBuf {
-    let dir = common::test_dir(name).join("store");
+/// A store with one commit of `n` contexts, closed, and the guard of the directory holding it
+/// (removed when the test passes).
+fn store(name: &str, n: usize) -> (common::TestDir, std::path::PathBuf) {
+    let base = common::test_dir(name);
+    let dir = base.join("store");
     let s = NativeStore::create(&dir, *b"verify-cli-store").unwrap();
     let changes = (0..n)
         .map(|i| Change::PutContext {
@@ -44,12 +46,12 @@ fn store(name: &str, n: usize) -> std::path::PathBuf {
     )
     .unwrap();
     s.close().unwrap();
-    dir
+    (base, dir)
 }
 
 #[test]
 fn a_consistent_store_exits_zero_with_json_lines_and_is_not_changed() {
-    let dir = store("verify-ok", 300);
+    let (_base, dir) = store("verify-ok", 300);
     let before = files(&dir);
     let out = run(&[dir.to_str().unwrap(), "--json"]);
     assert_eq!(
@@ -78,7 +80,7 @@ fn a_consistent_store_exits_zero_with_json_lines_and_is_not_changed() {
 fn a_damaged_reachable_page_exits_one_and_names_it() {
     // One commit of many contexts writes its leaves before its root, so the page after the empty
     // store's root is a reachable leaf; the root itself (checked by open) is untouched.
-    let dir = store("verify-damaged", 300);
+    let (_base, dir) = store("verify-damaged", 300);
     let meta = dir.join("meta.cce");
     let mut bytes = std::fs::read(&meta).unwrap();
     let leaf = 3 * 4096;
@@ -107,7 +109,7 @@ fn a_damaged_reachable_page_exits_one_and_names_it() {
 #[test]
 fn a_store_that_cannot_be_inspected_exits_two() {
     // Owned by a live process: the read-only open is refused, so nothing is inspected.
-    let dir = store("verify-owned", 3);
+    let (_base, dir) = store("verify-owned", 3);
     let before = files(&dir);
     let owner = NativeStore::open(&dir).unwrap();
     let out = run(&[dir.to_str().unwrap()]);
@@ -116,7 +118,8 @@ fn a_store_that_cannot_be_inspected_exits_two() {
     drop(owner);
     assert_eq!(files(&dir), before);
 
-    let missing = common::test_dir("verify-missing").join("nothing-here");
+    let missing_base = common::test_dir("verify-missing");
+    let missing = missing_base.join("nothing-here");
     assert_eq!(run(&[missing.to_str().unwrap()]).status.code(), Some(2));
     assert_eq!(run(&[]).status.code(), Some(2), "no store argument");
     assert_eq!(
@@ -129,7 +132,8 @@ fn a_store_that_cannot_be_inspected_exits_two() {
 #[test]
 fn a_scrub_reads_content_and_exits_one_on_a_damaged_segment() {
     use cce_core::storage::ContentBinding;
-    let dir = common::test_dir("verify-scrub").join("store");
+    let base = common::test_dir("verify-scrub");
+    let dir = base.join("store");
     let s = NativeStore::create(&dir, *b"verify-cli-store").unwrap();
     let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
     let staged = s.stage_content(&mut &payload[..]).unwrap();

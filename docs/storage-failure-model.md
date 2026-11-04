@@ -330,6 +330,7 @@ length and is reused by later staging or after a restart.
 
 ## Not implemented yet
 
-Concurrent commit validation beyond preconditions, recovery from an uncertain outcome without
-reopening, and a maintenance pass over the content file that would reclaim the content space reuse
-does not reach (see the storage format document).
+Recovery from an uncertain outcome without reopening, and a maintenance pass over the content
+file that would reclaim the content space reuse does not reach (see the storage format document).
+(Concurrent commit validation against views' observations is implemented; see "Concurrent views and
+conflict validation" above.)

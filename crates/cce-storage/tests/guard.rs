@@ -18,7 +18,8 @@ fn guarded(min: u64) -> StoreOptions {
 
 #[test]
 fn a_guarded_open_through_store_options_checks_the_retained_position() {
-    let dir = common::test_dir("guarded-open").join("store");
+    let base = common::test_dir("guarded-open");
+    let dir = base.join("store");
     let s = NativeStore::create(&dir, ID).unwrap();
     let receipt = s
         .commit(
