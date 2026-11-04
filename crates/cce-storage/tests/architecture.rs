@@ -156,6 +156,9 @@ const PUBLIC_ITEMS: &[&str] = &[
     "CommitTicket",
     "StoreOptions",
     "StoreStats",
+    "VerifyLevel",
+    "Finding",
+    "Report",
 ];
 
 /// Public items compiled only with a cargo feature: (feature, item).
@@ -363,8 +366,34 @@ fn storage_public_items_are_exactly_the_listed_ones() {
 }
 
 #[test]
+fn the_verify_tool_uses_only_the_public_api_and_never_touches_files() {
+    for line in read("src/bin/cce-verify.rs").lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("use cce_storage::") {
+            assert_eq!(
+                rest, "{NativeStore, VerifyLevel};",
+                "verify tool imports internals"
+            );
+        }
+        assert!(
+            !(line.contains("std::fs") || line.contains("File::") || line.contains("OpenOptions")),
+            "verify tool touches files directly: {line}"
+        );
+    }
+}
+
+#[test]
 fn public_item_check_flags_unlisted_items_and_nothing_else() {
-    let listed = "pub struct NativeStore;\npub struct NativeReadOnly;\npub struct NativeView;\npub struct CommitTicket;\npub struct StoreOptions;\npub struct StoreStats;\n#[cfg(feature = \"fuzz-api\")]\n/// Doc.\npub fn fuzz_target() {}\n";
+    // Every listed item, as a crate root would declare it.
+    let mut listed: String = PUBLIC_ITEMS
+        .iter()
+        .map(|n| format!("pub struct {n};\n"))
+        .collect();
+    for (feature, name) in FEATURE_ITEMS {
+        listed.push_str(&format!(
+            "#[cfg(feature = \"{feature}\")]\n/// Doc.\npub fn {name}() {{}}\n"
+        ));
+    }
+    let listed = listed.as_str();
     assert_eq!(public_item_violations(listed), Vec::<String>::new());
     for kw in ["fn", "struct", "enum", "trait", "type", "const", "static"] {
         let text = format!("{listed}pub {kw} Sneaky");

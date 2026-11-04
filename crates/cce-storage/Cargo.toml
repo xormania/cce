@@ -19,6 +19,11 @@ sha2 = "0.11"
 name = "storage-driver"
 path = "src/bin/storage-driver.rs"
 
+# Structure check of a store: see the binary's documentation for its output and exit status.
+[[bin]]
+name = "cce-verify"
+path = "src/bin/cce-verify.rs"
+
 [lints]
 workspace = true
 

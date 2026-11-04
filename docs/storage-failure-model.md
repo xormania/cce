@@ -216,6 +216,38 @@ attempt outcomes.
 The lock is an advisory `flock` lock: it excludes processes that use this engine, on local
 filesystems. Network filesystems may not provide it.
 
+## Integrity inspection
+
+`NativeReadOnly::verify(VerifyLevel::Structure)` and the `cce-verify <store-dir> [--json]` command
+inspect a store through the read-only open. They never write, sync or repair; the store files are
+byte-identical afterwards. Because the read-only open is refused while another process owns the
+store, inspection cannot run against a live owner.
+
+The structure level checks, for the current publication record:
+
+- both publication slots, reporting what each holds; a valid record in the wrong slot is a finding;
+- every metadata page reachable from the root decodes and belongs to this store, lies within
+  committed metadata, has the incarnation its parent recorded (no newer than the generation), and
+  is reached only once; all leaves are at the same depth; every key and separator lies within the
+  range its parent assigns;
+- every record's key family, key components and identifiers, and its value encoding;
+- every relationship has both directional index entries, and every index entry matches a
+  relationship;
+- every context's bound content has its manifest record, and every extent record lies within
+  committed content;
+- history positions are exactly 1 through the committed position, and each history entry's attempt
+  record points back to it with the fingerprint recomputed from the entry; every attempt record
+  points at an entry.
+
+It reads the history entries but no content bytes, and holds every record for the cross-checks, so
+its memory grows with the metadata. It does not check whether a relationship's endpoints exist.
+
+`--json` prints one JSON object per line in a deterministic order: a summary, both slots, the
+recovery diagnostics, each finding (`check`, `location`, `detail`), and a result line. Findings name
+pages by number and records by key family and a hash prefix of the key; output never contains stored
+bodies, content, evidence or identifiers. Exit status: 0 consistent, 1 inconsistencies found, 2 the
+store could not be inspected (missing, owned, unsupported or unreadable) or the arguments are wrong.
+
 ## Readers and content integrity
 
 A view reads the generation that was current when it began. Content streams one segment at a time

@@ -36,6 +36,9 @@ mod sim;
 mod tree;
 #[cfg(test)]
 mod tree_reopen_tests;
+mod verify;
+#[cfg(test)]
+mod verify_tests;
 #[cfg(test)]
 mod view_gap_tests;
 #[cfg(test)]
@@ -160,7 +163,93 @@ pub struct NativeReadOnly {
     inner: Arc<Inner>,
 }
 
+/// How thoroughly [`NativeReadOnly::verify`] inspects a store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VerifyLevel {
+    /// Both publication slots, every metadata page reachable from the current publication record,
+    /// every record in the tree and the relations between records, and the history entries with
+    /// their attempt records. Content bytes are not read.
+    Structure,
+}
+
+/// One inconsistency found by [`NativeReadOnly::verify`].
+///
+/// Findings never contain stored bodies, content, evidence or identifiers: a record is named by its
+/// key family and a hash prefix of its key, a page by its number.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Finding {
+    /// Stable name of the check that failed (for example `relationship-index`).
+    pub check: &'static str,
+    pub location: String,
+    pub detail: String,
+}
+
+/// The result of [`NativeReadOnly::verify`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+    /// The publication record that was inspected.
+    pub generation: u64,
+    pub history_position: u64,
+    /// What each publication slot holds.
+    pub slots: [String; 2],
+    /// Recovery diagnostics from opening the store.
+    pub diagnostics: Vec<String>,
+    /// Metadata pages and tree records visited.
+    pub pages: u64,
+    pub records: u64,
+    /// Inconsistencies, in a deterministic order.
+    pub findings: Vec<Finding>,
+}
+
+impl Report {
+    /// True if no check failed.
+    pub fn is_consistent(&self) -> bool {
+        self.findings.is_empty()
+    }
+
+    /// The report as JSON objects, one per line, in a deterministic order: a summary, the two
+    /// slots, the diagnostics, the findings, and a result line.
+    pub fn json_lines(&self) -> Vec<String> {
+        let q = |s: &str| verify::json_string(s);
+        let mut out = vec![format!(
+            "{{\"type\":\"summary\",\"generation\":{},\"history_position\":{},\"pages\":{},\"records\":{}}}",
+            self.generation, self.history_position, self.pages, self.records
+        )];
+        for (i, s) in self.slots.iter().enumerate() {
+            out.push(format!(
+                "{{\"type\":\"slot\",\"slot\":{i},\"state\":{}}}",
+                q(s)
+            ));
+        }
+        for d in &self.diagnostics {
+            out.push(format!("{{\"type\":\"diagnostic\",\"text\":{}}}", q(d)));
+        }
+        for f in &self.findings {
+            out.push(format!(
+                "{{\"type\":\"finding\",\"check\":{},\"location\":{},\"detail\":{}}}",
+                q(f.check),
+                q(&f.location),
+                q(&f.detail)
+            ));
+        }
+        out.push(format!(
+            "{{\"type\":\"result\",\"consistent\":{},\"findings\":{}}}",
+            self.is_consistent(),
+            self.findings.len()
+        ));
+        out
+    }
+}
+
 impl NativeReadOnly {
+    /// Inspects the opened store's structure without changing it. Returns `Err` only when the
+    /// store cannot be inspected; inconsistencies are findings in the report. Because a read-only
+    /// open is refused while another process owns the store, this never runs against a live owner.
+    pub fn verify(&self, level: VerifyLevel) -> Result<Report, StorageError> {
+        verify::run(&self.inner, level)
+    }
+
     /// A consistent view of the selected committed state.
     pub fn begin(&self) -> Result<NativeView, StorageError> {
         Ok(NativeView {

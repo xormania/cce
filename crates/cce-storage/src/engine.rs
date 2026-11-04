@@ -587,6 +587,18 @@ impl Inner {
         finish_pending(&self.pending, attempt);
     }
 
+    /// Both publication slots as stored now (inspection). Reads only.
+    pub(crate) fn publication_slots(&self) -> Result<Vec<Slot>, StorageError> {
+        (0..2u64)
+            .map(|s| {
+                let mut buf = vec![0; PAGE_SIZE];
+                self.io
+                    .read_at(FileId::Meta, s * PAGE_SIZE as u64, &mut buf)?;
+                Ok(decode_slot(&buf))
+            })
+            .collect()
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot, StorageError> {
         Ok(Snapshot {
             desc: lock(&self.state).current,
