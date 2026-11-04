@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import urllib.error
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools/ci"))
@@ -224,6 +226,65 @@ class ExecutionTests(unittest.TestCase):
         checks, limits, waiting = self.collect()
         self.assertTrue(waiting)
         self.assertIn("execution_log_unavailable", limits)
+        self.assertTrue(self.violations(checks))
+
+    def test_synthetic_contract_check_has_no_runner_log_to_download(self):
+        # GitHub includes checks created through the Checks API in the producer's
+        # jobs inventory, although they have no steps or downloadable runner log.
+        self.api.responses["/actions/runs/12/jobs?per_page=50"]["jobs"].append({
+            "id": 114, "name": "CCE drift contracts", "conclusion": "failure", "steps": []})
+        def log(job):
+            if job == 114:
+                raise urllib.error.HTTPError(
+                    "https://api.github.com/jobs/114/logs", 404, "Not Found", {}, None)
+            return self.api.logs[job]
+        self.api.log = mock.Mock(side_effect=log)
+        checks, limits, waiting = self.collect()
+        self.assertEqual((limits, waiting, self.violations(checks)), ([], False, []))
+        self.assertNotIn(mock.call(114), self.api.log.call_args_list)
+
+    def test_unrelated_job_logs_cannot_invalidate_required_execution(self):
+        for log in (None, "x" * 1_000_001):
+            with self.subTest(log="missing" if log is None else "oversized"):
+                self.api.responses["/actions/runs/12/jobs?per_page=50"]["jobs"] = [
+                    {"id": 112, "conclusion": "success", "steps": [
+                        {"name": name, "conclusion": "success"} for name in ("Format", "Clippy", "Test")]},
+                    {"id": 114, "conclusion": "failure", "steps": [
+                        {"name": "Publish optional artifact", "conclusion": "failure"}]}]
+                if log is not None:
+                    self.api.logs[114] = log
+                checks, limits, waiting = self.collect()
+                self.assertEqual((limits, waiting, self.violations(checks)), ([], False, []))
+                self.assertNotIn(("log", 114), self.api.calls)
+
+    def test_unavailable_required_log_does_not_discard_other_jobs_witnesses(self):
+        for log in (None, "", "x" * 1_000_001):
+            with self.subTest(log="missing" if log is None else "empty" if not log else "oversized"):
+                self.api.responses["/actions/runs/12/jobs?per_page=50"]["jobs"] = [
+                    {"id": 112, "conclusion": "success", "steps": [
+                        {"name": "Format", "conclusion": "success"},
+                        {"name": "Clippy", "conclusion": "success"}]},
+                    {"id": 114, "conclusion": "success", "steps": [
+                        {"name": "Test", "conclusion": "success"}]}]
+                self.api.logs[112] = "Format and Clippy finished\n"
+                if log is not None:
+                    self.api.logs[114] = log
+                checks, limits, waiting = self.collect()
+                self.assertTrue(waiting)
+                self.assertIn("execution_log_unavailable", limits)
+                rows = {row["id"]: row for row in checks}
+                self.assertTrue(rows["Format"]["executed"])
+                self.assertTrue(rows["Clippy"]["executed"])
+                self.assertFalse(rows["Test"]["executed"])
+                self.assertEqual([v["code"] for v in self.violations(checks)], ["required_check_not_executed"])
+
+    def test_duplicate_required_steps_remain_ambiguous(self):
+        self.api.responses["/actions/runs/12/jobs?per_page=50"]["jobs"].append({
+            "id": 114, "conclusion": "success", "steps": [{"name": "Test", "conclusion": "success"}]})
+        self.api.logs[114] = self.api.logs[112]
+        checks, _, _ = self.collect()
+        test = next(row for row in checks if row["id"] == "Test")
+        self.assertFalse(test["executed"])
         self.assertTrue(self.violations(checks))
 
     def test_cumulative_markdown_pr_does_not_require_filtered_rust(self):
