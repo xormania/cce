@@ -34,6 +34,8 @@ mod maintain_tests;
 #[cfg(test)]
 mod merge_skip_tests;
 #[cfg(test)]
+mod model_tests;
+#[cfg(test)]
 mod quiescence_tests;
 #[cfg(test)]
 mod reader_race_tests;
