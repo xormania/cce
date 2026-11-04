@@ -6,7 +6,7 @@ use cce_core::storage::{CommitError, StorageError};
 
 use std::sync::{Arc, Mutex};
 
-use super::{ContentPool, Inner, Reuse, Taken, lock, rejected, sha256};
+use super::{ContentPool, Inner, Reuse, Taken, lock, rejected, sha256, take_from};
 use crate::codec::{corrupt, key_components};
 use crate::format::Descriptor;
 use crate::format::PageRef;
@@ -258,7 +258,16 @@ impl Inner {
             // stream with nowhere lower to go is not work left to do.
             let mut placed = Vec::new();
             for s in m.segments.iter().chain(std::iter::once(&old)) {
-                match self.take_retired(s.len, bound, Some(s.offset), &mut taken) {
+                // Under the pool lock, like staging: nothing is taken once writes are fenced.
+                let got = {
+                    let mut pool = lock(&self.pool);
+                    if pool.fenced {
+                        None
+                    } else {
+                        take_from(&mut pool, s.len, bound, Some(s.offset), &mut taken)
+                    }
+                };
+                match got {
                     Some(at) => placed.push(at),
                     None => break,
                 }
@@ -410,7 +419,9 @@ impl Inner {
                 len: 0,
             },
         );
-        let remainders = self.consume_reuse(&mut txn, &[(serial, unbound)]);
+        let remainders = self
+            .consume_reuse(&mut txn, &[(serial, unbound)])
+            .map(|(remainders, _consumed)| remainders);
         let published = remainders.and_then(|rem| {
             self.publish(&cur, txn, generation, cur.history_pos, None)
                 .map(|p| (p, rem))

@@ -29,6 +29,8 @@ mod key_bounds_tests;
 #[cfg(test)]
 mod maintain_tests;
 #[cfg(test)]
+mod merge_skip_tests;
+#[cfg(test)]
 mod quiescence_tests;
 #[cfg(test)]
 mod reader_race_tests;
@@ -44,6 +46,8 @@ mod resource_tests;
 #[cfg(test)]
 mod reuse_tests;
 #[cfg(test)]
+mod seal_tests;
+#[cfg(test)]
 mod sim;
 #[cfg(test)]
 mod split_sweep_tests;
@@ -52,6 +56,8 @@ mod test_support;
 mod tree;
 #[cfg(test)]
 mod tree_reopen_tests;
+#[cfg(test)]
+mod uncertain_publication_tests;
 #[cfg(test)]
 mod view_gap_tests;
 #[cfg(test)]
