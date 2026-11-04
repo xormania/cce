@@ -1,6 +1,7 @@
-# Storage format (version 1)
+# Storage format (version 5)
 
-This describes the bytes the `cce-storage` engine writes today. It changes with the code; a
+This describes the bytes the `cce-storage` engine writes today, in the format version of the title,
+which pages and publication records carry as their "format version". It changes with the code; a
 change that alters how existing bytes are read must change the version and either migrate or refuse
 older stores without modifying them.
 
@@ -24,7 +25,7 @@ Node page header (48 bytes), followed by the payload and zero padding:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `CCEP` |
-| 4 | 2 | format version (5) |
+| 4 | 2 | format version |
 | 6 | 1 | page kind (1 = leaf) |
 | 7 | 1 | reserved (0) |
 | 8 | 16 | store identity |
@@ -57,12 +58,13 @@ as it reaches them; trees deeper than 32 levels are rejected as damaged.
 ## Publication records (slots 0 and 1)
 
 Generation `g` is written to slot `g mod 2`, so the previous generation's record is never
-overwritten by the next commit. Record layout (76 bytes, rest of the page zero):
+overwritten by the next commit. Record layout (78 bytes, rest of the page zero):
 
 | Field | Size |
 |---|---|
 | magic `CCED` | 4 |
 | format version | 2 |
+| required features | 4 |
 | store identity | 16 |
 | generation | 8 |
 | root page, root incarnation | 8 + 8 |
@@ -70,6 +72,13 @@ overwritten by the next commit. Record layout (76 bytes, rest of the page zero):
 | committed content length | 8 |
 | last history position | 8 |
 | CRC-32 of the preceding fields | 4 |
+
+A record is checked in this order: its checksum (a mismatch makes the slot damaged), its magic, its
+format version, and its required features, a bit set of features a reader must implement to read
+the store. No feature is defined yet and writers set none; a record that requires any feature this
+build does not implement is unsupported, exactly like an unknown format version. Records of earlier
+versions had no required features, so their checksum ends 4 bytes earlier; such an intact record is
+reported as its unsupported version rather than as a damaged slot.
 
 ## Logical key space
 

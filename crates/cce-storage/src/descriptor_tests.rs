@@ -17,8 +17,9 @@ use crate::sim::SimIo;
 
 const STORE: StoreId = StoreId(*b"descriptor-tests");
 const IDS: [&str; 2] = ["A", "B"];
-/// Encoded publication record length: magic, version, store, six counters, checksum.
-const RECORD_LEN: usize = 4 + 2 + 16 + 8 * 6 + 4;
+/// Encoded publication record length: magic, version, required features, store, six counters,
+/// checksum.
+const RECORD_LEN: usize = 4 + 2 + 4 + 16 + 8 * 6 + 4;
 
 fn cid(s: &str) -> ContextId {
     ContextId::new(s.as_bytes().to_vec()).unwrap()
@@ -224,6 +225,58 @@ fn a_store_recovered_past_a_damaged_record_commits_again_and_replaces_it() {
     );
     assert_eq!(descriptor(&s).generation, 3);
     assert_eq!(logical_state(&s), after);
+}
+
+/// The generation 3 record of `t` requiring `features`, its checksum recomputed: intact and of
+/// this format version.
+fn requiring(t: &TwoCommits, features: u32) -> Vec<u8> {
+    let mut slot = t.gen3.encode();
+    slot[6..10].copy_from_slice(&features.to_le_bytes());
+    let crc = crc32fast::hash(&slot[..RECORD_LEN - 4]);
+    slot[RECORD_LEN - 4..RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
+    slot
+}
+
+/// Durable and cached bytes of both store files.
+fn file_images(sim: &SimIo) -> Vec<Option<(Vec<u8>, Vec<u8>)>> {
+    [FileId::Meta, FileId::Content]
+        .into_iter()
+        .map(|f| sim.file_images_for_test(f))
+        .collect()
+}
+
+#[test]
+fn a_record_requiring_unknown_features_is_refused_without_falling_back_or_writing() {
+    let t = two_commits();
+    for bit in [0, 7, 31] {
+        let img = t.sim.after_process_exit();
+        write_durably(&img, PAGE_SIZE as u64, &requiring(&t, 1 << bit));
+        let before = file_images(&img);
+        for read_only in [false, true] {
+            let r = if read_only {
+                Inner::open_read_only(Box::new(img.clone()), Default::default()).map(drop)
+            } else {
+                try_open(&img).map(drop)
+            };
+            img.release();
+            // Never the intact older record in the other slot: the store needs what this build
+            // lacks.
+            assert!(
+                matches!(&r, Err(StorageError::Unsupported(m)) if m.contains("required features")),
+                "bit {bit}, read_only {read_only}: {r:?}"
+            );
+            assert!(
+                file_images(&img) == before,
+                "bit {bit}: the refused open changed the store"
+            );
+        }
+    }
+    // Positive neighbour: the same record requiring nothing opens at generation 3.
+    let img = t.sim.after_process_exit();
+    write_durably(&img, PAGE_SIZE as u64, &requiring(&t, 0));
+    let s = open(&img);
+    assert_eq!(descriptor(&s), t.gen3);
+    assert!(s.recovery_diagnostics().is_empty());
 }
 
 #[test]

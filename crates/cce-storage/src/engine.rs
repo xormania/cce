@@ -2120,9 +2120,11 @@ fn select(slots: &[Slot]) -> Result<(Descriptor, Vec<String>), StorageError> {
             )),
             Slot::Empty => {}
             Slot::Invalid(why) => diags.push(format!("slot {i}: damaged or torn ({why}); ignored")),
-            Slot::Unsupported(v) => {
+            // Never the other slot instead: an older record does not make a store this build cannot
+            // read readable.
+            Slot::Unsupported(why) => {
                 return Err(StorageError::Unsupported(format!(
-                    "publication record format version {v}"
+                    "publication record of {why}"
                 )));
             }
         }

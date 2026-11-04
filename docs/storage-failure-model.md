@@ -36,8 +36,10 @@ receipt — survives a crash, and no part of it appears without the rest.
 Opening reads both slots. A slot is usable if its checksum, magic, version and slot position are
 valid. Recovery selects the usable record with the highest generation; damaged slots are ignored and
 reported through `NativeStore::recovery_diagnostics`. If neither slot is usable, opening fails and
-the store is left untouched; the engine never initializes a new store over existing files. An
-unsupported format version is refused without modification.
+the store is left untouched; the engine never initializes a new store over existing files. A record
+of an unsupported format version, or one that requires features this build does not implement, is
+refused without modification, whatever the other slot holds: an older record does not make a store
+this build cannot read readable.
 
 Before the recovered state is used, its cursors are checked against the files (the root lies below
 the next unallocated page, the metadata file holds every allocated page, the content file holds the
