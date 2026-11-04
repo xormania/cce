@@ -456,3 +456,51 @@ fn a_panicking_commit_leaves_no_attempt_pending_and_fences_writes() {
         "{r:?}"
     );
 }
+
+#[test]
+fn closing_waits_for_every_admitted_commit_and_refuses_new_ones() {
+    use cce_core::storage::{AttemptOutcome, StorageError};
+    use std::sync::Arc;
+    let s = Arc::new(store());
+    let gate = s.inner.pause_worker_for_test();
+    let [a, b, late] = ["a", "b", "late"].map(|x| AttemptId::new(x.as_bytes().to_vec()).unwrap());
+    let ta = s
+        .submit(a.clone(), s.begin().unwrap(), cs(vec![put("A")]))
+        .unwrap();
+    let tb = s
+        .submit(b.clone(), s.begin().unwrap(), cs(vec![put("B")]))
+        .unwrap();
+    // Close from another thread; record what the store says the moment close returns.
+    let closer = {
+        let s = s.clone();
+        let (a, b) = (a.clone(), b.clone());
+        std::thread::spawn(move || {
+            s.inner.close().unwrap();
+            (s.outcome(&a).unwrap(), s.outcome(&b).unwrap())
+        })
+    };
+    // Close has begun (new work is refused) while the admitted commits still wait.
+    let mut refused = false;
+    for _ in 0..10 {
+        match s.submit(late.clone(), s.begin().unwrap(), cs(vec![put("L")])) {
+            Err(CommitError::Rejected(StorageError::StoreState(m))) if m.contains("closing") => {
+                refused = true;
+                break;
+            }
+            Err(e) => panic!("unexpected refusal: {e:?}"),
+            // Admitted before close began: it must still complete before close returns.
+            Ok(t) => drop(t),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(refused, "close never began refusing new commits");
+    assert!(
+        !closer.is_finished(),
+        "close returned while admitted commits were waiting"
+    );
+    drop(gate);
+    let (oa, ob) = closer.join().unwrap();
+    assert!(matches!(oa, AttemptOutcome::Committed(_)), "{oa:?}");
+    assert!(matches!(ob, AttemptOutcome::Committed(_)), "{ob:?}");
+    assert!(ta.wait().is_ok() && tb.wait().is_ok());
+}
