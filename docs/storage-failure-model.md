@@ -148,6 +148,15 @@ metadata with an incarnation no newer than the current generation; and a travers
 as many nodes as the store has pages, so a shared or cyclic subtree fails instead of looping. Full
 structural validation of hostile stores is not implemented yet.
 
+## Requests the format cannot hold
+
+Identifiers are at most 255 bytes, but a relationship's index keys hold four of them, and records
+are limited in size (see the format document's key and record limits). A request containing a
+relationship whose index keys would be too long, or a record too large for metadata, is refused
+with `InvalidRequest` that names the limit exceeded and nothing of the request is applied. For a
+relationship this happens before any change of the request is applied, so it is the answer even
+when an earlier change would fail too.
+
 ## Concurrent views and conflict validation
 
 A view records what it reads: each context read (including one that finds nothing) protects that
