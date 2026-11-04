@@ -1741,7 +1741,12 @@ fn a_maintenance_step_that_panics_after_publishing_is_uncertain_and_keeps_its_sp
     let s = open(&sim);
     let free_before = s.inner.reusable_content_bytes();
     s.inner.panic_next_maintenance_for_test();
-    let r = s.maintain(MaintenanceTask::Relocate, CONTENT_ONLY);
+    // On its own thread: the step's panic stays there, caught by the step.
+    let r = std::thread::scope(|t| {
+        t.spawn(|| s.maintain(MaintenanceTask::Relocate, CONTENT_ONLY))
+            .join()
+            .unwrap_or_else(|_| panic!("a maintenance panic must not reach the caller"))
+    });
     assert!(
         matches!(&r, Err(CommitError::Indeterminate(m)) if m.contains("failed unexpectedly")),
         "a panicking step must be reported as uncertain: {r:?}"
