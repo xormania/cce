@@ -892,8 +892,9 @@ fn space_relocation_moves_out_of_is_not_reused_while_a_pinned_view_reads_it() {
 fn a_stream_over_the_budget_does_not_keep_smaller_streams_from_moving() {
     let sim = SimIo::new();
     let s = create(&sim);
-    // X is retired below everything; B is small; L, highest in the file, is larger than the budget.
-    commit_content(&s, "one", "X", 1, 100_000);
+    // X is retired below everything, with room for B and for L; B is small; L, highest in the
+    // file, is larger than the budget.
+    commit_content(&s, "one", "X", 1, 300_000);
     commit_content(&s, "two", "B", 2, 10_000);
     commit_content(&s, "three", "L", 3, 150_000);
     commit_plain(&s, "four", "X");
@@ -938,6 +939,49 @@ fn a_stream_over_the_budget_does_not_keep_smaller_streams_from_moving() {
         read_bound(&mut s.begin().unwrap(), "B"),
         Ok(bytes_of(2, 10_000))
     );
+    audit(&sim);
+}
+
+#[test]
+fn streams_left_for_lack_of_remaining_budget_move_on_the_next_call() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    // X is retired below both; S1 and S2 each fit the budget, together they do not.
+    commit_content(&s, "one", "X", 1, 200_000);
+    commit_content(&s, "two", "S1", 2, 30_000);
+    commit_content(&s, "three", "S2", 3, 30_000);
+    commit_plain(&s, "four", "X");
+    commit_plain(&s, "five", "C");
+    commit_plain(&s, "six", "D");
+    let budget = MaintenanceBudget {
+        max_pages: 1024,
+        max_content_bytes: 40_000,
+    };
+    let stream = 30_000 + Manifest::encoded_len(1);
+    let first = s.maintain(MaintenanceTask::Relocate, budget).unwrap();
+    assert_eq!(
+        first.content_bytes_moved, stream,
+        "one stream fits the budget"
+    );
+    assert_eq!(
+        first.content_streams_over_budget, 0,
+        "a stream left for lack of remaining budget is not over the budget"
+    );
+    assert!(!first.complete, "the other stream is still to move");
+    let second = s.maintain(MaintenanceTask::Relocate, budget).unwrap();
+    assert_eq!(
+        second.content_bytes_moved, stream,
+        "the other stream moves now"
+    );
+    assert_eq!(second.content_streams_over_budget, 0);
+    assert!(
+        second.complete,
+        "nothing is left to move: streams that cannot go lower do not keep the task incomplete"
+    );
+    let mut v = s.begin().unwrap();
+    assert_eq!(read_bound(&mut v, "S1"), Ok(bytes_of(2, 30_000)));
+    assert_eq!(read_bound(&mut v, "S2"), Ok(bytes_of(3, 30_000)));
+    drop(v);
     audit(&sim);
 }
 

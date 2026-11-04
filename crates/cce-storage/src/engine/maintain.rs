@@ -253,19 +253,9 @@ impl Inner {
         let mut over_budget = 0u64;
         for (_, key, old, m) in candidates {
             let total = m.segments.iter().map(|s| s.len).sum::<u64>() + old.len;
-            // A stream that does not fit is skipped, never a reason to stop: smaller streams below
-            // it may still fit. One larger than the whole budget can only move with a larger one.
-            if total > budget.max_content_bytes {
-                over_budget += 1;
-                complete = false;
-                continue;
-            }
-            if bytes + total > budget.max_content_bytes {
-                complete = false;
-                continue;
-            }
             let mark = taken.taken.len();
-            // Every piece must land entirely below where it is now, or the move gains nothing.
+            // Every piece must land entirely below where it is now, or the move gains nothing. A
+            // stream with nowhere lower to go is not work left to do.
             let mut placed = Vec::new();
             for s in m.segments.iter().chain(std::iter::once(&old)) {
                 match self.take_retired(s.len, bound, Some(s.offset), &mut taken) {
@@ -275,6 +265,20 @@ impl Inner {
             }
             if placed.len() != m.segments.len() + 1 {
                 give_back(&self.pool, &mut taken, mark);
+                continue;
+            }
+            // A movable stream that does not fit is skipped, never a reason to stop: smaller
+            // streams below it may still fit. One larger than the whole budget can only move with
+            // a larger one; one that only exceeds what remains moves on a later call.
+            if total > budget.max_content_bytes {
+                give_back(&self.pool, &mut taken, mark);
+                over_budget += 1;
+                complete = false;
+                continue;
+            }
+            if bytes + total > budget.max_content_bytes {
+                give_back(&self.pool, &mut taken, mark);
+                complete = false;
                 continue;
             }
             // Copy one segment at a time, through the verified read.

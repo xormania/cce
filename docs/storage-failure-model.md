@@ -313,9 +313,10 @@ space, which is proportional to the metadata (as for the integrity check).
 - `Relocate` moves committed content streams, highest first, into retired space below them: each
   segment and a new manifest are copied, one segment at a time, into retired extents eligible for
   reuse that lie entirely below the piece being moved, and the old manifest and segments are
-  retired. A stream that does not fit what remains of the content budget is skipped and smaller
-  ones are still considered; a stream larger than the whole budget is counted in the report and
-  keeps the task incomplete until a call with a larger budget moves it. The copy runs without the writer lock, on a
+  retired. A stream that could move but does not fit what remains of the content budget is skipped
+  and smaller ones are still considered; a later call moves it. One larger than the whole budget
+  is counted in the report and keeps the task incomplete until a call with a larger budget moves
+  it. A stream with no retired space below it is not left work. The copy runs without the writer lock, on a
   pinned generation (so nothing it reads can be reused meanwhile), into extents reserved as
   staging reserves them (so no staging can take them). Publication then takes the writer lock and
   applies a move to the newest state only if that content still has the manifest the move copied;
