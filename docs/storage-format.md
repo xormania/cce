@@ -129,15 +129,25 @@ original receipt; any difference is rejected as a mismatch.
 
 ## Allocation
 
-Content extents are allocated by advancing the content length; content space is not reused yet.
+Staging places each segment and its manifest in the smallest retired content extent that fits,
+else at the content length. It may reuse an extent retired at generation `r` only if `r` is at most
+one generation before the current one (so neither publication slot reaches it while it is
+written) and no live view or content reader pins a generation older than `r`. A staging holds the
+extents it took until a commit binding it publishes, which deletes their retirement records; the
+unused rest of a longer extent stays retired under its original generation. Extents held by a
+staging that is never committed (abandoned, or whose commit is still pending) are not handed out
+again in that process; a failed staging returns them at once.
 
 A content entry counts the records that use the content. When a commit leaves it with none (the
 last such record is removed or replaced), the entry becomes a removed entry and the commit retires
 the content's manifest and segments (prefix `08`, kind `01`). A commit that binds a second staging
 of content that is already committed, or binds content no change uses, retires that staging too:
 no published state reaches it. Committing the same bytes again later indexes them afresh.
-Content staged but not committed lies beyond the committed content length and is ignored, and later
-overwritten, after a restart.
+
+Content staged but not committed lies at the extents it was given. After a restart nothing refers
+to it: staged bytes beyond the committed content length are overwritten later, and retired
+extents a staging was using are still recorded as retired and reused. Staged bytes that a later
+commit's content length came to cover are not reclaimed.
 
 Tree pages are allocated from retired pages first, then by advancing the next unallocated page. A
 commit producing generation `n` may reuse a page retired at generation `r` only if `r <= n - 2` and

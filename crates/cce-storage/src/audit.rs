@@ -296,13 +296,34 @@ pub(crate) fn check_retirement(io: &dyn Io) -> Result<(), String> {
             cur.generation, rc.content_refs, rc.record_refs
         ));
     }
-    // No retired content extent is reachable.
-    let reachable: BTreeSet<(u64, u64)> =
-        rc.manifests.union(&rc.content_segments).copied().collect();
-    for (offset, (generation, len)) in &rc.retired_extents {
-        if reachable.contains(&(*offset, *len)) {
+    // Reachable content, history and retired content extents never overlap one another.
+    let mut all: Vec<(u64, u64, &str)> = rc
+        .manifests
+        .iter()
+        .chain(&rc.content_segments)
+        .map(|(o, l)| (*o, *l, "reachable content"))
+        .chain(rc.history_extents.iter().map(|(o, l)| (*o, *l, "history")))
+        .chain(
+            rc.retired_extents
+                .iter()
+                .map(|(o, (_, l))| (*o, *l, "retired content")),
+        )
+        .collect();
+    all.sort_unstable();
+    all.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+    for w in all.windows(2) {
+        if w[0].0 + w[0].1 > w[1].0 {
             return Err(format!(
-                "generation {}: content extent at {offset} retired at {generation} is reachable",
+                "generation {}: {} at {}+{} overlaps {} at {}+{}",
+                cur.generation, w[0].2, w[0].0, w[0].1, w[1].2, w[1].0, w[1].1
+            ));
+        }
+    }
+    for (offset, (generation, len)) in &rc.retired_extents {
+        if *generation > cur.generation || offset + len > cur.content_len {
+            return Err(format!(
+                "generation {}: retired content at {offset}+{len} (retired at {generation}) lies \
+                 outside the state",
                 cur.generation
             ));
         }
