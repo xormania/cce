@@ -2581,3 +2581,62 @@ fn a_fenced_store_refuses_maintenance_and_writes_nothing() {
         assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
     }
 }
+
+/// A store over `sim` whose reads are tallied per file.
+fn tallied(sim: &SimIo) -> (NativeStore, std::sync::Arc<std::sync::Mutex<FileReads>>) {
+    let reads = std::sync::Arc::new(std::sync::Mutex::new(FileReads::default()));
+    let s = NativeStore {
+        inner: Inner::open(
+            Box::new(Sizes {
+                sim: sim.clone(),
+                largest: Default::default(),
+                reads: reads.clone(),
+            }),
+            Options::default(),
+        )
+        .unwrap(),
+    };
+    (s, reads)
+}
+
+#[test]
+fn reclaiming_holes_counts_every_metadata_page_it_reads() {
+    let (sim, s, _) = leaked(100_000, false);
+    drop(s);
+    sim.release();
+    let (s, reads) = tallied(&sim);
+    let pages_before = s.stats().unwrap().pages_read;
+    let meta_before = reads.lock().unwrap()[0].1;
+    let r = s
+        .maintain(
+            MaintenanceTask::ReclaimContentHoles,
+            MaintenanceBudget::default(),
+        )
+        .unwrap();
+    assert!(r.content_bytes_reclaimed > 0, "nothing was reclaimed");
+    let pages = s.stats().unwrap().pages_read - pages_before;
+    let meta = reads.lock().unwrap()[0].1 - meta_before;
+    assert_eq!(
+        pages * crate::format::PAGE_SIZE as u64,
+        meta,
+        "pages_read must count every metadata page read from the file"
+    );
+}
+
+#[test]
+fn relocation_counts_its_copy_buffer_as_held_content_buffer() {
+    let sim = fragmented();
+    let (s, _) = tallied(&sim);
+    assert_eq!(s.stats().unwrap().content_buffer_bytes_peak, 0);
+    let r = s
+        .maintain(MaintenanceTask::Relocate, MaintenanceBudget::default())
+        .unwrap();
+    assert!(r.content_bytes_moved > 0, "nothing moved");
+    let st = s.stats().unwrap();
+    assert_eq!(
+        st.content_buffer_bytes_peak,
+        crate::engine::CONTENT_CHUNK as u64,
+        "the copy holds one segment at a time"
+    );
+    assert_eq!(st.content_buffer_bytes, 0, "the copy released its buffer");
+}

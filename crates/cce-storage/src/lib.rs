@@ -31,6 +31,8 @@ mod fuzz_api;
 mod fuzz_replay_tests;
 #[cfg(test)]
 mod guard_tests;
+#[cfg(test)]
+mod instrumentation_tests;
 mod io;
 #[cfg(test)]
 mod key_bounds_tests;
@@ -261,6 +263,11 @@ impl NativeStore {
         stats_of(&self.inner)
     }
 
+    /// Space use of the current committed state (see [`SpaceReport`] for cost and meaning).
+    pub fn space_report(&self) -> Result<SpaceReport, StorageError> {
+        self.inner.space_report()
+    }
+
     /// Admits a commit without waiting for it. The commit proceeds even if the ticket is dropped.
     pub fn submit(
         &self,
@@ -440,6 +447,11 @@ impl NativeReadOnly {
     pub fn stats(&self) -> Result<StoreStats, StorageError> {
         stats_of(&self.inner)
     }
+
+    /// Space use of the selected committed state (see [`SpaceReport`] for cost and meaning).
+    pub fn space_report(&self) -> Result<SpaceReport, StorageError> {
+        self.inner.space_report()
+    }
 }
 
 fn stats_of(inner: &Arc<Inner>) -> Result<StoreStats, StorageError> {
@@ -456,6 +468,11 @@ fn stats_of(inner: &Arc<Inner>) -> Result<StoreStats, StorageError> {
         pages_reused: get(&c.pages_reused),
         content_bytes_reused: get(&c.content_bytes_reused),
         reusable_content_bytes: inner.reusable_content_bytes(),
+        pages_read: get(&c.pages_read),
+        pages_read_at_open: get(&c.pages_read_at_open),
+        entries_visited: get(&c.entries_visited),
+        content_buffer_bytes: get(&c.content_buffer_bytes),
+        content_buffer_bytes_peak: get(&c.content_buffer_bytes_peak),
     })
 }
 
@@ -547,7 +564,13 @@ impl From<StoreOptions> for Options {
 }
 
 /// Instrumentation for one open store (since it was opened).
+///
+/// Counters are relaxed atomic counts: exact when the store is used from one thread at a time,
+/// approximate (each counter consistent with itself, not with the others) while operations run
+/// concurrently. Reading the statistics walks the tree's leftmost path for `tree_height`, which can
+/// itself read pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StoreStats {
     pub pages_written: u64,
     pub page_bytes_written: u64,
@@ -563,8 +586,54 @@ pub struct StoreStats {
     /// publication consumes those extents (space a staging or relocation took and gave back again
     /// does not count).
     pub content_bytes_reused: u64,
-    /// Retired content bytes currently available for reuse (not held by a staging).
+    /// Retired content bytes currently available for reuse (not held by a staging or a
+    /// maintenance step).
     pub reusable_content_bytes: u64,
+    /// Metadata pages read from the metadata file, the publication records included.
+    pub pages_read: u64,
+    /// Of `pages_read`, those read while opening the store (fixed once it is open).
+    pub pages_read_at_open: u64,
+    /// Index entries visited: one per point lookup, plus one per entry a range scan yields.
+    pub entries_visited: u64,
+    /// Bytes held right now in content stream buffers (content readers, stagings and the segment
+    /// copies of a relocation step).
+    pub content_buffer_bytes: u64,
+    /// The most `content_buffer_bytes` has been since the store was opened.
+    pub content_buffer_bytes_peak: u64,
+}
+
+/// Space use of one committed state, by kind.
+///
+/// Computed from a pinned snapshot of the current state by walking its tree: every tree page and
+/// every index entry, plus one content manifest read per distinct live content; no content bytes
+/// and no history entries are read. The cost is proportional to the store's index size, so this is
+/// not for frequent use. The snapshot may be stale by the time the report is returned.
+///
+/// A retired page or content extent is *protected* while the reuse rule forbids taking it: it was
+/// retired too recently for both publication records to have moved past it, or a live view or
+/// content reader can still reach it. Otherwise it is *reusable*.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SpaceReport {
+    /// Tree pages the state reaches.
+    pub live_pages: u64,
+    /// Bytes of the distinct content the state's records use.
+    pub live_content_bytes: u64,
+    /// Retained history entries (one per committed transaction) and their encoded bytes.
+    pub history_entries: u64,
+    pub history_bytes: u64,
+    /// Retired tree pages, by whether the reuse rule allows taking them now.
+    pub retired_pages_protected: u64,
+    pub retired_pages_reusable: u64,
+    /// Retired content-file bytes, by whether the reuse rule allows taking them now. The split is by
+    /// rule only: "reusable" also counts retired space a staging or a maintenance step currently holds
+    /// or is taking, which is not free to take until that staging is committed or discarded or that
+    /// step ends (see `reusable_content_bytes` in `StoreStats` for what is free now).
+    pub retired_content_bytes_protected: u64,
+    pub retired_content_bytes_reusable: u64,
+    /// Sizes of the two store files.
+    pub meta_file_bytes: u64,
+    pub content_file_bytes: u64,
 }
 
 /// A consistent view of one committed state of a [`NativeStore`].

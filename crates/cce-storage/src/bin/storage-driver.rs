@@ -11,6 +11,10 @@
 //! create <dir> | open <dir> [<cache-nodes>]
 //! open-ro <dir>                           read-only inspection open (reads only; no commits)
 //! stats                                   prints instrumentation counters and tree height
+//! space                                   prints the space report of the current state
+//! get <id>                                prints one context record (no history, no content)
+//! read-digest <digest> <len>              streams content through a new view and prints only
+//!                                         its SHA-256 and length
 //! stage <name> hex <bytes>                stage literal bytes
 //! stage <name> gen <len> <seed>           stage a generated stream (see `gen_byte`)
 //! put-context <id> <expect> <body> <content-name|->
@@ -25,6 +29,10 @@
 //! dump <id>[,<id>...]                     prints the committed state reachable from those ids
 //! rels <id> out|in <kind|-> <limit> [<after-kind> <after-other> <after-id>]  paged query
 //! read-content <digest> <len>             reads content by logical reference through a new view
+//! view <name>                           begins and keeps a named view of the current state
+//! dump-in <name> <id>[,<id>...]          like `dump`, through a kept view (its reads are observed)
+//! commit-from <name> <attempt>           like `commit`, with a kept view as the basis (consumes it)
+//! drop-view <name>                       drops a kept view
 //! keep-reader <id>                       opens and keeps a reader over a context's committed content
 //! drop-store                             drops the store handle (kept readers keep the engine alive)
 //! drop-readers                           drops kept readers
@@ -165,6 +173,7 @@ struct Driver {
     store: Option<NativeStore>,
     read_only: Option<NativeReadOnly>,
     readers: Vec<Box<dyn cce_core::storage::ContentReader>>,
+    views: HashMap<String, <NativeStore as StorageEngine>::View>,
     staged: HashMap<String, StagedContent>,
     pending: ChangeSet,
     out: io::Stdout,
@@ -234,11 +243,75 @@ impl Driver {
             ["stats"] => {
                 let s = self.store()?.stats().map_err(|e| e.to_string())?;
                 self.say(&format!(
-                    "stats height={} pages_written={} page_bytes={} content_bytes={} misses={} evictions={} cache={} pages_reused={} content_reused={} reusable={}",
+                    "stats height={} pages_written={} page_bytes={} content_bytes={} misses={} evictions={} cache={} pages_reused={} content_reused={} reusable={} pages_read={} pages_read_at_open={} entries_visited={} buffer_bytes={} buffer_peak={}",
                     s.tree_height, s.pages_written, s.page_bytes_written, s.content_bytes_written,
                     s.node_cache_misses, s.node_cache_evictions, s.node_cache_capacity,
-                    s.pages_reused, s.content_bytes_reused, s.reusable_content_bytes
+                    s.pages_reused, s.content_bytes_reused, s.reusable_content_bytes,
+                    s.pages_read, s.pages_read_at_open, s.entries_visited,
+                    s.content_buffer_bytes, s.content_buffer_bytes_peak
                 ));
+            }
+            ["space"] => {
+                let r = match (&self.store, &self.read_only) {
+                    (Some(s), _) => s.space_report(),
+                    (None, Some(r)) => r.space_report(),
+                    (None, None) => return Err("no store open".into()),
+                }
+                .map_err(|e| e.to_string())?;
+                self.say(&format!(
+                    "space live_pages={} live_content={} history_entries={} history_bytes={} retired_pages_protected={} retired_pages_reusable={} retired_content_protected={} retired_content_reusable={} meta_file={} content_file={}",
+                    r.live_pages, r.live_content_bytes, r.history_entries, r.history_bytes,
+                    r.retired_pages_protected, r.retired_pages_reusable,
+                    r.retired_content_bytes_protected, r.retired_content_bytes_reusable,
+                    r.meta_file_bytes, r.content_file_bytes
+                ));
+            }
+            ["get", raw] => {
+                let mut view = self.begin()?;
+                let cid = ContextId::new(raw.as_bytes().to_vec()).map_err(|e| e.to_string())?;
+                let line = match view.context(&cid).map_err(|e| e.to_string())? {
+                    None => format!("context {raw} absent"),
+                    Some(rec) => format!(
+                        "context {raw} rev:{} {} {}",
+                        rec.revision.0,
+                        hex(&rec.body),
+                        rec.content.map_or("- -".into(), |c| format!(
+                            "{} {}",
+                            hex(&c.digest.0),
+                            c.len
+                        ))
+                    ),
+                };
+                self.say(&line);
+            }
+            ["read-digest", digest, len] => {
+                use sha2::{Digest, Sha256};
+                let d: [u8; 32] = unhex(digest)?
+                    .try_into()
+                    .map_err(|_| "digest must be 32 bytes")?;
+                let c = ContentRef {
+                    digest: ContentDigest(d),
+                    len: len.parse().map_err(|_| "bad len")?,
+                };
+                let mut view = self.begin()?;
+                match view.content(&c) {
+                    Ok(mut r) => {
+                        let mut h = Sha256::new();
+                        let mut n = 0u64;
+                        let mut buf = vec![0u8; 8192];
+                        loop {
+                            let k = r.read(&mut buf).map_err(|e| e.to_string())?;
+                            if k == 0 {
+                                break;
+                            }
+                            h.update(&buf[..k]);
+                            n += k as u64;
+                        }
+                        let got: [u8; 32] = h.finalize().into();
+                        self.say(&format!("digest {} {n}", hex(&got)));
+                    }
+                    Err(e) => self.say(&format!("content-error {e:?}")),
+                }
             }
             ["stage", name, "hex", bytes] => {
                 let bytes = unhex(bytes)?;
@@ -346,7 +419,39 @@ impl Driver {
                     AttemptOutcome::Unknown => self.say("outcome unknown"),
                 }
             }
-            ["dump", ids] => self.dump(ids)?,
+            ["dump", ids] => {
+                let mut view = self.begin()?;
+                let lines = dump(&mut view, ids)?;
+                for l in lines {
+                    self.say(&l);
+                }
+            }
+            ["view", name] => {
+                let view = self.begin()?;
+                self.views.insert(name.to_string(), view);
+                self.say("ok view kept");
+            }
+            ["dump-in", name, ids] => {
+                let view = self.views.get_mut(*name).ok_or("unknown view")?;
+                let lines = dump(view, ids)?;
+                for l in lines {
+                    self.say(&l);
+                }
+            }
+            ["drop-view", name] => {
+                self.views.remove(*name).ok_or("unknown view")?;
+                self.say("ok view dropped");
+            }
+            ["commit-from", name, attempt] => {
+                let attempt =
+                    AttemptId::new(attempt.as_bytes().to_vec()).map_err(|e| e.to_string())?;
+                let basis = self.views.remove(*name).ok_or("unknown view")?;
+                let changes = std::mem::take(&mut self.pending);
+                match self.store()?.commit(attempt, basis, changes) {
+                    Ok(r) => self.say(&format!("committed {}", r.position.0)),
+                    Err(e) => self.say(&format!("commit-error {e:?}")),
+                }
+            }
             ["keep-reader", id] => {
                 let mut view = self.begin()?;
                 let cid = ContextId::new(id.as_bytes().to_vec()).map_err(|e| e.to_string())?;
@@ -360,6 +465,7 @@ impl Driver {
                 self.say("ok reader kept");
             }
             ["drop-store"] => {
+                self.views.clear();
                 self.store = None;
                 self.read_only = None;
                 self.say("ok store dropped");
@@ -451,6 +557,7 @@ impl Driver {
                 self.say("ok closed");
             }
             ["close"] => {
+                self.views.clear();
                 let store = self.store.take().ok_or("no store open")?;
                 store.close().map_err(|e| e.to_string())?;
                 self.say("ok closed");
@@ -459,74 +566,71 @@ impl Driver {
         }
         Ok(())
     }
+}
 
-    fn dump(&mut self, ids: &str) -> Result<(), String> {
-        let mut lines = Vec::new();
-        let mut view = self.begin()?;
-        for raw in ids.split(',') {
-            let cid = ContextId::new(raw.as_bytes().to_vec()).map_err(|e| e.to_string())?;
-            match view.context(&cid).map_err(|e| e.to_string())? {
-                None => lines.push(format!("context {raw} absent")),
-                Some(rec) => {
-                    let content = rec
-                        .content
-                        .map_or("- -".into(), |c| format!("{} {}", hex(&c.digest.0), c.len));
-                    lines.push(format!(
-                        "context {raw} rev:{} {} {content}",
-                        rec.revision.0,
-                        hex(&rec.body)
-                    ));
-                    if let Some(c) = rec.content {
-                        let mut r = view.content(&c).map_err(|e| e.to_string())?;
-                        let mut bytes = Vec::new();
-                        r.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-                        lines.push(format!("content {raw} {}", hex(&bytes)));
-                    }
-                }
-            }
-            for (dir, name) in [(Direction::Outgoing, "out"), (Direction::Incoming, "in")] {
-                let q = RelationshipQuery {
-                    from: cid.clone(),
-                    direction: dir,
-                    kind: None,
-                    after: None,
-                };
-                for rel in view.relationships(&q).map_err(|e| e.to_string())? {
-                    let rel = rel.map_err(|e| e.to_string())?;
-                    lines.push(format!(
-                        "rel {name} {raw} {} {} {} {} rev:{}",
-                        hex(rel.id.as_bytes()),
-                        hex(rel.kind.as_bytes()),
-                        hex(rel.source.as_bytes()),
-                        hex(rel.target.as_bytes()),
-                        rel.revision.0
-                    ));
+/// The committed state reachable from `ids` in `view`, as `dump` prints it.
+fn dump<V: ReadView>(view: &mut V, ids: &str) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    for raw in ids.split(',') {
+        let cid = ContextId::new(raw.as_bytes().to_vec()).map_err(|e| e.to_string())?;
+        match view.context(&cid).map_err(|e| e.to_string())? {
+            None => lines.push(format!("context {raw} absent")),
+            Some(rec) => {
+                let content = rec
+                    .content
+                    .map_or("- -".into(), |c| format!("{} {}", hex(&c.digest.0), c.len));
+                lines.push(format!(
+                    "context {raw} rev:{} {} {content}",
+                    rec.revision.0,
+                    hex(&rec.body)
+                ));
+                if let Some(c) = rec.content {
+                    let mut r = view.content(&c).map_err(|e| e.to_string())?;
+                    let mut bytes = Vec::new();
+                    r.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                    lines.push(format!("content {raw} {}", hex(&bytes)));
                 }
             }
         }
-        for entry in view
-            .history(HistoryPosition(0))
-            .map_err(|e| e.to_string())?
-        {
-            let e = entry.map_err(|e| e.to_string())?;
-            let p = e.position.0;
-            lines.push(format!("history {p} {}", hex(e.attempt.as_bytes())));
-            for (i, ev) in e.evidence.iter().enumerate() {
+        for (dir, name) in [(Direction::Outgoing, "out"), (Direction::Incoming, "in")] {
+            let q = RelationshipQuery {
+                from: cid.clone(),
+                direction: dir,
+                kind: None,
+                after: None,
+            };
+            for rel in view.relationships(&q).map_err(|e| e.to_string())? {
+                let rel = rel.map_err(|e| e.to_string())?;
                 lines.push(format!(
-                    "evidence {p} {i} {} {}",
-                    hex(&ev.label),
-                    hex(&ev.bytes)
+                    "rel {name} {raw} {} {} {} {} rev:{}",
+                    hex(rel.id.as_bytes()),
+                    hex(rel.kind.as_bytes()),
+                    hex(rel.source.as_bytes()),
+                    hex(rel.target.as_bytes()),
+                    rel.revision.0
                 ));
             }
-            for (i, c) in e.changes.iter().enumerate() {
-                lines.push(format!("change {p} {i} {}", change_tokens(c)));
-            }
         }
-        for l in lines {
-            self.say(&l);
-        }
-        Ok(())
     }
+    for entry in view
+        .history(HistoryPosition(0))
+        .map_err(|e| e.to_string())?
+    {
+        let e = entry.map_err(|e| e.to_string())?;
+        let p = e.position.0;
+        lines.push(format!("history {p} {}", hex(e.attempt.as_bytes())));
+        for (i, ev) in e.evidence.iter().enumerate() {
+            lines.push(format!(
+                "evidence {p} {i} {} {}",
+                hex(&ev.label),
+                hex(&ev.bytes)
+            ));
+        }
+        for (i, c) in e.changes.iter().enumerate() {
+            lines.push(format!("change {p} {i} {}", change_tokens(c)));
+        }
+    }
+    Ok(lines)
 }
 
 fn main() -> ExitCode {
@@ -534,6 +638,7 @@ fn main() -> ExitCode {
         store: None,
         read_only: None,
         readers: Vec::new(),
+        views: HashMap::new(),
         staged: HashMap::new(),
         pending: ChangeSet::default(),
         out: io::stdout(),
