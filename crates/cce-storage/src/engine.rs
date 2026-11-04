@@ -735,7 +735,7 @@ impl Inner {
     /// Only meaningful while nothing is in flight: a staging's takes stay outside the pool's
     /// reservations until it registers, and a commit changes ownership as it publishes. The check
     /// refuses to run otherwise.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz-api"))]
     pub(crate) fn ledger_check_for_test(&self) -> Result<(), String> {
         let e = |x: StorageError| x.to_string();
         let staging = lock(&self.pool).taking().len();
@@ -929,7 +929,7 @@ impl Inner {
     /// What the engine would reuse right now under its own rules: retired tree pages the next
     /// commit may take, and retired content extents a staging may take (tests auditing reuse
     /// against every retained root and pin).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz-api"))]
     pub(crate) fn reusable_for_test(&self) -> Result<Reusable, StorageError> {
         let cur = lock(&self.state).current;
         let bound = self.reusable_through(cur.generation.saturating_add(1));
@@ -2286,7 +2286,7 @@ impl Inner {
 
     /// Test hook: total length of the retired extents stagings hold, and of those an uncertain
     /// publication owns.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz-api"))]
     pub(crate) fn reserved_bytes_for_test(&self) -> (u64, u64) {
         let pool = lock(&self.pool);
         let sum = |rs: &[Reuse]| rs.iter().map(|r| r.record_len).sum::<u64>();
@@ -2621,7 +2621,7 @@ pub(crate) fn relationship_range(q: &RelationshipQuery) -> Vec<u8> {
 /// Logical write sets of recent commits. `floor` is the newest history position whose successors'
 /// writes are all retained; a basis older than that cannot be validated.
 /// Reusable space as (tree pages, content extents `(offset, len)`) (tests only).
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz-api"))]
 pub(crate) type Reusable = (Vec<u64>, Vec<(u64, u64)>);
 
 /// One recorded commit: its history position and the logical keys it wrote.
