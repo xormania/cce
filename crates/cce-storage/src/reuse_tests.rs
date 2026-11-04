@@ -1471,3 +1471,147 @@ fn reusable_space_never_overlaps_a_published_or_pinned_state() {
         "nothing was ever reusable"
     );
 }
+
+// ----- crash matrix across retiring and reusing commits ----------------------------------------
+
+/// One step of the matrix script: each stages (possibly into reused space) and/or commits.
+fn matrix_step(s: &NativeStore, k: usize) -> Result<(), String> {
+    let size = CONTENT_CHUNK + 300;
+    let commit = |cs: ChangeSet| {
+        s.commit(
+            AttemptId::new(format!("m{k}").into_bytes()).unwrap(),
+            s.begin().map_err(|e| format!("{e:?}"))?,
+            cs,
+        )
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+    };
+    let put_staged = |id: &str, bytes: Vec<u8>, removal| -> Result<(), String> {
+        let staged = s
+            .stage_content(&mut &bytes[..])
+            .map_err(|e| format!("{e:?}"))?;
+        commit(ChangeSet {
+            changes: vec![Change::PutContext {
+                id: cid(id),
+                expect: Precondition::Any,
+                body: id.as_bytes().to_vec(),
+                content: Some(0),
+            }],
+            content: vec![ContentBinding::from(&staged)],
+            removal,
+            ..ChangeSet::default()
+        })
+    };
+    match k {
+        // Replace K's content: retires K's old content, reuses X's retired space.
+        0 => put_staged(
+            "K",
+            payload(70, size),
+            cce_core::storage::RemovalMode::PreserveViews,
+        ),
+        // Remove M0 (absent at first: put it) and retire.
+        1 => put_staged(
+            "M",
+            payload(71, 5000),
+            cce_core::storage::RemovalMode::PreserveViews,
+        ),
+        2 => commit(ChangeSet {
+            changes: vec![Change::RemoveContext {
+                id: cid("M"),
+                expect: Precondition::Any,
+            }],
+            ..ChangeSet::default()
+        }),
+        // Requiring quiescence, with content that reuses retired space.
+        3 => put_staged(
+            "Q",
+            payload(72, size),
+            cce_core::storage::RemovalMode::RequireQuiescence,
+        ),
+        _ => unreachable!(),
+    }
+}
+
+const MATRIX_STEPS: usize = 4;
+
+/// Records K, M and Q with their content bytes.
+fn matrix_state(s: &NativeStore) -> Vec<String> {
+    let mut v = s.begin().unwrap();
+    ["K", "M", "Q"]
+        .iter()
+        .map(|id| match v.context(&cid(id)).unwrap() {
+            None => format!("{id} absent"),
+            Some(r) => {
+                let bytes = read_all(&mut v, &r.content.unwrap()).unwrap();
+                format!(
+                    "{id} rev {} {} bytes sum {}",
+                    r.revision.0,
+                    bytes.len(),
+                    bytes.iter().map(|b| *b as u64).sum::<u64>()
+                )
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn every_cut_of_every_retiring_or_reusing_step_recovers_and_continues() {
+    let size = CONTENT_CHUNK + 300;
+    // Probe: operations of each step and the state before and after it.
+    let probe = SimIo::new();
+    let (s, _, _) = with_reusable_content(&probe, size);
+    let mut ops = Vec::new();
+    let mut states = vec![matrix_state(&s)];
+    for k in 0..MATRIX_STEPS {
+        let before = probe.ops();
+        matrix_step(&s, k).unwrap();
+        ops.push(probe.ops() - before);
+        states.push(matrix_state(&s));
+    }
+    assert!(
+        s.stats().unwrap().content_bytes_reused > 0,
+        "the script reused no content"
+    );
+    let fin = states[MATRIX_STEPS].clone();
+    drop(s);
+
+    let mut checked = 0;
+    for k in 0..MATRIX_STEPS {
+        for cut in 0..=ops[k] {
+            let sim = SimIo::new();
+            let (s, _, _) = with_reusable_content(&sim, size);
+            for j in 0..k {
+                matrix_step(&s, j).unwrap();
+            }
+            sim.crash_after(cut);
+            let acked = matrix_step(&s, k).is_ok();
+            drop(s);
+            let persists = [crate::sim::Persist::None, crate::sim::Persist::All]
+                .into_iter()
+                .chain((1..=3).map(crate::sim::Persist::Seeded));
+            for p in persists {
+                let img = sim.after_crash(p);
+                let rec = NativeStore {
+                    inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
+                };
+                let what = format!("step {k} cut {cut} {p:?}");
+                crate::audit::check_retirement(&img).unwrap_or_else(|e| panic!("{what}: {e}"));
+                let got = matrix_state(&rec);
+                assert!(got == states[k] || got == states[k + 1], "{what}: {got:?}");
+                if acked {
+                    assert_eq!(got, states[k + 1], "{what}: acknowledged step lost");
+                }
+                // The recovered store carries on: finish the script, auditing each step.
+                let from = if got == states[k] { k } else { k + 1 };
+                for j in from..MATRIX_STEPS {
+                    matrix_step(&rec, j).unwrap_or_else(|e| panic!("{what}: step {j}: {e}"));
+                    crate::audit::check_retirement(&img)
+                        .unwrap_or_else(|e| panic!("{what}: after step {j}: {e}"));
+                }
+                assert_eq!(matrix_state(&rec), fin, "{what}: final state");
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, ops.iter().map(|n| (n + 1) * 5).sum::<u64>());
+}

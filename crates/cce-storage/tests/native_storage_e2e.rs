@@ -581,3 +581,153 @@ fn a_short_write_at_the_file_size_limit_fails_the_commit_explicitly() {
     assert_eq!(answered(fresh.step("commit a2"), "retry"), ["committed 2"]);
     answered(fresh.step("close"), "close");
 }
+
+/// Commits generated content `seed` as record `id` (absent before), then removes it and commits
+/// once more, so its space is retired and reusable by the next staging.
+fn commit_and_retire(d: &mut Driver, id: &str, len: u64, seed: u64, attempt: &str) {
+    for cmd in [
+        format!("stage {id} gen {len} {seed}"),
+        format!("put-context {id} absent - {id}"),
+    ] {
+        answered(d.step(&cmd), &cmd);
+    }
+    assert_eq!(
+        answered(d.step(&format!("commit {attempt}-put")), "put")[0]
+            .split(' ')
+            .next(),
+        Some("committed")
+    );
+    answered(d.step(&format!("remove-context {id} any")), "remove");
+    assert_eq!(
+        answered(d.step(&format!("commit {attempt}-remove")), "remove")[0]
+            .split(' ')
+            .next(),
+        Some("committed")
+    );
+    answered(d.step("put-context advance any - -"), "advance");
+    assert_eq!(
+        answered(d.step(&format!("commit {attempt}-advance")), "advance")[0]
+            .split(' ')
+            .next(),
+        Some("committed")
+    );
+}
+
+#[test]
+fn a_quiescent_removal_waits_for_readers_in_the_same_process() {
+    let dir = test_dir("quiescent-removal");
+    let store = dir.join("store");
+    let mut d = Driver::spawn();
+    answered(d.step(&format!("create {}", store.display())), "create");
+    answered(d.step("stage a hex 616263"), "stage");
+    answered(d.step("put-context A absent - a"), "put");
+    assert_eq!(answered(d.step("commit a1"), "commit"), ["committed 1"]);
+
+    answered(d.step("keep-reader A"), "keep reader");
+    answered(d.step("removal quiescent"), "mode");
+    answered(d.step("remove-context A any"), "remove");
+    let r = answered(d.step("commit q"), "quiescent commit");
+    assert_eq!(r.len(), 1);
+    assert!(r[0].starts_with("commit-error ReadersActive(\"1 "), "{r:?}");
+    assert_eq!(answered(d.step("outcome q"), "outcome"), ["outcome absent"]);
+
+    answered(d.step("drop-readers"), "drop readers");
+    answered(d.step("removal quiescent"), "mode");
+    answered(d.step("remove-context A any"), "remove");
+    assert_eq!(answered(d.step("commit q"), "retry"), ["committed 2"]);
+    let dump = answered(d.step("dump A"), "dump");
+    assert!(dump.iter().any(|l| l == "context A absent"), "{dump:?}");
+    answered(d.step("close"), "close");
+}
+
+#[test]
+fn reused_content_space_survives_a_writer_kill_and_removed_content_is_not_retained() {
+    let dir = test_dir("reuse-kill");
+    let store = dir.join("store");
+    let content_file = store.join("content.cce");
+    let (len, x_seed, y_seed) = (70_000u64, 11u64, 12u64);
+    let x = common::gen_bytes(x_seed, len);
+    let y = common::gen_bytes(y_seed, len);
+
+    let mut w = Driver::spawn();
+    answered(w.step(&format!("create {}", store.display())), "create");
+    commit_and_retire(&mut w, "X", len, x_seed, "x");
+    let before = std::fs::metadata(&content_file).unwrap().len();
+    for cmd in [
+        format!("stage Y gen {len} {y_seed}"),
+        "put-context Y absent - Y".to_string(),
+    ] {
+        answered(w.step(&cmd), &cmd);
+    }
+    assert_eq!(
+        answered(w.step("commit y"), "commit y")[0]
+            .split(' ')
+            .next(),
+        Some("committed")
+    );
+    let stats = answered(w.step("stats"), "stats");
+    assert!(
+        stats[0].contains("content_reused=") && !stats[0].contains("content_reused=0 "),
+        "no content was reused: {stats:?}"
+    );
+    // Y went into X's retired space: the file grew by far less than Y.
+    let after = std::fs::metadata(&content_file).unwrap().len();
+    assert!(
+        after - before < len,
+        "content file grew by {} bytes",
+        after - before
+    );
+    assert_eq!(w.wait_for("hold", "holding"), Step::Answered(vec![]));
+    assert!(w.kill().code().is_none(), "writer must die by signal");
+
+    let mut r = Driver::spawn();
+    answered(r.step(&format!("open {}", store.display())), "open");
+    let read = |r: &mut Driver, bytes: &[u8]| {
+        answered(
+            r.step(&format!(
+                "read-content {} {}",
+                common::hex(&common::sha256(bytes)),
+                bytes.len()
+            )),
+            "read-content",
+        )
+    };
+    assert_eq!(read(&mut r, &y), [format!("content {}", common::hex(&y))]);
+    assert_eq!(read(&mut r, &x), ["content-error ContentNotRetained"]);
+    answered(r.step("close"), "close");
+}
+
+#[test]
+fn under_a_file_size_limit_new_content_fits_only_by_reusing_retired_space() {
+    let dir = test_dir("reuse-limit");
+    let store = dir.join("store");
+    let content_file = store.join("content.cce");
+    let len = 70_000u64;
+    let mut setup = Driver::spawn();
+    answered(setup.step(&format!("create {}", store.display())), "create");
+    commit_and_retire(&mut setup, "X", len, 21, "x");
+    answered(setup.step("close"), "close");
+    assert_eq!(setup.finish().and_then(|s| s.code()), Some(0));
+
+    // Room for history and metadata growth, but not for another 70 KB appended.
+    let size = std::fs::metadata(&content_file).unwrap().len();
+    let limit_kib = size / 1024 + 4;
+    let mut d = Driver::spawn_with_shell(&format!("trap '' XFSZ; ulimit -f {limit_kib}"));
+    answered(d.step(&format!("open {}", store.display())), "open");
+    answered(
+        d.step(&format!("stage Y gen {len} 22")),
+        "stage into reused space",
+    );
+    answered(d.step("put-context Y absent - Y"), "put");
+    assert_eq!(
+        answered(d.step("commit y"), "commit")[0].split(' ').next(),
+        Some("committed")
+    );
+    // Control: with the retired space used up, the same staging exceeds the limit.
+    let err = failed(
+        d.step(&format!("stage Z gen {len} 23")),
+        "stage beyond the limit",
+    );
+    assert!(err.contains("Io"), "{err}");
+    assert!(std::fs::metadata(&content_file).unwrap().len() <= limit_kib * 1024);
+}
