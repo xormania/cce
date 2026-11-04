@@ -11,7 +11,7 @@ use cce_core::storage::{
 
 use crate::NativeStore;
 use crate::engine::Inner;
-use crate::format::{DESC_MAGIC, Descriptor, PAGE_HEADER_LEN, PAGE_SIZE, StoreId};
+use crate::format::{DESC_MAGIC, Descriptor, FORMAT_VERSION, PAGE_HEADER_LEN, PAGE_SIZE, StoreId};
 use crate::io::{FileId, Io};
 use crate::sim::SimIo;
 
@@ -277,6 +277,66 @@ fn a_record_requiring_unknown_features_is_refused_without_falling_back_or_writin
     let s = open(&img);
     assert_eq!(descriptor(&s), t.gen3);
     assert!(s.recovery_diagnostics().is_empty());
+}
+
+#[test]
+fn a_later_version_extending_the_record_is_refused_as_unsupported_not_damaged() {
+    // A later version keeps bytes 0..78 as this one does and appends an extension after them,
+    // with its own check; this build reads its version and refuses it.
+    let t = two_commits();
+    let mut slot = t.gen3.encode();
+    slot[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+    let crc = crc32fast::hash(&slot[..RECORD_LEN - 4]);
+    slot[RECORD_LEN - 4..RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
+    for (i, b) in slot[RECORD_LEN..RECORD_LEN + 64].iter_mut().enumerate() {
+        *b = 0xa0 | i as u8;
+    }
+    let img = t.sim.after_process_exit();
+    write_durably(&img, PAGE_SIZE as u64, &slot);
+    let before = file_images(&img);
+    for read_only in [false, true] {
+        let r = if read_only {
+            Inner::open_read_only(Box::new(img.clone()), Default::default()).map(drop)
+        } else {
+            try_open(&img).map(drop)
+        };
+        img.release();
+        let version = format!("format version {}", FORMAT_VERSION + 1);
+        assert!(
+            matches!(&r, Err(StorageError::Unsupported(m)) if m.contains(&version)),
+            "read_only {read_only}: {r:?}"
+        );
+        assert!(
+            file_images(&img) == before,
+            "the refused open changed the store"
+        );
+    }
+}
+
+#[test]
+fn a_record_of_this_version_in_the_earlier_layout_is_damaged_not_unsupported() {
+    // This version's fields without the required features, checksummed as earlier versions were:
+    // no build ever wrote it, so it is a damaged slot, and the previous generation is recovered.
+    let t = two_commits();
+    let current = t.gen3.encode();
+    let mut earlier = [&current[..6], &current[10..RECORD_LEN - 4]].concat();
+    let crc = crc32fast::hash(&earlier);
+    earlier.extend(crc.to_le_bytes());
+    assert_eq!(earlier.len(), RECORD_LEN - 4);
+    let mut slot = earlier;
+    slot.resize(PAGE_SIZE, 0);
+    assert!(matches!(
+        crate::format::decode_slot(&slot),
+        crate::format::Slot::Invalid(_)
+    ));
+    let img = t.sim.after_process_exit();
+    write_durably(&img, PAGE_SIZE as u64, &slot);
+    assert_recovers_generation_2(
+        &t,
+        &img,
+        &[CHECKSUM_DIAGNOSTIC],
+        "this version, earlier layout",
+    );
 }
 
 #[test]

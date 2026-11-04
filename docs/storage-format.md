@@ -80,6 +80,12 @@ build does not implement is unsupported, exactly like an unknown format version.
 versions had no required features, so their checksum ends 4 bytes earlier; such an intact record is
 reported as its unsupported version rather than as a damaged slot.
 
+Every later version keeps bytes 0 to 78 of the record as they are here: the magic, the format
+version, the required features and the other fields at the same offsets, and the CRC-32 at byte 74
+over bytes 0 to 74. Anything a later version adds follows byte 78, with its own check. The bytes after
+the record are not required to be zero, so this build reads such a record's intact first 78 bytes,
+finds a version it does not support, and refuses the store as unsupported rather than as damaged.
+
 ## Logical key space
 
 One ordered key space holds all record families. Keys are a prefix byte followed by components;
