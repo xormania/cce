@@ -375,7 +375,8 @@ fn check_layout(fuzz: &Path) -> Result<usize, String> {
                 if inner.is_dir() {
                     return Err(format!("{kind}/{name}/{file}: nested directory"));
                 }
-                if kind == "regressions" {
+                // A .gitkeep only keeps an empty directory in version control.
+                if kind == "regressions" && file != ".gitkeep" {
                     findings += 1;
                 }
             }
@@ -408,6 +409,16 @@ fn layout_case(name: &str, build: impl FnOnce(&Path)) -> Result<usize, String> {
 #[test]
 fn a_valid_fuzz_layout_counts_its_saved_findings() {
     assert_eq!(layout_case("valid", |_| {}), Ok(1));
+}
+
+#[test]
+fn a_gitkeep_inside_a_target_directory_is_not_a_saved_finding() {
+    let r = layout_case("gitkeep", |d| {
+        std::fs::write(d.join("regressions/node/.gitkeep"), b"").unwrap();
+        std::fs::create_dir_all(d.join("regressions/page")).unwrap();
+        std::fs::write(d.join("regressions/page/.gitkeep"), b"").unwrap();
+    });
+    assert_eq!(r, Ok(1), "only the one real finding counts");
 }
 
 #[test]

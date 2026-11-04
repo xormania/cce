@@ -143,6 +143,98 @@ fn surface_violations(lib_rs: &str) -> Vec<String> {
         .collect()
 }
 
+/// The public items at the root of `cce-storage`. A top-level public item that is not listed fails
+/// `storage_public_items_are_exactly_the_listed_ones`, and so does a listed item that no longer
+/// exists, so every change to the public surface shows up in review here.
+///
+/// Caveat: only top-level items of `src/lib.rs` are checked. Public methods on the listed types are
+/// covered by those types' ownership and by review, not by this list.
+const PUBLIC_ITEMS: &[&str] = &[
+    "NativeStore",
+    "NativeReadOnly",
+    "NativeView",
+    "CommitTicket",
+    "StoreOptions",
+    "StoreStats",
+];
+
+/// Public items compiled only with a cargo feature: (feature, item).
+const FEATURE_ITEMS: &[(&str, &str)] = &[("fuzz-api", "fuzz_target")];
+
+/// Top-level public items of a crate root and the feature that gates each, if any.
+fn public_items(lib_rs: &str) -> Vec<(String, Option<String>)> {
+    const KINDS: &[&str] = &["fn", "struct", "enum", "trait", "type", "const", "static"];
+    let mut out = Vec::new();
+    // A `#[cfg(feature = "...")]` applies to the next item; doc comments and other attributes
+    // between them keep it.
+    let mut feature: Option<String> = None;
+    for line in lib_rs.lines() {
+        if let Some(rest) = line.strip_prefix("#[cfg(feature = \"") {
+            feature = rest.split('"').next().map(str::to_string);
+            continue;
+        }
+        if line.starts_with("///") || line.starts_with("#[") {
+            continue;
+        }
+        // Only items at the crate root: they start in the first column.
+        let item = KINDS.iter().find_map(|kind| {
+            line.strip_prefix("pub ")
+                .and_then(|l| l.strip_prefix(kind))
+                .and_then(|l| l.strip_prefix(' '))
+        });
+        if let Some(rest) = item {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            out.push((name, feature.take()));
+        } else {
+            feature = None;
+        }
+    }
+    out
+}
+
+/// Violations of the listed-surface rule: unlisted public items, and listed ones that are gone.
+fn public_item_violations(lib_rs: &str) -> Vec<String> {
+    let found = public_items(lib_rs);
+    let mut v = Vec::new();
+    for (name, feature) in &found {
+        let listed = match feature {
+            None => PUBLIC_ITEMS.contains(&name.as_str()),
+            Some(f) => FEATURE_ITEMS.contains(&(f.as_str(), name.as_str())),
+        };
+        if !listed {
+            v.push(format!(
+                "unlisted public item {name}{}",
+                feature
+                    .as_ref()
+                    .map_or(String::new(), |f| format!(" (feature {f})"))
+            ));
+        }
+    }
+    let present = |name: &str, feature: Option<&str>| {
+        found
+            .iter()
+            .any(|(n, f)| n == name && f.as_deref() == feature)
+    };
+    for name in PUBLIC_ITEMS {
+        if !present(name, None) {
+            v.push(format!(
+                "listed public item {name} is not in the crate root"
+            ));
+        }
+    }
+    for (feature, name) in FEATURE_ITEMS {
+        if !present(name, Some(feature)) {
+            v.push(format!(
+                "listed public item {name} (feature {feature}) is not in the crate root"
+            ));
+        }
+    }
+    v
+}
+
 fn workspace_metadata() -> Value {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let out = Command::new(cargo)
@@ -256,6 +348,57 @@ fn storage_exposes_no_physical_modules() {
 fn surface_check_rejects_public_physical_modules() {
     assert!(surface_violations("mod tree;\npub struct NativeStore;").is_empty());
     assert_eq!(surface_violations("pub mod tree;").len(), 1);
+}
+
+#[test]
+fn storage_public_items_are_exactly_the_listed_ones() {
+    let lib = read("src/lib.rs");
+    assert_eq!(public_item_violations(&lib), Vec::<String>::new());
+    let found = public_items(&lib);
+    assert_eq!(
+        found.len(),
+        PUBLIC_ITEMS.len() + FEATURE_ITEMS.len(),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn public_item_check_flags_unlisted_items_and_nothing_else() {
+    let listed = "pub struct NativeStore;\npub struct NativeReadOnly;\npub struct NativeView;\npub struct CommitTicket;\npub struct StoreOptions;\npub struct StoreStats;\n#[cfg(feature = \"fuzz-api\")]\n/// Doc.\npub fn fuzz_target() {}\n";
+    assert_eq!(public_item_violations(listed), Vec::<String>::new());
+    for kw in ["fn", "struct", "enum", "trait", "type", "const", "static"] {
+        let text = format!("{listed}pub {kw} Sneaky");
+        let v = public_item_violations(&text);
+        assert_eq!(v.len(), 1, "pub {kw}: {v:?}");
+        assert!(v[0].contains("Sneaky"), "{v:?}");
+    }
+    // Methods, crate-visible items and listed items are not violations.
+    let inner = format!(
+        "{listed}impl NativeStore {{\n    pub fn method(&self) {{}}\n}}\npub(crate) fn helper() {{}}\n"
+    );
+    assert_eq!(public_item_violations(&inner), Vec::<String>::new());
+    // A feature-gated item is listed with its feature only: ungated, or under another feature, it
+    // is both unlisted and missing from its listed place.
+    let ungated = listed.replace("#[cfg(feature = \"fuzz-api\")]\n", "");
+    assert_eq!(
+        public_item_violations(&ungated),
+        [
+            "unlisted public item fuzz_target",
+            "listed public item fuzz_target (feature fuzz-api) is not in the crate root"
+        ]
+    );
+    let other = listed.replace("fuzz-api", "other");
+    assert_eq!(
+        public_item_violations(&other),
+        [
+            "unlisted public item fuzz_target (feature other)",
+            "listed public item fuzz_target (feature fuzz-api) is not in the crate root"
+        ]
+    );
+    // A listed item that disappeared is reported too.
+    let gone = listed.replace("pub struct StoreStats;\n", "");
+    let v = public_item_violations(&gone);
+    assert!(v.len() == 1 && v[0].contains("StoreStats"), "{v:?}");
 }
 
 /// True if `code` mentions `pat` as a whole path segment (`SimFile::` does not mention `File::`).
