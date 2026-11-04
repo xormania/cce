@@ -3,7 +3,7 @@
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use cce_core::storage::{
@@ -644,65 +644,28 @@ fn outcome_moves_from_pending_to_committed_without_passing_through_absent() {
 }
 
 #[test]
-fn outcome_called_while_a_commit_publishes_answers_from_the_published_state() {
+fn outcome_looks_at_pending_attempts_before_the_published_state() {
+    // An attempt leaves `pending` only after its publication. Checking pending first and the
+    // published state second is what makes a finishing commit impossible to miss, so the order
+    // itself is pinned here (no schedule can expose a reversed order reliably).
     let (s, gate) = gated_store();
     let a = attempt("x");
     let cs = request(&s, Variant::Identical);
     gate.arm();
     let ticket = s.submit(a.clone(), s.begin().unwrap(), cs).unwrap();
     wait_until("commit at its data barrier", || gate.reached());
-
-    // outcome() has begun while the commit is in flight; before it looks at anything, the hook
-    // lets the commit finish completely (published, then no longer pending).
-    let (tx, rx) = mpsc::channel();
-    let finish = {
-        let gate = gate.clone();
-        move || {
-            gate.release();
-            tx.send(ticket.wait()).unwrap();
-        }
-    };
-    let hook_ran = Arc::new(AtomicBool::new(false));
-    let ran = hook_ran.clone();
-    assert!(
-        s.inner
-            .set_outcome_hook_for_test(Some(Box::new(move || {
-                ran.store(true, Ordering::SeqCst);
-                finish();
-            })))
-            .is_none()
+    s.inner.take_outcome_trace_for_test();
+    // In flight: answered from `pending` alone.
+    assert_eq!(s.outcome(&a).unwrap(), AttemptOutcome::Pending);
+    assert_eq!(s.inner.take_outcome_trace_for_test(), ["pending"]);
+    gate.release();
+    let receipt = ticket.wait().unwrap();
+    // Finished, and never seen: pending first, then the published state.
+    assert_eq!(s.outcome(&a).unwrap(), AttemptOutcome::Committed(receipt));
+    assert_eq!(s.inner.take_outcome_trace_for_test(), ["pending", "state"]);
+    assert_eq!(
+        s.outcome(&attempt("never")).unwrap(),
+        AttemptOutcome::Absent
     );
-    let answer = s.outcome(&a).unwrap();
-    assert!(
-        hook_ran.load(Ordering::SeqCst),
-        "the interleaving under test did not happen"
-    );
-    let receipt = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("commit finished")
-        .unwrap();
-    assert_eq!(receipt.position, HistoryPosition(2));
-    // The commit finished during the call: the answer reflects it, never a state from before it.
-    assert_eq!(answer, AttemptOutcome::Committed(receipt));
-}
-
-#[test]
-fn outcome_reaches_its_hook_when_no_commit_is_in_flight() {
-    let (s, _gate) = gated_store();
-    let seed_receipt = CommitReceipt {
-        attempt: attempt("seed"),
-        position: HistoryPosition(1),
-    };
-    for (a, want) in [
-        ("unknown", AttemptOutcome::Absent),
-        ("seed", AttemptOutcome::Committed(seed_receipt)),
-    ] {
-        let ran = Arc::new(AtomicBool::new(false));
-        let r = ran.clone();
-        s.inner
-            .set_outcome_hook_for_test(Some(Box::new(move || r.store(true, Ordering::SeqCst))));
-        assert_eq!(s.outcome(&attempt(a)).unwrap(), want, "{a}");
-        assert!(ran.load(Ordering::SeqCst), "{a}: hook not reached");
-        assert!(s.inner.set_outcome_hook_for_test(None).is_none(), "{a}");
-    }
+    assert_eq!(s.inner.take_outcome_trace_for_test(), ["pending", "state"]);
 }

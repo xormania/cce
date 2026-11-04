@@ -658,7 +658,7 @@ fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
     struct StageAfterContentSync {
         sim: SimIo,
         store: Arc<OnceLock<Weak<Inner>>>,
-        fired: AtomicBool,
+        fired: Arc<AtomicBool>,
     }
     impl Io for StageAfterContentSync {
         fn create(&self) -> Result<(), StorageError> {
@@ -693,12 +693,13 @@ fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
 
     let sim = SimIo::new();
     let hook = Arc::new(OnceLock::new());
+    let fired = Arc::new(AtomicBool::new(false));
     let s = NativeStore {
         inner: Inner::create(
             Box::new(StageAfterContentSync {
                 sim: sim.clone(),
                 store: hook.clone(),
-                fired: AtomicBool::new(false),
+                fired: fired.clone(),
             }),
             StoreId([3; 16]),
             Default::default(),
@@ -712,6 +713,10 @@ fn a_commit_publishes_only_content_covered_by_its_data_barrier() {
         changes(vec![put("A", Precondition::Absent, b"a", None)]),
     )
     .expect("commit acknowledged");
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "the staging after the content barrier did not happen"
+    );
     drop(s);
     // Power is lost: unsynced writes vanish. The acknowledged commit must still open.
     let after_power_loss = sim.after_crash(Persist::None);

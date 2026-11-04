@@ -140,10 +140,9 @@ pub(crate) struct Inner {
     /// Makes the next commit panic inside the worker (tests of worker robustness only).
     #[cfg(test)]
     panic_next_commit: std::sync::atomic::AtomicBool,
-    /// Runs once at the start of `outcome`, before it looks at pending attempts or the published
-    /// state (tests of answer ordering only).
+    /// The lookups `outcome` performed, in order (tests of answer ordering only).
     #[cfg(test)]
-    outcome_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    outcome_trace: Mutex<Vec<&'static str>>,
     /// Largest number of segments one content stream may have.
     max_segments: usize,
     /// Largest variable-length request field or list (see `Options::max_request_field`).
@@ -352,7 +351,7 @@ impl Inner {
             #[cfg(test)]
             panic_next_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
-            outcome_hook: Mutex::new(None),
+            outcome_trace: Mutex::new(Vec::new()),
             conflicts: Mutex::new(ConflictLog {
                 floor: desc.history_pos,
                 entries: VecDeque::new(),
@@ -378,14 +377,10 @@ impl Inner {
         lock(&self.gate)
     }
 
-    /// Test hook: installs (or with `None` removes) the callback `outcome` runs once at its start,
-    /// before it looks at pending attempts or the published state. Returns the callback it replaced.
+    /// Test hook: the lookups `outcome` performed since the last call, in order.
     #[cfg(test)]
-    pub(crate) fn set_outcome_hook_for_test(
-        &self,
-        hook: Option<Box<dyn FnOnce() + Send>>,
-    ) -> Option<Box<dyn FnOnce() + Send>> {
-        std::mem::replace(&mut *lock(&self.outcome_hook), hook)
+    pub(crate) fn take_outcome_trace_for_test(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *lock(&self.outcome_trace))
     }
 
     /// Starts the store's commit worker: the single thread that orders publications. The worker
@@ -879,18 +874,15 @@ impl Inner {
     }
 
     pub fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
-        // Test seam: lets a concurrent commit finish after this call began, before it looks at
-        // anything (tests of answer ordering only).
+        // Order matters: an attempt leaves `pending` only after its publication, so checking
+        // `pending` first and the published state second can never miss a finishing commit.
         #[cfg(test)]
-        {
-            let hook = lock(&self.outcome_hook).take();
-            if let Some(hook) = hook {
-                hook();
-            }
-        }
+        lock(&self.outcome_trace).push("pending");
         if lock(&self.pending).contains_key(attempt) {
             return Ok(AttemptOutcome::Pending);
         }
+        #[cfg(test)]
+        lock(&self.outcome_trace).push("state");
         let st = lock(&self.state);
         if st
             .fenced
