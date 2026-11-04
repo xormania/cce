@@ -42,8 +42,9 @@ pub(crate) struct ContentPool {
     /// serial, with that commit's attempt and generation: neither offered for reuse nor freed by
     /// a discard until reopen decides which publication won.
     uncertain: HashMap<u64, (AttemptId, u64, Vec<Reuse>)>,
-    /// Taken by stagings still writing, not yet reserved or given back.
-    taking: Vec<Reuse>,
+    /// Taken and still being written, not yet reserved or given back, with the taker that took
+    /// each (a staging call or a maintenance step, by taker id).
+    taking: Vec<(u64, Reuse)>,
     /// Writes are fenced: nothing more is taken.
     fenced: bool,
 }
@@ -114,14 +115,25 @@ impl ContentPool {
                 .uncertain
                 .values()
                 .flat_map(|(_, _, rs)| rs)
-                .chain(&self.taking)
+                .chain(self.taking.iter().map(|(_, r)| r))
                 .any(|r| overlap(x, (r.offset, r.record_len)))
     }
 
-    /// Extents taken by stagings that are still writing.
+    /// Extents taken and still being written, by any taker.
     #[cfg(test)]
-    pub(crate) fn taking(&self) -> &[Reuse] {
-        &self.taking
+    pub(crate) fn taking(&self) -> Vec<Reuse> {
+        self.taking.iter().map(|(_, r)| *r).collect()
+    }
+
+    /// The extents taker `owner` has taken and not yet reserved or given back, for its own
+    /// cleanup. (Used by maintenance steps that take space.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn taking_of(&self, owner: u64) -> Vec<Reuse> {
+        self.taking
+            .iter()
+            .filter(|(o, _)| *o == owner)
+            .map(|(_, r)| *r)
+            .collect()
     }
 
     // ----- changing ----------------------------------------------------------------------
@@ -155,11 +167,12 @@ impl ContentPool {
     }
 
     /// Takes the smallest free extent of at least `need` bytes retired no later than `bound`, if
-    /// any, for a staging to write into. With `below`, only an extent whose first `need` bytes
-    /// end at or below that offset qualifies (moving content towards the start of the file).
-    /// Refused while writes are fenced.
+    /// any, for taker `owner` to write into. With `below`, only an extent whose first `need`
+    /// bytes end at or below that offset qualifies (moving content towards the start of the
+    /// file). Refused while writes are fenced.
     pub(crate) fn take(
         &mut self,
+        owner: u64,
         need: u64,
         bound: u64,
         below: Option<u64>,
@@ -185,15 +198,15 @@ impl ContentPool {
                 record_len,
                 retired_at,
             };
-            self.taking.push(r);
+            self.taking.push((owner, r));
             r
         }))
     }
 
-    /// Returns extents taken by a staging that did not complete to the free space, at their
-    /// original generation.
-    pub(crate) fn give_back(&mut self, taken: &[Reuse]) -> Result<(), String> {
-        let out = self.leave_taking(taken)?;
+    /// Returns extents taker `owner` took and will not use to the free space, at their original
+    /// generation. Only that taker's own takes are accepted.
+    pub(crate) fn give_back(&mut self, owner: u64, taken: &[Reuse]) -> Result<(), String> {
+        let out = self.leave_taking(owner, taken)?;
         let extents: Vec<(u64, u64, u64)> = taken
             .iter()
             .map(|r| (r.offset, r.record_len, r.retired_at))
@@ -202,26 +215,33 @@ impl ContentPool {
             .inspect_err(|_| self.taking = out)
     }
 
-    /// Removes `taken` from the extents in flight, each of which it must be; returns the set as it
-    /// was, for undoing.
-    fn leave_taking(&mut self, taken: &[Reuse]) -> Result<Vec<Reuse>, String> {
-        if let Some(r) = taken.iter().find(|r| !self.taking.contains(r)) {
+    /// Removes `taken` from the extents in flight, each of which `owner` must have taken; returns
+    /// the set as it was, for undoing.
+    fn leave_taking(&mut self, owner: u64, taken: &[Reuse]) -> Result<Vec<(u64, Reuse)>, String> {
+        if let Some(r) = taken.iter().find(|r| !self.taking.contains(&(owner, **r))) {
             return Err(format!(
-                "content at offset {} was not taken by a staging",
+                "content at offset {} was not taken by taker {owner}",
                 r.offset
             ));
         }
         let before = self.taking.clone();
-        self.taking.retain(|r| !taken.contains(r));
+        self.taking
+            .retain(|(o, r)| !(*o == owner && taken.contains(r)));
         Ok(before)
     }
 
-    /// Records the extents a completed staging took as reserved by it. A staging reserves once.
-    pub(crate) fn hold(&mut self, serial: u64, taken: Vec<Reuse>) -> Result<(), Vec<Reuse>> {
+    /// Records the extents taker `owner` took as reserved by staging `serial`, which it has
+    /// become. Only that taker's own takes are accepted; a staging reserves once.
+    pub(crate) fn hold(
+        &mut self,
+        owner: u64,
+        serial: u64,
+        taken: Vec<Reuse>,
+    ) -> Result<(), Vec<Reuse>> {
         if self.held.contains_key(&serial) || self.uncertain.contains_key(&serial) {
             return Err(taken);
         }
-        if self.leave_taking(&taken).is_err() {
+        if self.leave_taking(owner, &taken).is_err() {
             return Err(taken);
         }
         self.held.insert(serial, taken);
@@ -412,7 +432,7 @@ mod tests {
         free.extend(
             p.taking
                 .iter()
-                .map(|r| (r.offset, r.record_len, u64::MAX - r.retired_at)),
+                .map(|(o, r)| (r.offset, r.record_len, u64::MAX - r.retired_at * 8 - o)),
         );
         (free, held, p.discarded.clone(), unc, adm, p.fenced)
     }
@@ -428,7 +448,7 @@ mod tests {
                 .map(|r| (r.offset, r.record_len)),
         );
         all.extend(p.discarded.iter().copied());
-        all.extend(p.taking.iter().map(|r| (r.offset, r.record_len)));
+        all.extend(p.taking.iter().map(|(_, r)| (r.offset, r.record_len)));
         all.sort_unstable();
         match all.windows(2).find(|w| overlap(w[0], w[1])) {
             Some(w) => Err(format!("{:?} and {:?} overlap", w[0], w[1])),
@@ -442,7 +462,7 @@ mod tests {
             .iter()
             .map(|&(o, l, g)| {
                 assert_eq!(p.insert_free(&[(o, l, g)]), Ok(()));
-                let r = p.take(l, g, None).unwrap().unwrap();
+                let r = p.take(0, l, g, None).unwrap().unwrap();
                 assert_eq!(r.offset, o);
                 r
             })
@@ -466,9 +486,9 @@ mod tests {
         let mut p = ContentPool::default();
         assert_eq!(p.insert_free(&[(100, 50, 1)]), Ok(()));
         let t = taken(&mut p, &[(300, 20, 1)]);
-        assert_eq!(p.hold(7, t), Ok(()));
+        assert_eq!(p.hold(0, 7, t), Ok(()));
         let t = taken(&mut p, &[(400, 20, 1)]);
-        assert!(p.hold(8, t).is_ok());
+        assert!(p.hold(0, 8, t).is_ok());
         p.hand_to_uncertain(&attempt(), 9, &[8]);
         for x in [
             (120, 10, 2),
@@ -496,7 +516,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            p.take(50, 4, None),
+            p.take(0, 50, 4, None),
             Ok(Some(Reuse {
                 offset: 200,
                 used: 50,
@@ -504,9 +524,9 @@ mod tests {
                 retired_at: 1
             }))
         );
-        assert_eq!(p.take(500, 4, None), Ok(None));
+        assert_eq!(p.take(0, 500, 4, None), Ok(None));
         p.fence();
-        refused(&mut p, |p| assert!(p.take(10, 9, None).is_err()));
+        refused(&mut p, |p| assert!(p.take(0, 10, 9, None).is_err()));
     }
 
     #[test]
@@ -518,17 +538,17 @@ mod tests {
         );
         // The smallest fit (400) ends past the limit; the next smallest that fits below it wins.
         assert_eq!(
-            p.take(20, 9, Some(230)).map(|r| r.map(|r| r.offset)),
+            p.take(0, 20, 9, Some(230)).map(|r| r.map(|r| r.offset)),
             Ok(Some(200))
         );
         // Exactly at the limit qualifies; one byte past does not.
         assert_eq!(
-            p.take(20, 9, Some(20)).map(|r| r.map(|r| r.offset)),
+            p.take(0, 20, 9, Some(20)).map(|r| r.map(|r| r.offset)),
             Ok(Some(0))
         );
-        assert_eq!(p.take(20, 9, Some(419)), Ok(None));
+        assert_eq!(p.take(0, 20, 9, Some(419)), Ok(None));
         assert_eq!(
-            p.take(20, 9, Some(420)).map(|r| r.map(|r| r.offset)),
+            p.take(0, 20, 9, Some(420)).map(|r| r.map(|r| r.offset)),
             Ok(Some(400))
         );
     }
@@ -537,9 +557,9 @@ mod tests {
     fn a_staging_reserves_once_and_a_refused_discard_keeps_its_reservations() {
         let mut p = ContentPool::default();
         let t = taken(&mut p, &[(0, 10, 1)]);
-        assert_eq!(p.hold(1, t), Ok(()));
+        assert_eq!(p.hold(0, 1, t), Ok(()));
         let t = taken(&mut p, &[(50, 10, 1)]);
-        refused(&mut p, |p| assert!(p.hold(1, t).is_err()));
+        refused(&mut p, |p| assert!(p.hold(0, 1, t).is_err()));
         // A staging cannot reserve space it did not take.
         let stray = Reuse {
             offset: 60,
@@ -547,7 +567,13 @@ mod tests {
             record_len: 1,
             retired_at: 1,
         };
-        refused(&mut p, |p| assert!(p.hold(2, vec![stray]).is_err()));
+        refused(&mut p, |p| assert!(p.hold(0, 2, vec![stray]).is_err()));
+        // Nor space another taker took: taker 1 cannot reserve or give back taker 0's take.
+        let others = p.taking_of(0);
+        assert!(!others.is_empty());
+        let copy = others.clone();
+        refused(&mut p, |p| assert!(p.hold(1, 2, copy).is_err()));
+        refused(&mut p, |p| assert!(p.give_back(1, &others).is_err()));
         p.admit(1);
         refused(&mut p, |p| assert!(p.discard(1, &[(100, 10)]).is_err()));
         p.resolve_admission(1);
@@ -571,7 +597,7 @@ mod tests {
     fn an_uncertain_publication_owns_every_reservation_of_a_repeated_staging() {
         let mut p = ContentPool::default();
         let t = taken(&mut p, &[(0, 10, 1), (20, 10, 1)]);
-        assert_eq!(p.hold(3, t), Ok(()));
+        assert_eq!(p.hold(0, 3, t), Ok(()));
         p.hand_to_uncertain(&attempt(), 4, &[3, 3]);
         assert_eq!(
             p.uncertain().map(|(_, _, _, rs)| rs.len()).sum::<usize>(),
@@ -580,7 +606,7 @@ mod tests {
         refused(&mut p, |p| assert!(p.discard(3, &[]).is_err()));
         refused(&mut p, |p| assert!(p.release(3).is_err()));
         refused(&mut p, |p| assert!(p.release(99).is_err()));
-        refused(&mut p, |p| assert!(p.take(1, 9, None).is_err()));
+        refused(&mut p, |p| assert!(p.take(0, 1, 9, None).is_err()));
     }
 
     /// Random sequences of every operation: free, reserved and queued space never overlaps, and
@@ -596,7 +622,8 @@ mod tests {
         for seed in 1..=200u64 {
             let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
             let mut p = ContentPool::default();
-            let mut taken: Vec<Reuse> = Vec::new();
+            // Extents in flight, by the taker that took them.
+            let mut taken: Vec<(u64, Reuse)> = Vec::new();
             for step in 0..120 {
                 let before = snapshot(&p);
                 let at = rng(&mut s) % 64 * 16;
@@ -634,38 +661,43 @@ mod tests {
                     0 | 1 => p.insert_free(&[(at, len, rng(&mut s) % 5)]).is_ok(),
                     2 => {
                         let below = rng(&mut s).is_multiple_of(2).then(|| rng(&mut s) % 1100);
-                        match p.take(len, rng(&mut s) % 6, below) {
+                        let owner = rng(&mut s) % 3;
+                        match p.take(owner, len, rng(&mut s) % 6, below) {
                             Ok(Some(r)) => {
                                 assert!(
                                     below.is_none_or(|b| r.offset + len <= b),
                                     "seed {seed} step {step}: {r:?} for {len} bytes, below {below:?}"
                                 );
-                                taken.push(r);
+                                taken.push((owner, r));
                                 true
                             }
                             Ok(None) => true,
                             Err(_) => false,
                         }
                     }
-                    3 => {
-                        let back: Vec<Reuse> = std::mem::take(&mut taken);
-                        match p.give_back(&back) {
-                            Ok(()) => true,
-                            Err(_) => {
-                                taken = back;
-                                false
-                            }
+                    3 | 4 => {
+                        // A taker settles a list of takes: its own, or (wrongly) another's.
+                        let (owner, whose) = (rng(&mut s) % 3, rng(&mut s) % 3);
+                        let list: Vec<Reuse> = taken
+                            .iter()
+                            .filter(|(o, _)| *o == whose)
+                            .map(|(_, r)| *r)
+                            .collect();
+                        let settled = if rng(&mut s).is_multiple_of(2) {
+                            p.give_back(owner, &list).is_ok()
+                        } else {
+                            p.hold(owner, serial, list.clone()).is_ok()
+                        };
+                        if owner != whose && !list.is_empty() {
+                            assert!(
+                                !settled,
+                                "seed {seed} step {step}: taker {owner} settled taker {whose}'s takes"
+                            );
                         }
-                    }
-                    4 => {
-                        let mine: Vec<Reuse> = std::mem::take(&mut taken);
-                        match p.hold(serial, mine) {
-                            Ok(()) => true,
-                            Err(back) => {
-                                taken = back;
-                                false
-                            }
+                        if settled {
+                            taken.retain(|(o, r)| !(*o == whose && list.contains(r)));
                         }
+                        settled
                     }
                     5 => p.discard(serial, &[(at, len)]).is_ok(),
                     6 => p.queue_discarded((at, len)).is_ok(),

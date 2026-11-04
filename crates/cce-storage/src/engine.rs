@@ -144,6 +144,8 @@ pub(crate) struct Inner {
     pool: Mutex<ContentPool>,
     /// Inconsistencies in space ownership found during cleanup, where no caller could be told.
     faults: Mutex<Vec<String>>,
+    /// Next taker id for the reuse pool (one per staging call).
+    next_taker: AtomicU64,
     cache: Mutex<NodeCache>,
     /// Logical write sets of recent commits, for validating older read bases.
     conflicts: Mutex<ConflictLog>,
@@ -378,6 +380,8 @@ impl Drop for Unpublished<'_> {
 /// Extents one staging call took from the pool; returned to it unless the staging completes.
 struct Taken<'a> {
     inner: &'a Inner,
+    /// This staging call's taker id in the pool.
+    owner: u64,
     taken: Vec<Reuse>,
 }
 
@@ -386,7 +390,7 @@ impl Taken<'_> {
     fn hold(mut self, serial: u64) {
         let taken = std::mem::take(&mut self.taken);
         if !taken.is_empty() {
-            let held = lock(&self.inner.pool).hold(serial, taken);
+            let held = lock(&self.inner.pool).hold(self.owner, serial, taken);
             if let Err(taken) = held {
                 // A staging reserves once; give the space back rather than lose it.
                 self.taken = taken;
@@ -403,7 +407,7 @@ impl Drop for Taken<'_> {
     fn drop(&mut self) {
         if !self.taken.is_empty() {
             let taken = std::mem::take(&mut self.taken);
-            let given = lock(&self.inner.pool).give_back(&taken);
+            let given = lock(&self.inner.pool).give_back(self.owner, &taken);
             if let Err(why) = given {
                 self.inner.fault(&why);
             }
@@ -588,6 +592,7 @@ impl Inner {
             alloc: Mutex::new(desc.content_len),
             pool: Mutex::new(ContentPool::default()),
             faults: Mutex::new(Vec::new()),
+            next_taker: AtomicU64::new(0),
             state: Recorded::new(
                 "state",
                 State {
@@ -1190,6 +1195,7 @@ impl Inner {
         };
         let mut taken = Taken {
             inner: self,
+            owner: self.next_taker.fetch_add(1, Ordering::Relaxed),
             taken: Vec::new(),
         };
         let start = *cursor;
@@ -1808,7 +1814,7 @@ impl Inner {
             // ownership is made under: a staging that passed its entry check takes nothing once
             // writes are fenced.
             let took = lock(&self.pool)
-                .take(need, bound, None)
+                .take(taken.owner, need, bound, None)
                 .map_err(StorageError::StoreState)?;
             if let Some(r) = took {
                 self.counters
