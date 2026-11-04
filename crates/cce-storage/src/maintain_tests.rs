@@ -876,3 +876,198 @@ fn a_move_whose_content_was_committed_again_during_relocation_is_dropped() {
         Some(&bytes_of(2, 100_000)[..])
     );
 }
+
+/// A tree of many leaves whose low pages were vacated by later commits and are reusable, so that
+/// the newest leaves sit above retired space. Released.
+fn scattered() -> SimIo {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    let body = |i: usize, round: usize| format!("{i:04}-{round}-{}", "x".repeat(400));
+    commit(
+        &s,
+        "many",
+        ChangeSet {
+            changes: (0..400)
+                .map(|i| put(&format!("k{i:04}"), &body(i, 0), None))
+                .collect(),
+            ..ChangeSet::default()
+        },
+    );
+    // Rewriting every record moves every leaf to fresh pages above the first commit's.
+    commit(
+        &s,
+        "rewrite",
+        ChangeSet {
+            changes: (0..400)
+                .map(|i| put(&format!("k{i:04}"), &body(i, 1), None))
+                .collect(),
+            ..ChangeSet::default()
+        },
+    );
+    for a in ["three", "four"] {
+        commit(
+            &s,
+            a,
+            ChangeSet {
+                changes: vec![put("z", a, None)],
+                ..ChangeSet::default()
+            },
+        );
+    }
+    drop(s);
+    sim.release();
+    sim
+}
+
+fn tree_pages(sim: &SimIo) -> (std::collections::BTreeSet<u64>, crate::format::Descriptor) {
+    let d = crate::audit::published(sim).unwrap().pop().unwrap();
+    (crate::audit::reach(sim, &d).unwrap().pages, d)
+}
+
+#[test]
+fn relocation_moves_tree_pages_into_lower_retired_pages_and_changes_no_record() {
+    let sim = scattered();
+    let s = open(&sim);
+    let before = logical(&s);
+    let (pages, d) = tree_pages(&sim);
+    let r = s
+        .maintain(MaintenanceTask::Relocate, MaintenanceBudget::default())
+        .unwrap();
+    let (after, e) = tree_pages(&sim);
+    assert!(r.pages_moved > 0, "no page moved");
+    assert!(
+        after.last() < pages.last(),
+        "the highest tree page did not move down: {:?} -> {:?}",
+        pages.last(),
+        after.last()
+    );
+    assert_eq!(
+        e.next_page, d.next_page,
+        "relocation wrote past the end of the tree pages"
+    );
+    assert_eq!(e.history_pos, d.history_pos);
+    assert_eq!(logical(&s), before, "relocation changed logical state");
+    audit(&sim);
+    drop(s);
+    let s = open(&sim);
+    assert_eq!(logical(&s), before, "the move did not survive reopening");
+}
+
+#[test]
+fn page_relocation_moves_no_more_pages_than_the_budget() {
+    let sim = scattered();
+    let s = open(&sim);
+    let before = logical(&s);
+    let (pages, d) = tree_pages(&sim);
+    let r = s
+        .maintain(
+            MaintenanceTask::Relocate,
+            MaintenanceBudget {
+                max_pages: 2,
+                ..MaintenanceBudget::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(r.pages_moved, 2);
+    assert!(
+        !r.complete,
+        "a step cut short by its budget reported itself complete"
+    );
+    let (after, e) = tree_pages(&sim);
+    let top: Vec<u64> = pages.iter().rev().take(2).copied().collect();
+    assert!(
+        top.iter().all(|p| !after.contains(p)),
+        "the two highest pages {top:?} are still in use"
+    );
+    assert_eq!(e.next_page, d.next_page);
+    assert_eq!(logical(&s), before);
+    audit(&sim);
+}
+
+/// Runs one relocation step and checks what it did to the tree pages: the `pages_moved` highest
+/// pages are no longer in use, every page the step wrote is numbered below all of them, and the
+/// metadata file did not grow.
+fn relocate_checked(
+    sim: &SimIo,
+    s: &NativeStore,
+    budget: MaintenanceBudget,
+) -> crate::MaintenanceReport {
+    let (pages, d) = tree_pages(sim);
+    let r = s.maintain(MaintenanceTask::Relocate, budget).unwrap();
+    let after = tree_pages(sim).1;
+    let reach = crate::audit::reach(sim, &after).unwrap();
+    let top: Vec<u64> = pages
+        .iter()
+        .rev()
+        .take(r.pages_moved as usize)
+        .copied()
+        .collect();
+    assert!(
+        top.iter().all(|p| !reach.pages.contains(p)),
+        "moved pages {top:?} are still in use"
+    );
+    if let Some(lowest) = top.last() {
+        let written: Vec<u64> = reach
+            .incarnations
+            .iter()
+            .filter(|(_, g)| **g == r.generation)
+            .map(|(p, _)| *p)
+            .collect();
+        assert!(
+            written.iter().all(|p| p < lowest),
+            "the step wrote pages {written:?}, not all below the moved pages {top:?}"
+        );
+    }
+    assert_eq!(
+        after.next_page, d.next_page,
+        "relocation wrote past the end of the tree pages"
+    );
+    r
+}
+
+#[test]
+fn page_relocation_never_moves_pages_up_into_space_it_vacated() {
+    let sim = scattered();
+    let s = open(&sim);
+    let first = relocate_checked(&sim, &s, MaintenanceBudget::default());
+    assert!(first.pages_moved > 0);
+    // Two commits make the pages the first step vacated reusable; they all lie above the tree now.
+    for a in ["five", "six"] {
+        commit(
+            &s,
+            a,
+            ChangeSet {
+                changes: vec![put("z", a, None)],
+                ..ChangeSet::default()
+            },
+        );
+    }
+    let mid = logical(&s);
+    relocate_checked(&sim, &s, MaintenanceBudget::default());
+    assert_eq!(logical(&s), mid);
+    audit(&sim);
+}
+
+#[test]
+fn page_relocation_without_lower_retired_pages_does_nothing() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    commit(
+        &s,
+        "one",
+        ChangeSet {
+            changes: vec![put("A", "a", None)],
+            ..ChangeSet::default()
+        },
+    );
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let r = s
+        .maintain(MaintenanceTask::Relocate, MaintenanceBudget::default())
+        .unwrap();
+    assert_eq!((r.pages_moved, r.content_bytes_moved), (0, 0));
+    assert_eq!(
+        r.generation, generation,
+        "a step with nothing to move published"
+    );
+    assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
+}

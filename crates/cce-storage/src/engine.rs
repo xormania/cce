@@ -1295,11 +1295,30 @@ impl Inner {
     fn publish(
         &self,
         cur: &Descriptor,
+        txn: TreeTxn<'_>,
+        generation: u64,
+        pos: u64,
+        uncertain: Option<&AttemptId>,
+    ) -> Result<Published, CommitError> {
+        self.publish_below(cur, txn, generation, pos, uncertain, None)?
+            .ok_or_else(|| {
+                rejected(StorageError::InvalidRequest(
+                    "an unrestricted publication found no pages to write".into(),
+                ))
+            })
+    }
+
+    /// [`Inner::publish`], but with `below` every tree page it writes must be a retired page
+    /// numbered below it: if there are too few, it writes and publishes nothing and returns `None`.
+    fn publish_below(
+        &self,
+        cur: &Descriptor,
         mut txn: TreeTxn<'_>,
         generation: u64,
         pos: u64,
         uncertain: Option<&AttemptId>,
-    ) -> Result<(Descriptor, Vec<(u64, u64)>), CommitError> {
+        below: Option<u64>,
+    ) -> Result<Option<Published>, CommitError> {
         // Discarded stagings' own space becomes retired with this commit.
         let discarded: Vec<(u64, u64)> = lock(&self.pool).discarded.clone();
         for (offset, len) in &discarded {
@@ -1321,8 +1340,11 @@ impl Inner {
                 hook();
             }
         }
-        let reuse = settle_allocation(&mut txn, self, cur, generation, reusable_through)
+        let reuse = settle_allocation(&mut txn, self, cur, generation, reusable_through, below)
             .map_err(rejected)?;
+        if below.is_some() && reuse.len() < txn.dirty_pages() {
+            return Ok(None);
+        }
         let mut sink = PageWriter {
             inner: self,
             next_page: cur.next_page,
@@ -1382,7 +1404,7 @@ impl Inner {
             return Err(CommitError::Indeterminate(why));
         }
 
-        Ok((desc, discarded))
+        Ok(Some((desc, discarded)))
     }
 
     fn resolve_content(&self, cs: &ChangeSet) -> Result<Vec<(u64, BoundContent)>, CommitError> {
@@ -2008,6 +2030,9 @@ impl ConflictLog {
 /// A retirement record taken from the committed tree: key, value and the retired page.
 type RetiredRecord = (Vec<u8>, Vec<u8>, u64);
 
+/// A published record and the discarded staging extents its publication retired.
+type Published = (Descriptor, Vec<(u64, u64)>);
+
 /// Upper bound on rounds of settling a commit's page allocation. Each round's edits touch pages
 /// already being rewritten (or split from them), so replaced pages and page demand stop changing
 /// within a few rounds; a commit that does not settle is rejected.
@@ -2015,15 +2040,17 @@ const ALLOCATION_ROUNDS: usize = 16;
 
 /// Records every committed page the transaction replaces as retired at `generation` and takes,
 /// for the pages the transaction will write, retired pages recorded no later than
-/// `reusable_through` (deleting their records). Recording, consuming and returning records all
-/// edit the tree, which can replace further pages and change how many pages it needs, so this
-/// repeats until a round changes nothing. Returns the pages to write first.
+/// `reusable_through` (deleting their records), and with `below` only pages numbered below it.
+/// Recording, consuming and returning records all edit the tree, which can replace further pages
+/// and change how many pages it needs, so this repeats until a round changes nothing. Returns the
+/// pages to write first.
 fn settle_allocation(
     txn: &mut TreeTxn,
     src: &dyn NodeSource,
     cur: &Descriptor,
     generation: u64,
     reusable_through: Option<u64>,
+    below: Option<u64>,
 ) -> Result<Vec<u64>, StorageError> {
     // Candidates in record order (oldest retirement first), from the committed tree.
     let mut candidates = match reusable_through {
@@ -2044,7 +2071,9 @@ fn settle_allocation(
                 Retired::Page {
                     generation, page, ..
                 } => {
-                    if reusable_through.is_some_and(|b| generation <= b) {
+                    if reusable_through.is_some_and(|b| generation <= b)
+                        && below.is_none_or(|b| page < b)
+                    {
                         return Ok(Some((k, v, page)));
                     }
                     generation

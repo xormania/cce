@@ -286,7 +286,11 @@ space, which is proportional to the metadata (as for the integrity check).
   staging reserves them (so no staging can take them). Publication then takes the writer lock and
   applies a move to the newest state only if that content still has the manifest the move copied;
   any other move is dropped, its reserved extents return to the pool, and its copied bytes remain
-  in retired space. Commits made during the copy are therefore never overwritten.
+  in retired space. Commits made during the copy are therefore never overwritten. The same step
+  then moves tree pages: under the writer lock, like a commit, it rewrites the highest pages (at
+  most the page budget) and their paths from the root into retired pages numbered below all of
+  them. If there are too few such pages it tries half as many, so it never writes a fresh page and
+  never extends the metadata file. Each part publishes only if it moved something.
 
 ## Not implemented yet
 

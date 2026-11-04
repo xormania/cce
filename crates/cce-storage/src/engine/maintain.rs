@@ -9,12 +9,13 @@ use std::sync::{Arc, Mutex};
 use super::{ContentPool, Inner, Reuse, Taken, lock, rejected, sha256};
 use crate::codec::{corrupt, key_components};
 use crate::format::Descriptor;
+use crate::format::PageRef;
 use crate::io::FileId;
 use crate::records::{
     ContentEntry, ExtentRef, Manifest, P_CONTENT, P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED,
     RelValue, Retired, decode_retired, retired_extent_key,
 };
-use crate::tree::{Cursor, TreeTxn};
+use crate::tree::{Cursor, MAX_HEIGHT, Node, NodeSource, TreeTxn};
 use crate::{MaintenanceBudget, MaintenanceReport, MaintenanceTask};
 
 impl Inner {
@@ -202,7 +203,7 @@ impl Inner {
     /// (so no staging can take them). Publication then takes the writer lock and applies each move
     /// to the newest state only if that content still has the manifest the move copied; any other
     /// move is dropped and its reservations returned, leaving the copied bytes in retired space.
-    fn relocate(
+    fn relocate_content(
         self: &Arc<Self>,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceReport, CommitError> {
@@ -416,6 +417,78 @@ impl Inner {
         })
     }
 
+    /// Moves committed content, then tree pages; each part publishes only if it moved something.
+    fn relocate(
+        self: &Arc<Self>,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceReport, CommitError> {
+        let content = self.relocate_content(budget)?;
+        let pages = self.relocate_pages(budget)?;
+        Ok(MaintenanceReport {
+            generation: pages.generation.max(content.generation),
+            content_bytes_moved: content.content_bytes_moved,
+            pages_moved: pages.pages_moved,
+            ..report(0, 0, content.complete && pages.complete)
+        })
+    }
+
+    /// Rewrites the highest tree pages, at most `budget.max_pages` of them, into retired pages
+    /// numbered below all of them, under the writer lock like a commit. Rewriting a page rewrites
+    /// its path from the root; every page written must be such a retired page, so the step never
+    /// extends the metadata file. With too few, it tries half as many pages, down to none.
+    fn relocate_pages(&self, budget: MaintenanceBudget) -> Result<MaintenanceReport, CommitError> {
+        let _w = lock(&self.writer);
+        let (cur, fence) = {
+            let st = lock(&self.state);
+            (st.current, st.fenced.clone())
+        };
+        if let Some(f) = fence {
+            return Err(rejected(StorageError::StoreState(format!(
+                "writes fenced: {}",
+                f.why
+            ))));
+        }
+        let mut pages = Vec::new();
+        first_key_under(self, cur.root, 0, &mut pages).map_err(rejected)?;
+        pages.sort_by_key(|(page, _)| std::cmp::Reverse(*page));
+        let Some(generation) = cur.generation.checked_add(1) else {
+            return Err(rejected(StorageError::InvalidRequest(
+                "generation counter exhausted".into(),
+            )));
+        };
+        let budget_pages = usize::try_from(budget.max_pages).unwrap_or(usize::MAX);
+        let mut n = pages.len().min(budget_pages);
+        while n > 0 {
+            let chosen = &pages[..n];
+            let below = chosen[n - 1].0;
+            let mut txn = TreeTxn::new(self, cur.root);
+            for (_, key) in chosen {
+                // Writing a record back unchanged rewrites every page on its path.
+                let value = txn
+                    .get(key)
+                    .map_err(rejected)?
+                    .ok_or_else(|| rejected(corrupt("a tree page's first key is missing")))?;
+                txn.put(key.clone(), value).map_err(rejected)?;
+            }
+            if let Some((desc, discarded)) =
+                self.publish_below(&cur, txn, generation, cur.history_pos, None, Some(below))?
+            {
+                self.adopt(desc, &[], &discarded);
+                return Ok(MaintenanceReport {
+                    pages_moved: n as u64,
+                    ..report(generation, 0, n == pages.len())
+                });
+            }
+            n /= 2;
+        }
+        // Nothing could move: complete unless the budget allowed no page at all.
+        Ok(report(
+            cur.generation,
+            0,
+            pages.is_empty() || budget_pages > 0,
+        ))
+    }
+
     /// Makes a maintenance generation current. `retired` content extents it recorded, and the
     /// discarded extents its publication retired, become reusable under the ordinary rule.
     fn adopt(&self, desc: Descriptor, retired: &[(u64, u64)], discarded: &[(u64, u64)]) {
@@ -462,6 +535,34 @@ struct Move {
     /// Its reservations, as positions in the step's reservation list.
     takes: std::ops::Range<usize>,
     bytes: u64,
+}
+
+/// Lists every page of the tree under `at` with the smallest key below it into `out`, and returns
+/// that key for `at` (none for an empty leaf, whose page is not listed).
+fn first_key_under(
+    src: &Inner,
+    at: PageRef,
+    depth: usize,
+    out: &mut Vec<(u64, Vec<u8>)>,
+) -> Result<Option<Vec<u8>>, StorageError> {
+    if depth >= MAX_HEIGHT {
+        return Err(corrupt("tree deeper than the supported maximum"));
+    }
+    let first = match &*src.load(at)? {
+        Node::Leaf(entries) => entries.keys().next().cloned(),
+        Node::Branch { children, .. } => {
+            let mut first = None;
+            for child in children {
+                let f = first_key_under(src, *child, depth + 1, out)?;
+                first = first.or(f);
+            }
+            first
+        }
+    };
+    if let Some(k) = &first {
+        out.push((at.page, k.clone()));
+    }
+    Ok(first)
 }
 
 /// Returns reservations taken since `mark` to the pool.
