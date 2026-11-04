@@ -1,0 +1,99 @@
+name: Jev drift analysis
+
+on:
+  workflow_run:
+    workflows: [rust, drift-input, leak-guard]
+    types: [completed]
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: 'Existing candidate commit (empty selects default branch)'
+        type: string
+        required: false
+      force:
+        description: 'Explicitly repeat previously reserved provider requests'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+  checks: write
+
+# Serialize consumers across event types; scheduled rechecks resolve their candidate at runtime.
+concurrency:
+  group: jev-drift-consumer
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    name: Trusted drift analysis
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       github.event.workflow_run.conclusion != 'skipped') ||
+      (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)
+      || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted analysis code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          sparse-checkout: tools/ci
+          persist-credentials: false
+      - name: Identify trusted code
+        run: printf 'JEV_TRUSTED_SHA=%s\n' "$(git -C trusted rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Collect candidate evidence as data
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRIFT_HEAD_SHA: ${{ inputs.head_sha }}
+          DRIFT_FORCE: ${{ inputs.force }}
+          DRIFT_PROVIDER_CONFIGURED: ${{ secrets.TYPESAFE_API_KEY != '' }}
+          DRIFT_DATA_REPOSITORY: ${{ secrets.DRIFT_DATA_REPOSITORY }}
+          DRIFT_DATA_TOKEN: ${{ secrets.DRIFT_DATA_TOKEN }}
+          DRIFT_DATA_FILES: ${{ secrets.DRIFT_DATA_FILES }}
+          DRIFT_DATA_REQUIRED: ${{ vars.DRIFT_DATA_REQUIRED }}
+        run: python3 -I trusted/tools/ci/drift_runner.py collect --out "$RUNNER_TEMP/drift"
+      - name: Reserve bounded provider work
+        id: reserve
+        if: steps.collect.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: drift-reservation
+          path: ${{ runner.temp }}/drift/public/reservation.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Ask Jev focused drift questions
+        if: steps.collect.outcome == 'success' && steps.reserve.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: python3 -I trusted/tools/ci/drift_runner.py diagnose --out "$RUNNER_TEMP/drift"
+      - name: Publish candidate contract result
+        if: always() && steps.collect.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I trusted/tools/ci/drift_runner.py publish --out "$RUNNER_TEMP/drift"
+      - name: Preserve public results only
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: drift-state
+          path: ${{ runner.temp }}/drift/public/state.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve public summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: drift-summary
+          path: ${{ runner.temp }}/drift/public/summary.md
+          if-no-files-found: warn
+          retention-days: 14
