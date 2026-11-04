@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use cce_core::storage::{
@@ -135,6 +135,8 @@ pub(crate) struct Inner {
     worker: Mutex<Option<mpsc::SyncSender<Job>>>,
     /// Attempts admitted to the worker and not yet resolved.
     pending: Recorded<HashMap<AttemptId, u32>>,
+    /// Set (under the `pending` lock) once `close` began: new commits are refused from then on.
+    closing: AtomicBool,
     #[cfg(test)]
     gate: Mutex<()>,
     /// Makes the next commit panic inside the worker (tests of worker robustness only).
@@ -404,6 +406,7 @@ impl Inner {
             }),
             worker: Mutex::new(None),
             pending: Recorded::new("pending", HashMap::new()),
+            closing: AtomicBool::new(false),
             #[cfg(test)]
             gate: Mutex::new(()),
             #[cfg(test)]
@@ -484,7 +487,17 @@ impl Inner {
         let tx = lock(&self.worker).clone().ok_or_else(|| {
             rejected(StorageError::StoreState("commit worker not running".into()))
         })?;
-        *lock(&self.pending).entry(attempt.clone()).or_default() += 1;
+        {
+            // Checked under the same lock `close` sets it under, so `close` never misses an
+            // admission that raced with it.
+            let mut pending = lock(&self.pending);
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(rejected(StorageError::StoreState(
+                    "store is closing; no new commits are admitted".into(),
+                )));
+            }
+            *pending.entry(attempt.clone()).or_default() += 1;
+        }
         let job = Job {
             inner: self.clone(),
             attempt: attempt.clone(),
@@ -950,7 +963,16 @@ impl Inner {
         )
     }
 
+    /// Stops admitting commits, waits until every admitted commit has resolved (published,
+    /// refused or failed), then returns. Reads stay available on existing handles.
     pub fn close(&self) -> Result<(), StorageError> {
+        {
+            let _pending = lock(&self.pending);
+            self.closing.store(true, Ordering::SeqCst);
+        }
+        while !lock(&self.pending).is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let _w = lock(&self.writer);
         Ok(())
     }
