@@ -421,8 +421,7 @@ pub struct SpaceReport {
     /// Retired content-file bytes, by whether the reuse rule allows taking them now. The split is by
     /// rule only: "reusable" also counts retired space a staging or a maintenance step currently holds
     /// or is taking, which is not free to take until that staging is committed or discarded or that
-    /// step ends (see `reusable_content_bytes`
-    /// in `StoreStats` for what is free now).
+    /// step ends (see `reusable_content_bytes` in `StoreStats` for what is free now).
     pub retired_content_bytes_protected: u64,
     pub retired_content_bytes_reusable: u64,
     /// Sizes of the two store files.
