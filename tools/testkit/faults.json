@@ -1,0 +1,91 @@
+[
+  {
+    "id": "short-read",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "buf = &mut buf[n..];",
+    "new": "let len = buf.len();\n                buf = &mut buf[len..];",
+    "test": "fs_seam_tests::interrupted_and_short_transfers_still_write_and_read_every_byte",
+    "witness": "crates/cce-storage/src/fs_seam_tests.rs"
+  },
+  {
+    "id": "short-write",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "data = &data[n..];",
+    "new": "data = &data[data.len()..];",
+    "test": "fs_seam_tests::interrupted_and_short_transfers_still_write_and_read_every_byte",
+    "witness": "crates/cce-storage/src/fs_seam_tests.rs",
+    "success_expectation": {
+      "line": "io.read_at(FileId::Content, 4096, &mut got).unwrap();",
+      "contract": "A write that reports success must leave every byte readable."
+    }
+  },
+  {
+    "id": "read-error",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "Err(e) => return Err(e),\n        }\n    }\n    Ok(())\n}\n\n/// Writes",
+    "new": "Err(_) => return Ok(()),\n        }\n    }\n    Ok(())\n}\n\n/// Writes",
+    "test": "fs_seam_tests::a_permanent_read_error_is_reported_and_not_retried",
+    "witness": "crates/cce-storage/src/fs_seam_tests.rs",
+    "refusal": "other => panic!"
+  },
+  {
+    "id": "zero-write",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "Ok(0) => return Err(ErrorKind::WriteZero.into()),",
+    "new": "Ok(0) => return Ok(()),",
+    "test": "fs_seam_tests::a_transfer_that_makes_no_progress_fails_instead_of_looping_or_succeeding",
+    "witness": "crates/cce-storage/src/fs_seam_tests.rs"
+  },
+  {
+    "id": "sync-retry",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "match self.faults.decide(self.id, Call::Sync, 0) {\n            Some(Fault::Interrupted) => return Err(ErrorKind::Interrupted.into()),",
+    "new": "match self.faults.decide(self.id, Call::Sync, 0) {\n            Some(Fault::Interrupted) => return self.file.fsync(),",
+    "test": "fs_seam_tests::an_interrupted_sync_is_reported_not_retried",
+    "witness": "crates/cce-storage/src/fs_seam_tests.rs"
+  },
+  {
+    "id": "data-fence",
+    "path": "crates/cce-storage/src/engine.rs",
+    "old": "lock(&self.state).fenced = Some(Fence {\n                why: format!(\"data barrier failed: {e}\"),\n                uncertain: None,\n            });",
+    "new": "let _ = &e;",
+    "test": "engine_tests::a_failed_data_barrier_fences_writes",
+    "witness": "crates/cce-storage/src/engine_tests.rs"
+  },
+  {
+    "id": "content-integrity",
+    "path": "crates/cce-storage/src/engine.rs",
+    "old": "if sha256(&self.buf) != x.digest {",
+    "new": "if false && sha256(&self.buf) != x.digest {",
+    "test": "content_tests::a_damaged_segment_is_reported_before_any_of_its_bytes_are_delivered",
+    "witness": "crates/cce-storage/src/content_tests.rs"
+  },
+  {
+    "id": "attempt-mismatch",
+    "path": "crates/cce-storage/src/engine.rs",
+    "old": "return if prior.fingerprint == fp {",
+    "new": "return if prior.fingerprint == fp || true {",
+    "test": "attempt_tests::a_reused_attempt_id_returns_the_original_receipt_or_a_mismatch_before_and_after_reopen",
+    "witness": "crates/cce-storage/src/attempt_tests.rs"
+  },
+  {
+    "id": "relationship-incoming",
+    "path": "crates/cce-storage/src/engine.rs",
+    "old": "t.put(v.in_key(id.as_bytes()), Vec::new())\n                    .map_err(rejected)?;",
+    "new": "let _ = v.in_key(id.as_bytes());",
+    "test": "committed_bundle_survives_writer_kill_and_fresh_process_reopen",
+    "target": "native_storage_e2e",
+    "witness": "crates/cce-storage/tests/native_storage_e2e.rs"
+  },
+  {
+    "id": "driver-timeout",
+    "scope": "test-helper",
+    "path": "crates/cce-storage/tests/common/mod.rs",
+    "old": "Err(RecvTimeoutError::Timeout) => return Step::Hung { lines },",
+    "new": "Err(RecvTimeoutError::Timeout) => return Step::Answered(lines),",
+    "count": 2,
+    "test": "harness_distinguishes_answer_exit_and_hang",
+    "target": "native_storage_e2e",
+    "witness": "crates/cce-storage/tests/native_storage_e2e.rs"
+  }
+]

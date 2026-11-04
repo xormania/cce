@@ -177,10 +177,10 @@ pub(crate) fn reach(io: &dyn Io, d: &Descriptor) -> Result<Reach, StorageError> 
 }
 
 /// Checks the retirement records of the newest published state against what the states reach:
-/// no retired page is reachable, every retirement lies inside the state, and when the other slot
-/// holds the directly preceding generation, the pages retired by the newest commit are exactly the
-/// pages the preceding state reached and the newest no longer does, while older records carry over
-/// unchanged.
+/// no retired page or content extent is reachable, every retirement lies inside the state, and
+/// when the other slot holds the directly preceding generation, the pages retired by the newest
+/// commit are exactly the pages the preceding state reached and the newest no longer does, while
+/// older records carry over unchanged.
 pub(crate) fn check_retirement(io: &dyn Io) -> Result<(), String> {
     let e = |x: StorageError| x.to_string();
     let slots = published(io).map_err(e)?;
@@ -191,6 +191,25 @@ pub(crate) fn check_retirement(io: &dyn Io) -> Result<(), String> {
             "generation {}: overlapping extents",
             cur.generation
         ));
+    }
+    let reached: Vec<(u64, u64)> = rc
+        .manifests
+        .iter()
+        .chain(&rc.content_segments)
+        .chain(&rc.history_extents)
+        .copied()
+        .collect();
+    for (offset, (generation, len)) in &rc.retired_extents {
+        if reached
+            .iter()
+            .any(|(o, l)| *offset < o + l && *o < offset + len)
+        {
+            return Err(format!(
+                "generation {}: retired content extent {offset}+{len} (retired at {generation}) \
+                 is reachable",
+                cur.generation
+            ));
+        }
     }
     for (page, (generation, _)) in &rc.retired {
         if rc.pages.contains(page) {

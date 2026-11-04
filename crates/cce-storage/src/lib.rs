@@ -40,11 +40,15 @@ mod recovery_tests;
 #[cfg(test)]
 mod repro_tests;
 #[cfg(test)]
+mod resource_tests;
+#[cfg(test)]
 mod reuse_tests;
 #[cfg(test)]
 mod sim;
 #[cfg(test)]
 mod split_sweep_tests;
+#[cfg(test)]
+mod test_support;
 mod tree;
 #[cfg(test)]
 mod tree_reopen_tests;

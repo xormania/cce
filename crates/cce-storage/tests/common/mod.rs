@@ -4,7 +4,6 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -18,43 +17,8 @@ pub const DRIVER: &str = env!("CARGO_BIN_EXE_storage-driver");
 /// Deadline for a single driver step; identifies hangs, never arranges interleavings.
 pub const STEP_DEADLINE: Duration = Duration::from_secs(30);
 
-/// A fresh, empty directory for one test, outside any store and outside the build directory.
-/// Removed when the test passes; kept (and its path printed) when the test fails, so a failing
-/// store can be inspected. Declare it before any driver so it is dropped after the drivers exit.
-pub fn test_dir(name: &str) -> TestDir {
-    let dir = std::env::temp_dir()
-        .join("cce-e2e")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create test dir");
-    TestDir(dir)
-}
-
-/// Owns a test directory; see [`test_dir`].
-pub struct TestDir(PathBuf);
-
-impl std::ops::Deref for TestDir {
-    type Target = Path;
-    fn deref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl AsRef<Path> for TestDir {
-    fn as_ref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            eprintln!("test directory kept for inspection: {}", self.0.display());
-        } else {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-}
+pub mod resources;
+pub use resources::test_dir;
 
 /// How a driver step ended.
 #[derive(Debug, PartialEq, Eq)]
