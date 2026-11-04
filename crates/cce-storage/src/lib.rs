@@ -21,6 +21,8 @@ mod engine_tests;
 mod format;
 mod io;
 #[cfg(test)]
+mod quiescence_tests;
+#[cfg(test)]
 mod reader_race_tests;
 #[cfg(test)]
 mod readonly_tests;

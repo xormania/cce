@@ -160,6 +160,26 @@ pub struct ChangeSet {
     pub content: Vec<ContentBinding>,
     /// Supplied decision evidence recorded with this change, in order.
     pub evidence: Vec<Evidence>,
+    /// How this commit treats live views and content readers. Part of the request: an attempt
+    /// retried with a different mode is a different request.
+    pub removal: RemovalMode,
+}
+
+/// How a commit that removes or replaces records treats views and content readers that may still
+/// read the state it replaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RemovalMode {
+    /// Existing views and content readers keep reading their state; storage reuses the space the
+    /// commit retires only after they are gone.
+    #[default]
+    PreserveViews,
+    /// Commit only while no other view or content reader of the store is live. Otherwise nothing
+    /// is committed and the commit fails with [`CommitError::ReadersActive`]; once those readers
+    /// are gone, the same request can be prepared and committed. The mode applies to every commit
+    /// that carries it, whether or not it removes anything. The check is store-wide: it counts
+    /// every live view and reader of the owning process, not only those that could reach a
+    /// removed record (no other process can hold the store open while it is owned).
+    RequireQuiescence,
 }
 
 /// A staged content item bound into a change set.
@@ -298,6 +318,9 @@ pub enum CommitError {
     Rejected(StorageError),
     /// The outcome cannot be established now; reconcile with [`StorageEngine::outcome`].
     Indeterminate(String),
+    /// [`RemovalMode::RequireQuiescence`] and other views or content readers are live; nothing
+    /// committed. The message says how many.
+    ReadersActive(String),
 }
 
 impl fmt::Display for CommitError {

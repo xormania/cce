@@ -81,6 +81,7 @@ fn request(s: &NativeStore, v: Variant) -> ChangeSet {
                 _ => b"evidence".to_vec(),
             },
         }],
+        ..ChangeSet::default()
     }
 }
 
@@ -284,6 +285,7 @@ fn step_request(s: &NativeStore, step: u32) -> Option<ChangeSet> {
             label: b"decision".to_vec(),
             bytes: format!("evidence {step}").into_bytes(),
         }],
+        ..ChangeSet::default()
     })
 }
 

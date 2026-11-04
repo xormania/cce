@@ -13,13 +13,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
     ContentReader, ContentRef, ContextId, ContextRecord, Direction, HistoryEntry, HistoryPosition,
-    Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery, Revision,
-    StagedContent, StagingToken, StorageError,
+    Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery, RemovalMode,
+    Revision, StagedContent, StagingToken, StorageError,
 };
 use sha2::{Digest, Sha256};
 
@@ -107,6 +107,9 @@ struct State {
     next_stage: u64,
     /// Set when durability became uncertain; further writes are refused until reopen.
     fenced: Option<Fence>,
+    /// A commit requiring quiescence is in progress: views register only after it ends, and so
+    /// read the state it publishes.
+    quiescing: bool,
 }
 
 /// Why writes are fenced, and which attempt (if any) has an unknown publication outcome.
@@ -147,6 +150,8 @@ pub(crate) struct Inner {
     /// Live reader pins: committed generation -> number of views and content readers reading it.
     /// Space a pinned generation can reach must not be reused.
     pins: Mutex<BTreeMap<u64, u32>>,
+    /// Signalled when a quiescent commit ends.
+    quiesced: Condvar,
     #[cfg(test)]
     gate: Mutex<()>,
     /// Makes the next commit panic inside the worker (tests of worker robustness only).
@@ -156,6 +161,9 @@ pub(crate) struct Inner {
     /// takes any (tests forcing reader registration against that decision).
     #[cfg(test)]
     reuse_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// View registrations currently waiting for a quiescent commit (tests of that interleaving).
+    #[cfg(test)]
+    waiting_registrations: std::sync::atomic::AtomicUsize,
     /// Makes the worker pause after answering each job (tests of shutdown ordering only).
     #[cfg(test)]
     slow_job_release: std::sync::atomic::AtomicBool,
@@ -262,6 +270,19 @@ fn finish_pending(pending: &Recorded<HashMap<AttemptId, u32>>, attempt: &Attempt
 
 fn rejected(e: StorageError) -> CommitError {
     CommitError::Rejected(e)
+}
+
+/// Ends a quiescent commit when dropped (after its publication, or on any failure): views may
+/// register again.
+struct Quiescing<'a> {
+    inner: &'a Inner,
+}
+
+impl Drop for Quiescing<'_> {
+    fn drop(&mut self) {
+        lock(&self.inner.state).quiescing = false;
+        self.inner.quiesced.notify_all();
+    }
 }
 
 /// One retired content extent a staging took for reuse: it writes `used` bytes at its start.
@@ -487,6 +508,7 @@ impl Inner {
                     staged: HashMap::new(),
                     next_stage: 1,
                     fenced: None,
+                    quiescing: false,
                 },
             ),
             writer: Mutex::new(()),
@@ -499,12 +521,15 @@ impl Inner {
             pending: Arc::new(Recorded::new("pending", HashMap::new())),
             closing: AtomicBool::new(false),
             pins: Mutex::new(BTreeMap::new()),
+            quiesced: Condvar::new(),
             #[cfg(test)]
             gate: Mutex::new(()),
             #[cfg(test)]
             panic_next_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             reuse_hook: Mutex::new(None),
+            #[cfg(test)]
+            waiting_registrations: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             slow_job_release: std::sync::atomic::AtomicBool::new(false),
             conflicts: Mutex::new(ConflictLog {
@@ -546,6 +571,12 @@ impl Inner {
         hook: Option<Box<dyn FnOnce() + Send>>,
     ) -> Option<Box<dyn FnOnce() + Send>> {
         std::mem::replace(&mut *lock(&self.reuse_hook), hook)
+    }
+
+    /// How many view registrations are waiting for a quiescent commit to publish.
+    #[cfg(test)]
+    pub(crate) fn waiting_registrations_for_test(&self) -> &std::sync::atomic::AtomicUsize {
+        &self.waiting_registrations
     }
 
     /// The content-file extents `(offset, len)` of a staging issued by this instance: its
@@ -683,7 +714,18 @@ impl Inner {
     /// The current committed state, pinned: the pin is registered under the same lock that reads
     /// the current state, so no publication can slip between choosing the generation and pinning it.
     pub(crate) fn pin_current(self: &Arc<Self>) -> Result<(Snapshot, Pin), StorageError> {
-        let st = lock(&self.state);
+        let mut st = lock(&self.state);
+        // Never register on a state a quiescent commit is about to replace.
+        while st.quiescing {
+            #[cfg(test)]
+            self.waiting_registrations.fetch_add(1, Ordering::SeqCst);
+            st = self
+                .quiesced
+                .wait(st)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            #[cfg(test)]
+            self.waiting_registrations.fetch_sub(1, Ordering::SeqCst);
+        }
         let desc = st.current;
         *lock(&self.pins).entry(desc.generation).or_default() += 1;
         drop(st);
@@ -980,6 +1022,24 @@ impl Inner {
                 f.why
             ))));
         }
+
+        // Requiring quiescence: refuse, before writing anything, while any view or content
+        // reader is live (the request's own basis view was consumed at admission and is not).
+        // Otherwise keep new views from registering until this commit ends.
+        let _quiescing = if cs.removal == RemovalMode::RequireQuiescence {
+            let mut st = lock(&self.state);
+            let live: u64 = lock(&self.pins).values().map(|n| u64::from(*n)).sum();
+            if live > 0 {
+                return Err(CommitError::ReadersActive(format!(
+                    "{live} view or content reader{} live",
+                    if live == 1 { " is" } else { "s are" }
+                )));
+            }
+            st.quiescing = true;
+            Some(Quiescing { inner: self })
+        } else {
+            None
+        };
 
         // The basis must still hold: nothing it observed may have been written since.
         lock(&self.conflicts).validate(basis.desc.history_pos, observed)?;

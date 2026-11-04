@@ -210,6 +210,23 @@ attempt outcomes.
 The lock is an advisory `flock` lock: it excludes processes that use this engine, on local
 filesystems. Network filesystems may not provide it.
 
+## Removal and live readers
+
+A commit chooses how it treats views and content readers that may still read the state it
+replaces (`ChangeSet::removal`):
+
+- `PreserveViews` (the default): existing views and readers keep reading their state; the space the
+  commit retires is reused only after they are gone.
+- `RequireQuiescence`: before writing anything, the commit counts the live views and content
+  readers of the store. If there are any, it fails with `ReadersActive` (the message gives the
+  count only) and nothing changes: no write or sync, no published state, the attempt stays absent,
+  and its staged content stays bound to its handles for a retry. The request's own basis view is
+  consumed when the commit is admitted and is not counted; a content reader opened from it before
+  that still is. While such a commit runs, new views wait and then read the state it published (or,
+  if it failed, the unchanged state); reads through existing handles are unaffected. The count is
+  store-wide and covers this process only: no other process can hold the store open, read-write or
+  read-only, while it is owned.
+
 ## Readers and content integrity
 
 When the last record using some content is removed or replaced, retained history still names the

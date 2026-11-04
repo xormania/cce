@@ -1080,6 +1080,7 @@ fn the_computed_request_length_matches_the_encoding_for_every_change_shape() {
                                     bytes: vec![3; n],
                                 })
                                 .collect(),
+                            ..ChangeSet::default()
                         };
                         assert_eq!(
                             encoded_request_len(&cs),

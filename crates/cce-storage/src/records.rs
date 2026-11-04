@@ -16,7 +16,8 @@
 
 use cce_core::storage::{
     AttemptId, Change, ChangeSet, ContentDigest, ContentRef, ContextId, Evidence, HistoryEntry,
-    HistoryPosition, Precondition, RelationshipId, RelationshipKind, Revision, StorageError,
+    HistoryPosition, Precondition, RelationshipId, RelationshipKind, RemovalMode, Revision,
+    StorageError,
 };
 use sha2::{Digest, Sha256};
 
@@ -37,8 +38,10 @@ pub(crate) const RETIRED_PAGE: u8 = 0;
 /// Kind byte of a retired content-file extent in a retirement key.
 pub(crate) const RETIRED_EXTENT: u8 = 1;
 
-/// Version tag of the canonical request encoding used for attempt fingerprints.
+/// Version tags of the canonical request encoding used for attempt fingerprints. Version 2 ends
+/// with the removal mode; version 1 (no mode, read as preserving views) is still decoded.
 const REQUEST_ENCODING_V1: u8 = 1;
+const REQUEST_ENCODING_V2: u8 = 2;
 
 pub(crate) fn key(prefix: u8, parts: &[&[u8]]) -> Vec<u8> {
     let mut k = vec![prefix];
@@ -325,7 +328,7 @@ fn dec_id<T>(d: &mut Dec, f: fn(Vec<u8>) -> Result<T, StorageError>) -> Result<T
 /// logical request restaged elsewhere has the same encoding.
 pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
     let mut e = Enc::default();
-    e.u8(REQUEST_ENCODING_V1);
+    e.u8(REQUEST_ENCODING_V2);
     e.u32(changes.changes.len() as u32);
     for c in &changes.changes {
         match c {
@@ -374,6 +377,10 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
     for ev in &changes.evidence {
         e.bytes(&ev.label).bytes(&ev.bytes);
     }
+    e.u8(match changes.removal {
+        RemovalMode::PreserveViews => 0,
+        RemovalMode::RequireQuiescence => 1,
+    });
     debug_assert_eq!(e.buf.len() as u64, encoded_request_len(changes));
     e.buf
 }
@@ -421,7 +428,7 @@ pub(crate) fn encoded_request_len(changes: &ChangeSet) -> u64 {
     for ev in &changes.evidence {
         n += field(ev.label.len()) + field(ev.bytes.len());
     }
-    n
+    n + 1
 }
 
 /// Checks that every variable-length field and list of a request fits the encoding's 32-bit length
@@ -490,7 +497,8 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
     let req = d.bytes()?;
     d.finish()?;
     let mut d = Dec::new(req, "history request");
-    if d.u8()? != REQUEST_ENCODING_V1 {
+    let version = d.u8()?;
+    if version != REQUEST_ENCODING_V1 && version != REQUEST_ENCODING_V2 {
         return Err(StorageError::Unsupported("history request encoding".into()));
     }
     let n = d.count(2)?;
@@ -555,6 +563,9 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
             bytes: d.bytes()?.to_vec(),
         });
     }
+    if version == REQUEST_ENCODING_V2 && d.u8()? > 1 {
+        return Err(corrupt("history request removal mode"));
+    }
     d.finish()?;
     Ok(HistoryEntry {
         position,
@@ -598,6 +609,7 @@ mod tests {
                 label: b"l".to_vec(),
                 bytes: b"\x00e".to_vec(),
             }],
+            ..ChangeSet::default()
         }
     }
 

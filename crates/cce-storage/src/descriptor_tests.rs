@@ -53,6 +53,7 @@ fn commit_step(s: &NativeStore, step: u32) {
             label: b"decision".to_vec(),
             bytes: format!("evidence {step}").into_bytes(),
         }],
+        ..ChangeSet::default()
     };
     let r = s
         .commit(step_attempt(step), s.begin().unwrap(), cs)
