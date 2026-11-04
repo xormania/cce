@@ -27,6 +27,37 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Locate flagged additions without printing matches
+        env:
+          MARKERS: ${{ secrets.PRIVATE_MARKERS }}
+          BASE_REF: ${{ inputs.original || 'origin/master' }}
+          HEAD_REF: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          def pinned(ref):
+              return subprocess.check_output(["git", "rev-parse", "--verify", "--end-of-options", ref + "^{commit}"], text=True).strip()
+          base, head = pinned(os.environ["BASE_REF"]), pinned(os.environ["HEAD_REF"])
+          diff = subprocess.check_output(["git", "diff", "--text", "--no-ext-diff", "--no-textconv", "--unified=0", base + "..." + head, "--"], text=True)
+          additions, locations, path, line = [], [], "", 0
+          for row in diff.splitlines():
+              if row.startswith("+++ b/"):
+                  path = row[6:]
+              elif row.startswith("@@ "):
+                  line = int(re.search(r"\+(\d+)", row)[1])
+              elif row.startswith("+") and not row.startswith("+++"):
+                  additions.append(row[1:])
+                  locations.append({"path": path, "line": line})
+                  line += 1
+              elif row.startswith(" "):
+                  line += 1
+          if not os.environ.get("MARKERS"):
+              raise SystemExit("Scan patterns unavailable")
+          scan = subprocess.run(["grep", "-nEi", "--", os.environ["MARKERS"]], input="\n".join(additions) + "\n", text=True, capture_output=True)
+          if scan.returncode not in (0, 1):
+              raise SystemExit("Unable to scan additions")
+          print(json.dumps([locations[int(row.split(":", 1)[0]) - 1] for row in scan.stdout.splitlines()]))
+          PY
       - name: Tooling controls
         run: python3 -m unittest discover -s tests/ci -v
       - name: Toolchain
