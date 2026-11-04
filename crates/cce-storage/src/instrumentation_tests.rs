@@ -431,3 +431,43 @@ fn a_reader_that_fails_a_segment_read_frees_its_buffer() {
     drop(r);
     assert_eq!(stats(&s).content_buffer_bytes, 0);
 }
+
+#[test]
+fn a_reader_that_finds_a_damaged_segment_frees_its_buffer() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    let data: Vec<u8> = (0..2 * CONTENT_CHUNK).map(|i| (i % 251) as u8).collect();
+    let staged = s.stage_content(&mut &data[..]).unwrap();
+    commit(
+        &s,
+        "c",
+        vec![put("C", b"c".to_vec(), Some(0))],
+        vec![ContentBinding::from(&staged)],
+    );
+    let c = staged.content;
+    drop(staged);
+    let segs = s
+        .inner
+        .content_segments(&s.inner.snapshot().unwrap(), &c)
+        .unwrap();
+
+    let mut v = s.begin().unwrap();
+    let mut r = v.content(&c).unwrap();
+    let mut first = vec![0u8; CONTENT_CHUNK];
+    r.read_exact(&mut first).unwrap();
+    assert_eq!(stats(&s).content_buffer_bytes, CONTENT_CHUNK as u64);
+    // Flip one byte inside the second segment before the reader reaches it.
+    let target = segs[1].offset + 100;
+    let mut b = [0u8];
+    sim.read_at(FileId::Content, target, &mut b).unwrap();
+    sim.write_at(FileId::Content, target, &[b[0] ^ 0xff])
+        .unwrap();
+    let mut one = [0u8; 1];
+    let err = r.read(&mut one).unwrap_err();
+    assert!(err.to_string().contains("digest mismatch"), "{err}");
+    assert_eq!(
+        stats(&s).content_buffer_bytes,
+        0,
+        "a reader that failed a segment's check holds no buffer"
+    );
+}

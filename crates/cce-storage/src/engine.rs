@@ -3040,6 +3040,10 @@ impl Read for SegmentReader {
                 if got != self.manifest.content.digest.0 {
                     let why = "content stream digest mismatch".to_string();
                     self.failed = Some(why.clone());
+                    // A failed reader holds no buffer.
+                    self.buf = Vec::new();
+                    self.account();
+                    self.pos = 0;
                     return Err(io::Error::new(io::ErrorKind::InvalidData, why));
                 }
                 return Ok(0);
