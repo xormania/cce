@@ -2141,7 +2141,6 @@ impl Inner {
         (s == self.store.0 && inst == self.instance).then_some(serial)
     }
 
-    /// Total length of retired content extents no staging holds.
     /// Space use of the current state (see `SpaceReport`): a walk of a pinned snapshot, holding no
     /// lock across it. Retirements are split by the reuse rule as of that snapshot.
     pub(crate) fn space_report(self: &Arc<Self>) -> Result<crate::SpaceReport, StorageError> {
@@ -2190,6 +2189,7 @@ impl Inner {
         Ok(r)
     }
 
+    /// Total length of retired content extents no staging holds.
     pub fn reusable_content_bytes(&self) -> u64 {
         lock(&self.pool).free_bytes()
     }
