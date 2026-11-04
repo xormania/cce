@@ -12,6 +12,7 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 pub struct TestDir {
     path: PathBuf,
     retained: bool,
+    keep_on_unwind: bool,
 }
 
 impl TestDir {
@@ -28,6 +29,23 @@ impl TestDir {
     pub fn retain(&mut self) {
         self.retained = true;
     }
+
+    /// Remove the directory even if this scope unwinds (for failures that are expected).
+    pub fn discard_on_unwind(&mut self) {
+        self.keep_on_unwind = false;
+    }
+
+    /// Keep the directory if this scope unwinds, whatever `CCE_KEEP_FAILED_TEST_DIRS` says.
+    pub fn keep_on_unwind(&mut self) {
+        self.keep_on_unwind = true;
+    }
+}
+
+/// Whether a directory is kept when its test unwinds: yes unless `CCE_KEEP_FAILED_TEST_DIRS=0`,
+/// which high-volume runs that fail on purpose (fault-injection campaigns) set to avoid leaving
+/// one directory behind per expected failure.
+fn keep_failed_dirs() -> bool {
+    std::env::var_os("CCE_KEEP_FAILED_TEST_DIRS").is_none_or(|v| v != "0")
 }
 
 pub(crate) fn allocate(
@@ -49,6 +67,7 @@ pub(crate) fn allocate(
                 return Ok(TestDir {
                     path,
                     retained: false,
+                    keep_on_unwind: keep_failed_dirs(),
                 });
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -72,7 +91,7 @@ impl AsRef<Path> for TestDir {
 
 impl Drop for TestDir {
     fn drop(&mut self) {
-        if self.retained || std::thread::panicking() {
+        if self.retained || (self.keep_on_unwind && std::thread::panicking()) {
             eprintln!(
                 "test directory kept for inspection: {}",
                 self.path.display()
