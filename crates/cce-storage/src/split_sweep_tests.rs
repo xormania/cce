@@ -3,6 +3,8 @@
 //! the root back to a leaf. Each starts from a compact deterministic store just before the event;
 //! the probe proves on the real engine that the commit causes it.
 
+use crate::test_support::{create_on, open_on};
+
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::{
@@ -11,7 +13,6 @@ use cce_core::storage::{
 };
 
 use crate::NativeStore;
-use crate::engine::Inner;
 use crate::format::{PageRef, StoreId};
 use crate::io::{Io, Op, Traced};
 use crate::repro_tests::{PROCESS_EXIT, survival, with_repro};
@@ -35,9 +36,7 @@ fn create(sim: &SimIo, trace: &Trace) -> NativeStore {
         inner: sim.clone(),
         trace: trace.clone(),
     });
-    NativeStore {
-        inner: Inner::create(io, STORE, Default::default()).unwrap(),
-    }
+    create_on(io, STORE, Default::default()).unwrap()
 }
 
 /// Step `i` of the fixture: record `i` with a large body, in a commit of its own.
@@ -190,9 +189,7 @@ fn sweep(case: &Case, event: impl Fn(&[usize], &[usize]) -> bool) {
             let label = format!("{} cut {cut}, {survived}", case.name);
             let pristine = img.after_process_exit();
             with_repro(&label, &[("image", &pristine)], &trace, || {
-                let rec = NativeStore {
-                    inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
-                };
+                let rec = open_on(Box::new(img.clone()), Default::default()).unwrap();
                 let got = logical_state(&rec, case.records);
                 assert!(
                     got == old || got == new,
@@ -232,9 +229,7 @@ fn sweep(case: &Case, event: impl Fn(&[usize], &[usize]) -> bool) {
                 let later = logical_state(&rec, case.records);
                 drop(rec);
                 img.release();
-                let reopened = NativeStore {
-                    inner: Inner::open(Box::new(img), Default::default()).unwrap(),
-                };
+                let reopened = open_on(Box::new(img), Default::default()).unwrap();
                 assert_eq!(
                     logical_state(&reopened, case.records),
                     later,

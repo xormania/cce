@@ -1,0 +1,53 @@
+name: testkit
+
+on:
+  push:
+    branches: ['test-support/**']
+  workflow_dispatch:
+    inputs:
+      original:
+        description: Original suite ref (must have the same production inputs)
+        default: origin/master
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testkit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  comparison:
+    name: Test suite fault comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tooling controls
+        run: python3 -m unittest discover -s tests/ci -v
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Compare healthy suites and calibrated faults
+        env:
+          ORIGINAL: ${{ inputs.original || 'origin/master' }}
+          CANDIDATE: ${{ github.sha }}
+        run: |
+          python3 tools/testkit/sidebyside.py \
+            --original "$ORIGINAL" --candidate "$CANDIDATE" \
+            --output "$RUNNER_TEMP/testkit-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Retain comparison logs and failure images
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: testkit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/testkit-*/results.json
+            ${{ runner.temp }}/testkit-*/comparison.md
+            ${{ runner.temp }}/testkit-*/*.log
+            ${{ runner.temp }}/testkit-*/temporary/
+          if-no-files-found: warn
+          retention-days: 7
