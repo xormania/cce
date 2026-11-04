@@ -163,6 +163,7 @@ const PUBLIC_ITEMS: &[&str] = &[
     "MaintenanceTask",
     "MaintenanceBudget",
     "MaintenanceReport",
+    "SpaceReport",
     "VerifyLevel",
     "Finding",
     "Report",

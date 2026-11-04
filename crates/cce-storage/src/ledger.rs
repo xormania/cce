@@ -185,7 +185,7 @@ impl ContentPool {
             .iter()
             .filter(|(offset, (len, retired_at))| {
                 *len >= need
-                    && *retired_at <= bound
+                    && crate::engine::may_reuse(*retired_at, Some(bound))
                     && below.is_none_or(|b| offset.checked_add(need).is_some_and(|end| end <= b))
             })
             .min_by_key(|(offset, (len, _))| (*len, **offset))

@@ -6,8 +6,9 @@ use cce_core::storage::{AttemptId, CommitError, StorageError};
 
 use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use super::{Fence, Inner, MaintenanceSpace, Reuse, Taken, lock, rejected, sha256};
+use super::{BufferHold, Fence, Inner, MaintenanceSpace, Reuse, Taken, lock, rejected, sha256};
 use crate::codec::{corrupt, key_components};
 use crate::format::PageRef;
 use crate::format::{Descriptor, PAGE_SIZE, PageKind, decode_page};
@@ -103,6 +104,7 @@ impl Inner {
                 )));
             }
             let mut page = vec![0; PAGE_SIZE];
+            self.counters.pages_read.fetch_add(1, Ordering::Relaxed);
             self.io
                 .read_at(FileId::Meta, at.page * PAGE_SIZE as u64, &mut page)?;
             match Node::decode(&decode_page(cur.store, PageKind::Node, at, &page)?)? {
@@ -472,6 +474,7 @@ impl Inner {
             // Copy one segment at a time, through the verified read.
             let mut segments = Vec::with_capacity(m.segments.len());
             for (s, &at) in m.segments.iter().zip(&placed) {
+                let _held = BufferHold::new(self, s.len);
                 let data = self
                     .read_extent(s, crate::records::SEGMENT_MAX, "content segment")
                     .map_err(rejected)?;
