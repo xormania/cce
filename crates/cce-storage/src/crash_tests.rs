@@ -281,10 +281,8 @@ fn filesystem_and_simulator_run_the_same_protocol() {
     });
 
     let fs_trace = Arc::new(Mutex::new(Vec::new()));
-    let dir = std::env::temp_dir().join(format!("cce-parity-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = crate::test_support::resources::test_dir("adapter-parity");
     let fs_state = scenario(&mut |_| traced(FsIo::new(&dir), &fs_trace));
-    let _ = std::fs::remove_dir_all(&dir);
 
     let (sim_logical, sim_receipts, sim_outcomes, sim_contents) = &sim_state;
     let (fs_logical, fs_receipts, fs_outcomes, fs_contents) = &fs_state;
