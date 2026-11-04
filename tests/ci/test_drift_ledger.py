@@ -124,6 +124,13 @@ class ReplayTests(unittest.TestCase):
         # Q4 has no answer: asking it is correct, not a finding.
         self.assertNotIn("Q4", [f["question"] for f in flagged])
 
+    def test_incidental_resolution_words_in_the_question_text_do_not_hide_it(self):
+        text = OBSOLETE_LIST.replace("**Options.**", "Only short runs were done so far.\n**Options.**", 1)
+        _, findings = view(BASE, {"q.md": text})
+        self.assertEqual([f["question"] for f in findings], ["Q1"])
+        marked = text.replace("**Options.**", "**Decided:** see the ledger.\n**Options.**", 1)
+        self.assertEqual(view(BASE, {"q.md": marked})[1], [])
+
     def test_healthy_list_marks_sections_as_history_and_points_at_the_ledger(self):
         healthy = OBSOLETE_LIST.replace("## 1. Read-only mode\n",
             "## 1. Read-only mode\n\n> Original question as asked (history). Current status: ledger `Q1`.\n")

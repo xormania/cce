@@ -37,6 +37,10 @@ QUESTION_REF = re.compile(r"\bQ(\d{1,4})\b")
 ASKED_HEADING = re.compile(r"#{2,3}\s+Q?(\d{1,4})[.:]\s")
 # A section marked as the original question kept for history is not a current status claim.
 HISTORY_MARK = re.compile(r"original question as asked", re.I)
+# Only an explicit resolution marker at the start of a line settles a whole section; an incidental
+# word such as "done" inside the question text does not.
+SECTION_RESOLVED = re.compile(r"^\s*(?:>\s*)?(?:\*\*)?(?:decided|resolved|answered|superseded|withdrawn)\b",
+                              re.I | re.M)
 ASKING = re.compile(r"\*\*(Options|Recommendation|Ask)\b|^(Options|Ask):", re.M)
 
 
@@ -235,7 +239,7 @@ def scan(model, view, documents):
             end = heads[k + 1][0] if k + 1 < len(heads) else len(lines)
             body = "\n".join(lines[start:end])
             qid = numbers[n]
-            if (qid in settled and ASKING.search(body) and not RESOLVED_WORDS.search(body)
+            if (qid in settled and ASKING.search(body) and not SECTION_RESOLVED.search(body)
                     and not HISTORY_MARK.search(body)):
                 findings.append({"code": "settled_question_presented_open", "question": qid,
                                  "answer": settled[qid], "path": path, "line": start + 1})
