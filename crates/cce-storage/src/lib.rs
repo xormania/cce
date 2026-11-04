@@ -6,6 +6,8 @@
 
 #[cfg(test)]
 mod attempt_tests;
+#[cfg(test)]
+mod bundle_tests;
 mod codec;
 #[cfg(test)]
 mod content_tests;
@@ -21,6 +23,8 @@ mod format;
 mod fs_seam_tests;
 mod io;
 #[cfg(test)]
+mod key_bounds_tests;
+#[cfg(test)]
 mod reader_race_tests;
 #[cfg(test)]
 mod readonly_tests;
@@ -31,6 +35,8 @@ mod recovery_tests;
 mod repro_tests;
 #[cfg(test)]
 mod sim;
+#[cfg(test)]
+mod split_sweep_tests;
 mod tree;
 #[cfg(test)]
 mod tree_reopen_tests;

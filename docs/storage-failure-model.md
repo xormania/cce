@@ -138,8 +138,12 @@ The tests do **not** explore:
   single owner; a second owner is refused);
 - survival subsets beyond the 14 per cut: the seeded subsets are a sample, not an enumeration, and
   a surviving write is never cut except after a whole number of its 512-byte sectors;
-- cut sweeps of larger stores: every sweep starts from at most one committed transaction (deeper
-  trees are tested for reopening after power loss, but not cut at every operation);
+- cut sweeps of larger stores: the general sweeps start from at most one committed transaction.
+  Three more sweeps cut commits that reshape the tree, from small fixtures just before the change:
+  one that splits a leaf below the root, one that splits the root branch (the tree grows a level,
+  from a store of a few dozen commits) and one whose deletions shrink the root to a leaf. Deeper
+  trees and larger stores are tested for reopening after power loss, but not cut at every
+  operation;
 - damage to durable bytes beyond the cases listed, such as random or multiple-location corruption,
   damaged interior tree nodes, or writes that are lost or misdirected after a successful sync;
 - errors produced by a real filesystem: apart from the file size limit above, interruptions, short
@@ -163,6 +167,15 @@ extent bounds and content digests are checked; every node reference must lie ins
 metadata with an incarnation no newer than the current generation; and a traversal may load at most
 as many nodes as the store has pages, so a shared or cyclic subtree fails instead of looping. Full
 structural validation of hostile stores is not implemented yet.
+
+## Requests the format cannot hold
+
+Identifiers are at most 255 bytes, but a relationship's index keys hold four of them, and records
+are limited in size (see the format document's key and record limits). A request containing a
+relationship whose index keys would be too long, or a record too large for metadata, is refused
+with `InvalidRequest` that names the limit exceeded and nothing of the request is applied. For a
+relationship this happens before any change of the request is applied, so it is the answer even
+when an earlier change would fail too.
 
 ## Concurrent views and conflict validation
 
