@@ -17,6 +17,8 @@ mod engine;
 #[cfg(test)]
 mod engine_tests;
 mod format;
+#[cfg(test)]
+mod fs_seam_tests;
 mod io;
 #[cfg(test)]
 mod reader_race_tests;

@@ -108,6 +108,17 @@ not power loss); one scenario run on the filesystem adapter and on the simulator
 same persistence operations in the same order; and on a real filesystem, a file size limit makes a
 commit's write stop part-way and fail, as on a full disk, which must fail the commit explicitly.
 
+The filesystem adapter repeats a positional read or write interrupted by a signal and continues a
+short one where it stopped. A read that reaches the end of the file early is reported as an
+integrity error, and a write that makes no progress as an I/O error, rather than repeated. Any other
+error, such as a full disk or a device error, is reported without retrying; bytes written before it
+stay written. A failed sync is never retried, an interrupted one included. Tests exercise this
+through a test-only seam under the adapter's file handles, on real files: every read and write
+interrupted or cut to a few bytes, at the adapter and through a store that stages, commits, reads
+and is reopened; a full disk after a short write, at the adapter and in a commit's metadata page
+write (the commit is rejected, its attempt absent, and the store keeps committing); a device error
+on read; transfers that make no progress; and an interrupted sync.
+
 When a case of a cut sweep fails (the commit sweeps, the store-creation sweep, or the
 faults-during-recovery sweep), its crash image (durable bytes, and the bytes still cached after a
 process exit), the operation trace and a label naming the cut and the survival choice (which of the
@@ -127,9 +138,10 @@ The tests do **not** explore:
   trees are tested for reopening after power loss, but not cut at every operation);
 - damage to durable bytes beyond the cases listed, such as random or multiple-location corruption,
   damaged interior tree nodes, or writes that are lost or misdirected after a successful sync;
-- other errors of a real filesystem: `EINTR` inside the filesystem adapter, `ENOSPC` from a full
-  disk, and a failed `fsync` are not provoked through the filesystem adapter; apart from the file
-  size limit above, I/O errors are injected only in the simulator;
+- errors produced by a real filesystem: apart from the file size limit above, interruptions, short
+  transfers, a full disk and device errors are injected by the test seam under the adapter's file
+  handles, not provoked in the filesystem, and a real `fsync` failure is not provoked at all.
+  Opening files, file metadata and directory syncs are not under the seam;
 - a lossy failure of a directory sync: lossy failures are modelled for file syncs only.
 
 ## Store files on disk
