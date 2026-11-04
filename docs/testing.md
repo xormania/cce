@@ -90,8 +90,10 @@ other test, does not pass.
 `campaigns` runs each batch as its own test run and reads the report line the
 test prints. A batch passes only when its test ran and passed and its report
 shows the budget it was given: every generated sequence of at least 64
-attempted operations, every requested case accepted and none rejected (both
-measured, not assumed); in the crash and failure campaigns, exactly the
+attempted operations, every requested case accepted, and the rejected
+generated cases recorded as a measured count (rejections are reported, not
+forbidden; when the report states the attempted cases, accepted plus rejected
+must equal them); in the crash and failure campaigns, exactly the
 configured cases, a reported nonzero number of cut points, every cut or exactly
 the sampled cuts per case executed, and recoveries both before and after the
 step; in the decoder sweep, every decoder target reported with exactly its

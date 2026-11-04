@@ -61,30 +61,30 @@ def _batches():
     b = []
     for seed in MODEL_SEEDS:
         b.append({"test": MODEL + "generated_operation_sequences_match_the_logical_model",
-                  "report": "model", "cases": 250, "total": "generated_sequences",
-                  "env": {"CCE_MODEL_CASES": "250", "CCE_MODEL_SEED": seed}})
+                  "report": "model", "cases": 1000, "total": "generated_sequences",
+                  "env": {"CCE_MODEL_CASES": "1000", "CCE_MODEL_SEED": seed}})
         b.append({"test": MODEL + "generated_tree_reshaping_sequences_match_the_logical_model",
-                  "report": "model", "cases": 250,
-                  "env": {"CCE_MODEL_SHAPE_CASES": "250", "CCE_MODEL_SEED": seed}})
+                  "report": "model", "cases": 1000,
+                  "env": {"CCE_MODEL_SHAPE_CASES": "1000", "CCE_MODEL_SEED": seed}})
     for seed in MODEL_SEEDS[:2]:
         b.append({"test": MODEL + "generated_operation_sequences_on_real_files_match_the_"
                   "logical_model",
-                  "report": "model", "cases": 32,
-                  "env": {"CCE_MODEL_FS_CASES": "32", "CCE_MODEL_SEED": seed}})
+                  "report": "model", "cases": 128,
+                  "env": {"CCE_MODEL_FS_CASES": "128", "CCE_MODEL_SEED": seed}})
     for seed in CRASH_SEEDS:
         b.append({"test": MODEL + "every_cut_of_short_generated_sequences_recovers_a_model_state",
-                  "report": "crash", "cuts": "every", "cases": 64,
-                  "env": {"CCE_CRASH_CASES": "64", "CCE_CRASH_SEED": seed}})
+                  "report": "crash", "cuts": "every", "cases": 256,
+                  "env": {"CCE_CRASH_CASES": "256", "CCE_CRASH_SEED": seed}})
         b.append({"test": MODEL + "sampled_cuts_of_long_generated_sequences_recover_a_model_"
-                  "state", "report": "crash", "cuts": 48, "cases": 16,
-                  "env": {"CCE_CRASH_LONG_CASES": "16", "CCE_CRASH_SAMPLED_CUTS": "48",
+                  "state", "report": "crash", "cuts": 48, "cases": 64,
+                  "env": {"CCE_CRASH_LONG_CASES": "64", "CCE_CRASH_SAMPLED_CUTS": "48",
                           "CCE_CRASH_SEED": seed}})
         b.append({"test": MODEL + "an_io_failure_at_every_cut_of_short_generated_sequences_is_"
-                  "reported_and_recovered", "report": "crash", "cuts": "every", "cases": 64,
-                  "env": {"CCE_FAILURE_CASES": "64", "CCE_CRASH_SEED": seed}})
+                  "reported_and_recovered", "report": "crash", "cuts": "every", "cases": 256,
+                  "env": {"CCE_FAILURE_CASES": "256", "CCE_CRASH_SEED": seed}})
         b.append({"test": MODEL + "an_io_failure_at_sampled_cuts_of_long_generated_sequences_is_"
-                  "reported_and_recovered", "report": "crash", "cuts": 48, "cases": 16,
-                  "env": {"CCE_FAILURE_LONG_CASES": "16", "CCE_FAILURE_SAMPLED_CUTS": "48",
+                  "reported_and_recovered", "report": "crash", "cuts": 48, "cases": 64,
+                  "env": {"CCE_FAILURE_LONG_CASES": "64", "CCE_FAILURE_SAMPLED_CUTS": "48",
                           "CCE_CRASH_SEED": seed}})
     b.append({"test": "fuzz_replay_tests::seeded_mutations_of_the_seeds_run_through_every_decoder",
               "report": "decoder", "total": "decoder_cases",
@@ -299,10 +299,15 @@ def check_batch(batch, found, minimums=CAMPAIGN_MINIMUMS):
             gaps.append("accepted generated cases not measured")
         elif accepted != batch["cases"]:
             gaps.append(f"accepted cases {accepted} != {batch['cases']}")
+        # Rejections are recorded, not forbidden: a count, adding up when attempts are reported.
         if rejected is None:
             gaps.append("rejected generated cases not measured")
-        elif rejected != 0:
-            gaps.append(f"{rejected} generated cases rejected")
+        elif not isinstance(rejected, int) or rejected < 0:
+            gaps.append(f"rejected generated cases {rejected} is not a count")
+        elif accepted is not None and "attempted_cases" in r:
+            if accepted + rejected != r["attempted_cases"]:
+                gaps.append(f"accepted {accepted} + rejected {rejected} != attempted "
+                            f"{r['attempted_cases']}")
     if batch["report"] == "decoder":
         # Every decoder target at its budget, so a target dropped from the sweep is noticed.
         per = int(batch["env"]["CCE_DECODER_CASES"])

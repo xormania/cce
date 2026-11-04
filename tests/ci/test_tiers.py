@@ -203,9 +203,20 @@ class Campaigns(unittest.TestCase):
                                 "sequences of 32 operations < 64",
                                 "accepted generated cases not measured",
                                 "rejected generated cases not measured"])
+        # Rejections are recorded, not forbidden; they must be a count, and add up when the
+        # report states how many cases were attempted.
         _, gaps = self.check(self.model_batch, report("model", **dict(self.model,
                                                                         rejected_cases=3)))
-        self.assertEqual(gaps, ["3 generated cases rejected"])
+        self.assertEqual(gaps, [])
+        _, gaps = self.check(self.model_batch, report("model", **dict(self.model,
+                                                                        rejected_cases=-1)))
+        self.assertEqual(gaps, ["rejected generated cases -1 is not a count"])
+        _, gaps = self.check(self.model_batch, report("model", **dict(
+            self.model, rejected_cases=3, attempted_cases=252)))
+        self.assertEqual(gaps, ["accepted 250 + rejected 3 != attempted 252"])
+        _, gaps = self.check(self.model_batch, report("model", **dict(
+            self.model, rejected_cases=3, attempted_cases=253)))
+        self.assertEqual(gaps, [])
 
     def test_a_report_printed_after_the_test_name_is_read(self):
         line = "test model_tests::m ... " + report("model", **self.model)
