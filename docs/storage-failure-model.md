@@ -108,8 +108,10 @@ not power loss); one scenario run on the filesystem adapter and on the simulator
 same persistence operations in the same order; and on a real filesystem, a file size limit makes a
 commit's write stop part-way and fail, as on a full disk, which must fail the commit explicitly.
 
-When a case of the store-creation sweep or of the faults-during-recovery sweep fails, its durable
-crash image and operation trace are written to a new directory under the system temporary
+When a case of a cut sweep fails (the commit sweeps, the store-creation sweep, or the
+faults-during-recovery sweep), its crash image (durable bytes, and the bytes still cached after a
+process exit), the operation trace and a label naming the cut and the survival choice (which of the
+sampled subsets, or process exit) are written to a new directory under the system temporary
 directory, named in the failure message. Passing runs write nothing there.
 
 The tests do **not** explore:
