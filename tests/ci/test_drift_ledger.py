@@ -633,6 +633,24 @@ class WriterRoundTripTests(unittest.TestCase):
         hashed = proposed.replace('summary = "Implement bulk export"', 'summary = "Export #3 # not a comment"')
         self.assertIn('"Export #3 # not a comment"', self.merged(base, base, hashed))
 
+    def test_multi_line_values_with_comments_inside_are_kept(self):
+        # Review finding: a comment line inside a multi-line array made the writer crash.
+        entry = ('[[question]]\nid = "Q8"\nrev = 1\ntitle = "t"\nasked = "a"\nvalues = [\n'
+                 '# note inside the array\n  1,\n  [[2], 3],\n  "x # not a comment",\n]\nafter = "kept"\n')
+        top = '# about the list\nlist = [\n# why\n  "a",\n]\n'
+        text = BASE.replace("version = 2\n", "version = 2\n" + top, 1) + entry
+        ledger.load(text)
+        self.assertEqual(ledger.update(text, text, text)[1], [])
+        merged = self.merged(text, text, text + WORK)
+        self.assertTrue(_same(self.row(merged, "Q8"), self.row(text, "Q8")))
+        self.assertEqual(tomllib.loads(merged)["list"], ["a"])
+        lines = merged.splitlines()
+        for comment, field in (("# note inside the array", "values = "), ("# why", "list = "),
+                               ("# about the list", "list = ")):
+            # Each comment stays with its field: it comes just before that field's line.
+            self.assertLess(lines.index(comment), [i for i, l in enumerate(lines) if l.startswith(field)][0])
+        self.assertNotIn(("Q8", "1,"), ledger._comments(text)[0])
+
     def test_a_failed_write_publishes_nothing(self):
         # The writer re-reads what it wrote; any difference refuses the whole update.
         with mock.patch.object(ledger, "_value", side_effect=lambda v: '"damaged"' if v == "x" else ORIGINAL_VALUE(v)):

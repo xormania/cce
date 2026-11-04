@@ -399,8 +399,12 @@ def _value(value):
 
 
 def _scan_line(line, quote):
-    """Return (quote still open at the end of the line, True if a comment follows a value)."""
-    i = 0
+    """Scan one line outside of strings.
+
+    Returns (quote still open at the end of the line, True if a comment follows content on the
+    line, net change in bracket depth from [ ] { } outside strings).
+    """
+    i, depth = 0, 0
     while i < len(line):
         if quote is None:
             if line.startswith(TRIPLE, i):
@@ -410,7 +414,11 @@ def _scan_line(line, quote):
             if line[i] in "\"'":
                 quote = line[i]
             elif line[i] == "#":
-                return None, True
+                return None, True, depth
+            elif line[i] in "[{":
+                depth += 1
+            elif line[i] in "]}":
+                depth -= 1
         elif quote in TRIPLE:
             if quote == TRIPLE[0] and line[i] == "\\":
                 i += 2
@@ -426,41 +434,58 @@ def _scan_line(line, quote):
             if line[i] == quote:
                 quote = None
         i += 1
-    return (quote if quote in TRIPLE else None), False
+    return (quote if quote in TRIPLE else None), False, depth
 
 
 def _comments(text):
-    """Full-line comments by anchor, and whether any comment follows a value on the same line.
+    """Full-line comments by anchor, and whether any comment follows content on the same line.
 
-    Anchors: ("header",) for comments before the first key or table; (entry id,) for comments just
-    before an entry's [[kind]] line; (entry id, key) for comments inside an entry before that key;
-    ("trailer",) for comments after the last line with content.
+    Anchors: ("header",) for comments before the version line; ("top", key) for comments before
+    or inside a top-level key or before a [table] line; ("top", table, key) inside a table;
+    (entry id,) for comments just before an entry's [[kind]] line; (entry id, key) for comments
+    before or inside an entry's key; ("trailer",) after the last content. Lines that continue a
+    multi-line string or array are never read as keys or table headers.
     """
-    anchors, pending, inline, entries, current, open_quote = {}, [], False, [], None, None
+    anchors, pending, inline, entries, current = {}, [], False, [], None
+    open_quote, depth, field, table = None, 0, None, None
+    name = lambda key: next(iter(tomllib.loads(key + " = 0")))
     for line in text.splitlines():
         stripped = line.strip()
-        if open_quote is None and (stripped.startswith("#") or not stripped):
-            if stripped:
-                pending.append(line)
+        inside = open_quote is not None or depth > 0
+        if open_quote is None and stripped.startswith("#"):
+            pending.append(line)
             continue
-        was_open = open_quote
-        open_quote, has_comment = _scan_line(line, open_quote)
+        if open_quote is None and not stripped:
+            continue
+        open_quote, has_comment, delta = _scan_line(line, open_quote)
         inline = inline or has_comment
-        if was_open is not None:
+        if inside:
+            # A comment inside a multi-line value is kept with the field that holds it.
+            if pending:
+                field.extend(pending)
+                pending = []
+            depth += delta
             continue
+        depth += delta
         if stripped.startswith("[["):
             current = {"comments": pending, "keys": {}}
             entries.append(current)
+            field = []
         elif stripped.startswith("["):
             current = None
-            anchors.setdefault(("header",), []).extend(pending)
+            table = next(iter(tomllib.loads(stripped)))
+            field = anchors.setdefault(("top", table), [])
+            field.extend(pending)
         else:
             key = stripped.split("=", 1)[0].strip()
             if current is None:
-                anchors.setdefault(("header",), []).extend(pending)
+                anchor = (("header",) if table is None and name(key) == "version" else
+                          ("top", name(key)) if table is None else ("top", table, name(key)))
+                field = anchors.setdefault(anchor, [])
+                field.extend(pending)
             else:
-                if pending:
-                    current["keys"][key] = pending
+                field = current["keys"].setdefault(key, [])
+                field.extend(pending)
                 if key == "id":
                     try:
                         current["id"] = tomllib.loads(stripped)["id"]
@@ -473,13 +498,11 @@ def _comments(text):
         if entry["comments"]:
             anchors[(entry["id"],)] = entry["comments"]
         for key, block in entry["keys"].items():
-            name = next(iter(tomllib.loads(key + " = 0")))
-            anchors[(entry["id"], name)] = block
+            if block:
+                anchors[(entry["id"], name(key))] = block
     if pending:
         anchors[("trailer",)] = pending
-    if anchors.get(("header",)) == []:
-        del anchors[("header",)]
-    return anchors, inline
+    return {anchor: block for anchor, block in anchors.items() if block}, inline
 
 
 def _extras(text):
@@ -498,11 +521,18 @@ def serialize(entries, header="", extras=None, comments=None):
     out = list(head) if head is not None else ([header.rstrip("\n")] if header.strip() else [])
     out.append("version = " + str(VERSION))
     extras = extras or {}
-    out.extend(_key(k) + " = " + _value(v) for k, v in extras.items() if not isinstance(v, dict))
+    for k, v in extras.items():
+        if not isinstance(v, dict):
+            out.extend(comments.get(("top", k), []))
+            out.append(_key(k) + " = " + _value(v))
     for name, table in extras.items():
         if isinstance(table, dict):
-            out += ["", "[" + _key(name) + "]"]
-            out.extend(_key(k) + " = " + _value(v) for k, v in table.items())
+            out.append("")
+            out.extend(comments.get(("top", name), []))
+            out.append("[" + _key(name) + "]")
+            for k, v in table.items():
+                out.extend(comments.get(("top", name, k), []))
+                out.append(_key(k) + " = " + _value(v))
     for kind, _ in KINDS:
         for k, row in entries:
             if k != kind:
