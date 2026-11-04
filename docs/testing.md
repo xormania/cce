@@ -56,7 +56,7 @@ records what actually ran:
 | Tier | What it runs |
 |---|---|
 | `format` | `cargo fmt --all -- --check` |
-| `lint` | Clippy over the workspace and all targets, warnings denied |
+| `lint` | Clippy over the workspace, all targets and all features, warnings denied |
 | `routine` | `cargo test --workspace --locked --no-fail-fast` |
 | `release-story` | the end-to-end story (`tests/story_release.rs`) in a release build |
 | `bounded-resources` | the workload tier (`tests/workloads.rs`): release build, ignored tests, one test thread |
@@ -76,7 +76,10 @@ candidate commit (and the digest of every file when the working copy is dirty),
 the toolchain, and for each tier its exact commands, environment additions,
 timing, exit status, outcome, test counts per test binary, every executed test
 as `package:target:name` with its result, and the SHA-256 of each log under
-`logs/`. The runner exits 0 only when every selected tier passed.
+`logs/`, and every `RUST*`, `CARGO*` and `CCE_*` environment variable. With
+`--timeout`, a command that runs too long is stopped together with every
+process it started, test binaries included. Runs that show test output use one
+test thread. The runner exits 0 only when every selected tier passed.
 
 A Cargo tier passes only when Cargo succeeded, at least one test ran, no test
 failed, and every ignored test is one the runner declares as ignored on purpose:
@@ -87,15 +90,18 @@ other test, does not pass.
 `campaigns` runs each batch as its own test run and reads the report line the
 test prints. A batch passes only when its test ran and passed and its report
 shows the budget it was given: every generated sequence of at least 64
-attempted operations and no rejected generated case; every cut, or exactly the
-sampled cuts, executed in the crash and failure campaigns, with recoveries both
-before and after the step. The totals must reach at least 1,000 generated
+attempted operations, every requested case accepted and none rejected (both
+measured, not assumed); in the crash and failure campaigns, exactly the
+configured cases, a reported nonzero number of cut points, every cut or exactly
+the sampled cuts per case executed, and recoveries both before and after the
+step. The totals must reach at least 1,000 generated
 sequences on the simulator and 10,000 decoder cases. Anything short or missing
 is listed as a gap and the tier is `incomplete`, never passed.
 
 `--fresh-clone` clones the candidate commit into the output directory and runs
-the tiers there with a new Cargo target directory, so neither build output nor
-uncommitted files of the working copy take part. It needs only the repository,
+the tiers there with a new Cargo target directory, so no build output of the
+working copy takes part. It refuses a working copy with uncommitted changes,
+which a clone would silently leave out. It needs only the repository,
 the toolchain pinned in `rust-toolchain.toml`, Python 3 and the crates locked in
 `Cargo.lock`.
 

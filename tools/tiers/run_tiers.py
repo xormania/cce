@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -72,17 +73,17 @@ def _batches():
                   "env": {"CCE_MODEL_FS_CASES": "32", "CCE_MODEL_SEED": seed}})
     for seed in CRASH_SEEDS:
         b.append({"test": MODEL + "every_cut_of_short_generated_sequences_recovers_a_model_state",
-                  "report": "crash", "cuts": "every",
+                  "report": "crash", "cuts": "every", "cases": 64,
                   "env": {"CCE_CRASH_CASES": "64", "CCE_CRASH_SEED": seed}})
         b.append({"test": MODEL + "sampled_cuts_of_long_generated_sequences_recover_a_model_"
-                  "state", "report": "crash", "cuts": 48,
+                  "state", "report": "crash", "cuts": 48, "cases": 16,
                   "env": {"CCE_CRASH_LONG_CASES": "16", "CCE_CRASH_SAMPLED_CUTS": "48",
                           "CCE_CRASH_SEED": seed}})
         b.append({"test": MODEL + "an_io_failure_at_every_cut_of_short_generated_sequences_is_"
-                  "reported_and_recovered", "report": "crash", "cuts": "every",
+                  "reported_and_recovered", "report": "crash", "cuts": "every", "cases": 64,
                   "env": {"CCE_FAILURE_CASES": "64", "CCE_CRASH_SEED": seed}})
         b.append({"test": MODEL + "an_io_failure_at_sampled_cuts_of_long_generated_sequences_is_"
-                  "reported_and_recovered", "report": "crash", "cuts": 48,
+                  "reported_and_recovered", "report": "crash", "cuts": 48, "cases": 16,
                   "env": {"CCE_FAILURE_LONG_CASES": "16", "CCE_FAILURE_SAMPLED_CUTS": "48",
                           "CCE_CRASH_SEED": seed}})
     b.append({"test": "fuzz_replay_tests::seeded_mutations_of_the_seeds_run_through_every_decoder",
@@ -106,8 +107,8 @@ TIERS = {
     },
     "lint": {
         "kind": "command",
-        "argv": ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--",
-                 "--deny", "warnings"],
+        "argv": ["cargo", "clippy", "--locked", "--workspace", "--all-targets", "--all-features",
+                 "--", "--deny", "warnings"],
         "default": True,
     },
     "routine": {
@@ -281,26 +282,35 @@ def check_batch(batch, found, minimums=CAMPAIGN_MINIMUMS):
     r, gaps = lines[0], []
     if not r.get("passed"):
         gaps.append("the report says the campaign failed")
-    if batch["report"] == "model":
+    if batch["report"] in ("model", "crash"):
         if r.get("cases") != batch["cases"]:
             gaps.append(f"cases {r.get('cases')} != {batch['cases']}")
+    if batch["report"] == "model":
         if r.get("sequences_run", 0) < batch["cases"]:
             gaps.append(f"sequences run {r.get('sequences_run', 0)} < {batch['cases']}")
         shortest = (r.get("operations_per_sequence") or [0])[0]
         if shortest < minimums["operations_per_sequence"]:
             gaps.append(f"sequences of {shortest} operations < "
                         f"{minimums['operations_per_sequence']}")
-        if "rejected_cases" not in r:
-            gaps.append("the report does not count rejected generated cases")
-        elif r["rejected_cases"] != 0:
-            gaps.append(f"{r['rejected_cases']} generated cases rejected")
-    elif batch["report"] == "crash":
+    if batch["report"] in ("model", "crash"):
+        accepted, rejected = r.get("accepted_cases"), r.get("rejected_cases")
+        if accepted is None:
+            gaps.append("accepted generated cases not measured")
+        elif accepted != batch["cases"]:
+            gaps.append(f"accepted cases {accepted} != {batch['cases']}")
+        if rejected is None:
+            gaps.append("rejected generated cases not measured")
+        elif rejected != 0:
+            gaps.append(f"{rejected} generated cases rejected")
+    if batch["report"] == "crash":
+        points = r.get("cut_points_available") or 0
+        if points <= 0:
+            gaps.append("no cut points reported")
         if batch["cuts"] == "every":
-            if r.get("cuts_executed", 0) < r.get("cut_points_available", 1):
-                gaps.append(f"cuts executed {r.get('cuts_executed', 0)} < cut points "
-                            f"{r.get('cut_points_available')}")
+            if r.get("cuts_executed", 0) < points:
+                gaps.append(f"cuts executed {r.get('cuts_executed', 0)} < cut points {points}")
         else:
-            want = r.get("cases", 0) * batch["cuts"]
+            want = batch["cases"] * batch["cuts"]
             if r.get("cuts_executed") != want:
                 gaps.append(f"cuts executed {r.get('cuts_executed')} != {want}")
         for k in ("recovered_with_step", "recovered_without_step"):
@@ -335,15 +345,28 @@ def sha256_file(path):
 
 
 def run_logged(argv, cwd, env, log, timeout):
-    """Runs `argv`, writing combined output to `log`. Returns (exit code or None, text)."""
+    """Runs `argv` in a process group of its own, writing combined output to `log`. On timeout
+    the whole group is killed, so test binaries and their children stop with Cargo. Returns
+    (exit code or None on timeout, text)."""
     with open(log, "w") as f:
+        p = subprocess.Popen(argv, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT,
+                             start_new_session=True)
         try:
-            r = subprocess.run(argv, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT,
-                               timeout=timeout)
-            code = r.returncode
+            code = p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait()
             code = None
     return code, Path(log).read_text(errors="replace")
+
+
+def campaign_argv(tier, batch):
+    """One batch's test run: its test alone, output shown, one test thread."""
+    return ["cargo", "test", *tier["args"], "--", "--exact", batch["test"], "--nocapture",
+            "--test-threads=1"]
 
 
 class Runner:
@@ -369,7 +392,7 @@ class Runner:
             },
             "environment": {
                 k: v for k, v in sorted(os.environ.items())
-                if k in ("CARGO_BUILD_JOBS", "RUST_TEST_THREADS") or k.startswith("CCE_")
+                if k.startswith(("RUST", "CARGO", "CCE_"))
             },
             "tiers": [],
         }
@@ -461,8 +484,7 @@ class Runner:
         exes, crates = executables(listing.splitlines())
         batches, gaps, failed = [], [], False
         for i, batch in enumerate(CAMPAIGN_BATCHES):
-            argv = ["cargo", "test", *tier["args"], "--", "--exact", batch["test"],
-                    "--nocapture"]
+            argv = campaign_argv(tier, batch)
             code, text = self.logged(name, argv, record, batch["env"], f"-{i:02}")
             tests, binaries = parse_test_output(text, exes, crates)
             outcome, problems = qualify(code if code is not None else -1, tests, binaries)
@@ -523,6 +545,10 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.output.exists():
         p.error(f"{a.output} exists; the output directory must be new")
+    if a.fresh_clone and out(["git", "status", "--porcelain", "--untracked-files=all"],
+                             a.repo.resolve()):
+        p.error("the working copy has uncommitted changes; a fresh clone would test only its "
+                "last commit, so commit or remove them first")
     a.output.mkdir(parents=True)
     output = a.output.resolve()
     ws = fresh_clone(a.repo.resolve(), output) if a.fresh_clone else a.repo.resolve()

@@ -168,6 +168,9 @@ class Qualification(unittest.TestCase):
         self.assertEqual(t.qualify(0, {}, none),
                          ("no-tests", [{"no_tests": "no test executed"}]))
 
+    def test_lint_covers_every_feature(self):
+        self.assertIn("--all-features", t.TIERS["lint"]["argv"])
+
     def test_every_declared_ignored_test_names_its_tier_or_reason(self):
         for test, why in t.DECLARED_IGNORED.items():
             self.assertTrue(why in t.TIERS or why.startswith("maintenance action"), test)
@@ -181,7 +184,7 @@ class Campaigns(unittest.TestCase):
     model_batch = {"test": "m", "report": "model", "cases": 250, "total": "generated_sequences",
                    "env": {}}
     model = dict(passed=True, cases=250, sequences_run=250, operations_per_sequence=[64, 80],
-                 attempted_operations=18000, rejected_cases=0)
+                 attempted_operations=18000, accepted_cases=250, rejected_cases=0)
 
     def check(self, batch, *lines):
         return t.check_batch(batch, t.reports("\n".join(lines)))
@@ -194,10 +197,12 @@ class Campaigns(unittest.TestCase):
     def test_a_model_batch_short_of_its_budget_or_without_a_rejection_count_has_gaps(self):
         short = dict(self.model, cases=200, sequences_run=200, operations_per_sequence=[32, 40])
         del short["rejected_cases"]
+        del short["accepted_cases"]
         _, gaps = self.check(self.model_batch, report("model", **short))
         self.assertEqual(gaps, ["cases 200 != 250", "sequences run 200 < 250",
                                 "sequences of 32 operations < 64",
-                                "the report does not count rejected generated cases"])
+                                "accepted generated cases not measured",
+                                "rejected generated cases not measured"])
         _, gaps = self.check(self.model_batch, report("model", **dict(self.model,
                                                                         rejected_cases=3)))
         self.assertEqual(gaps, ["3 generated cases rejected"])
@@ -213,10 +218,11 @@ class Campaigns(unittest.TestCase):
         self.assertEqual(gaps, ["the report says the campaign failed"])
 
     def test_crash_batches_require_every_cut_or_exactly_the_sampled_cuts_and_both_outcomes(self):
-        every = {"test": "c", "report": "crash", "cuts": "every", "env": {}}
+        every = {"test": "c", "report": "crash", "cuts": "every", "cases": 16, "env": {}}
         sampled = dict(every, cuts=48)
         ok = dict(passed=True, cases=16, cut_points_available=900, cuts_executed=900,
-                  recovered_with_step=3, recovered_without_step=4)
+                  recovered_with_step=3, recovered_without_step=4, accepted_cases=16,
+                  rejected_cases=0)
         self.assertEqual(self.check(every, report("crash", **ok))[1], [])
         self.assertEqual(self.check(every, report("crash", **dict(ok, cuts_executed=899)))[1],
                          ["cuts executed 899 < cut points 900"])
@@ -227,6 +233,41 @@ class Campaigns(unittest.TestCase):
                                                        recovered_with_step=0)))[1],
             ["cuts executed 767 != 768", "no case recovered with step"])
 
+    def test_crash_batches_must_run_their_configured_cases_and_report_cut_points(self):
+        every = {"test": "c", "report": "crash", "cuts": "every", "cases": 64, "env": {}}
+        sampled = dict(every, cuts=48, cases=16)
+        base = dict(passed=True, cut_points_available=900, cuts_executed=900,
+                    recovered_with_step=3, recovered_without_step=4, rejected_cases=0)
+        _, gaps = self.check(every, report("crash", **dict(base, cases=1, accepted_cases=1)))
+        self.assertIn("cases 1 != 64", gaps)
+        no_points = dict(base, cases=64, accepted_cases=64)
+        del no_points["cut_points_available"]
+        _, gaps = self.check(every, report("crash", **no_points))
+        self.assertIn("no cut points reported", gaps)
+        _, gaps = self.check(sampled, report("crash", **dict(
+            base, cases=0, accepted_cases=0, cut_points_available=0, cuts_executed=0)))
+        self.assertIn("cases 0 != 16", gaps)
+        self.assertIn("no cut points reported", gaps)
+        _, gaps = self.check(sampled, report("crash", **dict(
+            base, cases=1, accepted_cases=1, cuts_executed=48)))
+        self.assertIn("cases 1 != 16", gaps)
+
+    def test_accepted_and_rejected_cases_must_be_measured(self):
+        for kind, batch, fields in [
+            ("model", self.model_batch, self.model),
+            ("crash", {"test": "c", "report": "crash", "cuts": "every", "cases": 16, "env": {}},
+             dict(passed=True, cases=16, cut_points_available=9, cuts_executed=9,
+                  recovered_with_step=1, recovered_without_step=1, accepted_cases=16,
+                  rejected_cases=0)),
+        ]:
+            self.assertEqual(self.check(batch, report(kind, **fields))[1], [], kind)
+            _, gaps = self.check(batch, report(kind, **dict(fields, rejected_cases=None,
+                                                            accepted_cases=None)))
+            self.assertIn("rejected generated cases not measured", gaps, kind)
+            self.assertIn("accepted generated cases not measured", gaps, kind)
+            _, gaps = self.check(batch, report(kind, **dict(fields, accepted_cases=3)))
+            self.assertIn(f"accepted cases 3 != {fields['cases']}", gaps, kind)
+
     def test_totals_must_meet_the_minimums(self):
         decoder = {"test": "d", "report": "decoder", "total": "decoder_cases", "env": {}}
         batches = [{"batch": self.model_batch, "report_line": self.model}] * 4 + [
@@ -236,6 +277,19 @@ class Campaigns(unittest.TestCase):
         self.assertEqual(totals["generated_sequences"], 1000)
         totals, gaps = t.campaign_totals(batches[1:4] + [{"batch": decoder, "report_line": None}])
         self.assertEqual(gaps, ["generated sequences 750 < 1000", "decoder cases 0 < 10000"])
+
+    def test_every_crash_batch_states_its_configured_cases(self):
+        for b in t.CAMPAIGN_BATCHES:
+            if b["report"] == "crash":
+                self.assertGreater(b.get("cases", 0), 0, b["test"])
+
+    def test_every_capturing_run_uses_one_test_thread(self):
+        for b in t.CAMPAIGN_BATCHES:
+            argv = t.campaign_argv(t.TIERS["campaigns"], b)
+            self.assertIn("--test-threads=1", argv, b["test"])
+        for name, tier in t.TIERS.items():
+            if "--nocapture" in tier.get("test_args", []):
+                self.assertIn("--test-threads=1", tier["test_args"], name)
 
     def test_the_selection_stages_its_budgets_in_batches_with_recorded_seeds(self):
         generated = [b for b in t.CAMPAIGN_BATCHES if b.get("total") == "generated_sequences"]
@@ -305,8 +359,12 @@ class EndToEnd(unittest.TestCase):
         self.assertTrue(c["dirty"])
         self.assertEqual(set(c["files_sha256"]), {"a.txt"})
 
-    def test_a_fresh_clone_runs_the_committed_candidate_without_working_copy_changes(self):
-        (self.repo / "untracked.txt").write_text("not committed\n")
+    def test_a_fresh_clone_runs_the_committed_candidate_without_ignored_working_files(self):
+        # Ignored files (like build output) leave the working copy clean but stay out of a clone.
+        (self.repo / ".gitignore").write_text("ignored.txt\n")
+        self.git("add", ".gitignore")
+        self.git("commit", "-q", "-m", "ignore")
+        (self.repo / "ignored.txt").write_text("build output\n")
         tiers = {"look": {"kind": "command", "default": True, "argv": [
             sys.executable, "-c",
             "import os; print(sorted(f for f in os.listdir('.') if not f.startswith('.')))"]}}
@@ -319,10 +377,56 @@ class EndToEnd(unittest.TestCase):
         log = self.root / "run" / r["tiers"][0]["commands"][0]["log"]
         self.assertEqual(log.read_text(), "['a.txt']\n")
 
+    def test_a_fresh_clone_of_a_dirty_working_copy_is_refused(self):
+        (self.repo / "a.txt").write_text("changed\n")
+        with self.assertRaises(SystemExit):
+            self.run_tiers("--output", str(self.root / "run"), "--fresh-clone")
+        self.assertFalse((self.root / "run").exists())
+
+    def test_every_rust_and_cargo_setting_in_the_environment_is_recorded(self):
+        env = {"RUSTFLAGS": "-C debug-assertions", "CARGO_PROFILE_RELEASE_LTO": "true",
+               "RUSTUP_TOOLCHAIN": "stable", "CCE_MODEL_CASES": "7", "HOME_ISH": "no"}
+        with mock.patch.dict(os.environ, env):
+            self.run_tiers("--output", str(self.root / "run"))
+        got = json.loads((self.root / "run/results.json").read_text())["environment"]
+        for k in ("RUSTFLAGS", "CARGO_PROFILE_RELEASE_LTO", "RUSTUP_TOOLCHAIN", "CCE_MODEL_CASES"):
+            self.assertEqual(got.get(k), env[k], k)
+        self.assertNotIn("HOME_ISH", got)
+
     def test_an_existing_output_directory_is_refused(self):
         (self.root / "run").mkdir()
         with self.assertRaises(SystemExit):
             self.run_tiers("--output", str(self.root / "run"))
+
+
+class Timeouts(unittest.TestCase):
+    def test_a_timeout_kills_the_whole_process_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            pid_file = Path(d) / "grandchild.pid"
+            script = (
+                "import subprocess, sys, time\n"
+                "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                f"open({str(pid_file)!r}, 'w').write(str(c.pid))\n"
+                "time.sleep(60)\n"
+            )
+            # Long enough for the grandchild to start and record itself, even on a busy host.
+            code, _ = t.run_logged([sys.executable, "-c", script], d, dict(os.environ),
+                                   Path(d) / "log", 8)
+            self.assertIsNone(code)
+            self.assertTrue(pid_file.is_file(), "the grandchild never started; raise the timeout")
+            pid = int(pid_file.read_text())
+            # The grandchild was killed; at most a zombie remains until its parent is reaped.
+            deadline = __import__("time").monotonic() + 5
+            alive = True
+            while alive and __import__("time").monotonic() < deadline:
+                try:
+                    state = Path(f"/proc/{pid}/stat").read_text().split()[2]
+                    alive = state != "Z"
+                except FileNotFoundError:
+                    alive = False
+                if alive:
+                    __import__("time").sleep(0.1)
+            self.assertFalse(alive, "the test binary's child kept running after the timeout")
 
 
 if __name__ == "__main__":
