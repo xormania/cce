@@ -48,6 +48,57 @@ tests that need no shared machinery can remain direct. Support stays test-only:
 the integration driver uses the logical storage port and physical modules remain
 private.
 
+## Qualification tiers
+
+`tools/tiers/run_tiers.py` reruns the checks that qualify one candidate and
+records what actually ran:
+
+| Tier | What it runs |
+|---|---|
+| `format` | `cargo fmt --all -- --check` |
+| `lint` | Clippy over the workspace and all targets, warnings denied |
+| `routine` | `cargo test --workspace --locked --no-fail-fast` |
+| `release-story` | the end-to-end story (`tests/story_release.rs`) in a release build |
+| `bounded-resources` | the workload tier (`tests/workloads.rs`): release build, ignored tests, one test thread |
+| `tooling` | the Python tooling tests under `tests/ci` |
+| `campaigns` (opt-in) | the generated-sequence, crash and failure campaigns and the decoder sweep, in staged batches with recorded seeds and budgets |
+| `planted-defects` (opt-in) | the planted-defect catalog against the candidate's own suite |
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 python3 tools/tiers/run_tiers.py --output /tmp/cce-tiers-1
+python3 tools/tiers/run_tiers.py --output /tmp/cce-tiers-2 --tier campaigns --tier planted-defects
+python3 tools/tiers/run_tiers.py --output /tmp/cce-tiers-3 --fresh-clone
+```
+
+Without `--tier` the default tiers run; the opt-in tiers take hours and are
+selected explicitly. The output directory must be new. `results.json` holds the
+candidate commit (and the digest of every file when the working copy is dirty),
+the toolchain, and for each tier its exact commands, environment additions,
+timing, exit status, outcome, test counts per test binary, every executed test
+as `package:target:name` with its result, and the SHA-256 of each log under
+`logs/`. The runner exits 0 only when every selected tier passed.
+
+A Cargo tier passes only when Cargo succeeded, at least one test ran, no test
+failed, and every ignored test is one the runner declares as ignored on purpose:
+the workload tests (run by `bounded-resources`) and the two maintenance actions
+that rewrite committed fixtures. A tier that ran no test, or that ignored any
+other test, does not pass.
+
+`campaigns` runs each batch as its own test run and reads the report line the
+test prints. A batch passes only when its test ran and passed and its report
+shows the budget it was given: every generated sequence of at least 64
+attempted operations and no rejected generated case; every cut, or exactly the
+sampled cuts, executed in the crash and failure campaigns, with recoveries both
+before and after the step. The totals must reach at least 1,000 generated
+sequences on the simulator and 10,000 decoder cases. Anything short or missing
+is listed as a gap and the tier is `incomplete`, never passed.
+
+`--fresh-clone` clones the candidate commit into the output directory and runs
+the tiers there with a new Cargo target directory, so neither build output nor
+uncommitted files of the working copy take part. It needs only the repository,
+the toolchain pinned in `rust-toolchain.toml`, Python 3 and the crates locked in
+`Cargo.lock`.
+
 ## Compare suites against planted defects
 
 The comparative runner pins two suite revisions and verifies their production
