@@ -682,10 +682,13 @@ fn source_files() -> Vec<(String, String)> {
 #[test]
 fn production_storage_io_goes_through_the_adapter() {
     let files = source_files();
-    assert!(
-        files.iter().any(|(n, _)| n == "engine.rs"),
-        "engine source not found"
-    );
+    // The engine and a module nested below it: the scan reaches every source directory.
+    for want in ["engine.rs", "engine/maintain.rs"] {
+        assert!(
+            files.iter().any(|(n, _)| n.replace('\\', "/") == want),
+            "{want} not scanned"
+        );
+    }
     assert_eq!(io_routing_violations(&files), Vec::<String>::new());
 }
 
