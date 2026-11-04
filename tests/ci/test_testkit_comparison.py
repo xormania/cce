@@ -79,10 +79,12 @@ class ComparisonTests(unittest.TestCase):
 
     def test_campaign_records_both_sources_and_leaves_operator_checkout_intact(self):
         before = self.git("status", "--porcelain")
+        self.args.original = "HEAD~1"
         code, report = self.execute()
         self.assertEqual(code, 0)
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["original"], self.original)
+        self.assertEqual(report["reproduce"][report["reproduce"].index("--original") + 1], self.original)
         row = report["faults"][0]
         for role in ("original", "candidate"):
             self.assertEqual(row[role]["result"], "detected")
@@ -148,6 +150,10 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(s.classify(self.result(output, 101), self.fault, self.repo)[0], "build/setup error")
         (self.repo / "tests/witness.rs").write_text('let label = "assert!(not executed)"; setup().unwrap();\n')
         self.assertEqual(s.classify(self.result(output, 101), self.fault, self.repo)[0], "build/setup error")
+        self.fault["success_expectation"] = {"line": "checked_read().unwrap();",
+                                              "contract": "written bytes must be readable"}
+        (self.repo / "tests/witness.rs").write_text("checked_read().unwrap();\n")
+        self.assertEqual(s.classify(self.result(output, 101), self.fault, self.repo)[0], "detected")
 
     def test_io_module_normalization_preserves_trailing_production_and_masks_literals(self):
         original = 'use std::io;\n#[cfg(test)]\nmod tests { let x = r#"}"#; /* } */ }\npub fn tail() {}\n'
@@ -161,6 +167,31 @@ class ComparisonTests(unittest.TestCase):
         for f in catalog:
             self.assertEqual((ROOT / f["path"]).read_text().count(f["old"]), f.get("count", 1), f["id"])
             self.assertIn("fn " + f["test"].split("::")[-1] + "(", (ROOT / f["witness"]).read_text(), f["id"])
+            if f.get("success_expectation"):
+                self.assertEqual((ROOT / f["witness"]).read_text().count(f["success_expectation"]["line"]), 1)
+
+    def test_success_expectations_require_one_source_location_and_a_contract(self):
+        self.fault["success_expectation"] = {"line": "checked_read().unwrap();",
+                                              "contract": "written bytes must be readable"}
+        witness = self.repo / "tests/witness.rs"
+        witness.write_text("checked_read().unwrap();\n" * 2)
+        with self.assertRaisesRegex(ValueError, "expectation is ambiguous"):
+            s.apply_fault(self.repo, self.fault)
+        witness.write_text("checked_read().unwrap();\n")
+        self.fault["success_expectation"]["contract"] = ""
+        with self.assertRaisesRegex(ValueError, "expectation is ambiguous"):
+            s.apply_fault(self.repo, self.fault)
+
+    def test_a_failed_healthy_suite_prevents_mutation_interpretation(self):
+        def unhealthy(command, cwd, log, timeout, env):
+            if "--exact" not in command and "--list" not in command and "test" in command:
+                log.write_text("test result: FAILED. 0 passed; 1 failed;\n")
+                return self.result(log.read_text(), 101)
+            return self.fake_cargo(command, cwd, log, timeout, env)
+        code, report = self.execute(unhealthy)
+        self.assertEqual(code, 1)
+        self.assertIn("healthy suite did not pass", report["error"])
+        self.assertEqual(report["faults"], [])
 
     def test_deadline_terminates_owned_child_processes(self):
         pidfile = self.root / "child.pid"

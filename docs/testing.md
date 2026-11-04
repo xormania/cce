@@ -70,8 +70,11 @@ build pins remain compared. This is specific to the current workspace layout.
 Update the comparison rules explicitly if that layout changes.
 
 A detected defect requires execution of the selected test and a failure at a
-behavioral assertion, explicit error expectation, or declared refusal witness.
-Build/setup failures, ordinary `unwrap` failures, empty selections and aborted
+behavioral assertion, explicit error expectation, declared successful-operation
+expectation, or declared refusal witness. A successful-operation expectation
+specifies the exact source line and the contract it checks; for example, every
+byte must be readable after a write reports success. Unscoped `unwrap` failures
+are setup errors. Build/setup failures, empty selections and aborted
 or timed-out processes are separate results. The command succeeds only when
 both suites detect every selected defect. A survivor in either suite leaves
 the campaign failed, with its evidence retained for investigation. The catalog

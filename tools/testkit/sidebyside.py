@@ -130,7 +130,8 @@ def digest(value):
 
 def apply_fault(root, fault):
     path = Path(fault["path"])
-    if path.is_absolute() or ".." in path.parts:
+    witness = Path(fault["witness"])
+    if any(p.is_absolute() or ".." in p.parts for p in (path, witness)):
         raise ValueError("fault path must be relative")
     target = root / path
     before = target.read_text()
@@ -138,6 +139,11 @@ def apply_fault(root, fault):
     count = fault.get("count", 1)
     if not old or old == new or type(count) is not int or count < 1 or before.count(old) != count:
         raise ValueError("fault anchor count mismatch: " + fault["id"])
+    expectation = fault.get("success_expectation")
+    if expectation:
+        lines = [line.strip() for line in (root / witness).read_text().splitlines()]
+        if not expectation.get("contract") or lines.count(expectation.get("line")) != 1:
+            raise ValueError("successful-operation expectation is ambiguous")
     after = before.replace(old, new)
     target.write_text(after)
     return target, before, {"before": hashlib.sha256(before.encode()).hexdigest(),
@@ -177,8 +183,12 @@ def classify(result, fault, root):
             # and an intentional refusal panic can be behavioral witnesses.
             assertion = re.search(r"\bassert(?:_eq|_ne)?!|\.unwrap_err\(|\.expect_err\(", observed_line)
             refusal = fault.get("refusal") and fault["refusal"] in observed_line and "panic!" in observed_line
-            if assertion or refusal:
-                return "detected", {"path": fault["witness"], "line": line, "context": context}
+            expectation = fault.get("success_expectation", {})
+            success = (bool(expectation.get("contract")) and bool(observed_line.strip()) and
+                       observed_line.strip() == _rust_code(expectation.get("line", "")).strip())
+            if assertion or refusal or success:
+                return "detected", {"path": fault["witness"], "line": line, "context": context,
+                    "kind": "declared successful operation" if success else "behavioral assertion"}
     if "running 0 tests" in result.output:
         return "not exercised", None
     return "build/setup error", None
@@ -209,7 +219,7 @@ def compare(args):
     repo = Path(args.repo).resolve()
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=False)
-    (out / "worktrees").mkdir()
+    (out / "checkouts").mkdir()
     catalog_path = Path(args.catalog).resolve()
     faults = json.loads(catalog_path.read_text())
     if args.fault:
@@ -231,15 +241,18 @@ def compare(args):
                   "--output", str(out) + "-repeat"] +
                   [v for f in args.fault for v in ("--fault", f)]}
     publish(out, report)
+    for key in ("original", "candidate", "production"):
+        index = report["reproduce"].index("--" + key)
+        report["reproduce"][index + 1] = report[key]
     try:
-        with checkout(repo, report["production"], out / "worktrees/production") as base:
+        with checkout(repo, report["production"], out / "checkouts/production") as base:
             expected = production_inputs(base)
         report["production_inputs"] = expected
         report["healthy"] = {}
         report["environment"] = {}
         for role in ("original", "candidate"):
             report["environment"][role] = {}
-            with checkout(repo, report[role], out / ("worktrees/" + role)) as root:
+            with checkout(repo, report[role], out / ("checkouts/" + role)) as root:
                 actual = production_inputs(root)
                 if actual != expected:
                     raise ValueError(role + " production inputs differ from the pinned baseline")
