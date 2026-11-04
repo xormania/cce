@@ -15,11 +15,11 @@ use sha2::{Digest, Sha256};
 
 use crate::codec::key_components;
 use crate::engine::{HISTORY_ENTRY_MAX, Inner};
-use crate::format::{Descriptor, FIRST_NODE_PAGE, PageRef, Slot};
+use crate::format::{Descriptor, FEATURE_HISTORY_MARKERS, FIRST_NODE_PAGE, PageRef, Slot};
 use crate::records::{
     AttemptValue, ContentEntry, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT,
-    P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, SEGMENT_MAX, decode_history,
-    decode_retired, history_key, key, stored_fingerprint,
+    P_HISTORY, P_HISTORY_REMOVED, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, SEGMENT_MAX,
+    decode_history, decode_retired, history_key, key, stored_fingerprint,
 };
 use crate::tree::{MAX_HEIGHT, Node, NodeSource};
 use crate::{Finding, Report, VerifyLevel};
@@ -91,6 +91,7 @@ fn locate(k: &[u8]) -> String {
         Some(&P_OUT) => "outgoing index",
         Some(&P_IN) => "incoming index",
         Some(&P_HISTORY) => "history",
+        Some(&P_HISTORY_REMOVED) => "history marker",
         Some(&P_ATTEMPT) => "attempt",
         Some(&P_CONTENT) => "content",
         Some(&P_RETIRED) => "retirement",
@@ -241,6 +242,22 @@ impl Verifier<'_> {
             }
             if family == P_RETIRED {
                 self.retirement(k, val, committed, at);
+                continue;
+            }
+            if family == P_HISTORY_REMOVED {
+                if k.len() != 9 {
+                    self.find("key", at.clone(), "history marker key is not a position");
+                }
+                if AttemptId::new(val.clone()).is_err() {
+                    self.find("value", at.clone(), "history marker names no valid attempt");
+                }
+                if self.desc.features & FEATURE_HISTORY_MARKERS == 0 {
+                    self.find(
+                        "history",
+                        at,
+                        "history marker in a state that does not require the marker feature",
+                    );
+                }
                 continue;
             }
             let parts = match key_components(&k[1..]) {
@@ -501,17 +518,39 @@ impl Verifier<'_> {
         }
     }
 
-    /// History positions are exactly 1..=history_pos; each entry's attempt record points back to
-    /// it with the fingerprint recomputed from the entry; every attempt record points at an entry
-    /// that records that attempt. Missing positions are reported once per gap, so the findings
-    /// grow with the records present, not with the position the publication record claims.
+    /// History positions are exactly 1..=history_pos, each held by a retained entry or by the
+    /// marker of a removed one, never both; each entry's attempt record points back to it with the
+    /// fingerprint recomputed from the entry, and each marker's attempt record points back to the
+    /// marker; every attempt record points at an entry or marker naming that attempt. Missing
+    /// positions are reported once per gap, so the findings grow with the records present, not
+    /// with the position the publication record claims.
     fn history_and_attempts(&mut self) {
         let last = self.desc.history_pos;
-        let positions: Vec<u64> = self
+        let position = |k: &[u8]| u64::from_be_bytes(k[1..9].try_into().unwrap_or_default());
+        let retained: Vec<u64> = self
             .records
             .keys()
             .filter(|k| k.first() == Some(&P_HISTORY) && k.len() == 9)
-            .map(|k| u64::from_be_bytes(k[1..9].try_into().unwrap_or_default()))
+            .map(|k| position(k))
+            .collect();
+        // Markers of removed entries: position -> the attempt record key the marker names.
+        let marked: BTreeMap<u64, Vec<u8>> = self
+            .records
+            .iter()
+            .filter(|(k, _)| k.first() == Some(&P_HISTORY_REMOVED) && k.len() == 9)
+            .map(|(k, v)| (position(k), key(P_ATTEMPT, &[v])))
+            .collect();
+        for p in retained.iter().filter(|p| marked.contains_key(p)) {
+            self.find(
+                "history",
+                format!("history position {p}"),
+                "both retained and removed",
+            );
+        }
+        let positions: Vec<u64> = retained
+            .iter()
+            .copied()
+            .chain(marked.keys().copied())
             .collect();
         for p in &positions {
             if *p == 0 || *p > last {
@@ -545,9 +584,32 @@ impl Verifier<'_> {
             self.missing_history(e, last);
         }
         let present: HashSet<u64> = held.iter().copied().collect();
-        // The attempt record key each readable entry names.
+        // The attempt record key each readable entry and each marker names.
         let mut owners: HashMap<u64, Vec<u8>> = HashMap::new();
-        for &p in &held {
+        for (&p, akey) in marked.iter().filter(|(p, _)| (1..=last).contains(*p)) {
+            owners.insert(p, akey.clone());
+            match self
+                .records
+                .get(akey)
+                .and_then(|v| AttemptValue::decode(v).ok())
+            {
+                None => self.find(
+                    "attempt",
+                    format!("history position {p}"),
+                    "the removed entry's attempt has no attempt record",
+                ),
+                Some(a) if a.position != p => self.find(
+                    "attempt",
+                    locate(akey),
+                    format!(
+                        "points at position {}, its removed entry is at {p}",
+                        a.position
+                    ),
+                ),
+                Some(_) => {}
+            }
+        }
+        for &p in held.iter().filter(|p| !marked.contains_key(p)) {
             let at = format!("history position {p}");
             let Some(x) = self
                 .records

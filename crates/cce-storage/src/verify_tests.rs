@@ -15,7 +15,8 @@ use crate::format::{Descriptor, PAGE_SIZE, PageKind, PageRef, StoreId, encode_pa
 use crate::io::{FileId, Io};
 use crate::records::{
     AttemptValue, ContentEntry, ContextValue, P_ATTEMPT, P_CONTENT, P_IN, P_OUT, P_RETIRED,
-    Retired, decode_retired, history_key, key, retired_extent_key, retired_page_key,
+    Retired, decode_retired, history_key, key, removed_history_key, retired_extent_key,
+    retired_page_key,
 };
 use crate::sim::SimIo;
 use crate::tree::{Entries, Node, NodeSink, TreeTxn};
@@ -402,6 +403,80 @@ fn assert_consistent(sim: &SimIo) {
         let r = verify_at(sim, level);
         assert!(r.findings.is_empty(), "{level:?}: {:#?}", r.findings);
     }
+}
+
+/// [`rich`] with the history entries of its first two commits removed, and later commits that
+/// reuse the space. Released.
+fn with_removed_history() -> SimIo {
+    let sim = rich();
+    let s = NativeStore {
+        inner: Inner::open(Box::new(sim.clone()), Options::default()).unwrap(),
+    };
+    commit(
+        &s,
+        "forget",
+        ChangeSet {
+            changes: [1, 2]
+                .map(|p| Change::RemoveHistory {
+                    position: cce_core::storage::HistoryPosition(p),
+                })
+                .into(),
+            ..ChangeSet::default()
+        },
+    );
+    for i in 0..3 {
+        commit(
+            &s,
+            &format!("after-{i}"),
+            ChangeSet {
+                changes: vec![put(&format!("after-{i}"), None)],
+                ..ChangeSet::default()
+            },
+        );
+    }
+    drop(s);
+    sim.release();
+    sim
+}
+
+#[test]
+fn a_store_with_removed_history_is_consistent() {
+    assert_consistent(&with_removed_history());
+}
+
+#[test]
+fn a_history_marker_naming_another_attempt_is_an_attempt_finding() {
+    let sim = with_removed_history();
+    edit_tree(&sim, |t| {
+        t.put(removed_history_key(1), b"forged".to_vec()).unwrap();
+    });
+    assert_only(&verify(&sim), "attempt");
+}
+
+#[test]
+fn a_position_both_retained_and_removed_is_a_history_finding() {
+    let sim = rich();
+    edit_tree(&sim, |t| {
+        t.put(removed_history_key(1), b"one".to_vec()).unwrap();
+    });
+    // The state does not require the marker feature either; both are history findings.
+    assert_only(&verify(&sim), "history");
+}
+
+#[test]
+fn a_history_marker_in_a_state_without_the_marker_feature_is_a_history_finding() {
+    let sim = with_removed_history();
+    let mut d = *crate::audit::published(&sim).unwrap().last().unwrap();
+    d.features = 0;
+    sim.write_at(
+        FileId::Meta,
+        Descriptor::slot(d.generation) * PAGE_SIZE as u64,
+        &d.encode(),
+    )
+    .unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    sim.release();
+    assert_only(&verify(&sim), "history");
 }
 
 #[test]
