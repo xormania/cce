@@ -1,2 +1,4 @@
 /target
 /.cargo-home
+# libFuzzer job logs, written where a campaign is started
+/crates/cce-storage/fuzz-*.log

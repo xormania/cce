@@ -19,6 +19,10 @@ mod engine;
 #[cfg(test)]
 mod engine_tests;
 mod format;
+#[cfg(any(test, feature = "fuzz-api"))]
+mod fuzz_api;
+#[cfg(test)]
+mod fuzz_replay_tests;
 mod io;
 #[cfg(test)]
 mod reader_race_tests;
@@ -27,7 +31,7 @@ mod readonly_tests;
 mod records;
 #[cfg(test)]
 mod recovery_tests;
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz-api"))]
 mod sim;
 mod tree;
 #[cfg(test)]
@@ -48,6 +52,14 @@ use cce_core::storage::{
 };
 
 use engine::{Inner, Observation, Options, Snapshot};
+
+/// Fuzzing entry point, with the `fuzz-api` feature only: runs the named target of the fuzz harness
+/// (`page`, `slots`, `node`, `manifest`, `history`, `records` or `image`) on `data`. Not part of the
+/// storage API.
+#[cfg(feature = "fuzz-api")]
+pub fn fuzz_target(name: &str, data: &[u8]) {
+    fuzz_api::run(name, data);
+}
 
 /// A native store owned by this process.
 ///

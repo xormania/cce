@@ -102,6 +102,10 @@ The simulator tests run the production engine with a simulated I/O adapter. They
 - **Damaged durable bytes** in specific places: a newest publication record with a bad checksum or
   torn after any number of bytes, both publication records damaged, the newest root page damaged,
   a content file shorter than the newest record claims, and a damaged content segment.
+- **Arbitrary bytes into every decoder:** fuzz targets (in `crates/cce-storage/fuzz`, run on demand
+  with a nightly toolchain, not in CI) feed arbitrary input to each decoder of stored bytes and to a
+  read-only open that reads a whole store image through. The ordinary tests replay the committed
+  seed inputs and every saved finding through the same entry points.
 
 Separately, real processes are killed and the store is reopened by a fresh process (process exit,
 not power loss); one scenario run on the filesystem adapter and on the simulator must issue the
