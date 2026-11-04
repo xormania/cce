@@ -344,6 +344,105 @@ fn every_seed_and_saved_finding_replays_through_its_harness() {
     );
 }
 
+/// Saved findings the suite must replay (raise when one is added).
+const MIN_REGRESSIONS: usize = 1;
+
+/// Checks the layout of a fuzz directory: `seeds/` and `regressions/` both exist, every directory
+/// in them is named after a target, those directories hold only files, and nothing else sits at
+/// their top level except a `.gitkeep`. Returns the number of saved findings. A misspelled or
+/// nested directory would otherwise be skipped by the replay without notice.
+fn check_layout(fuzz: &Path) -> Result<usize, String> {
+    let names: Vec<&str> = TARGETS.iter().map(|(n, _)| *n).collect();
+    let mut findings = 0;
+    for kind in ["seeds", "regressions"] {
+        let top = fuzz.join(kind);
+        let entries = std::fs::read_dir(&top).map_err(|e| format!("{}: {e}", top.display()))?;
+        for entry in entries {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !path.is_dir() {
+                if name == ".gitkeep" {
+                    continue;
+                }
+                return Err(format!("{kind}/{name}: not in a target directory"));
+            }
+            if !names.contains(&name.as_str()) {
+                return Err(format!("{kind}/{name}: not a fuzz target ({names:?})"));
+            }
+            for inner in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
+                let inner = inner.map_err(|e| e.to_string())?.path();
+                let file = inner.file_name().unwrap().to_string_lossy().into_owned();
+                if inner.is_dir() {
+                    return Err(format!("{kind}/{name}/{file}: nested directory"));
+                }
+                if kind == "regressions" {
+                    findings += 1;
+                }
+            }
+        }
+    }
+    Ok(findings)
+}
+
+#[test]
+fn the_fuzz_directories_hold_only_known_targets() {
+    let n = check_layout(&fuzz_dir("")).unwrap();
+    assert!(n >= MIN_REGRESSIONS, "only {n} saved findings");
+}
+
+/// A fuzz directory with one seed directory and one saved finding for `node`, changed by `build`,
+/// checked, and removed.
+fn layout_case(name: &str, build: impl FnOnce(&Path)) -> Result<usize, String> {
+    let dir = std::env::temp_dir().join(format!("cce-fuzz-layout-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for kind in ["seeds", "regressions"] {
+        std::fs::create_dir_all(dir.join(kind).join("node")).unwrap();
+    }
+    std::fs::write(dir.join("regressions/node/finding"), b"").unwrap();
+    build(&dir);
+    let r = check_layout(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+    r
+}
+
+#[test]
+fn a_valid_fuzz_layout_counts_its_saved_findings() {
+    assert_eq!(layout_case("valid", |_| {}), Ok(1));
+}
+
+#[test]
+fn a_misspelled_target_directory_is_refused() {
+    let r = layout_case("misspelled", |d| {
+        std::fs::create_dir_all(d.join("regressions/nodes")).unwrap();
+        std::fs::write(d.join("regressions/nodes/finding"), b"").unwrap();
+    });
+    assert!(matches!(&r, Err(m) if m.contains("nodes")), "{r:?}");
+}
+
+#[test]
+fn a_nested_directory_is_refused() {
+    let r = layout_case("nested", |d| {
+        std::fs::create_dir_all(d.join("seeds/node/deeper")).unwrap()
+    });
+    assert!(matches!(&r, Err(m) if m.contains("deeper")), "{r:?}");
+}
+
+#[test]
+fn a_missing_regressions_directory_is_refused() {
+    let r = layout_case("missing", |d| {
+        std::fs::remove_dir_all(d.join("regressions")).unwrap()
+    });
+    assert!(matches!(&r, Err(m) if m.contains("regressions")), "{r:?}");
+}
+
+#[test]
+fn a_loose_file_beside_the_target_directories_is_refused() {
+    let r = layout_case("stray", |d| {
+        std::fs::write(d.join("seeds/loose-input"), b"").unwrap()
+    });
+    assert!(matches!(&r, Err(m) if m.contains("loose-input")), "{r:?}");
+}
+
 #[test]
 #[ignore = "writes the seed files; run after a format change"]
 fn write_seeds() {

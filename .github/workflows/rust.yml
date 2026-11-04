@@ -52,5 +52,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- --deny warnings
 
+      # The fuzzing harness is compiled only with this feature; the fuzz targets themselves live
+      # outside the workspace and need a nightly toolchain.
+      - name: Clippy (fuzz-api feature)
+        run: cargo clippy --locked -p cce-storage --features fuzz-api --all-targets -- --deny warnings
+
       - name: Test
         run: cargo test --workspace --locked
