@@ -200,10 +200,11 @@ yet.
 
 Stored bytes are not authenticated: checksums are not keyed, so anyone who can write the store files
 can produce records the engine accepts. In particular, the engine trusts attempt records. A
-checksum-valid attempt record that names another attempt's history entry makes `outcome` report
-that attempt as committed, and makes a retry of it return the existing receipt without applying its
-changes. `cce-verify` reports such a record as an attempt finding. Accidental damage cannot produce
-one: it needs a record written with a valid checksum, by deliberate editing or by an engine defect.
+checksum-valid attempt record that the history does not back (one naming another attempt's entry, or
+a position with no entry) makes `outcome` report that attempt as committed, and makes a retry of it
+return a receipt for that position without applying its changes. `cce-verify` reports such a record
+as an attempt finding. Accidental damage cannot produce one: it needs a record written with a valid
+checksum, by deliberate editing or by an engine defect.
 
 ## Requests the format cannot hold
 
