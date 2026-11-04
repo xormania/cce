@@ -367,7 +367,11 @@ fn an_admitted_commit_completes_after_its_caller_goes_away() {
     }
     let mut v = s.begin().unwrap();
     assert_eq!(
-        v.history(HistoryPosition(0)).unwrap().count(),
+        v.history(HistoryPosition(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("a retained history entry is unreadable")
+            .len(),
         1,
         "the commit must apply exactly once"
     );

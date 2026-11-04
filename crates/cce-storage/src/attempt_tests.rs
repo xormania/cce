@@ -131,12 +131,15 @@ fn logical_state(s: &NativeStore) -> Vec<String> {
     out
 }
 
+/// The number of retained history entries; every one must be readable.
 fn history_len(s: &NativeStore) -> usize {
     s.begin()
         .unwrap()
         .history(HistoryPosition(0))
         .unwrap()
-        .count()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("a retained history entry is unreadable")
+        .len()
 }
 
 fn descriptor(s: &NativeStore) -> Descriptor {
