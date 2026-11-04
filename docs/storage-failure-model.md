@@ -233,8 +233,8 @@ The structure level checks, for the current publication record:
 - every record's key family, key components and identifiers, and its value encoding;
 - every relationship has both directional index entries, and every index entry matches a
   relationship;
-- every context's bound content has its manifest record, and every extent record lies within
-  committed content;
+- every context's bound content, and all content a history entry binds, has its manifest record,
+  and every extent record lies within committed content;
 - history positions are exactly 1 through the committed position, and each history entry's attempt
   record points back to it with the fingerprint recomputed from the entry; every attempt record
   points at an entry.
@@ -245,7 +245,7 @@ its memory grows with the metadata. It does not check whether a relationship's e
 The scrub level (`VerifyLevel::Scrub`, `--scrub`) also reads every committed content stream: each
 manifest record's manifest must describe the content its key names, every segment must match its
 SHA-256, the whole stream must match the content's digest and length, and every context's binding
-must match its content's manifest. Manifests and segments are read through the verified read, one at
+and every history entry's binding must match its content's manifest. Manifests and segments are read through the verified read, one at
 a time; the report counts the content bytes read.
 
 `--json` prints one JSON object per line in a deterministic order: a summary, both slots, the

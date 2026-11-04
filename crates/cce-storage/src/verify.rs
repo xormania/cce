@@ -34,6 +34,7 @@ pub(crate) fn run(inner: &Inner, level: VerifyLevel) -> Result<Report, StorageEr
         leaf_depth: None,
         records: BTreeMap::new(),
         content_bytes: 0,
+        history_bindings: Vec::new(),
     };
     let slots = v.slots()?;
     v.visit(d.root, 1, None, None);
@@ -65,6 +66,8 @@ struct Verifier<'a> {
     leaf_depth: Option<usize>,
     records: BTreeMap<Vec<u8>, Vec<u8>>,
     content_bytes: u64,
+    /// Content each history entry binds, by position (compared with the manifests by a scrub).
+    history_bindings: Vec<(u64, ContentRef)>,
 }
 
 /// A record's location: its key family and the first 8 bytes of the SHA-256 of its key.
@@ -386,6 +389,18 @@ impl Verifier<'_> {
                     format!("entry records position {}", entry.position.0),
                 );
             }
+            // Content a history entry binds stays committed: its manifest record must exist (and a
+            // scrub compares it with the manifest).
+            for c in &entry.content {
+                if !self.records.contains_key(&key(P_CONTENT, &[&c.digest.0])) {
+                    self.find(
+                        "content-ref",
+                        at.clone(),
+                        "history entry binds content that has no manifest record",
+                    );
+                }
+                self.history_bindings.push((p, *c));
+            }
             // The fingerprint covers the canonical request; staging tokens are not part of it.
             let request = ChangeSet {
                 changes: entry.changes,
@@ -541,6 +556,17 @@ impl Verifier<'_> {
                     "content",
                     locate(&k),
                     "binding differs from its content's manifest",
+                );
+            }
+        }
+        for (p, c) in std::mem::take(&mut self.history_bindings) {
+            if let Some(m) = manifests.get(c.digest.0.as_slice())
+                && *m != c
+            {
+                self.find(
+                    "content",
+                    format!("history position {p}"),
+                    "history binding differs from its content's manifest",
                 );
             }
         }

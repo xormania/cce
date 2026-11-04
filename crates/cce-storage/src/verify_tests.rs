@@ -149,6 +149,8 @@ struct Sink {
     sim: SimIo,
     next: u64,
     incarnation: u64,
+    /// Committed content length of the next generation (raised when content is appended).
+    content_len: u64,
 }
 
 impl NodeSink for Sink {
@@ -176,12 +178,14 @@ fn publish(sim: &SimIo, build: impl FnOnce(&Inner, &Descriptor, &mut Sink) -> Pa
         sim: sim.clone(),
         next: cur.next_page,
         incarnation: cur.generation + 1,
+        content_len: cur.content_len,
     };
     let root = build(&inner, &cur, &mut sink);
     let d = Descriptor {
         generation: cur.generation + 1,
         root,
         next_page: sink.next,
+        content_len: sink.content_len,
         ..cur
     };
     sim.write_at(
@@ -558,5 +562,119 @@ fn a_binding_whose_length_differs_from_its_manifest_is_found_by_a_scrub() {
         t.finish(sink).unwrap()
     });
     assert!(verify(&sim).is_consistent());
+    assert_only(&verify_at(&sim, VerifyLevel::Scrub), "content");
+}
+
+/// Commit 1 binds content X to "A"; commit 2 rewrites "A" without content, so only history entry 1
+/// still binds X. Released.
+fn bound_only_by_history() -> (SimIo, cce_core::storage::ContentRef) {
+    let sim = SimIo::new();
+    let s = NativeStore {
+        inner: Inner::create(Box::new(sim.clone()), STORE, Options::default()).unwrap(),
+    };
+    let staged = s.stage_content(&mut &[3u8; 5_000][..]).unwrap();
+    commit(
+        &s,
+        "bind",
+        ChangeSet {
+            changes: vec![put("A", Some(0))],
+            content: vec![ContentBinding::from(&staged)],
+            ..ChangeSet::default()
+        },
+    );
+    commit(
+        &s,
+        "unbind",
+        ChangeSet {
+            changes: vec![put("A", None)],
+            ..ChangeSet::default()
+        },
+    );
+    drop(s);
+    sim.release();
+    (sim, staged.content)
+}
+
+#[test]
+fn content_bound_only_by_history_without_its_manifest_record_is_a_content_ref_finding() {
+    let (sim, x) = bound_only_by_history();
+    assert!(verify(&sim).is_consistent());
+    edit_tree(&sim, |t| {
+        t.delete(&key(P_CONTENT, &[&x.digest.0])).unwrap();
+    });
+    let r = verify(&sim);
+    assert_only(&r, "content-ref");
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.location == "history position 1"),
+        "{:#?}",
+        r.findings
+    );
+}
+
+#[test]
+fn a_history_binding_that_differs_from_its_manifest_is_found_by_a_scrub() {
+    use cce_core::storage::StagingToken;
+    use sha2::Digest;
+
+    use crate::records::{ExtentRef, decode_history, encode_history, fingerprint};
+
+    let (sim, _) = bound_only_by_history();
+    let content = sim.clone();
+    // Rewrite history entry 1 so that it binds X with the wrong length, as a new, checksum-valid
+    // extent, with its attempt record's fingerprint updated to match: only the binding is wrong.
+    publish(&sim, |inner, cur, sink| {
+        let old = ExtentRef::decode(
+            &crate::tree::get(inner, cur.root, &history_key(1))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let entry =
+            decode_history(&inner.read_extent(&old, u64::MAX, "history entry").unwrap()).unwrap();
+        let request = ChangeSet {
+            changes: entry.changes,
+            content: entry
+                .content
+                .into_iter()
+                .map(|mut c| {
+                    c.len += 1;
+                    ContentBinding {
+                        content: c,
+                        token: StagingToken(Vec::new()),
+                    }
+                })
+                .collect(),
+            evidence: entry.evidence,
+        };
+        let bytes = encode_history(1, &entry.attempt, &request);
+        let at = cur.content_len;
+        content.write_at(FileId::Content, at, &bytes).unwrap();
+        content.sync(FileId::Content).unwrap();
+        sink.content_len = at + bytes.len() as u64;
+        let mut t = TreeTxn::new(inner, cur.root);
+        t.put(
+            history_key(1),
+            ExtentRef {
+                offset: at,
+                len: bytes.len() as u64,
+                digest: sha2::Sha256::digest(&bytes).into(),
+            }
+            .encode(),
+        )
+        .unwrap();
+        t.put(
+            key(P_ATTEMPT, &[entry.attempt.as_bytes()]),
+            AttemptValue {
+                position: 1,
+                fingerprint: fingerprint(&entry.attempt, &request),
+            }
+            .encode(),
+        )
+        .unwrap();
+        t.finish(sink).unwrap()
+    });
+    assert!(verify(&sim).is_consistent(), "{:#?}", verify(&sim).findings);
     assert_only(&verify_at(&sim, VerifyLevel::Scrub), "content");
 }
