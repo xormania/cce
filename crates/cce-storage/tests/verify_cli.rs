@@ -5,9 +5,19 @@ mod common;
 
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard};
 
 use cce_core::storage::{AttemptId, Change, ChangeSet, ContextId, Precondition, StorageEngine};
 use cce_storage::NativeStore;
+
+/// Held for each test's whole body. The store lock belongs to the open file, and a child process
+/// keeps a copy of every open file until it starts its program: a child spawned by one test while
+/// another test's store is open keeps that store locked for a moment after it closes, so the other
+/// test's own reopen could be refused as `Busy`. Tests here therefore never overlap.
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cce-verify"))
@@ -51,6 +61,7 @@ fn store(name: &str, n: usize) -> (common::TestDir, std::path::PathBuf) {
 
 #[test]
 fn a_consistent_store_exits_zero_with_json_lines_and_is_not_changed() {
+    let _serial = serial();
     let (_base, dir) = store("verify-ok", 300);
     let before = files(&dir);
     let out = run(&[dir.to_str().unwrap(), "--json"]);
@@ -78,6 +89,7 @@ fn a_consistent_store_exits_zero_with_json_lines_and_is_not_changed() {
 
 #[test]
 fn a_damaged_reachable_page_exits_one_and_names_it() {
+    let _serial = serial();
     // One commit of many contexts writes its leaves before its root, so the page after the empty
     // store's root is a reachable leaf; the root itself (checked by open) is untouched.
     let (_base, dir) = store("verify-damaged", 300);
@@ -108,6 +120,7 @@ fn a_damaged_reachable_page_exits_one_and_names_it() {
 
 #[test]
 fn a_store_that_cannot_be_inspected_exits_two() {
+    let _serial = serial();
     // Owned by a live process: the read-only open is refused, so nothing is inspected.
     let (_base, dir) = store("verify-owned", 3);
     let before = files(&dir);
@@ -131,6 +144,7 @@ fn a_store_that_cannot_be_inspected_exits_two() {
 
 #[test]
 fn a_scrub_reads_content_and_exits_one_on_a_damaged_segment() {
+    let _serial = serial();
     use cce_core::storage::ContentBinding;
     let base = common::test_dir("verify-scrub");
     let dir = base.join("store");

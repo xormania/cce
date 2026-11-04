@@ -269,6 +269,13 @@ attempt outcomes.
 The lock is an advisory `flock` lock: it excludes processes that use this engine, on local
 filesystems. Network filesystems may not provide it.
 
+The lock belongs to the open lock file, and a child process keeps a copy of every open file from the
+moment it is created until it starts its program. So right after a handle closes, an open of the
+same store can briefly fail with `Busy` while this process, or another process that had the store
+open, is starting child processes: the copy in a child that has not started its program yet still
+holds the lock. Exclusion is never weakened, and nothing is written. Retrying the open is safe; the
+engine itself never retries.
+
 ## Integrity inspection
 
 `NativeReadOnly::verify` and the `cce-verify <store-dir> [--json] [--scrub]` command inspect a store

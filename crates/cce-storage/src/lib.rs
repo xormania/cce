@@ -268,6 +268,11 @@ impl NativeStore {
     }
 
     /// Opens an existing store in `dir`. Never initializes a new store in its place.
+    ///
+    /// Fails with [`StorageError::Busy`] while another handle owns the store. Right after a handle
+    /// closes, `Busy` can also be transient: a child process being started at that moment still
+    /// holds a copy of the lock until it starts its program (see the failure model). Retrying is
+    /// safe.
     pub fn open(dir: &Path) -> Result<Self, StorageError> {
         Self::open_with(dir, StoreOptions::default())
     }
