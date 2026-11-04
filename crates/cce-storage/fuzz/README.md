@@ -3,11 +3,15 @@
 Each target feeds arbitrary bytes to one harness through `cce_storage::fuzz_target` (enabled by the
 `fuzz-api` feature): `page`, `slots`, `node`, `manifest`, `history`, `records` (record values and key
 components, selected by the first byte), `image` (a whole store image, opened read-only and read
-through) and `ops` (an operation sequence decoded from the input, run on the storage simulator
+through), `page_repaired` and `image_repaired` (the same, after recomputing the checksums of the
+input, so mutations reach the checks behind them; an accepted page's payload is also decoded as a
+tree node) and `ops` (an operation sequence decoded from the input, run on the storage simulator
 against the logical model of the model tests, completely or interrupted once by a crash or an I/O
 failure, with the same checks after every step and every recovery). Every entry point must return
 for any input: a panic, a hang or an allocation beyond its limit is a finding. Decoders that accept
-an input must re-encode it to an equal value.
+an input must re-encode the decoded value to exactly the input bytes, so a decoder that ignores a
+field, a reserved byte or trailing bytes is a finding too. A page whose checksum does not match must
+be reported as damage, whatever else its header claims.
 
 This package is outside the repository workspace and needs a nightly toolchain and
 [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). From `crates/cce-storage`:

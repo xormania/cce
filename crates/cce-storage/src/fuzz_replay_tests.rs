@@ -248,6 +248,18 @@ fn seeds() -> BTreeMap<(&'static str, String), Vec<u8>> {
     for (name, run, ops) in ops_seed_sources() {
         add("ops", name, ops_to_bytes(run, &ops));
     }
+    // The checksum-repairing targets start from the same intact pages and images.
+    let repaired: Vec<_> = out
+        .iter()
+        .filter_map(|((t, n), b)| match *t {
+            "page" => Some(("page_repaired", n.clone(), b.clone())),
+            "image" => Some(("image_repaired", n.clone(), b.clone())),
+            _ => None,
+        })
+        .collect();
+    for (t, n, b) in repaired {
+        out.insert((t, n), b);
+    }
     out
 }
 
@@ -483,7 +495,7 @@ fn seeds_are_valid_inputs_for_their_targets() {
         let what = format!("{target}/{name}");
         match target {
             "node" => assert!(Node::decode(&bytes).is_ok(), "{what}"),
-            "page" => {
+            "page" | "page_repaired" => {
                 let at = PageRef {
                     page: 2,
                     incarnation: 1,
@@ -505,7 +517,7 @@ fn seeds_are_valid_inputs_for_their_targets() {
             "manifest" => assert!(Manifest::decode(&bytes).is_ok(), "{what}"),
             "history" => assert!(crate::records::decode_history(&bytes).is_ok(), "{what}"),
             "records" => {} // each selector's value round-trips in the harness itself
-            "image" => {
+            "image" | "image_repaired" => {
                 let (meta, content) = split_image(&bytes);
                 let opened = Inner::open_read_only(
                     Box::new(SimIo::from_images(meta, content)),
@@ -540,7 +552,16 @@ fn every_seed_and_saved_finding_replays_through_its_harness() {
     assert_eq!(
         TARGETS.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
         [
-            "page", "slots", "node", "manifest", "history", "records", "image", "ops"
+            "page",
+            "page_repaired",
+            "slots",
+            "node",
+            "manifest",
+            "history",
+            "records",
+            "image",
+            "image_repaired",
+            "ops"
         ]
     );
 }

@@ -71,3 +71,17 @@ path = "fuzz_targets/ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "page_repaired"
+path = "fuzz_targets/page_repaired.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_repaired"
+path = "fuzz_targets/image_repaired.rs"
+test = false
+doc = false
+bench = false
