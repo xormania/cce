@@ -3,6 +3,8 @@
 //! bytes and a two-byte terminator, after a prefix byte; a relationship whose keys would exceed
 //! the key limit is refused before anything is applied, with an error naming it and the lengths.
 
+use crate::test_support::{create_on, open_on};
+
 use cce_core::storage::{
     AttemptId, Change, ChangeSet, CommitError, ContextId, Direction, HistoryPosition, Precondition,
     ReadView, RelationshipId, RelationshipKind, RelationshipQuery, Revision, StorageEngine,
@@ -10,7 +12,6 @@ use cce_core::storage::{
 };
 
 use crate::NativeStore;
-use crate::engine::Inner;
 use crate::format::StoreId;
 use crate::sim::SimIo;
 use crate::tree::MAX_KEY;
@@ -67,9 +68,7 @@ fn identifiers(total: usize, salt: u8) -> [Vec<u8>; 4] {
 }
 
 fn sim_create(sim: &SimIo) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), STORE, Default::default()).unwrap(),
-    }
+    create_on(Box::new(sim.clone()), STORE, Default::default()).unwrap()
 }
 
 fn commit(s: &NativeStore, attempt: &str, changes: Vec<Change>) -> Result<(), CommitError> {
@@ -166,9 +165,7 @@ fn a_relationship_at_the_key_limit_commits_and_one_byte_more_is_refused_precisel
     // A fresh process sees the same.
     drop(s);
     sim.release();
-    let s = NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Default::default()).unwrap(),
-    };
+    let s = open_on(Box::new(sim.clone()), Default::default()).unwrap();
     // Later commits added history; the refused relationship is still nowhere.
     assert_eq!(observe(&s, &over).0, before.0);
     assert_eq!(observe(&s, &at).0.len(), 2);
@@ -218,9 +215,7 @@ fn four_full_length_identifiers_without_zero_bytes_fit() {
     assert_eq!(observe(&s, &full).0.len(), 2, "both directions");
     drop(s);
     sim.release();
-    let s = NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Default::default()).unwrap(),
-    };
+    let s = open_on(Box::new(sim.clone()), Default::default()).unwrap();
     assert_eq!(
         observe(&s, &full).0.len(),
         2,
