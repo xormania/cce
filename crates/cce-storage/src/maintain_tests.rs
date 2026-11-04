@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, ContentBinding, ContextId, Direction, HistoryEntry,
+    AttemptId, Change, ChangeSet, CommitError, ContentBinding, ContextId, Direction, HistoryEntry,
     HistoryPosition, Precondition, ReadView, Relationship, RelationshipId, RelationshipKind,
-    RelationshipQuery, StorageEngine,
+    RelationshipQuery, StorageEngine, StorageError,
 };
 
 use crate::engine::{Inner, Options};
@@ -1502,5 +1502,99 @@ fn maintenance_steps_hold_one_page_or_segment_and_read_only_what_they_need() {
                 content.1
             ),
         }
+    }
+}
+
+/// Every record the maintenance fixtures hold, read through `view` with its content.
+fn read_everything(view: &mut impl ReadView) {
+    let names = IDS
+        .iter()
+        .map(|n| n.to_string())
+        .chain((0..400).map(|i| format!("k{i:04}")))
+        .chain(["z".to_string()]);
+    for name in names {
+        if let Some(c) = view.context(&cid(&name)).unwrap().and_then(|r| r.content) {
+            let mut bytes = Vec::new();
+            view.content(&c).unwrap().read_to_end(&mut bytes).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_view_that_read_what_maintenance_moved_still_commits() {
+    // Page relocation writes context records back unchanged; content relocation and hole reclaim
+    // change content and retirement records.
+    let steps: [Sweep; 3] = [SWEEPS[0], SWEEPS[2], SWEEPS[3]];
+    for (name, image, task, budget, _) in steps {
+        let sim = image();
+        let s = open(&sim);
+        let generation = s.inner.snapshot().unwrap().desc.generation;
+        let mut view = s.begin().unwrap();
+        read_everything(&mut view);
+        let log = s.inner.conflict_log_for_test();
+        let r = s.maintain(task, budget).unwrap();
+        assert!(
+            r.generation > generation,
+            "{name}: the step published nothing"
+        );
+        assert_eq!(
+            s.inner.conflict_log_for_test(),
+            log,
+            "{name}: maintenance recorded writes a view could conflict with"
+        );
+        s.commit(
+            AttemptId::new(*b"after-maintenance").unwrap(),
+            view,
+            ChangeSet {
+                changes: vec![put("E", "e", None)],
+                ..ChangeSet::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{name}: a view that read the moved records conflicted: {e:?}"));
+    }
+}
+
+#[test]
+fn a_fenced_store_refuses_maintenance_and_writes_nothing() {
+    for (name, image, task, budget, partial) in SWEEPS {
+        if partial {
+            continue;
+        }
+        let base = image();
+        let request = || ChangeSet {
+            changes: vec![put("E", "e", None)],
+            ..ChangeSet::default()
+        };
+        // The operations of one commit on this store: its last is the publication barrier.
+        let probe = base.after_process_exit();
+        let p = open(&probe);
+        let ops = probe.ops();
+        commit(&p, "uncertain", request());
+        let per_commit = probe.ops() - ops;
+        drop(p);
+        // That barrier fails: the outcome is unknown and writes are fenced.
+        let sim = base.after_process_exit();
+        let s = open(&sim);
+        sim.fail_nth_op(per_commit);
+        let err = s
+            .commit(
+                AttemptId::new(*b"uncertain").unwrap(),
+                s.begin().unwrap(),
+                request(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, CommitError::Indeterminate(_)),
+            "{name}: {err:?}"
+        );
+        let generation = s.inner.snapshot().unwrap().desc.generation;
+        let ops = sim.ops();
+        let refused = s.maintain(task, budget).unwrap_err();
+        assert!(
+            matches!(&refused, CommitError::Rejected(StorageError::StoreState(why)) if why.contains("fenced")),
+            "{name}: {refused:?}"
+        );
+        assert_eq!(sim.ops(), ops, "{name}: maintenance wrote while fenced");
+        assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
     }
 }

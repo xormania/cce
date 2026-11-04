@@ -207,7 +207,15 @@ impl Inner {
         self: &Arc<Self>,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceReport, CommitError> {
-        let (snap, _pin, ()) = self.pin_current_then(false, |_| ());
+        // A fenced store cannot publish: refuse before copying anything (checked again under the
+        // writer lock before publishing).
+        let (snap, _pin, fence) = self.pin_current_then(false, |st| st.fenced.clone());
+        if let Some(f) = fence {
+            return Err(rejected(StorageError::StoreState(format!(
+                "writes fenced: {}",
+                f.why
+            ))));
+        }
         let basis = snap.desc;
         let Some(bound) = self.reusable_through(basis.generation.saturating_add(1)) else {
             return Ok(report(basis.generation, 0, true));
