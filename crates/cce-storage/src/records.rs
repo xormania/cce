@@ -34,6 +34,8 @@ pub(crate) const P_RETIRED: u8 = 0x08;
 
 /// Kind byte of a retired metadata page in a retirement key.
 pub(crate) const RETIRED_PAGE: u8 = 0;
+/// Kind byte of a retired content-file extent in a retirement key.
+pub(crate) const RETIRED_EXTENT: u8 = 1;
 
 /// Version tag of the canonical request encoding used for attempt fingerprints.
 const REQUEST_ENCODING_V1: u8 = 1;
@@ -56,26 +58,59 @@ pub(crate) fn retired_page_key(generation: u64, page: u64) -> Vec<u8> {
     k
 }
 
-/// Parses a retired-page record: `(retiring generation, page, incarnation)`.
-pub(crate) fn decode_retired_page(
-    key: &[u8],
-    value: &[u8],
-) -> Result<(u64, u64, u64), StorageError> {
+/// One retirement record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retired {
+    /// A tree page and the incarnation it held.
+    Page {
+        generation: u64,
+        page: u64,
+        incarnation: u64,
+    },
+    /// A content-file extent.
+    Extent {
+        generation: u64,
+        offset: u64,
+        len: u64,
+    },
+}
+
+/// Parses a retirement record (prefix, retiring generation, kind, page or offset).
+pub(crate) fn decode_retired(key: &[u8], value: &[u8]) -> Result<Retired, StorageError> {
     let bad = || corrupt("retirement record");
     let [P_RETIRED, rest @ ..] = key else {
         return Err(bad());
     };
     let (generation, rest) = rest.split_first_chunk::<8>().ok_or_else(bad)?;
-    let [RETIRED_PAGE, page @ ..] = rest else {
+    let generation = u64::from_be_bytes(*generation);
+    let [kind, at @ ..] = rest else {
         return Err(bad());
     };
-    let page: [u8; 8] = page.try_into().map_err(|_| bad())?;
-    let incarnation: [u8; 8] = value.try_into().map_err(|_| bad())?;
-    Ok((
-        u64::from_be_bytes(*generation),
-        u64::from_be_bytes(page),
-        u64::from_le_bytes(incarnation),
-    ))
+    let at = u64::from_be_bytes(at.try_into().map_err(|_| bad())?);
+    let v = u64::from_le_bytes(value.try_into().map_err(|_| bad())?);
+    match *kind {
+        RETIRED_PAGE => Ok(Retired::Page {
+            generation,
+            page: at,
+            incarnation: v,
+        }),
+        RETIRED_EXTENT => Ok(Retired::Extent {
+            generation,
+            offset: at,
+            len: v,
+        }),
+        _ => Err(bad()),
+    }
+}
+
+/// Key recording that the content-file extent at `offset` is unreachable from generation
+/// `generation` on. The value is the extent's length.
+pub(crate) fn retired_extent_key(generation: u64, offset: u64) -> Vec<u8> {
+    let mut k = vec![P_RETIRED];
+    k.extend_from_slice(&generation.to_be_bytes());
+    k.push(RETIRED_EXTENT);
+    k.extend_from_slice(&offset.to_be_bytes());
+    k
 }
 
 pub(crate) fn history_key(pos: u64) -> Vec<u8> {
@@ -113,6 +148,46 @@ impl ExtentRef {
         let r = Self::dec(&mut d)?;
         d.finish()?;
         Ok(r)
+    }
+}
+
+/// Value of a content index entry (prefix `07`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContentEntry {
+    /// Committed content: its manifest extent and how many records use it.
+    Live { manifest: ExtentRef, refs: u64 },
+    /// Content that was committed, but that no record uses any more; its space is retired.
+    Removed,
+}
+
+impl ContentEntry {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::default();
+        match self {
+            ContentEntry::Live { manifest, refs } => {
+                e.u8(1);
+                manifest.enc(&mut e);
+                e.u64(*refs);
+            }
+            ContentEntry::Removed => {
+                e.u8(0);
+            }
+        }
+        e.buf
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, StorageError> {
+        let mut d = Dec::new(b, "content entry");
+        let entry = match d.u8()? {
+            1 => ContentEntry::Live {
+                manifest: ExtentRef::dec(&mut d)?,
+                refs: d.u64()?,
+            },
+            0 => ContentEntry::Removed,
+            t => return Err(corrupt(format!("content entry tag {t}"))),
+        };
+        d.finish()?;
+        Ok(entry)
     }
 }
 

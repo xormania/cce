@@ -274,6 +274,9 @@ pub enum StorageError {
     Io(String),
     /// The handle/view/token belongs to a different store or open instance.
     ForeignHandle,
+    /// The content was committed once, but no record uses it any more and storage no longer keeps
+    /// its bytes. Retained history may still name it by digest and length.
+    ContentNotRetained,
 }
 
 impl fmt::Display for StorageError {
@@ -326,6 +329,9 @@ pub trait ReadView: Send {
     ) -> Result<Box<dyn Iterator<Item = Result<HistoryEntry, StorageError>> + '_>, StorageError>;
 
     /// Opens a reader over committed content. The reader remains valid after the view drops.
+    ///
+    /// Content that no record in this view uses any more, and whose bytes storage no longer keeps,
+    /// fails with [`StorageError::ContentNotRetained`] even though history may still name it.
     fn content(&mut self, content: &ContentRef) -> Result<Box<dyn ContentReader>, StorageError>;
 }
 

@@ -6,6 +6,7 @@ use std::io::Read;
 
 use cce_core::storage::{
     AttemptId, Change, ChangeSet, ContentBinding, ContextId, Precondition, ReadView, StorageEngine,
+    StorageError,
 };
 
 use crate::audit::{published, reach};
@@ -522,4 +523,138 @@ fn a_fixed_live_set_keeps_idle_metadata_space_constant() {
         reachable - warm_reachable,
         "allocation grew beyond the growth of reachable (retained) metadata"
     );
+}
+
+// ----- logical content removal -----------------------------------------------------------------
+
+fn remove(s: &NativeStore, attempt: &str, id: &str) {
+    s.commit(
+        AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![Change::RemoveContext {
+                id: cid(id),
+                expect: Precondition::Any,
+            }],
+            ..ChangeSet::default()
+        },
+    )
+    .unwrap();
+}
+
+fn read_all(
+    v: &mut crate::NativeView,
+    c: &cce_core::storage::ContentRef,
+) -> Result<Vec<u8>, StorageError> {
+    let mut bytes = Vec::new();
+    v.content(c)?
+        .read_to_end(&mut bytes)
+        .map_err(|e| StorageError::Io(e.to_string()))?;
+    Ok(bytes)
+}
+
+#[test]
+fn content_whose_last_record_is_gone_is_not_retained_but_an_older_view_still_reads_it() {
+    let sim = SimIo::new();
+    let s = sim_create(&sim);
+    let payload: Vec<u8> = (0..CONTENT_CHUNK + 500).map(|i| (i % 251) as u8).collect();
+    put(&s, "a1", "A", &payload);
+    // A second record with the same bytes (staged again) shares the committed content; the second
+    // staging is never indexed, so the commit retires it although no earlier state reached it.
+    let before = reach(&sim, &desc(&s)).unwrap();
+    put(&s, "a2", "B", &payload);
+    let d = desc(&s);
+    let after = reach(&sim, &d).unwrap();
+    assert_eq!(
+        after.manifests, before.manifests,
+        "the duplicate was indexed"
+    );
+    let retired_now: Vec<_> = after
+        .retired_extents
+        .iter()
+        .filter(|(_, (g, _))| *g == d.generation)
+        .collect();
+    assert_eq!(
+        retired_now.len(),
+        3,
+        "the duplicate staging (manifest and two segments) was not retired: {retired_now:?}"
+    );
+    let c = s
+        .begin()
+        .unwrap()
+        .context(&cid("A"))
+        .unwrap()
+        .unwrap()
+        .content
+        .unwrap();
+    crate::audit::check_retirement(&sim).unwrap();
+
+    remove(&s, "a3", "A");
+    crate::audit::check_retirement(&sim).unwrap();
+    // Still used by B: readable through history's reference.
+    assert_eq!(read_all(&mut s.begin().unwrap(), &c).unwrap(), payload);
+
+    let mut old = s.begin().unwrap();
+    put_body(&s, "a4", "B", "no content any more");
+    crate::audit::check_retirement(&sim).unwrap();
+    // No record uses it: new views get exactly "not retained", while history still names it.
+    let mut v = s.begin().unwrap();
+    assert_eq!(read_all(&mut v, &c), Err(StorageError::ContentNotRetained));
+    let named: Vec<_> = v
+        .history(cce_core::storage::HistoryPosition(0))
+        .unwrap()
+        .map(|h| h.unwrap().content)
+        .collect();
+    assert_eq!(named[0], vec![c], "history no longer names the content");
+    // The view that began before the removal still reads it whole.
+    assert_eq!(read_all(&mut old, &c).unwrap(), payload);
+    drop((v, old));
+
+    // The same after a fresh open.
+    drop(s);
+    sim.release();
+    let s = NativeStore {
+        inner: Inner::open(Box::new(sim.clone()), Default::default()).unwrap(),
+    };
+    assert_eq!(
+        read_all(&mut s.begin().unwrap(), &c),
+        Err(StorageError::ContentNotRetained)
+    );
+    // Committing the same bytes again makes them readable again.
+    put(&s, "a5", "C", &payload);
+    assert_eq!(read_all(&mut s.begin().unwrap(), &c).unwrap(), payload);
+    crate::audit::check_retirement(&sim).unwrap();
+}
+
+#[test]
+fn every_commit_retires_exactly_the_content_it_stopped_reaching() {
+    let sim = SimIo::new();
+    let s = sim_create(&sim);
+    // Records alternate between distinct payloads, sometimes sharing, sometimes dropping content.
+    let mut present = std::collections::BTreeSet::new();
+    let mut removed_at_some_point = false;
+    for i in 0..60u32 {
+        let id = format!("R{}", i % 5);
+        let removing = i % 7 == 3 && present.contains(&id);
+        if removing {
+            present.remove(&id);
+        } else {
+            present.insert(id.clone());
+        }
+        match i % 7 {
+            3 if removing => remove(&s, &format!("x{i}"), &id),
+            5 => put_body(&s, &format!("x{i}"), &id, "plain"),
+            _ => {
+                let payload = vec![(i % 4) as u8; 1000 + (i % 4) as usize];
+                put(&s, &format!("x{i}"), &id, &payload);
+            }
+        }
+        crate::audit::check_retirement(&sim).unwrap_or_else(|e| panic!("after commit {i}: {e}"));
+        let cur = *published(&sim).unwrap().last().unwrap();
+        removed_at_some_point |= reach(&sim, &cur).unwrap().tombstones > 0;
+    }
+    let cur = *published(&sim).unwrap().last().unwrap();
+    let r = reach(&sim, &cur).unwrap();
+    assert!(!r.retired_extents.is_empty(), "no content was ever retired");
+    assert!(removed_at_some_point, "no content was ever removed");
 }

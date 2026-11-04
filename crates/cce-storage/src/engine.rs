@@ -30,9 +30,9 @@ use crate::format::{
 };
 use crate::io::{FileId, Io};
 use crate::records::{
-    AttemptValue, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT, P_HISTORY,
-    P_IN, P_OUT, P_REL, P_RETIRED, RelValue, decode_history, decode_retired_page, encode_history,
-    fingerprint, history_key, key, retired_page_key,
+    AttemptValue, ContentEntry, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT,
+    P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, decode_history, decode_retired,
+    encode_history, fingerprint, history_key, key, retired_extent_key, retired_page_key,
 };
 use crate::tree::{self, Cursor, Node, NodeSink, NodeSource, TreeTxn};
 
@@ -917,7 +917,7 @@ impl Inner {
         })?;
         let bound = self.resolve_content(&cs)?;
         let extents: Vec<BoundContent> = bound.iter().map(|(_, x)| *x).collect();
-        apply(&mut txn, &cs, &extents, pos)?;
+        let content_refs = apply(&mut txn, &cs, &extents, pos)?;
         let written: Vec<Vec<u8>> = txn
             .touched()
             .iter()
@@ -965,6 +965,7 @@ impl Inner {
                 "generation counter exhausted".into(),
             )));
         };
+        self.settle_content(&mut txn, &extents, content_refs, generation)?;
         // Retired pages this commit may reuse: none that either publication slot can still reach
         // while this commit is unpublished (retired at most two generations before it), and none
         // a live reader's generation can reach (retired no later than the oldest pinned one). A
@@ -1058,6 +1059,132 @@ impl Inner {
             .iter()
             .map(|b| self.staged_extent(&b.token, &b.content).map_err(rejected))
             .collect()
+    }
+
+    /// Brings content index entries in line with the records that use them: `refs` is this
+    /// commit's change in users per digest. Content gaining its first user is indexed with the
+    /// commit's binding for it; content losing its last user becomes a removed entry and its
+    /// manifest and segments are retired at `generation`. Bound content the index does not take
+    /// (a second staging of committed bytes, or a binding no change uses) is retired too: no
+    /// published state ever reaches it.
+    fn settle_content(
+        &self,
+        t: &mut TreeTxn,
+        bound: &[BoundContent],
+        refs: BTreeMap<[u8; 32], i64>,
+        generation: u64,
+    ) -> Result<(), CommitError> {
+        let mut first: BTreeMap<[u8; 32], ExtentRef> = BTreeMap::new();
+        let mut orphans: Vec<ExtentRef> = Vec::new();
+        for (manifest, c) in bound {
+            match first.entry(c.digest.0) {
+                std::collections::btree_map::Entry::Occupied(_) => orphans.push(*manifest),
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(*manifest);
+                }
+            }
+        }
+        let digests: BTreeSet<[u8; 32]> = refs.keys().chain(first.keys()).copied().collect();
+        for d in digests {
+            let delta = refs.get(&d).copied().unwrap_or(0);
+            let binding = first.get(&d).copied();
+            let ck = key(P_CONTENT, &[&d]);
+            let entry = t
+                .get(&ck)
+                .map_err(rejected)?
+                .map(|v| ContentEntry::decode(&v))
+                .transpose()
+                .map_err(rejected)?;
+            match entry {
+                Some(ContentEntry::Live { manifest, refs: n }) => {
+                    let now = i64::try_from(n)
+                        .ok()
+                        .and_then(|n| n.checked_add(delta))
+                        .filter(|n| *n >= 0)
+                        .ok_or_else(|| {
+                            rejected(corrupt(format!(
+                                "content used by {n} records cannot change by {delta}"
+                            )))
+                        })?;
+                    if now == 0 {
+                        t.put(ck, ContentEntry::Removed.encode())
+                            .map_err(rejected)?;
+                        self.retire_content(t, &manifest, generation)?;
+                    } else if now as u64 != n {
+                        t.put(
+                            ck,
+                            ContentEntry::Live {
+                                manifest,
+                                refs: now as u64,
+                            }
+                            .encode(),
+                        )
+                        .map_err(rejected)?;
+                    }
+                    orphans.extend(binding);
+                }
+                Some(ContentEntry::Removed) | None => {
+                    if delta < 0 {
+                        return Err(rejected(corrupt(
+                            "a record used content that is not committed",
+                        )));
+                    }
+                    if delta > 0 {
+                        let manifest = binding.ok_or_else(|| {
+                            rejected(corrupt("new use of content without a binding"))
+                        })?;
+                        t.put(
+                            ck,
+                            ContentEntry::Live {
+                                manifest,
+                                refs: delta as u64,
+                            }
+                            .encode(),
+                        )
+                        .map_err(rejected)?;
+                    } else {
+                        orphans.extend(binding);
+                    }
+                }
+            }
+        }
+        for o in orphans {
+            self.retire_content(t, &o, generation)?;
+        }
+        Ok(())
+    }
+
+    /// Records a content manifest and every segment it names as retired at `generation`.
+    fn retire_content(
+        &self,
+        t: &mut TreeTxn,
+        manifest: &ExtentRef,
+        generation: u64,
+    ) -> Result<(), CommitError> {
+        let m = Manifest::decode(&self.read_written_extent(manifest).map_err(rejected)?)
+            .map_err(rejected)?;
+        for x in std::iter::once(*manifest).chain(m.segments) {
+            t.put(
+                retired_extent_key(generation, x.offset),
+                x.len.to_le_bytes().to_vec(),
+            )
+            .map_err(rejected)?;
+        }
+        Ok(())
+    }
+
+    /// Reads an extent this store wrote, committed or staged, checking its digest.
+    fn read_written_extent(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+        let len = usize::try_from(x.len).map_err(|_| corrupt("extent too large"))?;
+        let mut buf = vec![0; len];
+        self.io.read_at(FileId::Content, x.offset, &mut buf)?;
+        if sha256(&buf) != x.digest {
+            return Err(corrupt(format!(
+                "content extent at {}: digest mismatch",
+                x.offset
+            )));
+        }
+        Ok(buf)
     }
 
     pub fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
@@ -1199,7 +1326,10 @@ impl Inner {
             tree::get(self, s.desc.root, &key(P_CONTENT, &[&c.digest.0]))?.ok_or_else(|| {
                 StorageError::InvalidRequest("content is not committed in this view".into())
             })?;
-        let x = ExtentRef::decode(&x)?;
+        let x = match ContentEntry::decode(&x)? {
+            ContentEntry::Live { manifest, .. } => manifest,
+            ContentEntry::Removed => return Err(StorageError::ContentNotRetained),
+        };
         let limit = Manifest::encoded_len(self.max_segments);
         if x.len > limit {
             return Err(corrupt(format!(
@@ -1395,21 +1525,25 @@ fn settle_allocation(
     };
     let next_candidate = |c: &mut Option<Cursor>| -> Result<Option<RetiredRecord>, StorageError> {
         let Some(cursor) = c else { return Ok(None) };
-        match cursor.next_entry()? {
-            Some((k, v)) => {
-                let (retired_at, page, _) = decode_retired_page(&k, &v)?;
-                if reusable_through.is_some_and(|b| retired_at <= b) {
-                    Ok(Some((k, v, page)))
-                } else {
-                    *c = None;
-                    Ok(None)
+        // Records sort by retiring generation; content extents are not reused by tree pages.
+        while let Some((k, v)) = cursor.next_entry()? {
+            let retired_at = match decode_retired(&k, &v)? {
+                Retired::Page {
+                    generation, page, ..
+                } => {
+                    if reusable_through.is_some_and(|b| generation <= b) {
+                        return Ok(Some((k, v, page)));
+                    }
+                    generation
                 }
-            }
-            None => {
-                *c = None;
-                Ok(None)
+                Retired::Extent { generation, .. } => generation,
+            };
+            if reusable_through.is_none_or(|b| retired_at > b) {
+                break;
             }
         }
+        *c = None;
+        Ok(None)
     };
     let mut taken: Vec<RetiredRecord> = Vec::new();
     let mut returned: Vec<RetiredRecord> = Vec::new();
@@ -1533,8 +1667,10 @@ fn apply(
     cs: &ChangeSet,
     bound: &[BoundContent],
     pos: u64,
-) -> Result<(), CommitError> {
+) -> Result<BTreeMap<[u8; 32], i64>, CommitError> {
     let invalid = |m: String| CommitError::Rejected(StorageError::InvalidRequest(m));
+    // Change in the number of records using each content digest.
+    let mut content_refs: BTreeMap<[u8; 32], i64> = BTreeMap::new();
     // Each logical identity may appear at most once per change set.
     let mut seen = BTreeSet::new();
     for c in &cs.changes {
@@ -1596,11 +1732,11 @@ fn apply(
                             .ok_or_else(|| invalid(format!("content index {i} out of range")))?,
                     ),
                 };
-                if let Some((manifest, c)) = content {
-                    let ck = key(P_CONTENT, &[&c.digest.0]);
-                    if t.get(&ck).map_err(rejected)?.is_none() {
-                        t.put(ck, manifest.encode()).map_err(rejected)?;
-                    }
+                if let Some(p) = prev.as_ref().and_then(|p| p.content) {
+                    *content_refs.entry(p.digest.0).or_default() -= 1;
+                }
+                if let Some((_, c)) = content {
+                    *content_refs.entry(c.digest.0).or_default() += 1;
                 }
                 let revision = pos;
                 t.put(
@@ -1627,8 +1763,11 @@ fn apply(
                     prev.as_ref().map(|p| p.revision),
                     expect,
                 )?;
-                if prev.is_none() {
+                let Some(prev) = prev else {
                     return Err(invalid(format!("remove of absent {id:?}")));
+                };
+                if let Some(p) = prev.content {
+                    *content_refs.entry(p.digest.0).or_default() -= 1;
                 }
                 t.delete(&k).map_err(rejected)?;
             }
@@ -1689,7 +1828,7 @@ fn apply(
             }
         }
     }
-    Ok(())
+    Ok(content_refs)
 }
 
 /// Streams committed content one segment at a time.

@@ -10,7 +10,10 @@ use sha2::{Digest, Sha256};
 use crate::codec::corrupt;
 use crate::format::{Descriptor, PAGE_SIZE, PageKind, PageRef, Slot, decode_page, decode_slot};
 use crate::io::{FileId, Io};
-use crate::records::{ExtentRef, Manifest, P_CONTENT, P_HISTORY, P_RETIRED, decode_retired_page};
+use crate::records::{
+    ContentEntry, ContextValue, ExtentRef, Manifest, P_CONTENT, P_CONTEXT, P_HISTORY, P_RETIRED,
+    Retired, decode_retired, key,
+};
 use crate::tree::Node;
 
 /// The valid publication records, in their proper slots, oldest generation first.
@@ -44,6 +47,14 @@ pub(crate) struct Reach {
     pub history_extents: BTreeSet<(u64, u64)>,
     /// Retired metadata pages recorded in this state: page -> (retiring generation, incarnation).
     pub retired: BTreeMap<u64, (u64, u64)>,
+    /// Retired content-file extents recorded in this state: offset -> (retiring generation, len).
+    pub retired_extents: BTreeMap<u64, (u64, u64)>,
+    /// Content entries marking content that was committed but is no longer retained.
+    pub tombstones: usize,
+    /// Live content entries (by index key) and the number of users each records.
+    pub content_refs: BTreeMap<Vec<u8>, u64>,
+    /// Number of records using each content (by index key), counted from the records themselves.
+    pub record_refs: BTreeMap<Vec<u8>, u64>,
 }
 
 impl Reach {
@@ -110,23 +121,52 @@ pub(crate) fn reach(io: &dyn Io, d: &Descriptor) -> Result<Reach, StorageError> 
             Node::Leaf(entries) => {
                 for (k, v) in entries {
                     match k.first() {
-                        Some(&P_CONTENT) => {
-                            let x = ExtentRef::decode(&v)?;
-                            r.manifests.insert((x.offset, x.len));
-                            for s in Manifest::decode(&read_extent(io, d, &x)?)?.segments {
-                                r.content_segments.insert((s.offset, s.len));
+                        Some(&P_CONTENT) => match ContentEntry::decode(&v)? {
+                            ContentEntry::Live { manifest: x, refs } => {
+                                r.manifests.insert((x.offset, x.len));
+                                for s in Manifest::decode(&read_extent(io, d, &x)?)?.segments {
+                                    r.content_segments.insert((s.offset, s.len));
+                                }
+                                r.content_refs.insert(k.clone(), refs);
+                            }
+                            ContentEntry::Removed => r.tombstones += 1,
+                        },
+                        Some(&P_CONTEXT) => {
+                            if let Some(c) = ContextValue::decode(&v)?.content {
+                                *r.record_refs
+                                    .entry(key(P_CONTENT, &[&c.digest.0]))
+                                    .or_default() += 1;
                             }
                         }
                         Some(&P_HISTORY) => {
                             let x = ExtentRef::decode(&v)?;
                             r.history_extents.insert((x.offset, x.len));
                         }
-                        Some(&P_RETIRED) => {
-                            let (generation, page, incarnation) = decode_retired_page(&k, &v)?;
-                            if r.retired.insert(page, (generation, incarnation)).is_some() {
-                                return Err(corrupt(format!("page {page} retired twice")));
+                        Some(&P_RETIRED) => match decode_retired(&k, &v)? {
+                            Retired::Page {
+                                generation,
+                                page,
+                                incarnation,
+                            } => {
+                                if r.retired.insert(page, (generation, incarnation)).is_some() {
+                                    return Err(corrupt(format!("page {page} retired twice")));
+                                }
                             }
-                        }
+                            Retired::Extent {
+                                generation,
+                                offset,
+                                len,
+                            } => {
+                                if r.retired_extents
+                                    .insert(offset, (generation, len))
+                                    .is_some()
+                                {
+                                    return Err(corrupt(format!(
+                                        "extent at {offset} retired twice"
+                                    )));
+                                }
+                            }
+                        },
                         _ => {}
                     }
                 }
@@ -224,6 +264,47 @@ pub(crate) fn check_retirement(io: &dyn Io) -> Result<(), String> {
                     cur.generation
                 ));
             }
+        }
+        // Content: what the newest commit retired that the preceding state reached is exactly
+        // the content space the newest state no longer reaches.
+        let extents = |r: &Reach| -> BTreeSet<(u64, u64)> {
+            r.manifests.union(&r.content_segments).copied().collect()
+        };
+        let (prev_x, cur_x) = (extents(&rp), extents(&rc));
+        let dropped: BTreeSet<(u64, u64)> = prev_x.difference(&cur_x).copied().collect();
+        let retired_now: BTreeSet<(u64, u64)> = rc
+            .retired_extents
+            .iter()
+            .filter(|(_, (g, _))| *g == cur.generation)
+            .map(|(o, (_, len))| (*o, *len))
+            .collect();
+        let retired_reached: BTreeSet<(u64, u64)> =
+            retired_now.intersection(&prev_x).copied().collect();
+        if retired_reached != dropped {
+            return Err(format!(
+                "generation {}: retired content {retired_reached:?} of the preceding state, but \
+                 stopped reaching {dropped:?}",
+                cur.generation
+            ));
+        }
+    }
+    // Every live content entry counts exactly the records using it, and no record uses content
+    // that is not live.
+    if rc.content_refs != rc.record_refs {
+        return Err(format!(
+            "generation {}: content entries count users {:?}, records use {:?}",
+            cur.generation, rc.content_refs, rc.record_refs
+        ));
+    }
+    // No retired content extent is reachable.
+    let reachable: BTreeSet<(u64, u64)> =
+        rc.manifests.union(&rc.content_segments).copied().collect();
+    for (offset, (generation, len)) in &rc.retired_extents {
+        if reachable.contains(&(*offset, *len)) {
+            return Err(format!(
+                "generation {}: content extent at {offset} retired at {generation} is reachable",
+                cur.generation
+            ));
         }
     }
     Ok(())

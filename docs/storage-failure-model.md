@@ -212,6 +212,12 @@ filesystems. Network filesystems may not provide it.
 
 ## Readers and content integrity
 
+When the last record using some content is removed or replaced, retained history still names the
+content by digest and length, but reading it through a view that began after that commit fails
+with `ContentNotRetained`. It never returns other bytes. A view, or a content reader, that began
+before the commit still reads the content whole: its space is retired, not reused, while it can
+still be reached.
+
 A view reads the generation that was current when it began. Content streams one segment at a time
 through a buffer of one segment. Each segment is read whole and checked against its SHA-256 before
 any of its bytes are delivered, and the SHA-256 of the whole stream is checked before end of stream

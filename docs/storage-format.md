@@ -85,8 +85,9 @@ tuple order of the raw components.
 | `04` | target, kind, source, relationship id | empty — incoming index |
 | `05` | history position (`u64` big-endian) | extent of the history entry |
 | `06` | attempt id | history position `u64`, request fingerprint (32 bytes) |
-| `07` | content SHA-256 | extent of the content's manifest |
+| `07` | content SHA-256 | `01`, extent of the content's manifest, number of records using it (`u64`); or `00`: committed once, no longer retained |
 | `08` | retiring generation (`u64` big-endian), kind `00`, page (`u64` big-endian) | incarnation `u64` of the retired page |
+| `08` | retiring generation (`u64` big-endian), kind `01`, offset (`u64` big-endian) | length `u64` of the retired content extent |
 
 Retirement keys are fixed-width, not escaped components, so they sort by retiring generation.
 
@@ -129,6 +130,12 @@ original receipt; any difference is rejected as a mismatch.
 ## Allocation
 
 Content extents are allocated by advancing the content length; content space is not reused yet.
+
+A content entry counts the records that use the content. When a commit leaves it with none (the
+last such record is removed or replaced), the entry becomes a removed entry and the commit retires
+the content's manifest and segments (prefix `08`, kind `01`). A commit that binds a second staging
+of content that is already committed, or binds content no change uses, retires that staging too:
+no published state reaches it. Committing the same bytes again later indexes them afresh.
 Content staged but not committed lies beyond the committed content length and is ignored, and later
 overwritten, after a restart.
 

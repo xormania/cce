@@ -170,6 +170,7 @@ fn retained_history_reports_the_content_each_commit_bound() {
         ..ChangeSet::default()
     };
     commit(&s, "c1", cs).unwrap();
+    let mut before = s.begin().unwrap();
     // Replace the record so the current state no longer refers to that content.
     commit(
         &s,
@@ -189,8 +190,15 @@ fn retained_history_reports_the_content_each_commit_bound() {
         "history lost the bound content reference"
     );
     assert!(h[1].content.is_empty());
+    // No record uses the content any more: history names it, but its bytes are not retained.
+    assert_eq!(
+        v.content(&h[0].content[0]).err(),
+        Some(StorageError::ContentNotRetained)
+    );
+    // A view from before the replacement still reads them.
     let mut got = Vec::new();
-    v.content(&h[0].content[0])
+    before
+        .content(&h[0].content[0])
         .unwrap()
         .read_to_end(&mut got)
         .unwrap();
@@ -220,7 +228,7 @@ fn a_retry_with_an_unrepresentable_content_index_is_not_matched_to_the_original(
 
 use crate::format::{Descriptor, PAGE_SIZE, PageKind, PageRef, encode_page};
 use crate::io::{FileId, Io};
-use crate::records::{ExtentRef, P_CONTENT, key};
+use crate::records::{ContentEntry, ExtentRef, P_CONTENT, key};
 use crate::sim::Persist;
 use crate::tree::{Node, NodeSink, TreeTxn};
 
@@ -599,8 +607,15 @@ fn an_oversized_manifest_reference_is_refused_before_allocation() {
         digest: [0; 32],
     };
     let mut t = TreeTxn::new(&*s.inner, cur.root);
-    t.put(key(P_CONTENT, &[&staged.content.digest.0]), huge.encode())
-        .unwrap();
+    t.put(
+        key(P_CONTENT, &[&staged.content.digest.0]),
+        ContentEntry::Live {
+            manifest: huge,
+            refs: 1,
+        }
+        .encode(),
+    )
+    .unwrap();
     struct Sink<'a>(&'a SimIo, u64, u64);
     impl NodeSink for Sink<'_> {
         fn write(&mut self, n: &Node) -> Result<PageRef, StorageError> {
