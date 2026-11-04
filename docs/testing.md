@@ -62,6 +62,15 @@ locations. `results.json` and `comparison.md` are written incrementally; retaine
 test images are under `temporary/`. The summary supplies a fresh-output rerun
 command. The operator checkout is never reset or patched.
 
+The runner builds and runs the healthy workspace suite for both revisions and then
+builds and runs once per selected defect, each at Cargo's default parallelism (one
+job and one test thread per available core). On a shared or constrained machine,
+bound it explicitly, for example:
+
+```text
+CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 python3 tools/testkit/sidebyside.py --original origin/master --candidate HEAD --output /tmp/cce-comparison-1
+```
+
 `tools/testkit/faults.json` defines each literal edit, expected anchor count,
 named test and witness file. Anchors must match before the edit is applied.
 Test-support declarations in `lib.rs` and the trailing unit-test module in
