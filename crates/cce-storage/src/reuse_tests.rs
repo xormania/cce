@@ -2069,6 +2069,79 @@ fn a_staging_takes_no_reusable_space_once_writes_are_fenced() {
     );
 }
 
+fn content_file_len(sim: &SimIo) -> u64 {
+    use crate::io::{FileId, Io};
+    sim.len(FileId::Content).unwrap()
+}
+
+/// A commit rejected after writing its history entry leaves those bytes unreferenced. They are
+/// not offered for reuse directly (no record covers them yet); the next publication retires
+/// them with a record, so no space is lost and nothing free lacks a record.
+#[test]
+fn a_rejected_commits_written_history_is_retired_by_the_next_publication() {
+    let attempt_after = |s: &NativeStore, n: u64, sim: &SimIo| -> Result<(), CommitError> {
+        sim.fail_nth_op(n);
+        s.commit(
+            AttemptId::new(*b"rejected").unwrap(),
+            s.begin().unwrap(),
+            ChangeSet {
+                changes: vec![Change::PutContext {
+                    id: cid("R"),
+                    expect: Precondition::Any,
+                    body: b"R".to_vec(),
+                    content: None,
+                }],
+                ..ChangeSet::default()
+            },
+        )
+        .map(|_| ())
+    };
+    // The first failing operation that rejects the commit after its history entry is written.
+    let found = (1..64u64).find_map(|n| {
+        let sim = SimIo::new();
+        let s = with_retired_space(&sim, CONTENT_CHUNK + 300);
+        let before = content_file_len(&sim);
+        let free_before = s.inner.reusable_content_bytes();
+        let r = attempt_after(&s, n, &sim);
+        let grown = content_file_len(&sim) - before;
+        matches!(r, Err(CommitError::Rejected(_)))
+            .then_some(())
+            .filter(|()| grown > 0 && lock_fenced(&s).is_none())
+            .map(|()| (n, sim, s, before, grown, free_before))
+    });
+    let Some((n, sim, s, before, grown, free_before)) = found else {
+        panic!("no failing operation rejects a commit after its history write");
+    };
+    let label = format!("failing operation {n}");
+    let hole = (before, grown);
+    // Not free before a record covers them: the free space is what it was before the attempt.
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        free_before,
+        "{label}: the rejected commit's bytes were offered for reuse without a record"
+    );
+    put_body(&s, "next", "N", "next");
+    let retired = retired_content(&sim, &s);
+    let covered: u64 = retired
+        .iter()
+        .map(|(o, l)| {
+            let lo = (*o).max(hole.0);
+            let hi = (o + l).min(hole.0 + hole.1);
+            hi.saturating_sub(lo)
+        })
+        .sum();
+    assert_eq!(
+        covered, hole.1,
+        "{label}: the rejected commit's history bytes {hole:?} are not retired by the next \
+         publication (retired: {retired:?})"
+    );
+    assert_eq!(crate::audit::check_retirement(&sim), Ok(()), "{label}");
+}
+
+fn lock_fenced(s: &NativeStore) -> Option<String> {
+    s.inner.fence_reason()
+}
+
 #[test]
 fn two_stagings_of_the_same_bytes_in_one_commit_keep_one_and_retire_the_other() {
     let len = CONTENT_CHUNK + 300;

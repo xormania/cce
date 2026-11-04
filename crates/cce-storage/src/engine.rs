@@ -332,6 +332,22 @@ struct ContentPool {
     fenced: bool,
 }
 
+/// Content a commit wrote that no publication references yet. If the commit ends before its
+/// publication record is written, the extent joins the discarded extents, which the next
+/// publication retires with a record: it is never made free without one.
+struct Unpublished<'a> {
+    pool: &'a Mutex<ContentPool>,
+    extent: Option<(u64, u64)>,
+}
+
+impl Drop for Unpublished<'_> {
+    fn drop(&mut self) {
+        if let Some(x) = self.extent.take() {
+            lock(self.pool).discarded.push(x);
+        }
+    }
+}
+
 /// Extents one staging call took from the pool; returned to it unless the staging completes.
 struct Taken<'a> {
     pool: &'a Mutex<ContentPool>,
@@ -1245,6 +1261,12 @@ impl Inner {
             *cursor = end;
             x
         };
+        // Until the publication record is written, nothing references the history entry: a
+        // commit that ends earlier hands its bytes to the next publication to retire.
+        let mut unpublished = Unpublished {
+            pool: &self.pool,
+            extent: Some((hist_ref.offset, hist_ref.len)),
+        };
         txn.put(history_key(pos), hist_ref.encode())
             .map_err(rejected)?;
         txn.put(
@@ -1328,6 +1350,8 @@ impl Inner {
             content_len,
             history_pos: pos,
         };
+        // From the record write on the publication may be durable and reference the entry.
+        unpublished.extent = None;
         let published = self
             .io
             .write_at(
@@ -1637,6 +1661,12 @@ impl Inner {
     fn fence(&self, fence: Fence) {
         lock(&self.state).fenced = Some(fence);
         lock(&self.pool).fenced = true;
+    }
+
+    /// Test hook: why writes are fenced, if they are.
+    #[cfg(test)]
+    pub(crate) fn fence_reason(&self) -> Option<String> {
+        lock(&self.state).fenced.as_ref().map(|f| f.why.clone())
     }
 
     /// Test hook: fences writes as a failed publication would, without one.
