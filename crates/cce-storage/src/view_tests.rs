@@ -504,3 +504,36 @@ fn closing_waits_for_every_admitted_commit_and_refuses_new_ones() {
     assert!(matches!(ob, AttemptOutcome::Committed(_)), "{ob:?}");
     assert!(ta.wait().is_ok() && tb.wait().is_ok());
 }
+
+#[test]
+fn after_close_returns_no_job_keeps_the_store_owned() {
+    use cce_core::storage::StorageEngine;
+    let dir = std::env::temp_dir().join(format!("cce-close-owner-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = NativeStore::create(&dir, [9; 16]).unwrap();
+    s.inner.slow_job_release_for_test();
+    let engine = std::sync::Arc::downgrade(&s.inner);
+    let tickets: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|x| {
+            let id = AttemptId::new(x.as_bytes().to_vec()).unwrap();
+            s.submit(id, s.begin().unwrap(), cs(vec![put(x)])).unwrap()
+        })
+        .collect();
+    StorageEngine::close(s).unwrap();
+    // Nothing the worker holds may outlive close(): the engine is gone and the store is free.
+    assert!(
+        engine.upgrade().is_none(),
+        "a job still holds the engine after close returned"
+    );
+    let reopened = NativeStore::open(&dir);
+    assert!(
+        reopened.is_ok(),
+        "store still owned after close: {:?}",
+        reopened.err()
+    );
+    for t in tickets {
+        assert!(t.wait().is_ok());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
