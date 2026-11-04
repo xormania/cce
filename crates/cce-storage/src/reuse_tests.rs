@@ -442,13 +442,12 @@ fn a_view_registered_while_a_commit_chooses_pages_to_reuse_keeps_its_state() {
 #[test]
 fn every_cut_of_a_reusing_commit_recovers_old_or_new_with_consistent_retirement() {
     let n = LIVE * 6;
-    let build = |sim: &SimIo| {
-        let s = sim_create(sim);
+    let build = |s: NativeStore| {
         churn(&s, None, 0..n);
         s
     };
     let probe = SimIo::new();
-    let s = build(&probe);
+    let s = build(sim_create(&probe));
     let before = probe.ops();
     churn(&s, None, n..n + 1);
     let per_commit = probe.ops() - before;
@@ -458,7 +457,9 @@ fn every_cut_of_a_reusing_commit_recovers_old_or_new_with_consistent_retirement(
 
     for cut in 0..=per_commit {
         let sim = SimIo::new();
-        let s = build(&sim);
+        let trace = Trace::default();
+        let s = build(traced_create(&sim, &trace));
+        trace.lock().unwrap().clear();
         sim.crash_after(cut);
         let acked = s
             .commit(
@@ -476,22 +477,21 @@ fn every_cut_of_a_reusing_commit_recovers_old_or_new_with_consistent_retirement(
             )
             .is_ok();
         drop(s);
-        let persists = [crate::sim::Persist::None, crate::sim::Persist::All]
-            .into_iter()
-            .chain((1..=6).map(crate::sim::Persist::Seeded));
-        for p in persists {
-            let img = sim.after_crash(p);
-            let rec = NativeStore {
-                inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
-            };
-            crate::audit::check_retirement(&img).unwrap_or_else(|e| panic!("cut {cut} {p:?}: {e}"));
-            let got = bodies(&mut rec.begin().unwrap());
-            assert!(got == old || got == new, "cut {cut} {p:?}: {got:?}");
-            if acked {
-                assert_eq!(got, new, "cut {cut} {p:?}: acknowledged commit lost");
-            }
-            // The recovered store keeps reusing correctly.
-            churn(&rec, Some(&img), n + 1..n + 4);
+        for (survived, img) in crash_images(&sim, 6) {
+            let what = format!("reusing commit cut {cut}, {survived}");
+            repro_case(&what, &img, &trace, || {
+                let rec = NativeStore {
+                    inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
+                };
+                crate::audit::check_retirement(&img).unwrap_or_else(|e| panic!("{what}: {e}"));
+                let got = bodies(&mut rec.begin().unwrap());
+                assert!(got == old || got == new, "{what}: {got:?}");
+                if acked {
+                    assert_eq!(got, new, "{what}: acknowledged commit lost");
+                }
+                // The recovered store keeps reusing correctly.
+                churn(&rec, Some(&img), n + 1..n + 4);
+            });
         }
     }
 }
@@ -929,10 +929,58 @@ fn with_reusable_content(
     sim: &SimIo,
     size: usize,
 ) -> (NativeStore, cce_core::storage::ContentRef, Extents) {
-    let s = sim_create(sim);
+    reusable_content_in(sim_create(sim), sim, size)
+}
+
+/// Fills `s` (on `sim`) so that its removed content X is retired and reusable by the next staging.
+fn reusable_content_in(
+    s: NativeStore,
+    sim: &SimIo,
+    size: usize,
+) -> (NativeStore, cce_core::storage::ContentRef, Extents) {
     put(&s, "keep", "K", &payload(20, 1000));
     let (cx, x_ext) = committed_then_removed(&s, sim, "X", &payload(21, size));
     (s, cx, x_ext)
+}
+
+type Trace = std::sync::Arc<std::sync::Mutex<Vec<crate::io::Op>>>;
+
+/// A store on `sim` whose I/O operations are recorded in `trace`.
+fn traced_create(sim: &SimIo, trace: &Trace) -> NativeStore {
+    NativeStore {
+        inner: Inner::create(
+            Box::new(crate::io::Traced {
+                inner: sim.clone(),
+                trace: trace.clone(),
+            }),
+            STORE,
+            Default::default(),
+        )
+        .unwrap(),
+    }
+}
+
+/// The images a crash of `sim` now leaves, each with its label: power loss with no, all, and
+/// `seeds` sampled subsets of the unsynced writes surviving, and a process exit that leaves them
+/// cached.
+fn crash_images(sim: &SimIo, seeds: u64) -> Vec<(String, SimIo)> {
+    [crate::sim::Persist::None, crate::sim::Persist::All]
+        .into_iter()
+        .chain((1..=seeds).map(crate::sim::Persist::Seeded))
+        .map(|p| (crate::repro_tests::survival(p), sim.after_crash(p)))
+        .chain(std::iter::once((
+            crate::repro_tests::PROCESS_EXIT.to_string(),
+            sim.after_process_exit(),
+        )))
+        .collect()
+}
+
+/// Runs one recovery case; if it fails, the image and the recorded operations are saved for
+/// offline reproduction (see the repro helpers).
+fn repro_case(label: &str, img: &SimIo, trace: &Trace, case: impl FnOnce()) {
+    let pristine = img.after_process_exit();
+    let ops = trace.lock().unwrap().clone();
+    crate::repro_tests::with_repro(label, &[("image", &pristine)], &ops, case);
 }
 
 #[test]
@@ -1055,9 +1103,11 @@ fn every_cut_of_a_commit_binding_reused_content_recovers_old_or_new() {
 
     for cut in 0..=per_commit {
         let sim = SimIo::new();
-        let (s, cx, _) = with_reusable_content(&sim, size);
+        let trace = Trace::default();
+        let (s, cx, _) = reusable_content_in(traced_create(&sim, &trace), &sim, size);
         let old = logical_view_state(&s);
         let sy = s.stage_content(&mut &y[..]).unwrap();
+        trace.lock().unwrap().clear();
         sim.crash_after(cut);
         let acked = s
             .commit(
@@ -1076,27 +1126,26 @@ fn every_cut_of_a_commit_binding_reused_content_recovers_old_or_new() {
             )
             .is_ok();
         drop((sy, s));
-        let persists = [crate::sim::Persist::None, crate::sim::Persist::All]
-            .into_iter()
-            .chain((1..=6).map(crate::sim::Persist::Seeded));
-        for p in persists {
-            let img = sim.after_crash(p);
-            let rec = NativeStore {
-                inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
-            };
-            crate::audit::check_retirement(&img).unwrap_or_else(|e| panic!("cut {cut} {p:?}: {e}"));
-            let got = logical_view_state(&rec);
-            let mut v = rec.begin().unwrap();
-            assert_eq!(read_all(&mut v, &cx), Err(StorageError::ContentNotRetained));
-            if got != old {
-                assert_eq!(
-                    read_all(&mut v, &content_of(&rec, "Y")).unwrap(),
-                    y,
-                    "cut {cut} {p:?}"
-                );
-            } else {
-                assert!(!acked, "cut {cut} {p:?}: acknowledged commit lost");
-            }
+        for (survived, img) in crash_images(&sim, 6) {
+            let what = format!("commit binding reused content, cut {cut}, {survived}");
+            repro_case(&what, &img, &trace, || {
+                let rec = NativeStore {
+                    inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
+                };
+                crate::audit::check_retirement(&img).unwrap_or_else(|e| panic!("{what}: {e}"));
+                let got = logical_view_state(&rec);
+                let mut v = rec.begin().unwrap();
+                assert_eq!(read_all(&mut v, &cx), Err(StorageError::ContentNotRetained));
+                if got != old {
+                    assert_eq!(
+                        read_all(&mut v, &content_of(&rec, "Y")).unwrap(),
+                        y,
+                        "{what}"
+                    );
+                } else {
+                    assert!(!acked, "{what}: acknowledged commit lost");
+                }
+            });
         }
     }
 }
@@ -1579,41 +1628,42 @@ fn every_cut_of_every_retiring_or_reusing_step_recovers_and_continues() {
     for k in 0..MATRIX_STEPS {
         for cut in 0..=ops[k] {
             let sim = SimIo::new();
-            let (s, _, _) = with_reusable_content(&sim, size);
+            let trace = Trace::default();
+            let (s, _, _) = reusable_content_in(traced_create(&sim, &trace), &sim, size);
             for j in 0..k {
                 matrix_step(&s, j).unwrap();
             }
+            trace.lock().unwrap().clear();
             sim.crash_after(cut);
             let acked = matrix_step(&s, k).is_ok();
             drop(s);
-            let persists = [crate::sim::Persist::None, crate::sim::Persist::All]
-                .into_iter()
-                .chain((1..=3).map(crate::sim::Persist::Seeded));
-            for p in persists {
-                let img = sim.after_crash(p);
-                let rec = NativeStore {
-                    inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
-                };
-                let what = format!("step {k} cut {cut} {p:?}");
-                crate::audit::check_retirement(&img).unwrap_or_else(|e| panic!("{what}: {e}"));
-                let got = matrix_state(&rec);
-                assert!(got == states[k] || got == states[k + 1], "{what}: {got:?}");
-                if acked {
-                    assert_eq!(got, states[k + 1], "{what}: acknowledged step lost");
-                }
-                // The recovered store carries on: finish the script, auditing each step.
-                let from = if got == states[k] { k } else { k + 1 };
-                for j in from..MATRIX_STEPS {
-                    matrix_step(&rec, j).unwrap_or_else(|e| panic!("{what}: step {j}: {e}"));
-                    crate::audit::check_retirement(&img)
-                        .unwrap_or_else(|e| panic!("{what}: after step {j}: {e}"));
-                }
-                assert_eq!(matrix_state(&rec), fin, "{what}: final state");
+            for (survived, img) in crash_images(&sim, 3) {
+                let what = format!("matrix step {k} cut {cut}, {survived}");
+                repro_case(&what, &img, &trace, || {
+                    let rec = NativeStore {
+                        inner: Inner::open(Box::new(img.clone()), Default::default()).unwrap(),
+                    };
+                    crate::audit::check_retirement(&img).unwrap_or_else(|e| panic!("{what}: {e}"));
+                    let got = matrix_state(&rec);
+                    assert!(got == states[k] || got == states[k + 1], "{what}: {got:?}");
+                    if acked {
+                        assert_eq!(got, states[k + 1], "{what}: acknowledged step lost");
+                    }
+                    // The recovered store carries on: finish the script, auditing each step.
+                    let from = if got == states[k] { k } else { k + 1 };
+                    for j in from..MATRIX_STEPS {
+                        matrix_step(&rec, j).unwrap_or_else(|e| panic!("{what}: step {j}: {e}"));
+                        crate::audit::check_retirement(&img)
+                            .unwrap_or_else(|e| panic!("{what}: after step {j}: {e}"));
+                    }
+                    assert_eq!(matrix_state(&rec), fin, "{what}: final state");
+                });
                 checked += 1;
             }
         }
     }
-    assert_eq!(checked, ops.iter().map(|n| (n + 1) * 5).sum::<u64>());
+    // Five power-loss choices and a process exit per cut.
+    assert_eq!(checked, ops.iter().map(|n| (n + 1) * 6).sum::<u64>());
 }
 
 /// A store whose next commit both reuses retired tree pages and needs more pages than are
