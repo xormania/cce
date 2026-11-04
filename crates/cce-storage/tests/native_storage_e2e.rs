@@ -271,7 +271,11 @@ fn read_only_opens_are_refused_while_owned_and_never_change_the_store() {
     let mut ro = Driver::spawn();
     answered(ro.step(&open_ro), "first read-only open");
     let mut ro2 = Driver::spawn();
-    answered(ro2.step(&open_ro), "second read-only open");
+    let step = ro2.step(&open_ro);
+    assert!(
+        matches!(&step, Step::Answered(lines) if !lines.iter().any(|l| l.starts_with("error "))),
+        "a second read-only open must share the store with the first: {step:?}"
+    );
     for (what, d) in [("first", &mut ro), ("second", &mut ro2)] {
         assert_eq!(
             answered(d.step("dump A,B,C"), "dump"),

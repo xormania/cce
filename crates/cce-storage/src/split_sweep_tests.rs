@@ -196,7 +196,8 @@ fn sweep(case: &Case, event: impl Fn(&[usize], &[usize]) -> bool) {
             let label = format!("{} cut {cut}, {survived}", case.name);
             let pristine = img.after_process_exit();
             with_repro(&label, &[("image", &pristine)], &trace, || {
-                let rec = open_on(Box::new(img.clone()), Default::default()).unwrap();
+                let rec = open_on(Box::new(img.clone()), Default::default())
+                    .unwrap_or_else(|e| panic!("{label}: recovery must open the store: {e:?}"));
                 let got = logical_state(&rec, case.records);
                 assert!(
                     got == old || got == new,

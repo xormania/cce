@@ -117,8 +117,10 @@ fn simulated_lock_admits_one_owner_or_any_number_of_readers() {
     drop(owner);
     sim.release();
 
-    let first = try_open_ro(&sim).expect("first reader");
-    let second = try_open_ro(&sim).expect("second reader");
+    let first = try_open_ro(&sim)
+        .unwrap_or_else(|e| panic!("a reader must open after the owner is gone: {e:?}"));
+    let second =
+        try_open_ro(&sim).unwrap_or_else(|e| panic!("a second reader must share the lock: {e:?}"));
     assert_busy(try_open(&sim), "read-write open under readers");
     drop((first, second));
     sim.release();
@@ -308,8 +310,10 @@ fn filesystem_readers_share_the_lock_and_exclude_owners() {
     );
     drop(owner);
 
-    let first = NativeStore::open_read_only(dir.as_ref()).expect("first reader");
-    let second = NativeStore::open_read_only(dir.as_ref()).expect("second reader");
+    let first = NativeStore::open_read_only(dir.as_ref())
+        .unwrap_or_else(|e| panic!("a reader must open after the owner is gone: {e:?}"));
+    let second = NativeStore::open_read_only(dir.as_ref())
+        .unwrap_or_else(|e| panic!("a second reader must share the lock: {e:?}"));
     assert_busy(
         NativeStore::open(dir.as_ref()),
         "read-write open under readers",
