@@ -3122,6 +3122,7 @@ fn apply(
                 key(P_REL, &[id.as_bytes()])
             }
             Change::RemoveHistory { position } => history_key(position.0),
+            _ => return Err(invalid(format!("unsupported change {c:?}"))),
         };
         if !seen.insert(k) {
             return Err(invalid(format!(
@@ -3298,6 +3299,7 @@ fn apply(
             }
             // History removal reads the entry it removes; the commit does it (`remove_history`).
             Change::RemoveHistory { .. } => {}
+            _ => return Err(invalid(format!("unsupported change {c:?}"))),
         }
     }
     Ok(content_refs)

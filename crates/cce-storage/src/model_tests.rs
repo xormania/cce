@@ -744,6 +744,7 @@ impl Model {
                         errs.insert(ErrKind::Rejected);
                     }
                 }
+                _ => unreachable!("the model generates no other change"),
             }
         }
         if errs.is_empty() {
@@ -803,6 +804,7 @@ impl Model {
                 Change::RemoveHistory { position } => {
                     self.history.retain(|h| h.position != *position);
                 }
+                _ => unreachable!("the model generates no other change"),
             }
         }
         self.history.push(HistoryEntry {

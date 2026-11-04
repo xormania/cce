@@ -124,8 +124,10 @@ pub struct StagedContent {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StagingToken(pub Vec<u8>);
 
-/// One logical mutation. Names logical identities only; never pages or index entries.
+/// One logical mutation. Names logical identities only; never pages or index entries. New kinds
+/// of change may be added.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Change {
     /// Create or replace a context record.
     PutContext {

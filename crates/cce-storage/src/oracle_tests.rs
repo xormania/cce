@@ -228,9 +228,7 @@ pub(crate) fn expected(steps: u32) -> State {
                     s.outgoing.retain(|(_, k), _| k != id.as_bytes());
                     s.incoming.retain(|(_, k), _| k != id.as_bytes());
                 }
-                Change::RemoveHistory { .. } => {
-                    unreachable!("the oracle's submissions do not remove history")
-                }
+                _ => unreachable!("the oracle's submissions only put and remove records"),
             }
         }
         s.history.push(HistoryEntry {

@@ -167,6 +167,7 @@ fn change_tokens(c: &Change) -> String {
             format!("remove-rel {} {}", hex(id.as_bytes()), expect_token(expect))
         }
         Change::RemoveHistory { position } => format!("remove-history {}", position.0),
+        other => format!("unsupported {other:?}"),
     }
 }
 

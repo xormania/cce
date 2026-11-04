@@ -393,6 +393,7 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
             Change::RemoveHistory { position } => {
                 e.u8(5).u64(position.0);
             }
+            _ => unreachable!("check_request_bounds refuses unknown changes before encoding"),
         }
     }
     e.u32(changes.content.len() as u32);
@@ -449,6 +450,7 @@ pub(crate) fn encoded_request_len(changes: &ChangeSet) -> u64 {
             }
             Change::RemoveRelationship { id, expect: p } => field(id.as_bytes().len()) + expect(p),
             Change::RemoveHistory { .. } => 8,
+            _ => unreachable!("check_request_bounds refuses unknown changes before encoding"),
         };
     }
     n += 4 + changes.content.len() as u64 * (32 + 8);
@@ -466,6 +468,21 @@ pub(crate) fn check_request_bounds(
     limit: u64,
     total_limit: u64,
 ) -> Result<(), StorageError> {
+    // A kind of change this build does not know cannot be encoded; refuse it first.
+    if let Some(c) = changes.changes.iter().find(|c| {
+        !matches!(
+            c,
+            Change::PutContext { .. }
+                | Change::RemoveContext { .. }
+                | Change::PutRelationship { .. }
+                | Change::RemoveRelationship { .. }
+                | Change::RemoveHistory { .. }
+        )
+    }) {
+        return Err(StorageError::InvalidRequest(format!(
+            "unsupported change {c:?}"
+        )));
+    }
     let limit = limit.min(u32::MAX as u64);
     let total_limit = total_limit.min(u32::MAX as u64);
     let check = |what: &str, len: usize| {
