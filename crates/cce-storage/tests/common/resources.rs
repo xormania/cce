@@ -30,7 +30,11 @@ impl TestDir {
     }
 }
 
-pub(crate) fn allocate(root: &Path, label: &str, mut next: impl FnMut() -> u64) -> io::Result<TestDir> {
+pub(crate) fn allocate(
+    root: &Path,
+    label: &str,
+    mut next: impl FnMut() -> u64,
+) -> io::Result<TestDir> {
     std::fs::create_dir_all(root)?;
     let label: String = label
         .chars()
