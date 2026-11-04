@@ -112,12 +112,16 @@ The filesystem adapter repeats a positional read or write interrupted by a signa
 short one where it stopped. A read that reaches the end of the file early is reported as an
 integrity error, and a write that makes no progress as an I/O error, rather than repeated. Any other
 error, such as a full disk or a device error, is reported without retrying; bytes written before it
-stay written. A failed sync is never retried, an interrupted one included. Tests exercise this
+stay written. A failed sync is never retried, an interrupted one included: an incomplete sync is
+exactly the uncertain case the engine fences on (a failed data barrier rejects the commit, a failed
+publication sync leaves its outcome unknown, and both fence writes until reopen), and retrying it
+could turn an unknown outcome into an apparent success. Tests exercise this
 through a test-only seam under the adapter's file handles, on real files: every read and write
 interrupted or cut to a few bytes, at the adapter and through a store that stages, commits, reads
 and is reopened; a full disk after a short write, at the adapter and in a commit's metadata page
 write (the commit is rejected, its attempt absent, and the store keeps committing); a device error
-on read; transfers that make no progress; and an interrupted sync.
+on read; transfers that make no progress; and an interrupted sync, at the adapter and at each sync
+of a commit (each fails the commit and fences writes; a fresh open settles the outcome).
 
 When a case of a cut sweep fails (the commit sweeps, the store-creation sweep, or the
 faults-during-recovery sweep), its crash image (durable bytes, and the bytes still cached after a

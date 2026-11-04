@@ -336,3 +336,110 @@ fn a_full_disk_under_the_real_adapter_fails_the_commit_and_leaves_the_store_usab
     assert!(read(&s, "A").is_some() && read(&s, "C").is_some());
     assert_eq!(read(&s, "B"), None);
 }
+
+#[test]
+fn an_interrupted_sync_in_a_commit_fails_it_and_fences_writes_like_any_failed_sync() {
+    let commit = |s: &NativeStore, attempt: &[u8], id: &str| {
+        s.commit(
+            AttemptId::new(attempt.to_vec()).unwrap(),
+            s.begin().unwrap(),
+            ChangeSet {
+                changes: vec![put(id, id.as_bytes(), None)],
+                ..ChangeSet::default()
+            },
+        )
+    };
+    // Probe: the syncs one commit makes (content and metadata barrier, then publication).
+    let (_probe_dir, probe) = scratch("sync-fence-probe");
+    let faults = Arc::new(Faults::default());
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(FsIo::with_faults(&probe, faults.clone())),
+            StoreId(*b"fs-seam-test-sto"),
+            Default::default(),
+        )
+        .unwrap(),
+    };
+    commit(&s, b"a", "A").unwrap();
+    faults.set(Box::new(|_, _, _| None));
+    commit(&s, b"b", "B").unwrap();
+    faults.clear();
+    let syncs: Vec<FileId> = calls(&faults)
+        .into_iter()
+        .filter(|c| c.1 == Call::Sync)
+        .map(|c| c.0)
+        .collect();
+    assert_eq!(syncs, [FileId::Content, FileId::Meta, FileId::Meta]);
+    drop(s);
+
+    for (i, _) in syncs.iter().enumerate() {
+        let publication = i == syncs.len() - 1;
+        let (_dir, store) = scratch(&format!("sync-fence-{i}"));
+        let faults = Arc::new(Faults::default());
+        let s = NativeStore {
+            inner: Inner::create(
+                Box::new(FsIo::with_faults(&store, faults.clone())),
+                StoreId(*b"fs-seam-test-sto"),
+                Default::default(),
+            )
+            .unwrap(),
+        };
+        commit(&s, b"a", "A").unwrap();
+        let mut n = 0;
+        faults.set(Box::new(move |_, call, _| {
+            if call != Call::Sync {
+                return None;
+            }
+            n += 1;
+            (n == i + 1).then_some(Fault::Interrupted)
+        }));
+        let r = commit(&s, b"b", "B");
+        faults.clear();
+        assert_eq!(
+            injected(&faults, Call::Sync, Fault::Interrupted),
+            1,
+            "sync {i}"
+        );
+        match (&r, publication) {
+            (Err(CommitError::Indeterminate(m)), true) => {
+                assert!(m.contains("interrupted"), "{m}")
+            }
+            (Err(CommitError::Rejected(StorageError::Io(m))), false) => {
+                assert!(m.contains("interrupted"), "{m}")
+            }
+            other => panic!("sync {i}: an interrupted sync must fail the commit: {other:?}"),
+        }
+        // Writes are fenced until the store is reopened.
+        let fenced = |what: String| assert!(what.contains("writes fenced"), "sync {i}: {what}");
+        fenced(format!("{:?}", commit(&s, b"c", "C")));
+        fenced(format!("{:?}", s.stage_content(&mut &b"x"[..]).err()));
+        let outcome = s.outcome(&AttemptId::new(*b"b").unwrap()).unwrap();
+        if publication {
+            assert_eq!(outcome, AttemptOutcome::Unknown, "sync {i}");
+        } else {
+            assert_eq!(outcome, AttemptOutcome::Absent, "sync {i}");
+        }
+        drop(s);
+
+        // A fresh open settles the outcome and accepts writes again.
+        let s = NativeStore::open(&store).unwrap();
+        let b = s.outcome(&AttemptId::new(*b"b").unwrap()).unwrap();
+        assert!(
+            matches!(b, AttemptOutcome::Absent | AttemptOutcome::Committed(_)),
+            "sync {i}: {b:?}"
+        );
+        assert_eq!(
+            read(&s, "B").is_some(),
+            matches!(b, AttemptOutcome::Committed(_)),
+            "sync {i}"
+        );
+        if !publication {
+            assert_eq!(
+                b,
+                AttemptOutcome::Absent,
+                "sync {i}: published after a failed barrier"
+            );
+        }
+        commit(&s, b"c", "C").unwrap();
+    }
+}
