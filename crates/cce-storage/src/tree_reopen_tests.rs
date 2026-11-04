@@ -1,7 +1,7 @@
 //! A multi-level metadata tree read back from the store files by a fresh open: every key, every
 //! value and the full ordered iteration, against a model built by the test.
 
-use crate::test_support::{create_on};
+use crate::test_support::create_on;
 
 use std::collections::{BTreeMap, HashSet};
 

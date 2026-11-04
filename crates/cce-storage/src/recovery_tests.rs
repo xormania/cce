@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cce_core::storage::{
-    AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, ContentBinding, Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
-    RelationshipQuery, StagedContent, StorageEngine, StorageError,
+    AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, ContentBinding, Direction, Evidence,
+    HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind, RelationshipQuery,
+    StagedContent, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;

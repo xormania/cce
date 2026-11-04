@@ -9,7 +9,8 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::{
-    AttemptId, AttemptOutcome, Change, ChangeSet, CommitReceipt, ContentBinding, Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
+    AttemptId, AttemptOutcome, Change, ChangeSet, CommitReceipt, ContentBinding, Direction,
+    Evidence, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
     RelationshipQuery, StorageEngine,
 };
 

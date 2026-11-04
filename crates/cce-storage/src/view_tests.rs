@@ -4,8 +4,8 @@
 use crate::test_support::{cid, create_on};
 
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, CommitError, Direction, Precondition, ReadView,
-    RelationshipId, RelationshipKind, RelationshipQuery, StorageEngine,
+    AttemptId, Change, ChangeSet, CommitError, Direction, Precondition, ReadView, RelationshipId,
+    RelationshipKind, RelationshipQuery, StorageEngine,
 };
 
 use crate::NativeStore;

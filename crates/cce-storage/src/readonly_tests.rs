@@ -6,8 +6,8 @@ use crate::test_support::{cid, create_on, open_on};
 use std::path::Path;
 
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, CommitError, ContentRef, HistoryPosition,
-    Precondition, ReadView, StorageEngine, StorageError,
+    AttemptId, Change, ChangeSet, CommitError, ContentRef, HistoryPosition, Precondition, ReadView,
+    StorageEngine, StorageError,
 };
 
 use crate::engine::Inner;
@@ -310,11 +310,17 @@ fn filesystem_readers_share_the_lock_and_exclude_owners() {
 
     let first = NativeStore::open_read_only(dir.as_ref()).expect("first reader");
     let second = NativeStore::open_read_only(dir.as_ref()).expect("second reader");
-    assert_busy(NativeStore::open(dir.as_ref()), "read-write open under readers");
+    assert_busy(
+        NativeStore::open(dir.as_ref()),
+        "read-write open under readers",
+    );
     // A view outlives its handle and keeps the shared lock.
     let mut view = first.begin().unwrap();
     drop((first, second));
-    assert_busy(NativeStore::open(dir.as_ref()), "read-write open under a view");
+    assert_busy(
+        NativeStore::open(dir.as_ref()),
+        "read-write open under a view",
+    );
     assert_eq!(view.context(&cid("A")).unwrap().expect("A").body, b"one");
     drop(view);
 
@@ -340,7 +346,11 @@ fn filesystem_read_only_open_without_a_lock_file_refuses_and_creates_nothing() {
         Err(e) => panic!("expected a refusal naming {LOCK_FILE}, got {e:?}"),
         Ok(_) => panic!("read-only open succeeded without a lock file"),
     }
-    assert_eq!(listing(dir.as_ref()), before, "the refused open created files");
+    assert_eq!(
+        listing(dir.as_ref()),
+        before,
+        "the refused open created files"
+    );
 
     // Positive neighbour: a read-write open recreates the lock file; then readers work.
     drop(NativeStore::open(dir.as_ref()).unwrap());
@@ -372,8 +382,5 @@ fn a_filesystem_read_only_handle_refuses_writes_and_syncs() {
         }
     }
     drop(io);
-    assert_eq!(
-        std::fs::read(dir.join(crate::io::META_FILE)).unwrap(),
-        meta
-    );
+    assert_eq!(std::fs::read(dir.join(crate::io::META_FILE)).unwrap(), meta);
 }

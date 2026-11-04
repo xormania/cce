@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentBinding,
-    Evidence, HistoryEntry, HistoryPosition, Precondition, ReadView, StorageEngine,
-    StorageError,
+    Evidence, HistoryEntry, HistoryPosition, Precondition, ReadView, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;

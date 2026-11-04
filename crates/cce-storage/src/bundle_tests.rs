@@ -8,8 +8,8 @@ use std::io::Read;
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, ContentBinding, ContentRef,
-    Direction, HistoryPosition, Precondition, ReadView, RelationshipId,
-    RelationshipKind, RelationshipQuery, Revision, StagedContent, StorageEngine, StorageError,
+    Direction, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
+    RelationshipQuery, Revision, StagedContent, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;

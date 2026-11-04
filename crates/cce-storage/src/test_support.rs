@@ -10,7 +10,11 @@ use crate::io::Io;
 #[path = "../tests/common/resources.rs"]
 pub(crate) mod resources;
 
-pub(crate) fn create_on(io: Box<dyn Io>, id: StoreId, options: Options) -> Result<NativeStore, StorageError> {
+pub(crate) fn create_on(
+    io: Box<dyn Io>,
+    id: StoreId,
+    options: Options,
+) -> Result<NativeStore, StorageError> {
     Inner::create(io, id, options).map(|inner| NativeStore { inner })
 }
 

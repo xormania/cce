@@ -7,7 +7,7 @@
 //! views and content readers opened and read while commits publish new versions, while other
 //! stagings succeed, fail or are abandoned, and after the store handle itself is dropped.
 
-use crate::test_support::{create_on};
+use crate::test_support::create_on;
 
 use std::collections::BTreeSet;
 use std::io::Read;

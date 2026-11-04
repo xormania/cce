@@ -5,8 +5,8 @@ use crate::test_support::{attempt, create_on, open_on};
 use std::io::Read;
 
 use cce_core::storage::{
-    Change, ChangeSet, CommitError, ContentBinding, ContextId, HistoryPosition,
-    Precondition, ReadView, Revision, StorageEngine, StorageError,
+    Change, ChangeSet, CommitError, ContentBinding, ContextId, HistoryPosition, Precondition,
+    ReadView, Revision, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;
