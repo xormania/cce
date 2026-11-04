@@ -157,6 +157,8 @@ def _workflow_ref(api, source, run, path, trusted, logs):
         raise ValueError("producer_merge_identity_unavailable")
     for number in (row["number"] for row in pulls):
         row = api.api("/pulls/" + str(int(number)))
+        if not isinstance(row, dict):
+            raise ValueError("producer_merge_identity_unavailable")
         merge = row.get("merge_commit_sha")
         if (row.get("state") == "open" and row.get("head", {}).get("sha") == head
                 and row.get("base", {}).get("sha") == source["base_sha"]

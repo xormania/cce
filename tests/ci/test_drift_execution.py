@@ -213,7 +213,9 @@ class ExecutionTests(unittest.TestCase):
     def test_malformed_pull_response_is_recorded_as_unavailable(self):
         self.change_rust()
         self.api.responses["/pulls/9"] = ["not", "an", "object"]
-        self.assertIn("producer_acceptance_unavailable", self.collect()[1])
+        limits = self.collect()[1]
+        self.assertIn("producer_acceptance_unavailable", limits)
+        self.assertIn("producer_merge_identity_unavailable", limits)
 
     def test_latest_review_is_ordered_by_time_not_list_position(self):
         self.change_rust()
