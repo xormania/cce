@@ -283,7 +283,8 @@ The structure level checks, for the current publication record:
   committed metadata, has the incarnation its parent recorded (no newer than the generation), and
   is reached only once; all leaves are at the same depth; every key and separator lies within the
   range its parent assigns;
-- every record's key family, key components and identifiers, and its value encoding;
+- every record's key family, key components and identifiers, and its value encoding, and that its
+  key and the whole record are within the 1800-byte limits every writer enforces;
 - every relationship has both directional index entries, and every index entry matches a
   relationship;
 - every context's bound content has a content entry for content that is still retained, and each

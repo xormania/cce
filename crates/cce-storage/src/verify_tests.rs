@@ -560,6 +560,83 @@ fn a_retired_extent_overlapping_live_content_is_an_extent_finding() {
     assert_only(&verify(&sim), "extent");
 }
 
+/// Publishes, over the empty store, a tree of one leaf holding `entries`.
+fn publish_leaf(sim: &SimIo, entries: Entries) {
+    publish(sim, |_, _, sink| sink.write(&Node::Leaf(entries)).unwrap());
+}
+
+#[test]
+fn a_record_larger_than_the_entry_limit_is_a_value_finding() {
+    use crate::tree::MAX_ENTRY;
+    let sim = empty();
+    let k = context_key(&cid("A"));
+    let body = vec![b'x'; MAX_ENTRY - k.len()];
+    let v = ContextValue {
+        revision: 1,
+        body,
+        content: None,
+    }
+    .encode();
+    assert!(k.len() + v.len() > MAX_ENTRY && k.len() + v.len() < 2 * MAX_ENTRY);
+    publish_leaf(&sim, Entries::from([(k, v)]));
+    let r = verify(&sim);
+    assert_only_besides_coverage(&r, "value");
+    assert!(
+        r.findings.iter().any(|f| f.detail.contains("entry limit")),
+        "{:#?}",
+        r.findings
+    );
+}
+
+#[test]
+fn a_key_longer_than_the_key_limit_is_a_key_finding() {
+    use crate::records::RelValue;
+    use crate::tree::MAX_KEY;
+    // A relationship whose identifiers are all zero bytes, which keys escape to two bytes each:
+    // its index keys exceed the key limit, its record does not.
+    let zeros = |n| vec![0u8; n];
+    let id = zeros(255);
+    let rv = RelValue {
+        revision: 1,
+        kind: zeros(255),
+        source: zeros(255),
+        target: zeros(255),
+    };
+    let (out, inc) = (rv.out_key(&id), rv.in_key(&id));
+    assert!(out.len() > MAX_KEY && inc.len() > MAX_KEY);
+    let rel = key(crate::records::P_REL, &[&id]);
+    assert!(rel.len() <= MAX_KEY);
+    // Too large for one page: the record and outgoing key in one leaf, the incoming key in another.
+    let sim = empty();
+    publish(&sim, |_, _, sink| {
+        let left = sink
+            .write(&Node::Leaf(Entries::from([
+                (rel, rv.encode()),
+                (out, Vec::new()),
+            ])))
+            .unwrap();
+        let right = sink
+            .write(&Node::Leaf(Entries::from([(inc.clone(), Vec::new())])))
+            .unwrap();
+        sink.write(&Node::Branch {
+            seps: vec![inc],
+            children: vec![left, right],
+        })
+        .unwrap()
+    });
+    let r = verify(&sim);
+    assert_only_besides_coverage(&r, "key");
+    assert_eq!(
+        r.findings
+            .iter()
+            .filter(|f| f.detail.contains("key limit"))
+            .count(),
+        2,
+        "{:#?}",
+        r.findings
+    );
+}
+
 #[test]
 fn a_record_in_the_wrong_slot_is_a_slot_finding() {
     let sim = rich();
