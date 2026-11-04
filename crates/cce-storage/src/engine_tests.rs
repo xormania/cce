@@ -1108,15 +1108,17 @@ fn a_request_written_under_a_raised_limit_reads_back_under_the_default() {
             Box::new(sim.clone()),
             Options::from(crate::StoreOptions::default()),
         )
-        .unwrap(),
+        .unwrap_or_else(|e| {
+            panic!("a store with a larger request must open under the default: {e:?}")
+        }),
     };
     let mut v = s.begin().unwrap();
     let entry = v
         .history(cce_core::storage::HistoryPosition(0))
-        .unwrap()
+        .unwrap_or_else(|e| panic!("history must list under the default limit: {e:?}"))
         .next()
-        .unwrap()
-        .unwrap();
+        .unwrap_or_else(|| panic!("the committed request must be in history"))
+        .unwrap_or_else(|e| panic!("a request over the default limit must read back: {e:?}"));
     assert!(
         entry.evidence[0].bytes == vec![5; 64 << 20],
         "the evidence read back differs"
@@ -1146,6 +1148,90 @@ fn the_computed_request_length_matches_the_encoding_for_every_change_shape() {
         Precondition::Absent,
         Precondition::AtRevision(Revision(u64::MAX)),
     ];
+    // Lengths worked out from the layout, independently of either function: version 1, change
+    // count 4, per change a tag 1 and its fields (each identifier, body or kind 4 + its bytes; a
+    // precondition 1, or 9 with a revision; a content index 1, or 9 when present), content count 4
+    // and per binding 32 + 8, evidence count 4 and per item label and bytes as fields, removal
+    // mode 1. An empty request is 1 + 4 + 4 + 4 + 1 = 14 bytes.
+    let one = |c: Change| ChangeSet {
+        changes: vec![c],
+        ..ChangeSet::default()
+    };
+    let worked = [
+        (ChangeSet::default(), 14),
+        (
+            one(Change::PutContext {
+                id: id(1),
+                expect: Precondition::Any,
+                body: vec![1],
+                content: None,
+            }),
+            14 + 1 + 5 + 1 + 5 + 1,
+        ),
+        (
+            one(Change::PutContext {
+                id: id(1),
+                expect: Precondition::AtRevision(Revision(3)),
+                body: vec![1],
+                content: Some(0),
+            }),
+            14 + 1 + 5 + 9 + 5 + 9,
+        ),
+        (
+            one(Change::RemoveContext {
+                id: id(1),
+                expect: Precondition::Absent,
+            }),
+            14 + 1 + 5 + 1,
+        ),
+        (
+            one(Change::PutRelationship {
+                id: rid(1),
+                expect: Precondition::Any,
+                kind: kind.clone(),
+                source: id(1),
+                target: id(1),
+            }),
+            14 + 1 + 5 + 1 + 5 + 5 + 5,
+        ),
+        (
+            one(Change::RemoveRelationship {
+                id: rid(1),
+                expect: Precondition::AtRevision(Revision(3)),
+            }),
+            14 + 1 + 5 + 9,
+        ),
+        (
+            ChangeSet {
+                content: vec![ContentBinding {
+                    token: StagingToken(vec![1]),
+                    content: ContentRef {
+                        digest: ContentDigest([1; 32]),
+                        len: 1,
+                    },
+                }],
+                ..ChangeSet::default()
+            },
+            14 + 32 + 8,
+        ),
+        (
+            ChangeSet {
+                evidence: vec![Evidence {
+                    label: vec![2],
+                    bytes: vec![3],
+                }],
+                ..ChangeSet::default()
+            },
+            14 + 5 + 5,
+        ),
+    ];
+    for (cs, len) in &worked {
+        assert_eq!(
+            encoded_request_len(cs),
+            *len,
+            "the computed length must follow the request layout: {cs:?}"
+        );
+    }
     let mut checked = 0;
     for p in &preconditions {
         for content in [None, Some(0), Some(usize::MAX)] {

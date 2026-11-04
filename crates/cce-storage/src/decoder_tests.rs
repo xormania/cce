@@ -750,14 +750,29 @@ fn data_written_under_larger_limits_reads_back_under_smaller_ones() {
         .unwrap(),
     };
     let mut v = s.begin().unwrap();
-    let entry = v.history(HistoryPosition(0)).unwrap().next().unwrap();
-    assert_eq!(entry.unwrap().evidence[0].bytes, vec![7; 100_000]);
-    let r = v.context(&ContextId::new(*b"A").unwrap()).unwrap().unwrap();
+    let entry = v
+        .history(HistoryPosition(0))
+        .unwrap_or_else(|e| panic!("history must list under smaller limits: {e:?}"))
+        .next()
+        .unwrap_or_else(|| panic!("the committed request must be in history"))
+        .unwrap_or_else(|e| panic!("a request over the open's limit must read back: {e:?}"));
+    assert_eq!(entry.evidence[0].bytes, vec![7; 100_000]);
+    let r = v
+        .context(&ContextId::new(*b"A").unwrap())
+        .unwrap_or_else(|e| panic!("the record must read under smaller limits: {e:?}"))
+        .unwrap_or_else(|| panic!("the committed record must exist"));
+    let c = r
+        .content
+        .unwrap_or_else(|| panic!("the record must keep its content"));
     let mut got = Vec::new();
-    v.content(&r.content.unwrap())
-        .expect("content of five segments under a two-segment limit")
+    v.content(&c)
+        .unwrap_or_else(|e| {
+            panic!("content of five segments must open under a two-segment limit: {e:?}")
+        })
         .read_to_end(&mut got)
-        .unwrap();
+        .unwrap_or_else(|e| {
+            panic!("content of five segments must read under a two-segment limit: {e:?}")
+        });
     assert!(got == payload, "content read back differs");
 }
 
@@ -765,6 +780,15 @@ fn data_written_under_larger_limits_reads_back_under_smaller_ones() {
 fn the_computed_manifest_length_matches_the_encoding() {
     use crate::records::{ExtentRef, Manifest};
     // Read limits are computed from `encoded_len`, so it must be exact for every segment count.
+    // The layout, independently of the encoder: version 1, content digest 32, content length 8 and
+    // segment count 4 bytes; then per segment offset 8, length 8 and digest 32 bytes.
+    for (n, len) in [(0, 45), (1, 93), (2, 141), (1000, 48_045)] {
+        assert_eq!(
+            Manifest::encoded_len(n),
+            len,
+            "{n} segments: the computed length must follow the manifest layout"
+        );
+    }
     for n in [0usize, 1, 2, 1000] {
         let m = Manifest {
             content: cce_core::storage::ContentRef {
@@ -1086,7 +1110,10 @@ fn verified_extents_read_back_whole_and_small_ones_in_one_read() {
         )
         .unwrap();
         sizes.lock().unwrap().clear();
-        let got = s.inner.read_extent(&x, u64::MAX, "history entry").unwrap();
+        let got = s
+            .inner
+            .read_extent(&x, u64::MAX, "history entry")
+            .unwrap_or_else(|e| panic!("a verified extent must read back whole: {e:?}"));
         assert_eq!(
             decode_history(&got).unwrap().evidence[0].bytes.len(),
             evidence
