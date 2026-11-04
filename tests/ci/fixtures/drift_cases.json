@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "origin": "historical-transformed",
+  "transformations": ["identifiers replaced", "excerpts shortened", "payload arrays removed"],
+  "cases": [
+    {
+      "name": "completion exceeds a partial mapped case",
+      "bundle": {"claims": [{"id": "case-a", "applicable": true, "status": "complete", "case_statuses": ["green", "partial"], "evidence_sha": "$head", "excerpts": ["Claim: both cases are complete.", "Mapped cases: green, partial."]}]},
+      "codes": ["claim_case_mismatch"]
+    },
+    {
+      "name": "reconciled completion is supported",
+      "bundle": {"claims": [{"id": "case-a", "applicable": true, "status": "complete", "case_statuses": ["green", "green"], "evidence_sha": "$head"}]},
+      "codes": []
+    },
+    {
+      "name": "honestly partial work stays open",
+      "bundle": {"claims": [{"id": "case-b", "applicable": true, "status": "partial", "case_statuses": ["green", "planned"], "evidence_sha": "$head"}]},
+      "codes": []
+    },
+    {
+      "name": "deferred is not completed",
+      "bundle": {"claims": [{"id": "case-c", "applicable": true, "status": "green", "case_statuses": ["deferred"], "evidence_sha": "$head"}]},
+      "codes": ["claim_case_mismatch"]
+    },
+    {
+      "name": "historical mismatch does not gate an unrelated candidate",
+      "bundle": {"claims": [{"id": "case-d", "applicable": false, "status": "green", "case_statuses": ["planned"], "evidence_sha": "$old"}]},
+      "codes": [],
+      "limitations": ["unscoped_claim"]
+    },
+    {
+      "name": "required skipped check is not execution",
+      "bundle": {"checks": [{"id": "scan", "required": true, "status": "skipped", "executed": false, "source_sha": "$head"}]},
+      "codes": ["required_check_not_executed"]
+    },
+    {
+      "name": "successful executed check",
+      "bundle": {"checks": [{"id": "scan", "required": true, "status": "pass", "executed": true, "source_sha": "$head"}]},
+      "codes": []
+    },
+    {
+      "name": "intentional duplicate job skip is not required",
+      "bundle": {"checks": [{"id": "duplicate", "required": false, "status": "skipped", "executed": false, "source_sha": "$head"}]},
+      "codes": []
+    },
+    {
+      "name": "stale receipt cannot clear a new candidate",
+      "bundle": {"checks": [{"id": "test", "required": true, "status": "pass", "executed": true, "source_sha": "$old"}]},
+      "codes": ["evidence_candidate_mismatch"]
+    },
+    {
+      "name": "collector verified equivalent inputs",
+      "bundle": {"checks": [{"id": "test", "required": true, "status": "pass", "executed": true, "source_sha": "$old", "equivalent": true}]},
+      "codes": []
+    },
+    {
+      "name": "abort alone does not prove an assertion catch",
+      "bundle": {"mutations": [{"id": "witness-a", "applicable": true, "disposition": "caught", "claimed_semantic": true, "runs": [{"exit": 101, "executed": false, "failed_by_assertion": false, "aborted": true}], "excerpts": ["Memory allocation failed; child terminated with SIGABRT."]}]},
+      "codes": ["semantic_catch_not_demonstrated"]
+    },
+    {
+      "name": "one assertion in mixed runs is still an aggregate catch",
+      "bundle": {"mutations": [{"id": "witness-a", "applicable": true, "disposition": "caught", "claimed_semantic": true, "runs": [{"exit": 101, "executed": true, "failed_by_assertion": true, "aborted": false}, {"exit": 101, "executed": false, "failed_by_assertion": false, "aborted": true}]}]},
+      "codes": []
+    },
+    {
+      "name": "accepted equivalence preserves the raw execution result",
+      "bundle": {"mutations": [{"id": "witness-b", "applicable": true, "raw_outcome": "caught", "disposition": "equivalent", "claimed_semantic": false, "runs": [{"exit": 101, "executed": true, "failed_by_assertion": true, "aborted": false}], "excerpts": ["The coverage assertion failed; accepted disposition is equivalent."]}]},
+      "codes": []
+    },
+    {
+      "name": "message guard must not be claimed as semantic evidence",
+      "bundle": {"mutations": [{"id": "witness-c", "applicable": true, "disposition": "defence-in-depth", "claimed_semantic": true, "runs": [{"exit": 101, "executed": true, "failed_by_assertion": true, "aborted": false}], "excerpts": ["A second guard still refused the read before allocation; only the error message differed."]}]},
+      "codes": ["semantic_disposition_conflict"]
+    },
+    {
+      "name": "message guard honestly retains its narrower meaning",
+      "bundle": {"mutations": [{"id": "witness-c", "applicable": true, "disposition": "defence-in-depth", "claimed_semantic": false, "runs": [{"exit": 101, "executed": true, "failed_by_assertion": true, "aborted": false}]}]},
+      "codes": []
+    },
+    {
+      "name": "exact reader bytes are an appropriate healthy control",
+      "bundle": {"semantic": [{"id": "reader-stability", "questions": ["proof", "guarantee"], "excerpts": ["Contract: a retained reader remains coherent through reuse.", "Assertion: held reader bytes equal original bytes. Fault returns a digest error and fails that equality. Clean candidate passes the named test."]}]},
+      "codes": []
+    }
+  ]
+}
