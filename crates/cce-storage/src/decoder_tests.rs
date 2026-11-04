@@ -1064,6 +1064,29 @@ fn a_crafted_manifest_extent_is_refused_before_more_than_a_chunk_is_held() {
 }
 
 #[test]
+fn the_independent_reach_holds_no_more_than_a_chunk_of_a_crafted_manifest() {
+    use crate::records::{ContentEntry, P_CONTENT, key};
+    let (s, sizes, staged) = forged(|c| key(P_CONTENT, &[&c.content.digest.0]));
+    let root = s.inner.snapshot().unwrap().desc.root;
+    let entry = crate::tree::get(
+        &*s.inner,
+        root,
+        &key(P_CONTENT, &[&staged.content.digest.0]),
+    )
+    .unwrap()
+    .unwrap();
+    let Ok(ContentEntry::Live { manifest, .. }) = ContentEntry::decode(&entry) else {
+        panic!("the crafted entry is live");
+    };
+    sizes.lock().unwrap().clear();
+    assert_digest_refused_within_chunk(
+        s.inner.read_raw(&manifest),
+        &sizes,
+        "independent reach manifest",
+    );
+}
+
+#[test]
 fn a_commit_retiring_crafted_content_holds_no_more_than_a_chunk_before_the_digest_check() {
     use crate::records::{P_CONTENT, key};
     use cce_core::storage::{

@@ -155,9 +155,38 @@ impl Inner {
         Ok(reach)
     }
 
-    /// Reads extent `x` straight from the content file and checks it against its digest.
-    fn read_raw(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+    /// Reads manifest extent `x` straight from the content file and checks it against its digest.
+    /// Its length is bounded by the format's maximum, and its digest is first checked by streaming
+    /// it through one chunk, so a damaged length never makes this hold more than a chunk before
+    /// the extent proves authentic.
+    pub(crate) fn read_raw(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+        if x.len > manifest_limit() {
+            return Err(corrupt(format!(
+                "manifest of {} bytes exceeds the format's {} byte maximum",
+                x.len,
+                manifest_limit()
+            )));
+        }
         let len = usize::try_from(x.len).map_err(|_| corrupt("extent too large"))?;
+        if len > super::VERIFY_CHUNK {
+            let mut chunk = vec![0; super::VERIFY_CHUNK];
+            let mut digest = <sha2::Sha256 as sha2::Digest>::new();
+            let mut done = 0;
+            while done < len {
+                let n = (len - done).min(super::VERIFY_CHUNK);
+                self.io
+                    .read_at(FileId::Content, x.offset + done as u64, &mut chunk[..n])?;
+                sha2::Digest::update(&mut digest, &chunk[..n]);
+                done += n;
+            }
+            let got: [u8; 32] = sha2::Digest::finalize(digest).into();
+            if got != x.digest {
+                return Err(corrupt(format!(
+                    "content extent at {}: digest mismatch",
+                    x.offset
+                )));
+            }
+        }
         let mut buf = vec![0; len];
         self.io.read_at(FileId::Content, x.offset, &mut buf)?;
         if sha256(&buf) != x.digest {

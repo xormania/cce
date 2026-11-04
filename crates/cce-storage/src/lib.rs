@@ -69,11 +69,11 @@ mod test_support;
 mod tree;
 #[cfg(test)]
 mod tree_reopen_tests;
+#[cfg(test)]
+mod uncertain_publication_tests;
 mod verify;
 #[cfg(test)]
 mod verify_tests;
-#[cfg(test)]
-mod uncertain_publication_tests;
 #[cfg(test)]
 mod view_gap_tests;
 #[cfg(test)]
