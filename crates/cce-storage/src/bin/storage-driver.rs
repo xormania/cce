@@ -225,6 +225,7 @@ impl Driver {
             ["open", dir, cache] => {
                 let opts = StoreOptions {
                     cache_nodes: cache.parse().map_err(|_| "bad cache size")?,
+                    ..StoreOptions::default()
                 };
                 self.store =
                     Some(NativeStore::open_with(Path::new(dir), opts).map_err(|e| e.to_string())?);

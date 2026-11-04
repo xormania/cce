@@ -60,7 +60,8 @@ pub(crate) struct Options {
     /// Largest length of any variable-length request field (record body, evidence label or bytes)
     /// and of any request list; bounded by the 32-bit length prefixes of the encoding.
     pub max_request_field: u64,
-    /// Largest encoded size of a whole request, which history stores as one length-prefixed field.
+    /// Largest encoded size of a whole request this open writes, which history stores as one
+    /// length-prefixed field. Reads are bounded by the format, not by this.
     pub max_request_len: u64,
 }
 
@@ -68,6 +69,8 @@ pub(crate) struct Options {
 pub(crate) const DEFAULT_CONFLICT_WINDOW: usize = 4096;
 /// Default number of admitted commits that may wait for the commit worker.
 pub(crate) const DEFAULT_COMMIT_QUEUE: usize = 64;
+/// Default largest encoded request a store writes: 64 MiB, well below the format's `u32` limit.
+pub(crate) const DEFAULT_MAX_REQUEST_LEN: u64 = 64 << 20;
 
 impl Default for Options {
     fn default() -> Self {
@@ -77,7 +80,7 @@ impl Default for Options {
             commit_queue: DEFAULT_COMMIT_QUEUE,
             max_content_segments: DEFAULT_MAX_CONTENT_SEGMENTS,
             max_request_field: u32::MAX as u64,
-            max_request_len: u32::MAX as u64,
+            max_request_len: DEFAULT_MAX_REQUEST_LEN,
         }
     }
 }

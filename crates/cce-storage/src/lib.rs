@@ -352,12 +352,18 @@ pub struct StoreOptions {
     /// Decoded metadata nodes kept in memory. Larger stores still work with a small cache; they
     /// read more pages.
     pub cache_nodes: usize,
+    /// Largest encoded request this handle writes, 64 MiB by default; a larger request is refused
+    /// whole, never split. Any value up to the format's limit (`u32::MAX` bytes) may be set, and
+    /// lowering it never makes data written under a larger value unreadable: reads are bounded by
+    /// the format, not by this.
+    pub max_request_len: u64,
 }
 
 impl Default for StoreOptions {
     fn default() -> Self {
         Self {
             cache_nodes: engine::DEFAULT_CACHE_NODES,
+            max_request_len: engine::DEFAULT_MAX_REQUEST_LEN,
         }
     }
 }
@@ -366,6 +372,7 @@ impl From<StoreOptions> for Options {
     fn from(o: StoreOptions) -> Self {
         Options {
             cache_nodes: o.cache_nodes,
+            max_request_len: o.max_request_len,
             ..Options::default()
         }
     }

@@ -1011,6 +1011,88 @@ fn a_request_whose_fields_fit_but_whose_whole_encoding_does_not_is_refused() {
     assert_eq!(commit(&s, "one", with_evidence(1)).unwrap(), 1);
 }
 
+/// A request whose encoding is a little over 64 MiB: one evidence item of 64 MiB.
+fn over_64_mib() -> ChangeSet {
+    ChangeSet {
+        changes: vec![put("E", Precondition::Any, b"e", None)],
+        evidence: vec![cce_core::storage::Evidence {
+            label: b"large".to_vec(),
+            bytes: vec![5; 64 << 20],
+        }],
+        ..ChangeSet::default()
+    }
+}
+
+#[test]
+fn the_default_write_limit_refuses_an_encoded_request_over_64_mib_whole() {
+    assert_eq!(crate::StoreOptions::default().max_request_len, 64 << 20);
+    let s = store();
+    let r = commit(&s, "large", over_64_mib());
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.starts_with("encoded request")),
+        "{r:?}"
+    );
+    // Nothing of it was committed: a request is never split.
+    assert!(revision(&s, "E").is_none());
+    assert_eq!(
+        s.begin()
+            .unwrap()
+            .history(cce_core::storage::HistoryPosition(0))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn a_request_written_under_a_raised_limit_reads_back_under_the_default() {
+    use crate::engine::Options;
+    let sim = SimIo::new();
+    let raised = crate::StoreOptions {
+        max_request_len: 80 << 20,
+        ..crate::StoreOptions::default()
+    };
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(sim.clone()),
+            StoreId([4; 16]),
+            Options::from(raised),
+        )
+        .unwrap(),
+    };
+    assert_eq!(commit(&s, "large", over_64_mib()).unwrap(), 1);
+    drop(s);
+    sim.release();
+    // Lowering the limit bounds what the store writes, never what it reads.
+    let s = NativeStore {
+        inner: Inner::open(
+            Box::new(sim.clone()),
+            Options::from(crate::StoreOptions::default()),
+        )
+        .unwrap(),
+    };
+    let mut v = s.begin().unwrap();
+    let entry = v
+        .history(cce_core::storage::HistoryPosition(0))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert!(
+        entry.evidence[0].bytes == vec![5; 64 << 20],
+        "the evidence read back differs"
+    );
+    assert!(revision(&s, "E").is_some());
+    assert!(
+        crate::verify::run(&s.inner, crate::VerifyLevel::Scrub)
+            .unwrap()
+            .is_consistent(),
+        "a store written under a raised limit is reported inconsistent"
+    );
+    // The default still refuses a new request of that size.
+    assert!(commit(&s, "again", over_64_mib()).is_err());
+}
+
 #[test]
 fn the_computed_request_length_matches_the_encoding_for_every_change_shape() {
     use crate::records::{encode_request, encoded_request_len};
