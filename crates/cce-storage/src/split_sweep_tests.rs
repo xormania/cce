@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContextId,
-    HistoryPosition, Precondition, ReadView, StorageEngine,
+    HistoryEntry, HistoryPosition, Precondition, ReadView, StorageEngine,
 };
 
 use crate::NativeStore;
@@ -76,7 +76,9 @@ fn shape(s: &NativeStore) -> Vec<usize> {
     levels
 }
 
-/// Every record the fixture can create, with revision and body, and the history length.
+/// Every record the fixture can create, with revision and body, and every retained history entry
+/// in full. A history entry that cannot be read fails the caller: counting entries would accept a
+/// key whose entry is lost.
 fn logical_state(s: &NativeStore, records: usize) -> Vec<String> {
     let mut v = s.begin().unwrap();
     let mut out: Vec<String> = (0..records)
@@ -90,10 +92,12 @@ fn logical_state(s: &NativeStore, records: usize) -> Vec<String> {
             ),
         })
         .collect();
-    out.push(format!(
-        "history {}",
-        v.history(HistoryPosition(0)).unwrap().count()
-    ));
+    let history: Vec<HistoryEntry> = v
+        .history(HistoryPosition(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap_or_else(|e| panic!("a retained history entry is unreadable: {e:?}"));
+    out.extend(history.iter().map(|h| format!("history {h:?}")));
     out
 }
 
