@@ -44,10 +44,33 @@ fn occupied_paths_are_preserved_and_failure_evidence_is_retained() {
     assert_eq!(std::fs::read(existing.join("sentinel")).unwrap(), b"keep");
     let failed = root.join("failed-path");
     let result = std::panic::catch_unwind(|| {
-        let d = TestDir::in_root(&root, "unwind").unwrap();
+        // Retention on unwind is asked for explicitly, so the witness holds under any
+        // CCE_KEEP_FAILED_TEST_DIRS setting.
+        let mut d = TestDir::in_root(&root, "unwind").unwrap();
+        d.keep_on_unwind();
         std::fs::write(&failed, d.to_string_lossy().as_bytes()).unwrap();
         panic!("intentional resource witness");
     });
     assert!(result.is_err());
     assert!(Path::new(&std::fs::read_to_string(&failed).unwrap()).is_dir());
+}
+
+#[test]
+fn a_directory_marked_for_discard_is_removed_even_when_its_test_unwinds() {
+    let root = TestDir::new("owner-discard-root");
+    let seen = root.join("seen-path");
+    let result = std::panic::catch_unwind(|| {
+        let mut d = TestDir::in_root(&root, "expected-failure").unwrap();
+        d.discard_on_unwind();
+        std::fs::write(d.join("payload"), b"bytes").unwrap();
+        std::fs::write(&seen, d.to_string_lossy().as_bytes()).unwrap();
+        panic!("intentional expected failure");
+    });
+    assert!(result.is_err(), "the scope must have unwound");
+    let path = std::path::PathBuf::from(std::fs::read_to_string(&seen).unwrap());
+    assert!(
+        !path.exists(),
+        "a directory marked for discard was kept after unwinding: {}",
+        path.display()
+    );
 }

@@ -347,8 +347,9 @@ pub(crate) struct TreeTxn<'a> {
     root: Child,
     /// Every key put or deleted, in order (the transaction's write set).
     touched: Vec<Vec<u8>>,
-    /// Committed pages this transaction copied in order to change them, in the order copied. The
-    /// result never refers to them.
+    /// Committed pages this transaction replaced, in order: each was recorded where the one
+    /// reference to it was overwritten with its working copy or removed, so the result never
+    /// refers to them and none is listed twice.
     replaced: Vec<PageRef>,
 }
 
@@ -371,22 +372,92 @@ impl<'a> TreeTxn<'a> {
         }
     }
 
-    fn dirty(&mut self, c: Child) -> Result<usize, StorageError> {
-        match c {
+    /// A working copy of committed page `at`, not yet referenced by anything. Only `dirty_root`
+    /// and `dirty_slot` call it, and each puts the copy in place of the reference it copied.
+    fn copy(&mut self, at: PageRef) -> Result<usize, StorageError> {
+        let w = match &*self.src.load(at)? {
+            Node::Leaf(e) => Work::Leaf(e.clone()),
+            Node::Branch { seps, children } => Work::Branch {
+                seps: seps.clone(),
+                children: children.iter().map(|&p| Child::Clean(p)).collect(),
+            },
+        };
+        self.arena.push(w);
+        Ok(self.arena.len() - 1)
+    }
+
+    /// The root as a working copy: a committed root is copied, the root reference overwritten
+    /// with the copy and the committed page recorded as replaced, in one step.
+    fn dirty_root(&mut self) -> Result<usize, StorageError> {
+        match self.root {
             Child::Dirty(i) => Ok(i),
             Child::Clean(at) => {
+                let i = self.copy(at)?;
+                self.root = Child::Dirty(i);
                 self.replaced.push(at);
-                let w = match &*self.src.load(at)? {
-                    Node::Leaf(e) => Work::Leaf(e.clone()),
-                    Node::Branch { seps, children } => Work::Branch {
-                        seps: seps.clone(),
-                        children: children.iter().map(|&p| Child::Clean(p)).collect(),
-                    },
-                };
-                self.arena.push(w);
-                Ok(self.arena.len() - 1)
+                Ok(i)
             }
         }
+    }
+
+    /// Child `slot` of working branch `parent` as a working copy: a committed child is copied,
+    /// the slot overwritten with the copy and the committed page recorded as replaced, in one
+    /// step. Inspecting a child without changing it uses `peek_leaf` instead.
+    fn dirty_slot(&mut self, parent: usize, slot: usize) -> Result<usize, StorageError> {
+        match self.children(parent)[slot] {
+            Child::Dirty(i) => Ok(i),
+            Child::Clean(at) => {
+                let i = self.copy(at)?;
+                self.children_mut(parent)[slot] = Child::Dirty(i);
+                self.replaced.push(at);
+                Ok(i)
+            }
+        }
+    }
+
+    /// Puts `with` in child `slot` of working branch `parent`; a committed page the slot referred
+    /// to is recorded as replaced.
+    fn replace_slot(&mut self, parent: usize, slot: usize, with: Child) {
+        let old = std::mem::replace(&mut self.children_mut(parent)[slot], with);
+        if let Child::Clean(at) = old {
+            self.replaced.push(at);
+        }
+    }
+
+    /// Removes child `slot` of working branch `parent` (its separator is the caller's); a
+    /// committed page the slot referred to is recorded as replaced.
+    fn remove_slot(&mut self, parent: usize, slot: usize) {
+        if let Child::Clean(at) = self.children_mut(parent).remove(slot) {
+            self.replaced.push(at);
+        }
+    }
+
+    fn children(&self, branch: usize) -> &[Child] {
+        let Work::Branch { children, .. } = &self.arena[branch] else {
+            unreachable!("not a branch")
+        };
+        children
+    }
+
+    fn children_mut(&mut self, branch: usize) -> &mut Vec<Child> {
+        let Work::Branch { children, .. } = &mut self.arena[branch] else {
+            unreachable!("not a branch")
+        };
+        children
+    }
+
+    /// The entries of `c` if it is a leaf, read without copying or replacing anything.
+    fn peek_leaf(&self, c: Child) -> Result<Option<Entries>, StorageError> {
+        Ok(match c {
+            Child::Dirty(i) => match &self.arena[i] {
+                Work::Leaf(e) => Some(e.clone()),
+                Work::Branch { .. } => None,
+            },
+            Child::Clean(at) => match &*self.src.load(at)? {
+                Node::Leaf(e) => Some(e.clone()),
+                Node::Branch { .. } => None,
+            },
+        })
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
@@ -419,8 +490,7 @@ impl<'a> TreeTxn<'a> {
             )));
         }
         self.touched.push(key.clone());
-        let root = self.dirty(self.root)?;
-        self.root = Child::Dirty(root);
+        let root = self.dirty_root()?;
         if let Outcome::Split(sep, right) = self.put_in(root, key, value, 0)? {
             self.arena.push(Work::Branch {
                 seps: vec![sep],
@@ -441,22 +511,18 @@ impl<'a> TreeTxn<'a> {
         if depth >= MAX_HEIGHT {
             return Err(corrupt("tree deeper than the supported maximum"));
         }
-        let (ci, child) = match &mut self.arena[i] {
+        let ci = match &mut self.arena[i] {
             Work::Leaf(e) => {
                 e.insert(key, value);
                 return Ok(self.split_leaf_if_needed(i));
             }
-            Work::Branch { seps, children } => {
-                let ci = child_index(seps, &key);
-                (ci, children[ci])
-            }
+            Work::Branch { seps, .. } => child_index(seps, &key),
         };
-        let d = self.dirty(child)?;
+        let d = self.dirty_slot(i, ci)?;
         let out = self.put_in(d, key, value, depth + 1)?;
         let Work::Branch { seps, children } = &mut self.arena[i] else {
             unreachable!()
         };
-        children[ci] = Child::Dirty(d);
         if let Outcome::Split(sep, right) = out {
             seps.insert(ci, sep);
             children.insert(ci + 1, Child::Dirty(right));
@@ -532,8 +598,7 @@ impl<'a> TreeTxn<'a> {
             return Ok(false);
         }
         self.touched.push(key.to_vec());
-        let root = self.dirty(self.root)?;
-        self.root = Child::Dirty(root);
+        let root = self.dirty_root()?;
         match self.delete_in(root, key, 0)? {
             Outcome::Empty => self.arena[root] = Work::Leaf(Entries::new()),
             Outcome::Single(c) => self.root = c,
@@ -553,7 +618,7 @@ impl<'a> TreeTxn<'a> {
         if depth >= MAX_HEIGHT {
             return Err(corrupt("tree deeper than the supported maximum"));
         }
-        let (ci, child) = match &mut self.arena[i] {
+        let ci = match &mut self.arena[i] {
             Work::Leaf(e) => {
                 e.remove(key);
                 return Ok(if e.is_empty() {
@@ -562,40 +627,31 @@ impl<'a> TreeTxn<'a> {
                     Outcome::Same
                 });
             }
-            Work::Branch { seps, children } => {
-                let ci = child_index(seps, key);
-                (ci, children[ci])
-            }
+            Work::Branch { seps, .. } => child_index(seps, key),
         };
-        let d = self.dirty(child)?;
-        let out = self.delete_in(d, key, depth + 1)?;
-        let removed = {
-            let Work::Branch { seps, children } = &mut self.arena[i] else {
-                unreachable!()
-            };
-            match out {
-                Outcome::Empty => {
-                    children.remove(ci);
-                    if ci > 0 {
-                        seps.remove(ci - 1);
-                    } else if !seps.is_empty() {
-                        seps.remove(0);
-                    }
-                    if children.is_empty() {
-                        return Ok(Outcome::Empty);
-                    }
-                    true
+        let d = self.dirty_slot(i, ci)?;
+        let removed = match self.delete_in(d, key, depth + 1)? {
+            Outcome::Empty => {
+                self.remove_slot(i, ci);
+                let Work::Branch { seps, children } = &mut self.arena[i] else {
+                    unreachable!()
+                };
+                if ci > 0 {
+                    seps.remove(ci - 1);
+                } else if !seps.is_empty() {
+                    seps.remove(0);
                 }
-                // The child branch kept one child: refer to that grandchild directly.
-                Outcome::Single(c) => {
-                    children[ci] = c;
-                    false
+                if children.is_empty() {
+                    return Ok(Outcome::Empty);
                 }
-                _ => {
-                    children[ci] = Child::Dirty(d);
-                    false
-                }
+                true
             }
+            // The child branch kept one child: refer to that grandchild directly.
+            Outcome::Single(c) => {
+                self.replace_slot(i, ci, c);
+                false
+            }
+            _ => false,
         };
         if !removed {
             self.merge_leaf_if_small(i, ci)?;
@@ -631,21 +687,23 @@ impl<'a> TreeTxn<'a> {
             (ci - 1, ci)
         };
         let (lc, rc) = (children[l], children[r]);
-        let (ld, rd) = (self.dirty(lc)?, self.dirty(rc)?);
-        let (Work::Leaf(a), Work::Leaf(b)) = (&self.arena[ld], &self.arena[rd]) else {
+        // Inspect both siblings without copying either: a pair that is not merged keeps its
+        // pages and references exactly as they are.
+        let (Some(a), Some(b)) = (self.peek_leaf(lc)?, self.peek_leaf(rc)?) else {
             return Ok(());
         };
-        if leaf_size(a) + leaf_size(b) - 5 > PAGE_PAYLOAD_MAX {
+        if leaf_size(&a) + leaf_size(&b) - 5 > PAGE_PAYLOAD_MAX {
             return Ok(());
         }
-        let mut merged = a.clone();
-        merged.extend(b.clone());
-        self.arena[ld] = Work::Leaf(merged);
-        let Work::Branch { seps, children } = &mut self.arena[i] else {
+        let ld = self.dirty_slot(i, l)?;
+        let Work::Leaf(merged) = &mut self.arena[ld] else {
+            unreachable!("peeked as a leaf")
+        };
+        merged.extend(b);
+        self.remove_slot(i, r);
+        let Work::Branch { seps, .. } = &mut self.arena[i] else {
             unreachable!()
         };
-        children[l] = Child::Dirty(ld);
-        children.remove(r);
         seps.remove(r - 1);
         Ok(())
     }
@@ -667,6 +725,29 @@ impl<'a> TreeTxn<'a> {
             }
         }
         count(&self.arena, self.root)
+    }
+
+    /// The committed pages the result refers to directly: the root if nothing changed it,
+    /// otherwise every unchanged child of a changed node the result reaches. Every other committed
+    /// page the result reaches lies below one of these. Provided every committed page has exactly
+    /// one parent (copy-on-write never shares a subtree; the audit checks that every page is
+    /// reached once, this method does not), a page below one of them was never copied, since
+    /// copies are only made from a changed node's slot or the root; so a replaced page the result
+    /// still reached would be one of these.
+    pub fn frontier(&self) -> Vec<PageRef> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.root];
+        while let Some(c) = stack.pop() {
+            match c {
+                Child::Clean(at) => out.push(at),
+                Child::Dirty(i) => {
+                    if let Work::Branch { children, .. } = &self.arena[i] {
+                        stack.extend(children.iter().copied());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Committed pages replaced so far (see `replaced`).
@@ -712,7 +793,7 @@ impl<'a> TreeTxn<'a> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     /// In-memory page store for tree unit tests.
     #[derive(Default)]
@@ -1180,5 +1261,165 @@ mod tests {
         .encode();
         assert!(Node::decode(&unsorted).is_err());
         assert!(Node::decode(&[9]).is_err());
+    }
+
+    // ----- retirement follows replacement ---------------------------------------------------
+
+    /// Every page a tree reaches from `root`.
+    fn reached(m: &Mem, root: PageRef) -> HashSet<PageRef> {
+        let mut out = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(at) = stack.pop() {
+            assert!(out.insert(at), "page {at:?} is reached twice");
+            if let Node::Branch { children, .. } = &*m.load(at).unwrap() {
+                stack.extend(children.iter().copied());
+            }
+        }
+        out
+    }
+
+    /// Runs `f` as one transaction over `root` and checks what it reports as replaced: no page is
+    /// listed twice, and the list is exactly the committed pages the new tree no longer reaches.
+    /// Returns the new root.
+    fn checked_commit(
+        m: &Mem,
+        root: PageRef,
+        generation: u64,
+        what: &str,
+        f: impl FnOnce(&mut TreeTxn),
+    ) -> PageRef {
+        let mut t = TreeTxn::new(m, root);
+        f(&mut t);
+        let replaced: Vec<PageRef> = t.replaced().to_vec();
+        let new_root = t.finish(&mut Sink(m, generation)).unwrap();
+        let listed: HashSet<PageRef> = replaced.iter().copied().collect();
+        assert_eq!(
+            listed.len(),
+            replaced.len(),
+            "{what}: a page is listed twice"
+        );
+        let before = reached(m, root);
+        let after = reached(m, new_root);
+        let still: Vec<&PageRef> = listed.intersection(&after).collect();
+        assert!(
+            still.is_empty(),
+            "{what}: replaced pages {still:?} are still reached"
+        );
+        let dropped: HashSet<PageRef> = before.difference(&after).copied().collect();
+        assert_eq!(listed, dropped, "{what}: replaced vs no longer reached");
+        new_root
+    }
+
+    fn write(m: &Mem, node: Node) -> PageRef {
+        Sink(m, 0).write(&node).unwrap()
+    }
+
+    fn leaf(entries: &[(Vec<u8>, usize)]) -> Node {
+        Node::Leaf(
+            entries
+                .iter()
+                .map(|(key, n)| (key.clone(), vec![7; *n]))
+                .collect(),
+        )
+    }
+
+    /// A small leaf's sibling is a clean leaf too full to take it: the merge is skipped. Two
+    /// deletions in one transaction attempt it twice.
+    #[test]
+    fn a_skipped_merge_with_a_full_leaf_sibling_retires_only_unreached_pages() {
+        let m = Mem::default();
+        let small = write(&m, leaf(&[(k(1), 20), (k(2), 20), (k(3), 20)]));
+        let full = write(&m, leaf(&(10..19).map(|i| (k(i), 430)).collect::<Vec<_>>()));
+        assert!(m.load(full).unwrap().size() > PAGE_PAYLOAD_MAX * 3 / 4);
+        let root = write(
+            &m,
+            Node::Branch {
+                seps: vec![k(10)],
+                children: vec![small, full],
+            },
+        );
+        let after = checked_commit(&m, root, 1, "one deletion", |t| {
+            assert!(t.delete(&k(1)).unwrap());
+        });
+        let keys: Vec<_> = all(&m, after).into_iter().map(|e| e.0).collect();
+        let want: Vec<_> = (2..4).chain(10..19).map(k).collect();
+        assert_eq!(keys, want);
+        checked_commit(&m, root, 2, "two deletions", |t| {
+            assert!(t.delete(&k(1)).unwrap());
+            assert!(t.delete(&k(2)).unwrap());
+        });
+    }
+
+    /// A small leaf's sibling is a branch (a shape a collapsed single-child branch leaves): the
+    /// merge is skipped.
+    #[test]
+    fn a_skipped_merge_with_a_branch_sibling_retires_only_unreached_pages() {
+        let m = Mem::default();
+        let small = write(&m, leaf(&[(k(1), 20), (k(2), 20), (k(3), 20)]));
+        let a = write(&m, leaf(&(10..14).map(|i| (k(i), 40)).collect::<Vec<_>>()));
+        let b = write(&m, leaf(&(20..24).map(|i| (k(i), 40)).collect::<Vec<_>>()));
+        let branch = write(
+            &m,
+            Node::Branch {
+                seps: vec![k(20)],
+                children: vec![a, b],
+            },
+        );
+        let root = write(
+            &m,
+            Node::Branch {
+                seps: vec![k(10)],
+                children: vec![small, branch],
+            },
+        );
+        let after = checked_commit(&m, root, 1, "one deletion", |t| {
+            assert!(t.delete(&k(1)).unwrap());
+        });
+        let keys: Vec<_> = all(&m, after).into_iter().map(|e| e.0).collect();
+        let want: Vec<_> = (2..4).chain(10..14).chain(20..24).map(k).collect();
+        assert_eq!(keys, want);
+        checked_commit(&m, root, 2, "two deletions", |t| {
+            assert!(t.delete(&k(1)).unwrap());
+            assert!(t.delete(&k(2)).unwrap());
+        });
+    }
+
+    /// Random deletions over uneven values, many transactions per seed: every
+    /// transaction replaces exactly the committed pages its tree stops reaching.
+    #[test]
+    fn every_transaction_replaces_exactly_the_pages_it_stops_reaching() {
+        fn rng(s: &mut u64) -> u64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        }
+        for seed in 1..=40u64 {
+            let m = Mem::default();
+            let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut model = Entries::new();
+            let mut root = commit(&m, empty(&m), 1, |t| {
+                for i in 0..3000u32 {
+                    let v = vec![i as u8; 20 + (rng(&mut s) % 201) as usize];
+                    t.put(k(i), v.clone()).unwrap();
+                    model.insert(k(i), v);
+                }
+            });
+            for g in 2..30u64 {
+                let what = format!("seed {seed} transaction {g}");
+                root = checked_commit(&m, root, g, &what, |t| {
+                    for _ in 0..60 {
+                        let i = (rng(&mut s) % 3000) as u32;
+                        let present = model.remove(&k(i)).is_some();
+                        assert_eq!(t.delete(&k(i)).unwrap(), present, "{what}: delete {i}");
+                    }
+                });
+                assert_eq!(
+                    all(&m, root),
+                    model.clone().into_iter().collect::<Vec<_>>(),
+                    "{what}"
+                );
+            }
+        }
     }
 }
