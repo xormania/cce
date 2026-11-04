@@ -6,6 +6,8 @@
 
 #[cfg(test)]
 mod attempt_tests;
+#[cfg(test)]
+mod bundle_tests;
 mod codec;
 #[cfg(test)]
 mod content_tests;
@@ -18,6 +20,8 @@ mod engine;
 mod engine_tests;
 mod format;
 mod io;
+#[cfg(test)]
+mod key_bounds_tests;
 #[cfg(test)]
 mod reader_race_tests;
 #[cfg(test)]
