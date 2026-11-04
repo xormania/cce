@@ -26,6 +26,11 @@ mod fs_seam_tests;
 mod io;
 #[cfg(test)]
 mod key_bounds_tests;
+mod ledger;
+#[cfg(test)]
+mod ledger_tests;
+#[cfg(test)]
+mod merge_skip_tests;
 #[cfg(test)]
 mod model_tests;
 #[cfg(test)]
@@ -43,6 +48,8 @@ mod repro_tests;
 mod resource_tests;
 #[cfg(test)]
 mod reuse_tests;
+#[cfg(test)]
+mod seal_tests;
 #[cfg(test)]
 mod sim;
 #[cfg(test)]

@@ -243,6 +243,73 @@ fn uncertain_commit_then_staging(discard: bool) -> Vec<String> {
     lost
 }
 
+/// The pool keeps one entry per retirement record across an uncertain publication and a
+/// discard of its staging (refused), before the store is reopened.
+#[test]
+fn an_uncertain_publication_keeps_the_pool_matching_its_records() {
+    let len = CONTENT_CHUNK + 300;
+    let sim = SimIo::new();
+    let state = Arc::new(UncertainState::default());
+    let s = create_on(
+        Box::new(UncertainRecord {
+            sim: sim.clone(),
+            state: state.clone(),
+        }),
+        STORE,
+        Default::default(),
+    )
+    .unwrap();
+    let x = bytes_of(1, len);
+    let sx = s.stage_content(&mut &x[..]).unwrap();
+    commit(
+        &s,
+        "x",
+        ChangeSet {
+            changes: vec![put_context("X", Precondition::Any, b"X", Some(0))],
+            content: vec![ContentBinding::from(&sx)],
+            ..ChangeSet::default()
+        },
+    );
+    commit(
+        &s,
+        "x-removed",
+        changes(vec![Change::RemoveContext {
+            id: cid("X"),
+            expect: Precondition::Any,
+        }]),
+    );
+    for k in 0..2 {
+        commit(
+            &s,
+            &format!("advance-{k}"),
+            changes(vec![put_context("advance", Precondition::Any, b"a", None)]),
+        );
+    }
+    let staged = s.stage_content(&mut &bytes_of(7, len)[..]).unwrap();
+    *state.on_record.lock().unwrap() = Some(Box::new(|| {}));
+    let r = s.commit(
+        attempt("uncertain"),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![put_context("E", Precondition::Any, b"e", Some(0))],
+            content: vec![ContentBinding::from(&staged)],
+            ..ChangeSet::default()
+        },
+    );
+    assert!(matches!(r, Err(CommitError::Indeterminate(_))), "{r:?}");
+    assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "after the uncertain commit"
+    );
+    assert!(s.discard_staged(staged).is_err());
+    assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "after the refused discard"
+    );
+}
+
 #[test]
 fn a_staging_never_takes_space_an_uncertain_commit_references_after_a_discard() {
     let lost = uncertain_commit_then_staging(true);
@@ -314,6 +381,11 @@ fn a_commit_that_panics_after_its_record_keeps_its_stagings_space() {
         "discarding the staging of a commit with an unknown outcome was accepted"
     );
     assert_eq!(
+        s.inner.ledger_check_for_test(),
+        Ok(()),
+        "after the refused discard"
+    );
+    assert_eq!(
         s.inner.reusable_content_bytes(),
         free_staged,
         "the panicked commit's reused space was offered for reuse"
@@ -329,6 +401,71 @@ fn a_commit_that_panics_after_its_record_keeps_its_stagings_space() {
             assert_eq!(got, Ok(content.clone()), "{how}");
         }
     }
+}
+
+/// A staging bound twice by a commit that panics after its record: every reservation it held is
+/// owned by the uncertain publication, none lost from the accounting.
+#[test]
+fn a_panicked_commit_binding_one_staging_twice_owns_all_its_reservations() {
+    let len = CONTENT_CHUNK + 300;
+    let sim = SimIo::new();
+    let state = Arc::new(UncertainState::default());
+    let s = create_on(
+        Box::new(UncertainRecord {
+            sim: sim.clone(),
+            state: state.clone(),
+        }),
+        STORE,
+        Default::default(),
+    )
+    .unwrap();
+    let x = bytes_of(1, len);
+    let sx = s.stage_content(&mut &x[..]).unwrap();
+    commit(
+        &s,
+        "x",
+        ChangeSet {
+            changes: vec![put_context("X", Precondition::Any, b"X", Some(0))],
+            content: vec![ContentBinding::from(&sx)],
+            ..ChangeSet::default()
+        },
+    );
+    commit(
+        &s,
+        "x-removed",
+        changes(vec![Change::RemoveContext {
+            id: cid("X"),
+            expect: Precondition::Any,
+        }]),
+    );
+    for k in 0..2 {
+        commit(
+            &s,
+            &format!("advance-{k}"),
+            changes(vec![put_context("advance", Precondition::Any, b"a", None)]),
+        );
+    }
+    let staged = s.stage_content(&mut &bytes_of(7, len)[..]).unwrap();
+    let (held, uncertain) = s.inner.reserved_bytes_for_test();
+    assert!(held > 0, "the staging holds no reserved space");
+    assert_eq!(uncertain, 0);
+    state.panic_after_record.store(true, Ordering::SeqCst);
+    let r = s.commit(
+        attempt("panics"),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![put_context("E", Precondition::Any, b"e", Some(1))],
+            content: vec![ContentBinding::from(&staged), ContentBinding::from(&staged)],
+            ..ChangeSet::default()
+        },
+    );
+    assert!(matches!(r, Err(CommitError::Indeterminate(_))), "{r:?}");
+    assert_eq!(
+        s.inner.reserved_bytes_for_test(),
+        (0, held),
+        "reservations held vs owned by the uncertain publication"
+    );
+    assert_eq!(s.inner.ledger_check_for_test(), Ok(()));
 }
 
 #[test]
