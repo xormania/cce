@@ -256,6 +256,23 @@ and compares length and digest at the end; a mismatch, a short stream or a sourc
 staged content. Space written by a failed or abandoned staging lies beyond the committed content
 length and is reused by later staging or after a restart.
 
+## Maintenance
+
+Maintenance is explicit: `NativeStore::maintain(task, budget)` runs one step, ordered with commits
+under the same writer lock, on the newest published state, and publishes its result as a new
+physical generation. It writes no logical record, adds no history entry (the history position does
+not move) and records nothing a view's reads could conflict with. Opening a store never runs
+maintenance and never repairs anything; read-only handles refuse it. A step that finds nothing to do
+publishes nothing.
+
+- `ReclaimContentHoles` retires content-file space below the committed length that no published
+  structure reaches, no retirement record covers, and no staging of this process holds or has
+  discarded, within the budget.
+- `RebuildRelationshipIndexes` removes every relationship index entry and writes both entries of
+  each relationship record again, in one publication; the old index is not consulted. It runs only
+  when asked, for example after an integrity check reports index findings. Its memory grows with the
+  size of the indexes.
+
 ## Not implemented yet
 
 Space reuse, removal modes, concurrent commit validation beyond preconditions,
