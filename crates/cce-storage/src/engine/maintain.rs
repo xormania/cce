@@ -4,9 +4,10 @@
 
 use cce_core::storage::{AttemptId, CommitError, StorageError};
 
+use std::cell::Cell;
 use std::sync::Arc;
 
-use super::{Inner, MaintenanceSpace, Reuse, Taken, lock, rejected, sha256};
+use super::{Fence, Inner, MaintenanceSpace, Reuse, Taken, lock, rejected, sha256};
 use crate::codec::{corrupt, key_components};
 use crate::format::Descriptor;
 use crate::format::PageRef;
@@ -25,8 +26,36 @@ impl Inner {
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceReport, CommitError> {
         self.refuse_if_read_only("maintenance").map_err(rejected)?;
+        // A step that panics may have written a durable publication record before it made it
+        // current: its outcome is unknown, as for a commit that panics. Writes are fenced, and
+        // space a relocation reserved stays owned by that uncertain publication.
+        let reserved: Cell<Option<(u64, u64)>> = Cell::new(None);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.maintain_step(task, budget, &reserved)
+        }))
+        .unwrap_or_else(|_| {
+            let why = format!("maintenance step {task:?} failed unexpectedly");
+            self.fence(Fence {
+                why: why.clone(),
+                uncertain: None,
+            });
+            if let Some((serial, generation)) = reserved.get() {
+                self.hold_for_uncertain(&relocation_owner(), generation, &[serial]);
+            }
+            Err(CommitError::Indeterminate(why))
+        })
+    }
+
+    /// One maintenance step; `reserved` names the reservations a relocation holds while their
+    /// outcome is not settled, as `(serial, generation)`.
+    fn maintain_step(
+        self: &Arc<Self>,
+        task: MaintenanceTask,
+        budget: MaintenanceBudget,
+        reserved: &Cell<Option<(u64, u64)>>,
+    ) -> Result<MaintenanceReport, CommitError> {
         if task == MaintenanceTask::Relocate {
-            return self.relocate(budget);
+            return self.relocate(budget, reserved);
         }
         let _w = lock(&self.writer);
         let (cur, fence) = {
@@ -245,6 +274,7 @@ impl Inner {
     fn relocate_content(
         self: &Arc<Self>,
         budget: MaintenanceBudget,
+        reserved: &Cell<Option<(u64, u64)>>,
     ) -> Result<MaintenanceReport, CommitError> {
         // A fenced store cannot publish: refuse before copying anything (checked again under the
         // writer lock before publishing).
@@ -459,14 +489,15 @@ impl Inner {
             s
         };
         let held: Vec<Reuse> = std::mem::take(&mut taken.taken);
-        let reserved = lock(&self.pool).hold(taken.owner, serial, held);
-        if let Err(back) = reserved {
+        let held_now = lock(&self.pool).hold(taken.owner, serial, held);
+        if let Err(back) = held_now {
             // Not this step's to reserve: give it back and refuse the step.
             taken.taken = back;
             return Err(rejected(StorageError::StoreState(format!(
                 "space check failed: relocation could not reserve its space as {serial}"
             ))));
         }
+        reserved.set(Some((serial, generation)));
         let unbound = (
             ExtentRef {
                 offset: 0,
@@ -504,11 +535,13 @@ impl Inner {
                 // owned by this uncertain publication until reopen decides, never offered for
                 // reuse (the publication already fenced writes).
                 self.hold_for_uncertain(&relocation_owner(), generation, &[serial]);
+                reserved.set(None);
                 return Err(e);
             }
             Err(e) => {
                 // Definitely not published: the reservations return to the pool at their
                 // original generation.
+                reserved.set(None);
                 let released = lock(&self.pool).release(serial);
                 if let Err(why) = released {
                     self.fault(&why);
@@ -516,11 +549,19 @@ impl Inner {
                 return Err(e);
             }
         };
+        #[cfg(test)]
+        if self
+            .panic_next_maintenance
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("injected: maintenance step panicked after its publication");
+        }
         self.adopt(desc, &retired, &discarded);
         // The reservations are consumed; the unused parts of their records stay free at their
         // original generation.
         let freed = {
             let mut pool = lock(&self.pool);
+            reserved.set(None);
             let held = pool.consume(serial);
             self.count_reused(&held);
             pool.insert_free(&remainders)
@@ -540,8 +581,9 @@ impl Inner {
     fn relocate(
         self: &Arc<Self>,
         budget: MaintenanceBudget,
+        reserved: &Cell<Option<(u64, u64)>>,
     ) -> Result<MaintenanceReport, CommitError> {
-        let content = self.relocate_content(budget)?;
+        let content = self.relocate_content(budget, reserved)?;
         let pages = self.relocate_pages(budget)?;
         Ok(MaintenanceReport {
             generation: pages.generation.max(content.generation),
@@ -641,6 +683,13 @@ impl Inner {
     #[cfg(test)]
     pub(crate) fn set_relocate_hook_for_test(&self, hook: Option<Box<dyn FnOnce() + Send>>) {
         *lock(&self.relocate_hook) = hook;
+    }
+
+    /// Makes the next relocation step panic right after its publication, before it is applied.
+    #[cfg(test)]
+    pub(crate) fn panic_next_maintenance_for_test(&self) {
+        self.panic_next_maintenance
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Makes the next relocation step skip revalidating its moves.

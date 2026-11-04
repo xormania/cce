@@ -1732,6 +1732,57 @@ fn a_move_of_a_superseded_manifest_is_refused_before_anything_is_written() {
     audit(&sim);
 }
 
+/// A maintenance step that panics after its publication record is durable, before it is applied,
+/// is reported as uncertain, fences writes and keeps the space its moves took; reopening recovers
+/// the published state.
+#[test]
+fn a_maintenance_step_that_panics_after_publishing_is_uncertain_and_keeps_its_space() {
+    let sim = fragmented();
+    let s = open(&sim);
+    let free_before = s.inner.reusable_content_bytes();
+    s.inner.panic_next_maintenance_for_test();
+    let r = s.maintain(MaintenanceTask::Relocate, CONTENT_ONLY);
+    assert!(
+        matches!(&r, Err(CommitError::Indeterminate(m)) if m.contains("failed unexpectedly")),
+        "a panicking step must be reported as uncertain: {r:?}"
+    );
+    assert!(
+        s.inner
+            .fence_reason()
+            .is_some_and(|why| why.contains("failed unexpectedly")),
+        "a panicking step must fence writes"
+    );
+    assert_eq!(
+        s.inner.reserved_bytes_for_test().1,
+        free_before,
+        "the space the moves took stays owned by the uncertain publication"
+    );
+    assert_eq!(
+        s.inner.reusable_content_bytes(),
+        0,
+        "space was offered for reuse"
+    );
+    assert!(
+        s.maintain(MaintenanceTask::Relocate, CONTENT_ONLY).is_err(),
+        "a fenced store must refuse further maintenance"
+    );
+    drop(s);
+    let s = open(&sim);
+    assert_eq!(
+        read_bound(&mut s.begin().unwrap(), "B"),
+        Ok(bytes_of(2, 100_000))
+    );
+    commit(
+        &s,
+        "after reopen",
+        ChangeSet {
+            changes: vec![put("E", "e", None)],
+            ..ChangeSet::default()
+        },
+    );
+    audit(&sim);
+}
+
 #[test]
 fn reuse_is_counted_only_for_space_a_publication_consumed() {
     let sim = fragmented();

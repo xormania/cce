@@ -181,6 +181,9 @@ pub(crate) struct Inner {
     /// still the one indexed (tests of what the space check alone refuses).
     #[cfg(test)]
     skip_relocation_revalidation: std::sync::atomic::AtomicBool,
+    /// The next relocation step panics right after its publication (tests of that outcome).
+    #[cfg(test)]
+    panic_next_maintenance: std::sync::atomic::AtomicBool,
     /// Runs once inside a commit on its space journal and tree just before the journal is sealed
     /// (tests planting a faulty change of ownership).
     #[cfg(test)]
@@ -637,6 +640,8 @@ impl Inner {
             relocate_hook: Mutex::new(None),
             #[cfg(test)]
             skip_relocation_revalidation: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            panic_next_maintenance: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             journal_hook: Mutex::new(None),
             #[cfg(test)]

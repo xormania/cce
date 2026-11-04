@@ -362,7 +362,9 @@ reachable, and every content entry it rewrites must name the new manifest. Hole 
 against everything the published state reaches, found independently of how it chose the holes. A
 failed check rejects the step definitely: what it reserved returns to the pool and nothing is
 published. If a step's publication record may be durable but its sync failed, the space its moves
-took stays owned by that uncertain publication, out of reach of staging, until reopen decides.
+took stays owned by that uncertain publication, out of reach of staging, until reopen decides. A
+step that panics is treated the same way: its record may already be durable, so writes are fenced,
+the call reports an unknown outcome, and space a relocation reserved stays owned until reopen.
 
 ## Not implemented yet
 
