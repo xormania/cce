@@ -17,8 +17,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::{
@@ -33,10 +31,11 @@ use proptest::test_runner::{Config, FileFailurePersistence, RngSeed, TestRunner}
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest};
 use sha2::{Digest, Sha256};
 
-use crate::engine::Inner;
 use crate::format::StoreId;
 use crate::io::{FileId, FsIo, Io};
 use crate::sim::{Persist, SimIo};
+use crate::test_support::resources::TestDir;
+use crate::test_support::{attempt, cid, create_on, open_on};
 use crate::{NativeStore, NativeView};
 
 /// Seed of the routine run. Changing it changes the generated sequences.
@@ -58,7 +57,7 @@ const MAX_HELD: usize = 3;
 // ---------------------------------------------------------------------------------------------
 
 fn ctx_id(i: u8) -> ContextId {
-    ContextId::new(CONTEXTS[i as usize % CONTEXTS.len()].as_bytes().to_vec()).unwrap()
+    cid(CONTEXTS[i as usize % CONTEXTS.len()])
 }
 
 fn rel_id(i: u8) -> RelationshipId {
@@ -461,7 +460,7 @@ impl Model {
 
     fn fresh_attempt(&mut self) -> AttemptId {
         self.next_attempt += 1;
-        AttemptId::new(format!("attempt-{}", self.next_attempt).into_bytes()).unwrap()
+        attempt(&format!("attempt-{}", self.next_attempt))
     }
 
     fn resolve(&mut self, spec: &RequestSpec) -> Request {
@@ -722,10 +721,7 @@ impl Model {
                 .iter()
                 .map(|a| (a.clone(), AttemptOutcome::Absent)),
         );
-        outcomes.push((
-            AttemptId::new(*b"never-submitted").unwrap(),
-            AttemptOutcome::Absent,
-        ));
+        outcomes.push((attempt("never-submitted"), AttemptOutcome::Absent));
         Snapshot {
             logical: self.state.clone(),
             history: self.history.clone(),
@@ -1029,21 +1025,15 @@ impl Io for Watched {
 /// Where the store under test lives.
 enum Backend {
     Sim(SimIo, FailedOp),
-    /// A fresh directory on the real filesystem, removed after a passing sequence.
-    Files(PathBuf),
+    /// A fresh directory on the real filesystem from the shared directory owner: removed when a
+    /// sequence passes, kept (and its path printed) when a failing case unwinds through it.
+    Files(TestDir),
 }
 
 impl Backend {
     fn new(files: bool) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
         if files {
-            let dir = std::env::temp_dir().join(format!(
-                "cce-model-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            Backend::Files(dir)
+            Backend::Files(TestDir::new("cce-model"))
         } else {
             Backend::Sim(SimIo::new(), FailedOp::default())
         }
@@ -1079,7 +1069,10 @@ impl Engine {
     }
 
     fn stage(&self, bytes: &[u8]) -> StagedContent {
-        let s = self.store().stage_content(&mut &bytes[..]).expect("stage");
+        let s = self
+            .store()
+            .stage_content(&mut &bytes[..])
+            .unwrap_or_else(|e| panic!("the store failed: stage: {e:?}"));
         assert_eq!(s.content, content_ref(bytes), "staged content description");
         s
     }
@@ -1098,14 +1091,21 @@ impl Engine {
 
 fn read_all(r: &mut dyn Read) -> Vec<u8> {
     let mut v = Vec::new();
-    r.read_to_end(&mut v).expect("read content");
+    r.read_to_end(&mut v)
+        .unwrap_or_else(|e| panic!("the store failed: read content: {e:?}"));
     v
 }
 
 fn check_read(view: &mut NativeView, expected: &ReadResult) {
     match expected {
         ReadResult::Context(id, e) => {
-            assert_eq!(&view.context(id).expect("context"), e, "context {id:?}");
+            assert_eq!(
+                &view
+                    .context(id)
+                    .unwrap_or_else(|e| panic!("the store failed: context: {e:?}")),
+                e,
+                "context {id:?}"
+            );
         }
         ReadResult::Relationships {
             query,
@@ -1114,16 +1114,16 @@ fn check_read(view: &mut NativeView, expected: &ReadResult) {
         } => {
             let all: Vec<Relationship> = view
                 .relationships(query)
-                .expect("relationships")
-                .map(|r| r.expect("relationship"))
+                .unwrap_or_else(|e| panic!("the store failed: relationships: {e:?}"))
+                .map(|r| r.unwrap_or_else(|e| panic!("the store failed: relationship: {e:?}")))
                 .collect();
             assert_eq!(&all, expected, "relationships for {query:?}");
             if *page > 0 && !expected.is_empty() {
                 let first: Vec<Relationship> = view
                     .relationships(query)
-                    .expect("relationships")
+                    .unwrap_or_else(|e| panic!("the store failed: relationships: {e:?}"))
                     .take(*page)
-                    .map(|r| r.expect("relationship"))
+                    .map(|r| r.unwrap_or_else(|e| panic!("the store failed: relationship: {e:?}")))
                     .collect();
                 let last = first.last().expect("nonempty page");
                 let other = if query.direction == Direction::Outgoing {
@@ -1141,8 +1141,8 @@ fn check_read(view: &mut NativeView, expected: &ReadResult) {
                 };
                 let rest: Vec<Relationship> = view
                     .relationships(&resumed)
-                    .expect("relationships")
-                    .map(|r| r.expect("relationship"))
+                    .unwrap_or_else(|e| panic!("the store failed: relationships: {e:?}"))
+                    .map(|r| r.unwrap_or_else(|e| panic!("the store failed: relationship: {e:?}")))
                     .collect();
                 let joined: Vec<Relationship> = first.into_iter().chain(rest).collect();
                 assert_eq!(&joined, expected, "paged relationships for {query:?}");
@@ -1150,7 +1150,9 @@ fn check_read(view: &mut NativeView, expected: &ReadResult) {
         }
         ReadResult::Content(e) => {
             if let Some((r, bytes)) = e {
-                let got = read_all(&mut view.content(r).expect("content of a live record"));
+                let got = read_all(&mut view.content(r).unwrap_or_else(|e| {
+                    panic!("the store failed: content of a live record: {e:?}")
+                }));
                 assert!(got == **bytes, "content bytes of {r:?}");
             }
         }
@@ -1159,11 +1161,14 @@ fn check_read(view: &mut NativeView, expected: &ReadResult) {
 
 fn main_check(engine: &Engine, snap: &Snapshot) {
     let store = engine.store();
-    let mut v = store.begin().expect("begin");
+    let mut v = store
+        .begin()
+        .unwrap_or_else(|e| panic!("the store failed: begin: {e:?}"));
     for i in 0..CONTEXTS.len() as u8 {
         let id = ctx_id(i);
         assert_eq!(
-            v.context(&id).expect("context"),
+            v.context(&id)
+                .unwrap_or_else(|e| panic!("the store failed: context: {e:?}")),
             snap.logical.context(&id),
             "context {id:?}"
         );
@@ -1183,21 +1188,24 @@ fn main_check(engine: &Engine, snap: &Snapshot) {
                 };
                 let got: Vec<Relationship> = v
                     .relationships(&q)
-                    .expect("relationships")
-                    .map(|r| r.expect("relationship"))
+                    .unwrap_or_else(|e| panic!("the store failed: relationships: {e:?}"))
+                    .map(|r| r.unwrap_or_else(|e| panic!("the store failed: relationship: {e:?}")))
                     .collect();
                 assert_eq!(got, snap.logical.query(&id, outgoing, k.as_ref()), "{q:?}");
             }
         }
         if let Some(c) = snap.logical.contexts.get(&id).and_then(|r| r.content) {
-            let got = read_all(&mut v.content(&c).expect("content of a live record"));
+            let got =
+                read_all(&mut v.content(&c).unwrap_or_else(|e| {
+                    panic!("the store failed: content of a live record: {e:?}")
+                }));
             assert!(got == *snap.bytes[&c.digest.0], "content of {id:?}");
         }
     }
     let history: Vec<HistoryEntry> = v
         .history(HistoryPosition(0))
-        .expect("history")
-        .map(|h| h.expect("history entry"))
+        .unwrap_or_else(|e| panic!("the store failed: history: {e:?}"))
+        .map(|h| h.unwrap_or_else(|e| panic!("the store failed: history entry: {e:?}")))
         .collect();
     assert_eq!(history, snap.history, "retained history");
     for (c, bytes) in &snap.unreferenced {
@@ -1209,7 +1217,13 @@ fn main_check(engine: &Engine, snap: &Snapshot) {
     }
     drop(v);
     for (a, o) in &snap.outcomes {
-        assert_eq!(&store.outcome(a).expect("outcome"), o, "outcome of {a:?}");
+        assert_eq!(
+            &store
+                .outcome(a)
+                .unwrap_or_else(|e| panic!("the store failed: outcome: {e:?}")),
+            o,
+            "outcome of {a:?}"
+        );
     }
 }
 
@@ -1252,9 +1266,8 @@ struct EngineTest<const FILES: bool>;
 
 /// Opens the store again after the previous handle closed.
 fn open(backend: &Backend) -> NativeStore {
-    NativeStore {
-        inner: Inner::open(backend.io(), Default::default()).expect("open"),
-    }
+    open_on(backend.io(), Default::default())
+        .unwrap_or_else(|e| panic!("a cleanly closed store must open again: {e:?}"))
 }
 
 fn reads_through(view: &mut NativeView, reads: &[ReadResult]) {
@@ -1269,9 +1282,8 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
 
     fn init_test(_: &Model) -> Engine {
         let backend = Backend::new(FILES);
-        let store = NativeStore {
-            inner: Inner::create(backend.io(), STORE, Default::default()).expect("create"),
-        };
+        let store = create_on(backend.io(), STORE, Default::default())
+            .unwrap_or_else(|e| panic!("creating the store under test: {e:?}"));
         Engine {
             backend,
             store: Some(store),
@@ -1297,7 +1309,10 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                         count("commit from held view");
                         e.held.remove(*s)
                     }
-                    None => e.store().begin().expect("begin"),
+                    None => e
+                        .store()
+                        .begin()
+                        .unwrap_or_else(|e| panic!("the store failed: begin: {e:?}")),
                 };
                 if held_slot.is_none() {
                     reads_through(&mut basis, reads);
@@ -1307,7 +1322,9 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                     count("submit and poll");
                     let store = e.store();
                     assert_eq!(
-                        store.outcome(&request.attempt).expect("outcome"),
+                        store
+                            .outcome(&request.attempt)
+                            .unwrap_or_else(|e| panic!("the store failed: outcome: {e:?}")),
                         AttemptOutcome::Absent
                     );
                     let ticket = match store.submit(request.attempt.clone(), basis, cs) {
@@ -1320,7 +1337,10 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                     };
                     let mut polls = 0u32;
                     loop {
-                        match store.outcome(&request.attempt).expect("outcome") {
+                        match store
+                            .outcome(&request.attempt)
+                            .unwrap_or_else(|e| panic!("the store failed: outcome: {e:?}"))
+                        {
                             AttemptOutcome::Pending => {}
                             AttemptOutcome::Committed(r) => {
                                 assert!(
@@ -1356,7 +1376,10 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
             }
             Action::Retry { request, expected } => {
                 let (cs, _staged) = e.change_set(request);
-                let basis = e.store().begin().expect("begin");
+                let basis = e
+                    .store()
+                    .begin()
+                    .unwrap_or_else(|e| panic!("the store failed: begin: {e:?}"));
                 let got = e.store().commit(request.attempt.clone(), basis, cs);
                 match (&got, expected) {
                     (Ok(r), Ok(p)) => {
@@ -1375,7 +1398,10 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                 if e.held.len() == MAX_HELD {
                     e.held.remove(0);
                 }
-                let mut v = e.store().begin().expect("begin");
+                let mut v = e
+                    .store()
+                    .begin()
+                    .unwrap_or_else(|e| panic!("the store failed: begin: {e:?}"));
                 reads_through(&mut v, reads);
                 e.held.push(v);
             }
@@ -1401,7 +1427,9 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                     count("discard refused");
                 } else {
                     let h = e.staged.remove(*index);
-                    e.store().discard_staged(h).expect("discard staged content");
+                    e.store().discard_staged(h).unwrap_or_else(|e| {
+                        panic!("the store failed: discard staged content: {e:?}")
+                    });
                     count("discard ok");
                 }
             }
@@ -1413,7 +1441,11 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                 count("reopen");
                 e.held.clear();
                 e.refused.append(&mut e.staged);
-                e.store.take().expect("store").close().expect("clean close");
+                e.store
+                    .take()
+                    .expect("store")
+                    .close()
+                    .unwrap_or_else(|e| panic!("the store failed: clean close: {e:?}"));
                 e.store = Some(open(&e.backend));
             }
         }
@@ -1426,13 +1458,19 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
         e.held.clear();
         e.staged.clear();
         e.refused.clear();
-        e.store.take().expect("store").close().expect("clean close");
+        e.store
+            .take()
+            .expect("store")
+            .close()
+            .unwrap_or_else(|e| panic!("the store failed: clean close: {e:?}"));
         e.store = Some(open(&e.backend));
         main_check(&e, &snap);
-        e.store.take().expect("store").close().expect("clean close");
-        if let Backend::Files(dir) = &e.backend {
-            std::fs::remove_dir_all(dir).expect("remove the test store");
-        }
+        e.store
+            .take()
+            .expect("store")
+            .close()
+            .unwrap_or_else(|e| panic!("the store failed: clean close: {e:?}"));
+        // A passing real-files sequence's directory is removed when its owner drops with `e`.
     }
 }
 
@@ -1647,9 +1685,7 @@ fn in_flight(
             if let Some(s) = e.store.take() {
                 let _ = s.close();
             }
-            e.store = Inner::open(e.backend.io(), Default::default())
-                .ok()
-                .map(|inner| NativeStore { inner });
+            e.store = open_on(e.backend.io(), Default::default()).ok();
             (None, None)
         }
         // Steps without mutating I/O never contain a cut.
@@ -1658,10 +1694,16 @@ fn in_flight(
 }
 
 fn last_position(store: &NativeStore) -> u64 {
-    let mut v = store.begin().expect("begin");
+    let mut v = store
+        .begin()
+        .unwrap_or_else(|e| panic!("the store failed: begin: {e:?}"));
     v.history(HistoryPosition(0))
-        .expect("history")
-        .map(|h| h.expect("history entry").position.0)
+        .unwrap_or_else(|e| panic!("the store failed: history: {e:?}"))
+        .map(|h| {
+            h.unwrap_or_else(|e| panic!("the store failed: history entry: {e:?}"))
+                .position
+                .0
+        })
         .last()
         .unwrap_or(0)
 }
@@ -1714,10 +1756,8 @@ impl Allowed {
 }
 
 fn open_image(img: &SimIo, what: &str) -> Engine {
-    let store = NativeStore {
-        inner: Inner::open(Box::new(img.clone()), Default::default())
-            .unwrap_or_else(|e| panic!("{what}: recovery must open the store: {e:?}")),
-    };
+    let store = open_on(Box::new(img.clone()), Default::default())
+        .unwrap_or_else(|e| panic!("{what}: recovery must open the store: {e:?}"));
     sim_engine(img.clone(), store)
 }
 
@@ -1739,14 +1779,19 @@ fn check_recovery(img: SimIo, allowed: &Allowed) {
     // even when the interrupted step itself did not); outcomes were compared by the full check.
     if !m.committed.iter().any(|(c, _)| c.attempt == req.attempt) {
         assert_eq!(
-            e.store().outcome(&req.attempt).expect("outcome"),
+            e.store()
+                .outcome(&req.attempt)
+                .unwrap_or_else(|e| panic!("the store failed: outcome: {e:?}")),
             AttemptOutcome::Absent,
             "an attempt whose effects did not survive must be absent"
         );
     }
     // Retry contract: the same request, from a fresh view, after recovery.
     let (cs, _staged) = e.change_set(req);
-    let basis = e.store().begin().expect("begin");
+    let basis = e
+        .store()
+        .begin()
+        .unwrap_or_else(|e| panic!("the store failed: begin: {e:?}"));
     let got = e.store().commit(req.attempt.clone(), basis, cs);
     if let Some(expected) = allowed.retry {
         // The interrupted step was itself a retry of a committed attempt; nothing changes.
@@ -1775,7 +1820,11 @@ fn check_recovery(img: SimIo, allowed: &Allowed) {
     }
     let snap = m.snapshot();
     main_check(&e, &snap);
-    e.store.take().expect("store").close().expect("clean close");
+    e.store
+        .take()
+        .expect("store")
+        .close()
+        .unwrap_or_else(|e| panic!("the store failed: clean close: {e:?}"));
     e.store = Some(open(&e.backend));
     main_check(&e, &snap);
 }
@@ -1812,7 +1861,7 @@ fn check_interrupted_recovery(sim: &SimIo, persist: Persist, allowed: &Allowed) 
         let img = sim.after_crash(persist);
         img.crash_after(j);
         assert!(
-            Inner::open(Box::new(img.clone()), Default::default()).is_err(),
+            open_on(Box::new(img.clone()), Default::default()).is_err(),
             "recovery reported success although it crashed after {j} of {n} operations"
         );
         count("crash during recovery");
@@ -1821,7 +1870,7 @@ fn check_interrupted_recovery(sim: &SimIo, persist: Persist, allowed: &Allowed) 
         let img = sim.after_crash(persist);
         img.fail_nth_op(j + 1);
         assert!(
-            Inner::open(Box::new(img.clone()), Default::default()).is_err(),
+            open_on(Box::new(img.clone()), Default::default()).is_err(),
             "recovery reported success although operation {} of {n} failed",
             j + 1
         );
@@ -1851,9 +1900,8 @@ fn replay_until(transitions: &[Op], bounds: &[u64], i: usize, e: &mut Option<Eng
 /// A fresh store whose simulator counts operations from zero after creation.
 fn fresh_engine() -> Engine {
     let backend = Backend::Sim(SimIo::new(), FailedOp::default());
-    let store = NativeStore {
-        inner: Inner::create(backend.io(), STORE, Default::default()).expect("create"),
-    };
+    let store = create_on(backend.io(), STORE, Default::default())
+        .unwrap_or_else(|e| panic!("creating the store under test: {e:?}"));
     let e = Engine {
         backend,
         store: Some(store),
@@ -2129,7 +2177,11 @@ fn fail_at(
                 allowed.with = None;
             }
         }
-        match e.store().outcome(&req.attempt).expect("outcome") {
+        match e
+            .store()
+            .outcome(&req.attempt)
+            .unwrap_or_else(|e| panic!("the store failed: outcome: {e:?}"))
+        {
             AttemptOutcome::Absent => {
                 count("live outcome absent");
                 allowed.with = None;
@@ -2165,7 +2217,7 @@ fn fail_at(
         });
         if let Some((handle, bytes)) = prestaged {
             let probe = Request {
-                attempt: AttemptId::new(*b"after-failure-probe").unwrap(),
+                attempt: attempt("after-failure-probe"),
                 changes: vec![Change::PutContext {
                     id: ctx_id(0),
                     expect: Precondition::Any,
