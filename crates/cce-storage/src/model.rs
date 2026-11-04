@@ -1747,7 +1747,7 @@ impl Engine {
                 let pages_before = match &e.backend {
                     Backend::Sim(sim, _) => {
                         let (desc, reach) = traverse(sim, "before maintenance");
-                        Some((desc.next_page, reach.pages.len() as u64))
+                        Some((desc.next_page, reach.pages))
                     }
                     #[cfg(test)]
                     Backend::Files(_) => None,
@@ -1760,7 +1760,28 @@ impl Engine {
                 if let (Some((before, tree_pages)), Backend::Sim(sim, _)) =
                     (pages_before, &e.backend)
                 {
-                    let after = traverse(sim, "after maintenance").0.next_page;
+                    let (desc_after, reach_after) = traverse(sim, "after maintenance");
+                    let after = desc_after.next_page;
+                    // A page relocation moves the highest pages and writes every page into
+                    // retired pages numbered below all the pages it moves.
+                    if *task == MaintenanceTask::Relocate
+                        && r.content_bytes_moved == 0
+                        && r.pages_moved > 0
+                    {
+                        let lowest_moved = tree_pages
+                            .iter()
+                            .rev()
+                            .nth(r.pages_moved as usize - 1)
+                            .copied()
+                            .unwrap_or(0);
+                        let written: Vec<u64> =
+                            reach_after.pages.difference(&tree_pages).copied().collect();
+                        assert!(
+                            written.iter().all(|p| *p < lowest_moved),
+                            "page relocation wrote pages {written:?}, not all below the lowest \
+                             moved page {lowest_moved} ({r:?})"
+                        );
+                    }
                     // A page relocation is complete when it rewrote every page of the tree.
                     if *task == MaintenanceTask::Relocate
                         && r.content_bytes_moved == 0
@@ -1768,7 +1789,8 @@ impl Engine {
                         && r.complete
                     {
                         assert_eq!(
-                            r.pages_moved, tree_pages,
+                            r.pages_moved,
+                            tree_pages.len() as u64,
                             "page relocation reported complete without moving every page ({r:?})"
                         );
                     }
