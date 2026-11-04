@@ -2,24 +2,21 @@
 //! relationship directions, history, the attempt's outcome and bound content all stay as they
 //! were, also for a fresh process, and the same attempt can then commit a valid request.
 
+use crate::test_support::{cid, create_on, open_on};
+
 use std::io::Read;
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, ContentBinding, ContentRef,
-    ContextId, Direction, HistoryPosition, Precondition, ReadView, RelationshipId,
+    Direction, HistoryPosition, Precondition, ReadView, RelationshipId,
     RelationshipKind, RelationshipQuery, Revision, StagedContent, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;
-use crate::engine::Inner;
 use crate::format::StoreId;
 use crate::sim::SimIo;
 
 const STORE: StoreId = StoreId(*b"bundle-atomicity");
-
-fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
-}
 
 fn put(id: &str, expect: Precondition, body: &[u8], content: Option<usize>) -> Change {
     Change::PutContext {
@@ -32,9 +29,7 @@ fn put(id: &str, expect: Precondition, body: &[u8], content: Option<usize>) -> C
 
 /// A store holding records A and B and nothing else.
 fn seeded(sim: &SimIo) -> NativeStore {
-    let s = NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), STORE, Default::default()).unwrap(),
-    };
+    let s = create_on(Box::new(sim.clone()), STORE, Default::default()).unwrap();
     s.commit(
         AttemptId::new(*b"seed").unwrap(),
         s.begin().unwrap(),
@@ -133,9 +128,7 @@ fn assert_atomic(failing: Change, expected: impl Fn(&CommitError) -> bool) {
     let content = staged.content;
     drop((staged, s));
     sim.release();
-    let s = NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Default::default()).unwrap(),
-    };
+    let s = open_on(Box::new(sim.clone()), Default::default()).unwrap();
     assert_eq!(observe(&s, &content), before, "after reopen");
     assert_eq!(s.outcome(&attempt).unwrap(), AttemptOutcome::Absent);
 

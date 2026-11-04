@@ -1,6 +1,8 @@
 //! Attempt identity: a reused attempt id either returns the original receipt for the identical
 //! request or is refused as a mismatch, without changing state, across concurrency and reopen.
 
+use crate::test_support::{attempt, cid, create_on, open_on};
+
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
@@ -8,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentBinding,
-    ContextId, Evidence, HistoryEntry, HistoryPosition, Precondition, ReadView, StorageEngine,
+    Evidence, HistoryEntry, HistoryPosition, Precondition, ReadView, StorageEngine,
     StorageError,
 };
 
@@ -23,24 +25,12 @@ const STORE: StoreId = StoreId(*b"attempt-id-store");
 const IDS: [&str; 3] = ["A", "B", "S"];
 const PAYLOAD: &[u8] = b"content bound by the attempt";
 
-fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
-}
-
-fn attempt(s: &str) -> AttemptId {
-    AttemptId::new(s.as_bytes().to_vec()).unwrap()
-}
-
 fn sim_store(sim: &SimIo) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), STORE, Default::default()).unwrap(),
-    }
+    create_on(Box::new(sim.clone()), STORE, Default::default()).unwrap()
 }
 
 fn reopen(sim: &SimIo) -> NativeStore {
-    NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Default::default()).expect("open"),
-    }
+    open_on(Box::new(sim.clone()), Default::default()).expect("open")
 }
 
 /// One field of the baseline request changed.
@@ -339,8 +329,7 @@ fn outcome_after_any_cut_matches_the_recovered_state() {
     for cut in 0..=total {
         let sim = SimIo::new();
         let trace = Arc::new(Mutex::new(Vec::new()));
-        let s = NativeStore {
-            inner: Inner::create(
+        let s = create_on(
                 Box::new(Traced {
                     inner: sim.clone(),
                     trace: trace.clone(),
@@ -602,8 +591,7 @@ fn gated_store() -> (NativeStore, Gate) {
         gate: gate.clone(),
     };
     let s = NativeStore {
-        inner: Inner::create(Box::new(io), STORE, Default::default()).unwrap(),
-    };
+        inner: Inner::create(Box::new(io), STORE, Default::default()).unwrap();
     seed(&s);
     (s, gate)
 }

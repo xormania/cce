@@ -2,15 +2,16 @@
 //! newest record is ignored and reported, never selected; damage to what the newest valid record
 //! references is an integrity error, never a silent return to an older generation.
 
+use crate::test_support::{cid, create_on, open_on};
+
 use std::io::Read;
 
 use cce_core::storage::{
-    AttemptId, AttemptOutcome, Change, ChangeSet, ContentBinding, ContextId, Evidence,
+    AttemptId, AttemptOutcome, Change, ChangeSet, ContentBinding, Evidence,
     HistoryPosition, Precondition, ReadView, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;
-use crate::engine::Inner;
 use crate::format::{DESC_MAGIC, Descriptor, PAGE_HEADER_LEN, PAGE_SIZE, StoreId};
 use crate::io::{FileId, Io};
 use crate::sim::SimIo;
@@ -20,16 +21,12 @@ const IDS: [&str; 2] = ["A", "B"];
 /// Encoded publication record length: magic, version, store, six counters, checksum.
 const RECORD_LEN: usize = 4 + 2 + 16 + 8 * 6 + 4;
 
-fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
-}
-
 fn step_attempt(step: u32) -> AttemptId {
     AttemptId::new(format!("attempt-{step}").into_bytes()).unwrap()
 }
 
 fn try_open(sim: &SimIo) -> Result<NativeStore, StorageError> {
-    Inner::open(Box::new(sim.clone()), Default::default()).map(|inner| NativeStore { inner })
+    open_on(Box::new(sim.clone()), Default::default())
 }
 
 fn open(sim: &SimIo) -> NativeStore {
@@ -113,9 +110,7 @@ struct TwoCommits {
 
 fn two_commits() -> TwoCommits {
     let sim = SimIo::new();
-    let s = NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), STORE, Default::default()).unwrap(),
-    };
+    let s = create_on(Box::new(sim.clone()), STORE, Default::default()).unwrap();
     commit_step(&s, 1);
     let gen2 = descriptor(&s);
     let old = logical_state(&s);

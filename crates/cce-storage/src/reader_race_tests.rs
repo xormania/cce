@@ -7,6 +7,8 @@
 //! views and content readers opened and read while commits publish new versions, while other
 //! stagings succeed, fail or are abandoned, and after the store handle itself is dropped.
 
+use crate::test_support::{create_on};
+
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::sync::Mutex;
@@ -18,7 +20,6 @@ use cce_core::storage::{
 };
 
 use crate::NativeStore;
-use crate::engine::Inner;
 use crate::format::StoreId;
 use crate::sim::SimIo;
 
@@ -114,9 +115,7 @@ fn read_version(v: &mut crate::NativeView, rng: &mut u64) -> u64 {
 
 #[test]
 fn readers_racing_commits_staging_and_store_drop_read_exactly_their_views_bytes() {
-    let s = NativeStore {
-        inner: Inner::create(Box::new(SimIo::new()), StoreId([9; 16]), Default::default()).unwrap(),
-    };
+    let s = create_on(Box::new(SimIo::new()), StoreId([9; 16]), Default::default()).unwrap();
     commit_version(&s, 0);
 
     let done = AtomicBool::new(false);

@@ -1,6 +1,8 @@
 //! A multi-level metadata tree read back from the store files by a fresh open: every key, every
 //! value and the full ordered iteration, against a model built by the test.
 
+use crate::test_support::{create_on};
+
 use std::collections::{BTreeMap, HashSet};
 
 use cce_core::storage::{
@@ -32,9 +34,7 @@ fn a_tree_of_height_three_reads_back_whole_after_reopening_from_the_files() {
     const IDS: u32 = 9000;
 
     let sim = SimIo::new();
-    let s = NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), StoreId([8; 16]), Default::default()).unwrap(),
-    };
+    let s = create_on(Box::new(sim.clone()), StoreId([8; 16]), Default::default()).unwrap();
     // Model of every key the tree must hold: contexts and attempt records exactly; history keys
     // by position (their values are physical extents, checked through the history port below).
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();

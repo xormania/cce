@@ -1,10 +1,12 @@
 //! Read-only inspection open: lock interplay with owners and other readers, selection identical to
 //! a read-write open, no writes or syncs of any kind, and refusal of staging and commits.
 
-use std::path::{Path, PathBuf};
+use crate::test_support::{cid, create_on, open_on};
+
+use std::path::Path;
 
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, CommitError, ContentRef, ContextId, HistoryPosition,
+    AttemptId, Change, ChangeSet, CommitError, ContentRef, HistoryPosition,
     Precondition, ReadView, StorageEngine, StorageError,
 };
 
@@ -16,18 +18,12 @@ use crate::{NativeReadOnly, NativeStore, NativeView};
 
 const STORE: StoreId = StoreId(*b"read-only-tests!");
 
-fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
-}
-
 fn sim_create(sim: &SimIo) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), STORE, Default::default()).unwrap(),
-    }
+    create_on(Box::new(sim.clone()), STORE, Default::default()).unwrap()
 }
 
 fn try_open(sim: &SimIo) -> Result<NativeStore, StorageError> {
-    Inner::open(Box::new(sim.clone()), Default::default()).map(|inner| NativeStore { inner })
+    open_on(Box::new(sim.clone()), Default::default())
 }
 
 fn try_open_ro(sim: &SimIo) -> Result<NativeReadOnly, StorageError> {
@@ -289,21 +285,7 @@ fn staging_and_commits_are_refused_on_a_read_only_handle() {
 
 // ----- filesystem adapter --------------------------------------------------------------------
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("cce-ro-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        Self(p)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use crate::test_support::resources::TestDir as TempDir;
 
 fn listing(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
@@ -318,27 +300,27 @@ fn listing(dir: &Path) -> Vec<String> {
 fn filesystem_readers_share_the_lock_and_exclude_owners() {
     // Each open below uses its own lock file descriptor, so the lock behaves as between processes.
     let dir = TempDir::new("matrix");
-    let owner = NativeStore::create(&dir.0, *b"read-only-matrix").unwrap();
+    let owner = NativeStore::create(dir.as_ref(), *b"read-only-matrix").unwrap();
     assert_eq!(put(&owner, "a1", "A", "one"), Ok(1));
     assert_busy(
-        NativeStore::open_read_only(&dir.0),
+        NativeStore::open_read_only(dir.as_ref()),
         "read-only open under an owner",
     );
     drop(owner);
 
-    let first = NativeStore::open_read_only(&dir.0).expect("first reader");
-    let second = NativeStore::open_read_only(&dir.0).expect("second reader");
-    assert_busy(NativeStore::open(&dir.0), "read-write open under readers");
+    let first = NativeStore::open_read_only(dir.as_ref()).expect("first reader");
+    let second = NativeStore::open_read_only(dir.as_ref()).expect("second reader");
+    assert_busy(NativeStore::open(dir.as_ref()), "read-write open under readers");
     // A view outlives its handle and keeps the shared lock.
     let mut view = first.begin().unwrap();
     drop((first, second));
-    assert_busy(NativeStore::open(&dir.0), "read-write open under a view");
+    assert_busy(NativeStore::open(dir.as_ref()), "read-write open under a view");
     assert_eq!(view.context(&cid("A")).unwrap().expect("A").body, b"one");
     drop(view);
 
-    let owner = NativeStore::open(&dir.0).expect("owner after readers");
+    let owner = NativeStore::open(dir.as_ref()).expect("owner after readers");
     assert_busy(
-        NativeStore::open_read_only(&dir.0),
+        NativeStore::open_read_only(dir.as_ref()),
         "read-only open under the new owner",
     );
     drop(owner);
@@ -347,23 +329,23 @@ fn filesystem_readers_share_the_lock_and_exclude_owners() {
 #[test]
 fn filesystem_read_only_open_without_a_lock_file_refuses_and_creates_nothing() {
     let dir = TempDir::new("no-lock");
-    let s = NativeStore::create(&dir.0, *b"read-only-nolock").unwrap();
+    let s = NativeStore::create(dir.as_ref(), *b"read-only-nolock").unwrap();
     assert_eq!(put(&s, "a1", "A", "one"), Ok(1));
     drop(s);
-    std::fs::remove_file(dir.0.join(LOCK_FILE)).unwrap();
-    let before = listing(&dir.0);
+    std::fs::remove_file(dir.join(LOCK_FILE)).unwrap();
+    let before = listing(dir.as_ref());
 
-    match NativeStore::open_read_only(&dir.0) {
+    match NativeStore::open_read_only(dir.as_ref()) {
         Err(StorageError::StoreState(m)) => assert!(m.contains(LOCK_FILE), "{m}"),
         Err(e) => panic!("expected a refusal naming {LOCK_FILE}, got {e:?}"),
         Ok(_) => panic!("read-only open succeeded without a lock file"),
     }
-    assert_eq!(listing(&dir.0), before, "the refused open created files");
+    assert_eq!(listing(dir.as_ref()), before, "the refused open created files");
 
     // Positive neighbour: a read-write open recreates the lock file; then readers work.
-    drop(NativeStore::open(&dir.0).unwrap());
-    assert!(dir.0.join(LOCK_FILE).exists());
-    let ro = NativeStore::open_read_only(&dir.0).unwrap();
+    drop(NativeStore::open(dir.as_ref()).unwrap());
+    assert!(dir.join(LOCK_FILE).exists());
+    let ro = NativeStore::open_read_only(dir.as_ref()).unwrap();
     let a = ro.begin().unwrap().context(&cid("A")).unwrap();
     assert_eq!(a.expect("A").body, b"one");
 }
@@ -371,10 +353,10 @@ fn filesystem_read_only_open_without_a_lock_file_refuses_and_creates_nothing() {
 #[test]
 fn a_filesystem_read_only_handle_refuses_writes_and_syncs() {
     let dir = TempDir::new("adapter");
-    drop(NativeStore::create(&dir.0, *b"read-only-adapt!").unwrap());
-    let meta = std::fs::read(dir.0.join(crate::io::META_FILE)).unwrap();
+    drop(NativeStore::create(dir.as_ref(), *b"read-only-adapt!").unwrap());
+    let meta = std::fs::read(dir.join(crate::io::META_FILE)).unwrap();
 
-    let io = FsIo::new(&dir.0);
+    let io = FsIo::new(dir.as_ref());
     io.open_read_only().unwrap();
     let mut buf = vec![0; 16];
     io.read_at(FileId::Meta, PAGE_SIZE as u64, &mut buf)
@@ -391,7 +373,7 @@ fn a_filesystem_read_only_handle_refuses_writes_and_syncs() {
     }
     drop(io);
     assert_eq!(
-        std::fs::read(dir.0.join(crate::io::META_FILE)).unwrap(),
+        std::fs::read(dir.join(crate::io::META_FILE)).unwrap(),
         meta
     );
 }

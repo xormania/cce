@@ -3,17 +3,17 @@
 //! Expected states come from an independent run of the same logical requests, never from what
 //! recovery chose.
 
+use crate::test_support::{cid, create_on, open_on};
+
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::{
-    AttemptId, AttemptOutcome, Change, ChangeSet, CommitReceipt, ContentBinding, ContextId,
-    Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
+    AttemptId, AttemptOutcome, Change, ChangeSet, CommitReceipt, ContentBinding, Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
     RelationshipQuery, StorageEngine,
 };
 
 use crate::NativeStore;
-use crate::engine::Inner;
 use crate::format::StoreId;
 use crate::io::{FsIo, Io, Op, Traced};
 use crate::repro_tests::{survival, with_repro};
@@ -21,10 +21,6 @@ use crate::sim::{Persist, SimIo};
 
 const STORE: StoreId = StoreId(*b"crash-test-store");
 const IDS: [&str; 4] = ["A", "B", "C", "D"];
-
-fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
-}
 
 fn traced<I: Io + 'static>(io: I, trace: &Arc<Mutex<Vec<Op>>>) -> Box<dyn Io> {
     Box::new(Traced {
@@ -34,15 +30,11 @@ fn traced<I: Io + 'static>(io: I, trace: &Arc<Mutex<Vec<Op>>>) -> Box<dyn Io> {
 }
 
 fn create(io: Box<dyn Io>) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(io, STORE, Default::default()).expect("create"),
-    }
+    create_on(io, STORE, Default::default()).expect("create")
 }
 
 fn open(io: Box<dyn Io>) -> NativeStore {
-    NativeStore {
-        inner: Inner::open(io, Default::default()).expect("recovery must open the store"),
-    }
+    open_on(io, Default::default()).expect("recovery must open the store")
 }
 
 /// The content bytes bound by `step`.

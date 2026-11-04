@@ -1,8 +1,10 @@
 //! Concurrent views and logical conflict validation. Schedules are explicit: the test decides the
 //! order of view creation, intervening commits and the final commit.
 
+use crate::test_support::{cid, create_on};
+
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, CommitError, ContextId, Direction, Precondition, ReadView,
+    AttemptId, Change, ChangeSet, CommitError, Direction, Precondition, ReadView,
     RelationshipId, RelationshipKind, RelationshipQuery, StorageEngine,
 };
 
@@ -12,13 +14,7 @@ use crate::format::StoreId;
 use crate::sim::SimIo;
 
 fn store() -> NativeStore {
-    NativeStore {
-        inner: Inner::create(Box::new(SimIo::new()), StoreId([6; 16]), Default::default()).unwrap(),
-    }
-}
-
-fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
+    create_on(Box::new(SimIo::new()), StoreId([6; 16]), Default::default()).unwrap()
 }
 
 fn put(id: &str) -> Change {
@@ -228,8 +224,7 @@ fn competing_updates_to_one_observed_record_do_not_both_commit() {
 
 #[test]
 fn a_basis_older_than_retained_conflict_history_is_refused_explicitly() {
-    let s = NativeStore {
-        inner: Inner::create(
+    let s = create_on(
             Box::new(SimIo::new()),
             StoreId([6; 16]),
             crate::engine::Options {
@@ -331,8 +326,7 @@ fn a_basis_from_another_store_is_rejected() {
 
 fn store_with(opts: crate::engine::Options) -> NativeStore {
     NativeStore {
-        inner: Inner::create(Box::new(SimIo::new()), StoreId([7; 16]), opts).unwrap(),
-    }
+        inner: Inner::create(Box::new(SimIo::new()), StoreId([7; 16]), opts).unwrap()
 }
 
 fn wait_resolved(s: &NativeStore, a: &AttemptId) -> cce_core::storage::AttemptOutcome {
