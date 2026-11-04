@@ -18,15 +18,15 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::{
-    AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentBinding, Precondition,
-    ReadView, StagedContent, StorageEngine, StorageError,
+    AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentBinding, HistoryPosition,
+    Precondition, ReadView, StagedContent, StorageEngine, StorageError,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config, FileFailurePersistence, RngSeed, TestRunner};
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest};
 
-use crate::NativeStore;
-use crate::test_support::{attempt, cid};
+use crate::test_support::{attempt, cid, open_on};
+use crate::{NativeStore, NativeView};
 
 use crate::model::*;
 pub(crate) struct ModelMachine;
@@ -1116,4 +1116,218 @@ fn a_staging_in_progress_across_an_uncertain_publication_takes_none_of_its_space
     recovered_ownership_check(&e, &prior);
     audit(&e, "recovery after the uncertain publication");
     assert_eq!(record_content(&e, "p"), None, "the record write failed");
+}
+
+/// A second committer races a commit paused between its validation and its publication (at its
+/// data barrier, before its publication record, or after the record's sync and before the running
+/// store applies it): one whose view read the paused commit's key before it, one whose view opened
+/// during the pause, and one that touches nothing the paused commit writes. The first two must
+/// conflict (their reads are stale once the paused commit publishes), the third must commit after
+/// it, and the view opened during the pause must read the state before it.
+#[test]
+fn a_second_committer_racing_a_commit_between_validation_and_publication_conflicts_on_its_reads() {
+    STATS.with(|s| s.borrow_mut().clear());
+    let read_k = |v: &mut NativeView| {
+        v.context(&cid("k"))
+            .unwrap_or_else(|x| panic!("the store failed: context k: {x:?}"))
+            .map(|r| r.body)
+    };
+    let write = |store: &NativeStore, a: &str, basis: NativeView, name: &str| {
+        store.commit(
+            attempt(a),
+            basis,
+            ChangeSet {
+                changes: vec![Change::PutContext {
+                    id: cid(name),
+                    expect: Precondition::Any,
+                    body: format!("written by {a}").into_bytes(),
+                    content: None,
+                }],
+                ..ChangeSet::default()
+            },
+        )
+    };
+    for point in POINTS {
+        let e = fresh_engine();
+        put_record(e.store(), "setup", "k", None).unwrap_or_else(|x| panic!("setup: {x:?}"));
+        let before = last_position(e.store());
+        // B1's basis read k before the paused commit runs.
+        let mut early = e.store().begin().expect("begin");
+        assert_eq!(read_k(&mut early), Some(b"record k".to_vec()));
+        let (a, (b1, b2, seen_during, b3), progress) = across_pause(
+            &e,
+            point,
+            |store| {
+                let basis = store.begin().expect("begin");
+                write(store, "a", basis, "k")
+            },
+            move |store| {
+                // Opening a view and reading take no writer lock: both happen during the pause.
+                let mut during = store.begin().expect("begin during the pause");
+                let seen = read_k(&mut during);
+                let b1 = write(store, "b1", early, "b1");
+                let b2 = write(store, "b2", during, "b2");
+                let fresh = store.begin().expect("begin");
+                let b3 = write(store, "b3", fresh, "b3");
+                (b1, b2, seen, b3)
+            },
+        );
+        count(&format!("{point:?}: second committer {progress:?}"));
+        let a = a.unwrap_or_else(|x| panic!("{point:?}: the paused commit failed: {x:?}"));
+        assert_eq!(
+            a.position,
+            HistoryPosition(before + 1),
+            "{point:?}: paused commit position"
+        );
+        assert!(
+            matches!(b1, Err(CommitError::Conflict(_))),
+            "{point:?}: a basis that read k before the paused commit committed: {b1:?}"
+        );
+        // Until the paused commit is applied, a new view reads the state before it.
+        assert_eq!(
+            seen_during,
+            Some(b"record k".to_vec()),
+            "{point:?}: a view opened during the pause read an unapplied commit"
+        );
+        assert!(
+            matches!(b2, Err(CommitError::Conflict(_))),
+            "{point:?}: a view that read k during the pause committed: {b2:?}"
+        );
+        let b3 = b3.unwrap_or_else(|x| panic!("{point:?}: an independent commit failed: {x:?}"));
+        assert!(
+            b3.position > a.position,
+            "{point:?}: the independent commit ordered before"
+        );
+        let mut v = e.store().begin().expect("begin");
+        assert_eq!(
+            read_k(&mut v),
+            Some(b"written by a".to_vec()),
+            "{point:?}: k after"
+        );
+        for (name, present) in [("b1", false), ("b2", false), ("b3", true)] {
+            let got = v
+                .context(&cid(name))
+                .unwrap_or_else(|x| panic!("the store failed: context {name}: {x:?}"));
+            assert_eq!(got.is_some(), present, "{point:?}: {name} present");
+        }
+        drop(v);
+        audit(&e, "a racing second committer");
+        ownership_check(&e, "a racing second committer");
+    }
+    let observed = STATS.with(|s| s.borrow().clone());
+    println!("schedule report: {}", serde_json::json!(observed));
+}
+
+/// The caller of a submitted commit disappears: it drops the ticket and its thread ends while the
+/// commit is paused at its data barrier, its publication or its application. The commit must
+/// still complete: its outcome is pending during the pause and committed afterwards with the
+/// receipt the store reports, the staging it binds is consumed, a retry of the same request
+/// returns that receipt, and all of it survives a reopen.
+#[test]
+fn a_submitted_commit_whose_caller_drops_the_ticket_and_exits_completes_and_reports_its_outcome() {
+    STATS.with(|s| s.borrow_mut().clear());
+    for point in POINTS {
+        let (mut e, _xb, yb) = schedule_store();
+        let y = e.staged.pop().expect("y");
+        let y_ranges: Vec<(u64, u64)> = y.ranges().collect();
+        let before = last_position(e.store());
+        let request = |handle: &StagedContent| ChangeSet {
+            changes: vec![Change::PutContext {
+                id: cid("orphan"),
+                expect: Precondition::Absent,
+                body: b"submitted by a caller that left".to_vec(),
+                content: Some(0),
+            }],
+            content: vec![ContentBinding::from(handle)],
+            ..ChangeSet::default()
+        };
+        let tap = e.tap().expect("schedules run on the simulator").clone();
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        *tap.gate.lock().unwrap() = Some(Gate {
+            point,
+            reached: reached_tx,
+            go: go_rx,
+        });
+        let deadline = std::time::Duration::from_secs(20);
+        std::thread::scope(|s| {
+            let store = e.store();
+            let cs = request(&y.handle);
+            s.spawn(move || {
+                let basis = store.begin().expect("begin");
+                let ticket = store
+                    .submit(attempt("orphan"), basis, cs)
+                    .unwrap_or_else(|x| panic!("{point:?}: admission failed: {x:?}"));
+                drop(ticket);
+            })
+            .join()
+            .expect("the caller thread");
+            reached.recv_timeout(deadline).unwrap_or_else(|_| {
+                panic!("{point:?}: the orphaned commit never reached {point:?}")
+            });
+            assert_eq!(
+                store.outcome(&attempt("orphan")).expect("outcome"),
+                AttemptOutcome::Pending,
+                "{point:?}: outcome while the orphaned commit is paused"
+            );
+            go.send(()).expect("release the commit");
+        });
+        let started = std::time::Instant::now();
+        let receipt = loop {
+            match e.store().outcome(&attempt("orphan")).expect("outcome") {
+                AttemptOutcome::Committed(r) => break r,
+                AttemptOutcome::Pending => {
+                    assert!(started.elapsed() < deadline, "{point:?}: never resolved");
+                    std::thread::yield_now();
+                }
+                other => panic!("{point:?}: an orphaned commit resolved as {other:?}"),
+            }
+        };
+        count(&format!("{point:?}: orphaned commit committed"));
+        assert_eq!(
+            receipt.position,
+            HistoryPosition(before + 1),
+            "{point:?}: receipt position"
+        );
+        assert_eq!(
+            record_content(&e, "orphan"),
+            Some(yb.clone()),
+            "{point:?}: orphan content"
+        );
+        consumed_check(&e, &y_ranges, "an orphaned commit");
+        let basis = e.store().begin().expect("begin");
+        let again = e
+            .store()
+            .commit(attempt("orphan"), basis, request(&y.handle))
+            .unwrap_or_else(|x| panic!("{point:?}: retry of the orphaned request: {x:?}"));
+        assert_eq!(
+            again, receipt,
+            "{point:?}: a retry returns the original receipt"
+        );
+        e.refused.push(y.handle);
+        audit(&e, "an orphaned commit");
+        ownership_check(&e, "an orphaned commit");
+        e.held.clear();
+        e.refused.clear();
+        e.staged.clear();
+        e.store
+            .take()
+            .expect("store")
+            .close()
+            .unwrap_or_else(|x| panic!("clean close: {x:?}"));
+        e.store = Some(open_on(e.backend.io(), Default::default()).expect("reopen"));
+        assert_eq!(
+            e.store().outcome(&attempt("orphan")).expect("outcome"),
+            AttemptOutcome::Committed(receipt),
+            "{point:?}: outcome after reopen"
+        );
+        assert_eq!(
+            record_content(&e, "orphan"),
+            Some(yb),
+            "{point:?}: content after reopen"
+        );
+        audit(&e, "reopen after an orphaned commit");
+    }
+    let observed = STATS.with(|s| s.borrow().clone());
+    println!("schedule report: {}", serde_json::json!(observed));
 }
