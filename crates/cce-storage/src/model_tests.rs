@@ -17,6 +17,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::{
@@ -31,7 +32,7 @@ use proptest::test_runner::{Config, FileFailurePersistence, RngSeed, TestRunner}
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest};
 use sha2::{Digest, Sha256};
 
-use crate::format::StoreId;
+use crate::format::{PAGE_SIZE, StoreId};
 use crate::io::{FileId, FsIo, Io};
 use crate::sim::{Persist, SimIo};
 use crate::test_support::resources::TestDir;
@@ -74,6 +75,9 @@ fn kind(i: u8) -> RelationshipKind {
 enum ContentPick {
     Fresh(ContentSpec),
     SameStaging(u8),
+    /// A handle staged earlier and still staged (by a stage step or a rejected commit); the
+    /// `n`-th one at the time the request is made.
+    Staged(u8),
 }
 
 /// Content bytes for a generated content choice: mostly small, sometimes several KiB, rarely
@@ -287,6 +291,9 @@ struct Request {
     contents: Vec<Arc<Vec<u8>>>,
     /// Per binding: `Some(i)` binds the same staging handle as binding `i` (missing: none).
     aliases: Vec<Option<usize>>,
+    /// Per binding: `Some(k)` binds the `k`-th handle still staged when the request was made
+    /// (missing: none). A rejected commit leaves it staged; a committed one consumes it.
+    from_staged: Vec<Option<usize>>,
     evidence: Vec<Evidence>,
     removal: RemovalMode,
 }
@@ -296,11 +303,22 @@ impl Request {
         self.aliases.get(j).copied().flatten()
     }
 
-    /// The bytes of each distinct staging the request binds, in binding order.
+    fn staged_pick(&self, j: usize) -> Option<usize> {
+        self.from_staged.get(j).copied().flatten()
+    }
+
+    /// The bytes of each staging the request makes itself, in binding order.
     fn stagings(&self) -> Vec<Arc<Vec<u8>>> {
         (0..self.contents.len())
-            .filter(|j| self.alias(*j).is_none())
+            .filter(|j| self.alias(*j).is_none() && self.staged_pick(*j).is_none())
             .map(|j| self.contents[j].clone())
+            .collect()
+    }
+
+    /// The distinct earlier stagings it binds, by their index among the staged handles.
+    fn staged_picks(&self) -> BTreeSet<usize> {
+        (0..self.contents.len())
+            .filter_map(|j| self.staged_pick(j))
             .collect()
     }
 
@@ -500,6 +518,8 @@ impl Model {
             .collect();
         let mut contents = Vec::new();
         let mut aliases: Vec<Option<usize>> = Vec::new();
+        let mut from_staged: Vec<Option<usize>> = Vec::new();
+        let staged_now = self.staged.clone();
         let mut fresh_at: Vec<Option<usize>> = vec![None; fresh.len()];
         let mut pending: Vec<(usize, usize)> = Vec::new();
         let mut next_fresh = 0;
@@ -520,7 +540,22 @@ impl Model {
                         body: body_bytes(*body, &id),
                         content: content.map(|pick| {
                             let j = contents.len();
+                            from_staged.push(None);
                             match pick {
+                                ContentPick::Staged(k) if !staged_now.is_empty() => {
+                                    let k = k as usize % staged_now.len();
+                                    contents.push(staged_now[k].clone());
+                                    aliases.push(None);
+                                    from_staged[j] = Some(k);
+                                }
+                                ContentPick::Staged(k) => {
+                                    let s = ContentSpec {
+                                        seed: k % 12,
+                                        size: 1,
+                                    };
+                                    contents.push(Arc::new(s.bytes()));
+                                    aliases.push(None);
+                                }
                                 ContentPick::SameStaging(k) if !fresh.is_empty() => {
                                     let k = k as usize % fresh.len();
                                     contents.push(Arc::new(fresh[k].bytes()));
@@ -590,6 +625,7 @@ impl Model {
             changes,
             contents,
             aliases,
+            from_staged,
             evidence: spec
                 .evidence
                 .iter()
@@ -812,14 +848,20 @@ impl Model {
         let request = self.resolve(spec);
         let (expected, written) = self.predict(&request, held.as_ref());
         match expected {
-            Expected::Committed(_) => self.apply_commit(&request, written),
+            Expected::Committed(_) => {
+                self.apply_commit(&request, written);
+                // Earlier stagings it bound are consumed: discarding them must now be refused.
+                for k in request.staged_picks().into_iter().rev() {
+                    self.staged.remove(k);
+                }
+                self.refused += request.stagings().len() + request.staged_picks().len();
+            }
             Expected::Failed(_) => {
+                // A rejected commit consumes nothing: earlier stagings it bound stay staged and
+                // usable, and its own stagings join them.
                 self.uncommitted.insert(request.attempt.clone());
                 self.staged.extend(request.stagings());
             }
-        }
-        if matches!(expected, Expected::Committed(_)) {
-            self.refused += request.stagings().len();
         }
         self.action = Action::Commit {
             reads,
@@ -859,6 +901,7 @@ fn content_pick() -> impl Strategy<Value = ContentPick> {
     prop_oneof![
         4 => content_spec().prop_map(ContentPick::Fresh),
         1 => any::<u8>().prop_map(ContentPick::SameStaging),
+        2 => any::<u8>().prop_map(ContentPick::Staged),
     ]
 }
 
@@ -1140,14 +1183,57 @@ fn op_name(op: &Op) -> &'static str {
     }
 }
 
-/// The kind of mutating operation ("write" or "sync") an injected simulator failure hit.
-type FailedOp = Arc<Mutex<Option<&'static str>>>;
+/// Where a controlled schedule pauses a commit: before its data barrier (everything it will
+/// publish is sealed), before its publication record is written, or after the publication sync
+/// returned and before the commit applies its result to the running store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Point {
+    Barrier,
+    Publish,
+    Apply,
+}
 
-/// The simulator as the store sees it, recording which kind of operation an injected failure hit
-/// (the commit itself runs on the store's worker thread).
+/// A pause armed at one point: the paused operation signals `reached` and waits for `go`.
+struct Gate {
+    point: Point,
+    reached: std::sync::mpsc::Sender<()>,
+    go: std::sync::mpsc::Receiver<()>,
+}
+
+/// What the harness observes of the simulator underneath the store, independently of the store's
+/// own bookkeeping: the kind of operation an injected failure hit, every content-file write (so a
+/// staging's space is known from the bytes it wrote), and an optional pause.
+#[derive(Default)]
+struct Tap {
+    failed: Mutex<Option<&'static str>>,
+    writes: Mutex<Vec<(u64, Vec<u8>)>>,
+    gate: Mutex<Option<Gate>>,
+    /// A publication record was written and its sync has not returned yet.
+    publishing: std::sync::atomic::AtomicBool,
+}
+
+impl Tap {
+    fn pause_at(&self, point: Point) {
+        let armed = {
+            let mut g = self.gate.lock().unwrap();
+            if g.as_ref().is_some_and(|g| g.point == point) {
+                g.take()
+            } else {
+                None
+            }
+        };
+        if let Some(g) = armed {
+            let _ = g.reached.send(());
+            let _ = g.go.recv();
+        }
+    }
+}
+
+/// The simulator as the store sees it, reporting to the harness's tap (the commit itself runs on
+/// the store's worker thread).
 struct Watched {
     sim: SimIo,
-    failed: FailedOp,
+    tap: Arc<Tap>,
 }
 
 impl Watched {
@@ -1155,7 +1241,7 @@ impl Watched {
         if let Err(StorageError::Io(m)) = &r
             && m.starts_with("simulated I/O error")
         {
-            *self.failed.lock().unwrap() = Some(kind);
+            *self.tap.failed.lock().unwrap() = Some(kind);
         }
         r
     }
@@ -1175,13 +1261,35 @@ impl Io for Watched {
         self.sim.read_at(file, offset, buf)
     }
     fn write_at(&self, file: FileId, offset: u64, data: &[u8]) -> Result<(), StorageError> {
-        self.note("write", self.sim.write_at(file, offset, data))
+        let publication = file == FileId::Meta && offset < 2 * PAGE_SIZE as u64;
+        if publication {
+            self.tap.pause_at(Point::Publish);
+        }
+        let r = self.note("write", self.sim.write_at(file, offset, data));
+        if r.is_ok() && file == FileId::Content {
+            self.tap
+                .writes
+                .lock()
+                .unwrap()
+                .push((offset, data.to_vec()));
+        }
+        if r.is_ok() && publication {
+            self.tap.publishing.store(true, Ordering::SeqCst);
+        }
+        r
     }
     fn len(&self, file: FileId) -> Result<u64, StorageError> {
         self.sim.len(file)
     }
     fn sync(&self, file: FileId) -> Result<(), StorageError> {
-        self.note("sync", self.sim.sync(file))
+        if file == FileId::Content {
+            self.tap.pause_at(Point::Barrier);
+        }
+        let r = self.note("sync", self.sim.sync(file));
+        if r.is_ok() && file == FileId::Meta && self.tap.publishing.swap(false, Ordering::SeqCst) {
+            self.tap.pause_at(Point::Apply);
+        }
+        r
     }
     fn sync_dir(&self) -> Result<(), StorageError> {
         self.note("sync", self.sim.sync_dir())
@@ -1190,7 +1298,7 @@ impl Io for Watched {
 
 /// Where the store under test lives.
 enum Backend {
-    Sim(SimIo, FailedOp),
+    Sim(SimIo, Arc<Tap>),
     /// A fresh directory on the real filesystem from the shared directory owner: removed when a
     /// sequence passes, kept (and its path printed) when a failing case unwinds through it.
     Files(TestDir),
@@ -1201,7 +1309,7 @@ impl Backend {
         if files {
             Backend::Files(TestDir::new("cce-model"))
         } else {
-            Backend::Sim(SimIo::new(), FailedOp::default())
+            Backend::Sim(SimIo::new(), Arc::default())
         }
     }
 
@@ -1209,11 +1317,11 @@ impl Backend {
     /// ends first (its "process" exited); on real files closing the handle released it.
     fn io(&self) -> Box<dyn Io> {
         match self {
-            Backend::Sim(sim, failed) => {
+            Backend::Sim(sim, tap) => {
                 sim.release();
                 Box::new(Watched {
                     sim: sim.clone(),
-                    failed: failed.clone(),
+                    tap: tap.clone(),
                 })
             }
             Backend::Files(dir) => Box::new(FsIo::new(dir)),
@@ -1225,8 +1333,24 @@ struct Engine {
     backend: Backend,
     store: Option<NativeStore>,
     held: Vec<NativeView>,
-    staged: Vec<StagedContent>,
+    staged: Vec<Staged>,
     refused: Vec<StagedContent>,
+}
+
+/// A live staging handle and the content-file bytes its staging wrote (observed through the tap,
+/// not taken from the store): the space this handle owns until a commit consumes it or it is
+/// discarded. Empty on real files.
+struct Staged {
+    handle: StagedContent,
+    owns: Vec<(u64, Vec<u8>)>,
+    /// Commits that bound this handle and were rejected.
+    rejected: u32,
+}
+
+impl Staged {
+    fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.owns.iter().map(|(o, b)| (*o, b.len() as u64))
+    }
 }
 
 impl Engine {
@@ -1234,27 +1358,66 @@ impl Engine {
         self.store.as_ref().expect("store open")
     }
 
-    fn stage(&self, bytes: &[u8]) -> StagedContent {
-        let s = self
+    fn tap(&self) -> Option<&Arc<Tap>> {
+        match &self.backend {
+            Backend::Sim(_, tap) => Some(tap),
+            Backend::Files(_) => None,
+        }
+    }
+
+    /// Content-file writes observed since the last call.
+    fn take_writes(&self) -> Vec<(u64, Vec<u8>)> {
+        self.tap()
+            .map(|t| std::mem::take(&mut *t.writes.lock().unwrap()))
+            .unwrap_or_default()
+    }
+
+    fn stage(&self, bytes: &[u8]) -> Staged {
+        self.take_writes();
+        let handle = self
             .store()
             .stage_content(&mut &bytes[..])
             .unwrap_or_else(|e| panic!("the store failed: stage: {e:?}"));
-        assert_eq!(s.content, content_ref(bytes), "staged content description");
-        s
+        assert_eq!(
+            handle.content,
+            content_ref(bytes),
+            "staged content description"
+        );
+        Staged {
+            handle,
+            owns: self.take_writes(),
+            rejected: 0,
+        }
     }
 
-    fn change_set(&self, req: &Request) -> (ChangeSet, Vec<StagedContent>) {
-        // One handle per distinct staging; an aliased binding binds its target's handle again.
+    /// The live handle a binding of `req` names, if it is staged here with the request's bytes
+    /// (after a reopen or in a replay that diverged, the request stages those bytes afresh).
+    fn earlier(&self, req: &Request, j: usize) -> Option<usize> {
+        req.staged_pick(j).filter(|k| {
+            self.staged
+                .get(*k)
+                .is_some_and(|s| s.handle.content == content_ref(&req.contents[j]))
+        })
+    }
+
+    /// The change set for `req` and the stagings it made itself (earlier stagings it binds stay
+    /// in `self.staged`).
+    fn change_set(&self, req: &Request) -> (ChangeSet, Vec<Staged>) {
+        // One handle per distinct staging; an aliased binding binds its target's handle again,
+        // a binding of an earlier staging binds that live handle.
         let mut handle_of = vec![usize::MAX; req.contents.len()];
-        let mut staged: Vec<StagedContent> = Vec::new();
+        let mut staged: Vec<Staged> = Vec::new();
         for (j, b) in req.contents.iter().enumerate() {
-            if req.alias(j).is_none() {
+            if req.alias(j).is_none() && self.earlier(req, j).is_none() {
                 handle_of[j] = staged.len();
                 staged.push(self.stage(b));
             }
         }
         let content = (0..req.contents.len())
-            .map(|j| ContentBinding::from(&staged[handle_of[req.alias(j).unwrap_or(j)]]))
+            .map(|j| match self.earlier(req, j) {
+                Some(k) => ContentBinding::from(&self.staged[k].handle),
+                None => ContentBinding::from(&staged[handle_of[req.alias(j).unwrap_or(j)]].handle),
+            })
             .collect();
         let cs = ChangeSet {
             changes: req.changes.clone(),
@@ -1509,6 +1672,8 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                         Err(err) => {
                             check_result(&Err(err), request, expected);
                             e.staged.extend(staged);
+                            audit(&e, "a refused submission");
+                            ownership_check(&e, "a refused submission");
                             return e;
                         }
                     };
@@ -1544,10 +1709,35 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                     e.store().commit(request.attempt.clone(), basis, cs)
                 };
                 check_result(&got, request, expected);
+                let picks: BTreeSet<usize> = (0..request.contents.len())
+                    .filter_map(|j| e.earlier(request, j))
+                    .collect();
                 if got.is_ok() {
                     count("commit ok");
-                    e.refused.extend(staged);
+                    if !picks.is_empty() {
+                        count("commit of earlier stagings");
+                    }
+                    // Its own stagings and the earlier ones it bound are consumed.
+                    let mut consumed: Vec<Staged> = staged;
+                    for k in picks.into_iter().rev() {
+                        let s = e.staged.remove(k);
+                        if s.rejected > 0 {
+                            count("staging committed after a rejected commit bound it");
+                        }
+                        consumed.push(s);
+                    }
+                    let ranges: Vec<(u64, u64)> =
+                        consumed.iter().flat_map(Staged::ranges).collect();
+                    consumed_check(&e, &ranges, "a commit");
+                    e.refused.extend(consumed.into_iter().map(|s| s.handle));
                 } else {
+                    // Rejected: earlier stagings it bound stay staged and owned, untouched.
+                    if !picks.is_empty() {
+                        count("rejected commit of earlier stagings");
+                    }
+                    for k in picks {
+                        e.staged[k].rejected += 1;
+                    }
                     e.staged.extend(staged);
                 }
             }
@@ -1593,6 +1783,27 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                 let s = e.stage(b);
                 e.staged.push(s);
             }
+            Action::Discard { index, refused } if !*refused => {
+                let h = e.staged.remove(*index);
+                if h.rejected > 0 {
+                    count("discard after a rejected commit bound the staging");
+                }
+                let ranges: Vec<(u64, u64)> = h.ranges().collect();
+                e.store()
+                    .discard_staged(h.handle)
+                    .unwrap_or_else(|e| panic!("the store failed: discard staged content: {e:?}"));
+                count("discard ok");
+                if let Backend::Sim(sim, _) = &e.backend {
+                    let (_, r) = traverse(sim, "a discard");
+                    let reached = reached_extents(&r);
+                    assert!(
+                        !ranges
+                            .iter()
+                            .any(|a| reached.iter().any(|b| overlaps(*a, *b))),
+                        "a discarded staging's space is reachable"
+                    );
+                }
+            }
             Action::Discard { index, refused } => {
                 if *refused {
                     let h = e.refused.remove(*index);
@@ -1603,11 +1814,7 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
                     );
                     count("discard refused");
                 } else {
-                    let h = e.staged.remove(*index);
-                    e.store().discard_staged(h).unwrap_or_else(|e| {
-                        panic!("the store failed: discard staged content: {e:?}")
-                    });
-                    count("discard ok");
+                    unreachable!("an ordinary discard is handled above")
                 }
             }
             Action::Check(snap) => {
@@ -1617,7 +1824,9 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
             Action::Reopen => {
                 count("reopen");
                 e.held.clear();
-                e.refused.append(&mut e.staged);
+                // Handles of the closed instance: discarding them must be refused; they own
+                // nothing any more.
+                e.refused.extend(e.staged.drain(..).map(|s| s.handle));
                 e.store
                     .take()
                     .expect("store")
@@ -1627,6 +1836,7 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
             }
         }
         audit(&e, &format!("step {}", op_name(&op)));
+        ownership_check(&e, &format!("step {}", op_name(&op)));
         e
     }
 
@@ -1715,6 +1925,22 @@ fn run_profile<const FILES: bool>(backend: &str, profile: Profile, cases: u32, s
     if let Err(e) = result {
         panic!("{e}");
     }
+    if !FILES && profile == Profile::Mixed {
+        // The staging lifecycle must actually be exercised: a staging a rejected commit bound is
+        // committed later, another is discarded, and stagings own space that still carries a
+        // retirement record.
+        let observed = STATS.with(|s| s.borrow().clone());
+        for what in [
+            "staging committed after a rejected commit bound it",
+            "discard after a rejected commit bound the staging",
+            "staging owns space with a retirement record",
+        ] {
+            assert!(
+                observed.get(what).copied().unwrap_or(0) > 0,
+                "the model never observed \"{what}\" (budget too small?)"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1724,6 +1950,97 @@ fn generated_operation_sequences_match_the_logical_model() {
         env_or("CCE_MODEL_CASES", ROUTINE_CASES),
         env_or("CCE_MODEL_SEED", ROUTINE_SEED),
     );
+}
+
+// Exact regressions: shrunk counterexamples the generated tests found, replayed step by step
+// through the same model, oracle, retirement audit and ownership checks. They are written in the
+// generator's terms, so they stay exact only while CONTEXTS and `body_bytes` stay as they are.
+
+fn replay(ops: Vec<Op>) {
+    STATS.with(|s| s.borrow_mut().clear());
+    let mut m = Model::default();
+    let mut e = EngineTest::<false>::init_test(&m);
+    for op in ops {
+        m = ModelMachine::apply(m, &op);
+        e = EngineTest::<false>::apply(e, &m, op);
+    }
+    EngineTest::<false>::teardown(e, m);
+}
+
+fn put(ctx: u8, body: u8) -> ChangeSpec {
+    ChangeSpec::PutContext {
+        ctx,
+        expect: ExpectSpec::Any,
+        body,
+        content: None,
+    }
+}
+
+fn remove(ctx: u8) -> ChangeSpec {
+    ChangeSpec::RemoveContext {
+        ctx,
+        expect: ExpectSpec::Any,
+    }
+}
+
+fn plain(changes: Vec<ChangeSpec>) -> RequestSpec {
+    RequestSpec {
+        changes,
+        evidence: Vec::new(),
+        quiesce: false,
+        reads: Vec::new(),
+    }
+}
+
+/// A removal leaves a small leaf beside a sibling too large to merge with: the sibling must not
+/// be retired while the published tree still reaches it. Bodies ending in 3 are 1650 bytes
+/// longer, in 2 700 bytes, in 0 short (`body_bytes`); "held" commits without a held view run
+/// from a fresh one.
+#[test]
+fn a_removal_beside_a_sibling_too_large_to_merge_retires_nothing_reachable() {
+    replay(vec![
+        Op::Commit(plain(vec![put(2, 3), put(6, 3), put(8, 0), put(9, 3)])),
+        Op::Commit(plain(vec![
+            put(2, 0),
+            ChangeSpec::PutRelationship {
+                rel: 0,
+                expect: ExpectSpec::Any,
+                kind: 0,
+                source: 0,
+                target: 3,
+            },
+        ])),
+        Op::CommitFromHeld {
+            slot: 126,
+            request: plain(vec![put(0, 227), remove(2), put(4, 114), put(7, 151)]),
+        },
+        Op::Commit(plain(vec![put(4, 239)])),
+        Op::Commit(plain(vec![put(2, 142)])),
+        Op::CommitFromHeld {
+            slot: 118,
+            request: plain(vec![remove(0), put(1, 75), remove(7)]),
+        },
+    ]);
+}
+
+/// One commit binds the same staging twice (two records, one handle): its content must be
+/// installed once and neither binding's space retired while the records reach it.
+#[test]
+fn one_staging_bound_twice_in_a_commit_is_installed_once_and_never_retired() {
+    replay(vec![Op::Commit(plain(vec![
+        ChangeSpec::PutContext {
+            ctx: 0,
+            expect: ExpectSpec::Any,
+            body: 0,
+            content: Some(ContentPick::Fresh(ContentSpec { seed: 0, size: 0 })),
+        },
+        ChangeSpec::PutContext {
+            ctx: 1,
+            expect: ExpectSpec::Any,
+            body: 0,
+            content: Some(ContentPick::SameStaging(0)),
+        },
+    ]))]);
 }
 
 /// Routine tier of the tree-reshaping profile; the retirement audit after every step is what
@@ -1780,7 +2097,7 @@ const LIVE_STEPS: usize = 6;
 
 fn sim_engine(sim: SimIo, store: NativeStore) -> Engine {
     Engine {
-        backend: Backend::Sim(sim, FailedOp::default()),
+        backend: Backend::Sim(sim, Arc::default()),
         store: Some(store),
         held: Vec::new(),
         staged: Vec::new(),
@@ -1803,6 +2120,155 @@ fn audit(e: &Engine, after: &str) {
     }
 }
 
+/// What the newest publication record reaches and records as retired, by traversal through the
+/// audit read path (the store's pool and journal are never consulted).
+fn traverse(sim: &SimIo, after: &str) -> (crate::format::Descriptor, crate::audit::Reach) {
+    let pubs = crate::audit::published(sim)
+        .unwrap_or_else(|x| panic!("{after}: publication records unreadable: {x:?}"));
+    let cur = pubs
+        .last()
+        .cloned()
+        .unwrap_or_else(|| panic!("{after}: no valid publication record"));
+    let r = crate::audit::reach(sim, &cur)
+        .unwrap_or_else(|x| panic!("{after}: the published state cannot be traversed: {x:?}"));
+    (cur, r)
+}
+
+fn reached_extents(r: &crate::audit::Reach) -> Vec<(u64, u64)> {
+    r.manifests
+        .iter()
+        .chain(&r.content_segments)
+        .chain(&r.history_extents)
+        .copied()
+        .collect()
+}
+
+fn overlaps(a: (u64, u64), b: (u64, u64)) -> bool {
+    a.0 < b.0 + b.1 && b.0 < a.0 + a.1
+}
+
+/// The independent ownership model, after every step: each live staging owns the content bytes
+/// its staging wrote (known from the operations the harness issued and the writes it observed).
+/// Owned bytes must be intact, no two stagings may own the same byte, and the published state
+/// must not reach owned space. Owned space may carry a persisted retirement record (a staging
+/// that took retired space before any commit consumed the record); that is counted, not refused.
+fn ownership_check(e: &Engine, after: &str) {
+    let Backend::Sim(sim, _) = &e.backend else {
+        return;
+    };
+    count("ownership checks");
+    let (cur, r) = traverse(sim, after);
+    let reached = reached_extents(&r);
+    let live: Vec<(usize, (u64, u64))> = e
+        .staged
+        .iter()
+        .enumerate()
+        .flat_map(|(i, s)| s.ranges().map(move |x| (i, x)))
+        .collect();
+    for (n, &(i, a)) in live.iter().enumerate() {
+        assert!(
+            !reached.iter().any(|b| overlaps(a, *b)),
+            "ownership after {after}: space {a:?} owned by live staging {i} is reachable from \
+             generation {}",
+            cur.generation
+        );
+        for &(j, b) in &live[n + 1..] {
+            assert!(
+                i == j || !overlaps(a, b),
+                "ownership after {after}: live stagings {i} and {j} own the same space ({a:?}, \
+                 {b:?})"
+            );
+        }
+        if r.retired_extents
+            .iter()
+            .any(|(o, (_, l))| overlaps(a, (*o, *l)))
+        {
+            count("staging owns space with a retirement record");
+        }
+    }
+    for (i, st) in e.staged.iter().enumerate() {
+        for (o, bytes) in &st.owns {
+            let mut now = vec![0; bytes.len()];
+            sim.read_at(FileId::Content, *o, &mut now)
+                .unwrap_or_else(|x| {
+                    panic!("ownership after {after}: owned bytes unreadable: {x:?}")
+                });
+            assert!(
+                now == *bytes,
+                "ownership after {after}: bytes at {o}+{} owned by live staging {i} were \
+                 overwritten",
+                bytes.len()
+            );
+        }
+    }
+}
+
+/// After a commit consumed stagings: each byte they owned is reached by the new state or
+/// recorded as retired (a staging the index did not take), never simply lost or left owned.
+fn consumed_check(e: &Engine, consumed: &[(u64, u64)], after: &str) {
+    let Backend::Sim(sim, _) = &e.backend else {
+        return;
+    };
+    let (cur, r) = traverse(sim, after);
+    let mut known = reached_extents(&r);
+    known.extend(r.retired_extents.iter().map(|(o, (_, l))| (*o, *l)));
+    for a in consumed {
+        assert!(
+            known.iter().any(|k| k.0 <= a.0 && a.0 + a.1 <= k.0 + k.1),
+            "ownership after {after}: consumed staging space {a:?} is neither reached nor \
+             retired by generation {}",
+            cur.generation
+        );
+        count("consumed staging space accounted");
+    }
+}
+
+/// After a recovery no staging owns anything: space owned by stagings that were live before the
+/// interruption and that the interrupted step did not bind is unreachable, and the publication
+/// the traversal reads is the one the store opened on.
+fn recovered_ownership_check(e: &Engine, prior: &[(u64, u64)]) {
+    let Backend::Sim(sim, _) = &e.backend else {
+        return;
+    };
+    let (cur, r) = traverse(sim, "recovery");
+    assert_eq!(
+        cur.history_pos,
+        last_position(e.store()),
+        "the publication record the traversal reads is not the state the store opened on"
+    );
+    let reached = reached_extents(&r);
+    for a in prior {
+        assert!(
+            !reached.iter().any(|b| overlaps(*a, *b)),
+            "after recovery: space {a:?} owned by an unconsumed staging before the interruption \
+             is reachable"
+        );
+    }
+    count("recovered ownership checks");
+}
+
+/// Space owned by live stagings that the step `action` does not bind.
+fn unbound_staged_space(e: &Engine, action: &Action) -> Vec<(u64, u64)> {
+    let bound: BTreeSet<usize> = match action {
+        Action::Commit { request, .. } | Action::Retry { request, .. } => {
+            (0..request.contents.len())
+                .filter_map(|j| e.earlier(request, j))
+                .collect()
+        }
+        Action::Discard {
+            index,
+            refused: false,
+        } => [*index].into(),
+        _ => BTreeSet::new(),
+    };
+    e.staged
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !bound.contains(i))
+        .flat_map(|(_, s)| s.ranges())
+        .collect()
+}
+
 fn sim_of(e: &Engine) -> &SimIo {
     match &e.backend {
         Backend::Sim(sim, _) => sim,
@@ -1813,7 +2279,7 @@ fn sim_of(e: &Engine) -> &SimIo {
 /// The kind of operation the injected failure hit so far, if any.
 fn failed_op(e: &Engine) -> Option<&'static str> {
     match &e.backend {
-        Backend::Sim(_, failed) => *failed.lock().unwrap(),
+        Backend::Sim(_, tap) => *tap.failed.lock().unwrap(),
         Backend::Files(_) => None,
     }
 }
@@ -1850,7 +2316,7 @@ fn submit_tolerant(
     let mut prestaged = prestaged;
     let mut handles: Vec<Option<StagedContent>> = (0..n).map(|_| None).collect();
     for (j, slot) in handles.iter_mut().enumerate() {
-        if request.alias(j).is_some() {
+        if request.alias(j).is_some() || e.earlier(request, j).is_some() {
             continue;
         }
         *slot = Some(match (j + 1 == n, prestaged.take()) {
@@ -1862,9 +2328,12 @@ fn submit_tolerant(
         });
     }
     let bindings = (0..n)
-        .map(|j| {
-            let h = handles[request.alias(j).unwrap_or(j)].as_ref();
-            ContentBinding::from(h.expect("an alias names a staged binding"))
+        .map(|j| match e.earlier(request, j) {
+            Some(k) => ContentBinding::from(&e.staged[k].handle),
+            None => {
+                let h = handles[request.alias(j).unwrap_or(j)].as_ref();
+                ContentBinding::from(h.expect("an alias names a staged binding"))
+            }
         })
         .collect();
     let cs = ChangeSet {
@@ -1895,8 +2364,14 @@ fn in_flight(
             (Some(request.clone()), got)
         }
         Action::Stage(b) => {
-            if let Ok(s) = e.store().stage_content(&mut &b[..]) {
-                e.staged.push(s);
+            e.take_writes();
+            if let Ok(handle) = e.store().stage_content(&mut &b[..]) {
+                let owns = e.take_writes();
+                e.staged.push(Staged {
+                    handle,
+                    owns,
+                    rejected: 0,
+                });
             }
             (None, None)
         }
@@ -1904,7 +2379,7 @@ fn in_flight(
             let h = if *refused {
                 e.refused.remove(*index)
             } else {
-                e.staged.remove(*index)
+                e.staged.remove(*index).handle
             };
             let _ = e.store().discard_staged(h);
             (None, None)
@@ -1948,6 +2423,9 @@ struct Allowed {
     /// The interrupted request and, when that step was a retry, what the retry must return.
     request: Option<Request>,
     retry: Option<Result<u64, ErrKind>>,
+    /// Space owned by stagings live before the interruption that nothing since bound: a
+    /// recovered state must not reach it.
+    prior: Vec<(u64, u64)>,
 }
 
 impl Allowed {
@@ -1961,6 +2439,7 @@ impl Allowed {
             with: (after.position == before.position + 1).then(|| (after.clone(), after.position)),
             request,
             retry,
+            prior: Vec::new(),
         }
     }
 
@@ -2003,6 +2482,7 @@ fn check_recovery(img: SimIo, allowed: &Allowed) {
     });
     main_check(&e, &m.snapshot());
     audit(&e, "recovery");
+    recovered_ownership_check(&e, &allowed.prior);
     let Some(req) = &allowed.request else {
         return;
     };
@@ -2130,7 +2610,7 @@ fn replay_until(transitions: &[Op], bounds: &[u64], i: usize, e: &mut Option<Eng
 
 /// A fresh store whose simulator counts operations from zero after creation.
 fn fresh_engine() -> Engine {
-    let backend = Backend::Sim(SimIo::new(), FailedOp::default());
+    let backend = Backend::Sim(SimIo::new(), Arc::default());
     let store = create_on(backend.io(), STORE, Default::default())
         .unwrap_or_else(|e| panic!("creating the store under test: {e:?}"));
     let e = Engine {
@@ -2167,8 +2647,10 @@ fn crash_at(transitions: &[Op], bounds: &[u64], cut: u64) {
     let mut e = e.unwrap();
     let after = ModelMachine::apply(before.clone(), &transitions[i]);
     count(&format!("in flight: {}", op_name(&transitions[i])));
+    let prior = unbound_staged_space(&e, &after.action);
     let (request, _) = in_flight(&mut e, &after.action);
-    let allowed = Allowed::around(&before, &after, request);
+    let mut allowed = Allowed::around(&before, &after, request);
+    allowed.prior = prior;
     let sim = sim_of(&e).clone();
     drop(e);
     for p in CRASH_PERSISTS {
@@ -2334,6 +2816,7 @@ fn fail_at(
         if post { "after" } else { "in" },
         op_name(&transitions[i])
     ));
+    let prior = unbound_staged_space(&e, &after.action);
     let (request, got) = in_flight(&mut e, &after.action);
     if post {
         let staged = e
@@ -2349,6 +2832,10 @@ fn fail_at(
         }
     }
     let mut allowed = Allowed::around(&before, &after, request.clone());
+    if !continue_live {
+        // Live commits after the failure may bind those stagings.
+        allowed.prior = prior;
+    }
 
     // Only a commit that reported a failed sync (its data barrier) or an uncertain publication
     // may fence later writes. A failed page or data write rejects that commit, and the store
@@ -2443,8 +2930,8 @@ fn fail_at(
         // The handle is the one whose content is the model's last staged bytes.
         let prestaged = before.staged.last().and_then(|bytes| {
             let want = content_ref(bytes);
-            let k = e.staged.iter().position(|s| s.content == want)?;
-            Some((e.staged.remove(k), bytes.clone()))
+            let k = e.staged.iter().position(|s| s.handle.content == want)?;
+            Some((e.staged.remove(k).handle, bytes.clone()))
         });
         if let Some((handle, bytes)) = prestaged {
             let probe = Request {
@@ -2457,6 +2944,7 @@ fn fail_at(
                 }],
                 contents: vec![bytes],
                 aliases: Vec::new(),
+                from_staged: Vec::new(),
                 evidence: Vec::new(),
                 removal: RemovalMode::PreserveViews,
             };
@@ -2737,4 +3225,363 @@ fn an_io_failure_at_sampled_cuts_of_long_generated_sequences_is_reported_and_rec
         },
         env_or("CCE_CRASH_SEED", CRASH_SEED),
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Controlled schedules: staging and discard interleaved with a commit paused at its seal
+// (before the data barrier), its publication (before the record is written) or its application
+// (after the record's sync returned, before the running store applies the result). The pause is
+// the harness's I/O tap; no store test hook is involved. A concurrent operation may finish while
+// the commit is paused or wait for it; both are legal progress, never finishing is not.
+// ---------------------------------------------------------------------------------------------
+
+const POINTS: [Point; 3] = [Point::Barrier, Point::Publish, Point::Apply];
+
+/// Did the concurrent operation finish while the commit was paused?
+#[derive(Debug, PartialEq, Eq)]
+enum Progress {
+    DuringPause,
+    AfterRelease,
+}
+
+/// Runs `commit` on its own thread paused at `point`; while it is paused runs `during` on another
+/// thread, then releases the commit. Returns the commit's result, `during`'s and its progress.
+fn across_pause<T: Send>(
+    e: &Engine,
+    point: Point,
+    commit: impl FnOnce(&NativeStore) -> Result<CommitReceipt, CommitError> + Send,
+    during: impl FnOnce(&NativeStore) -> T + Send,
+) -> (Result<CommitReceipt, CommitError>, T, Progress) {
+    let deadline = std::time::Duration::from_secs(20);
+    let tap = e.tap().expect("schedules run on the simulator");
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (go, go_rx) = std::sync::mpsc::channel();
+    *tap.gate.lock().unwrap() = Some(Gate {
+        point,
+        reached: reached_tx,
+        go: go_rx,
+    });
+    let store = e.store();
+    std::thread::scope(|s| {
+        let c = s.spawn(move || commit(store));
+        reached
+            .recv_timeout(deadline)
+            .unwrap_or_else(|_| panic!("the commit never reached {point:?}"));
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let d = s.spawn(move || {
+            let r = during(store);
+            let _ = done_tx.send(());
+            r
+        });
+        let progress = match done.recv_timeout(std::time::Duration::from_millis(300)) {
+            Ok(()) => Progress::DuringPause,
+            Err(_) => Progress::AfterRelease,
+        };
+        go.send(()).expect("release the commit");
+        let got = c.join().expect("commit thread");
+        let r = d.join().expect("concurrent thread");
+        (got, r, progress)
+    })
+}
+
+fn record_content(e: &Engine, name: &str) -> Option<Vec<u8>> {
+    let mut v = e
+        .store()
+        .begin()
+        .unwrap_or_else(|x| panic!("the store failed: begin: {x:?}"));
+    let rec = v
+        .context(&cid(name))
+        .unwrap_or_else(|x| panic!("the store failed: context {name}: {x:?}"))?;
+    let c = rec.content?;
+    Some(read_all(&mut v.content(&c).unwrap_or_else(|x| {
+        panic!("the store failed: content of {name}: {x:?}")
+    })))
+}
+
+fn bytes_of(seed: u8, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i.wrapping_mul(29) + seed as usize * 11 + (i >> 7)) as u8)
+        .collect()
+}
+
+/// Commits `name` binding `handle` (or no content) from a fresh view.
+fn put_record(
+    store: &NativeStore,
+    attempt_name: &str,
+    name: &str,
+    handle: Option<&StagedContent>,
+) -> Result<CommitReceipt, CommitError> {
+    let basis = store
+        .begin()
+        .unwrap_or_else(|x| panic!("the store failed: begin: {x:?}"));
+    store.commit(
+        attempt(attempt_name),
+        basis,
+        ChangeSet {
+            changes: vec![Change::PutContext {
+                id: cid(name),
+                expect: Precondition::Any,
+                body: format!("record {name}").into_bytes(),
+                content: handle.map(|_| 0),
+            }],
+            content: handle.map(ContentBinding::from).into_iter().collect(),
+            ..ChangeSet::default()
+        },
+    )
+}
+
+/// A store with retired content that is already reusable, and two live stagings: `x` (never
+/// bound) and `y` (to be bound by the paused commit).
+fn schedule_store() -> (Engine, Vec<u8>, Vec<u8>) {
+    let mut e = fresh_engine();
+    // Four records with their own content, then all removed in one commit: four retired
+    // content extents, reusable once two more generations have passed.
+    for i in 0..4u8 {
+        let s = e.stage(&bytes_of(i + 1, 6000));
+        put_record(
+            e.store(),
+            &format!("setup-{i}"),
+            &format!("old-{i}"),
+            Some(&s.handle),
+        )
+        .unwrap_or_else(|x| panic!("setup commit: {x:?}"));
+    }
+    let basis = e.store().begin().expect("begin");
+    e.store()
+        .commit(
+            attempt("setup-remove"),
+            basis,
+            ChangeSet {
+                changes: (0..4)
+                    .map(|i| Change::RemoveContext {
+                        id: cid(&format!("old-{i}")),
+                        expect: Precondition::Any,
+                    })
+                    .collect(),
+                ..ChangeSet::default()
+            },
+        )
+        .unwrap_or_else(|x| panic!("setup removal: {x:?}"));
+    for i in 0..3 {
+        put_record(e.store(), &format!("advance-{i}"), "tick", None)
+            .unwrap_or_else(|x| panic!("setup commit: {x:?}"));
+    }
+    let (xb, yb) = (bytes_of(7, 3000), bytes_of(8, 3000));
+    let x = e.stage(&xb);
+    let y = e.stage(&yb);
+    e.staged.push(x);
+    e.staged.push(y);
+    audit(&e, "schedule setup");
+    ownership_check(&e, "schedule setup");
+    (e, xb, yb)
+}
+
+#[test]
+fn staging_and_discard_across_a_commits_seal_publication_and_application_make_legal_progress() {
+    STATS.with(|s| s.borrow_mut().clear());
+    for point in POINTS {
+        let (mut e, _xb, yb) = schedule_store();
+        // Small enough for the retired extent the setup leaves reusable.
+        let zb = bytes_of(9, 2500);
+        let y = e.staged.pop().expect("y");
+        let x = e.staged.pop().expect("x");
+        let x_ranges: Vec<(u64, u64)> = x.ranges().collect();
+        let tap = e.tap().expect("tap").clone();
+        let y_handle = &y.handle;
+        let (got, (z, discard), progress) = across_pause(
+            &e,
+            point,
+            move |store| put_record(store, "paused", "p", Some(y_handle)),
+            |store| {
+                tap.writes.lock().unwrap().clear();
+                let z = store.stage_content(&mut &zb[..]);
+                let owns = std::mem::take(&mut *tap.writes.lock().unwrap());
+                let discard = store.discard_staged(x.handle);
+                (
+                    z.map(|handle| Staged {
+                        handle,
+                        owns,
+                        rejected: 0,
+                    }),
+                    discard,
+                )
+            },
+        );
+        count(&format!("{point:?}: concurrent staging {progress:?}"));
+        if let Ok(z) = &z {
+            let (cur, r) = traverse(sim_of(&e), "the paused commit");
+            if z.ranges().any(|a| {
+                a.0 < cur.content_len
+                    || r.retired_extents
+                        .iter()
+                        .any(|(o, (_, l))| overlaps(a, (*o, *l)))
+            }) {
+                count(&format!(
+                    "{point:?}: concurrent staging reused retired space"
+                ));
+            }
+        }
+        let receipt = got.unwrap_or_else(|x| panic!("{point:?}: the paused commit failed: {x:?}"));
+        let z = z.unwrap_or_else(|x| panic!("{point:?}: staging across the commit failed: {x:?}"));
+        discard.unwrap_or_else(|x| panic!("{point:?}: discard across the commit failed: {x:?}"));
+        assert_eq!(
+            record_content(&e, "p"),
+            Some(yb.clone()),
+            "{point:?}: committed content"
+        );
+        // y is consumed, x discarded, z live and owning its bytes.
+        let y_ranges: Vec<(u64, u64)> = y.ranges().collect();
+        consumed_check(&e, &y_ranges, &format!("the commit paused at {point:?}"));
+        e.staged.push(z);
+        audit(&e, &format!("the commit paused at {point:?}"));
+        ownership_check(&e, &format!("the commit paused at {point:?}"));
+        let (_, r) = traverse(sim_of(&e), "after the schedule");
+        let reached = reached_extents(&r);
+        assert!(
+            !x_ranges
+                .iter()
+                .any(|a| reached.iter().any(|b| overlaps(*a, *b))),
+            "{point:?}: the discarded staging's space is reachable"
+        );
+        // The staging made across the pause commits and reads back, before and after a reopen.
+        let z = e.staged.pop().expect("z");
+        put_record(e.store(), "after", "z", Some(&z.handle))
+            .unwrap_or_else(|x| panic!("{point:?}: committing the staging made across: {x:?}"));
+        assert!(receipt.position.0 > 0);
+        assert_eq!(
+            record_content(&e, "z"),
+            Some(zb.clone()),
+            "{point:?}: z content"
+        );
+        audit(&e, "the commit of z");
+        ownership_check(&e, "the commit of z");
+        e.store.take().expect("store").close().expect("clean close");
+        e.store = Some(open(&e.backend));
+        assert_eq!(
+            record_content(&e, "p"),
+            Some(yb),
+            "{point:?}: p after reopen"
+        );
+        assert_eq!(
+            record_content(&e, "z"),
+            Some(zb),
+            "{point:?}: z after reopen"
+        );
+        audit(&e, "reopen after the schedule");
+    }
+    let observed = STATS.with(|s| s.borrow().clone());
+    println!("schedule report: {}", serde_json::json!(observed));
+    for point in POINTS {
+        assert!(
+            observed.contains_key(&format!(
+                "{point:?}: concurrent staging reused retired space"
+            )),
+            "{point:?}: the staging across the pause did not reuse retired space, so the schedule \
+             tested nothing about reuse"
+        );
+    }
+}
+
+#[test]
+fn discarding_a_staging_a_paused_commit_binds_is_refused_and_the_commit_completes() {
+    for point in POINTS {
+        let (mut e, _xb, yb) = schedule_store();
+        let y = e.staged.pop().expect("y");
+        let y_handle = &y.handle;
+        let y_again = StagedContent {
+            content: y.handle.content,
+            token: y.handle.token.clone(),
+        };
+        let (got, discard, _) = across_pause(
+            &e,
+            point,
+            move |store| put_record(store, "paused", "p", Some(y_handle)),
+            move |store| store.discard_staged(y_again),
+        );
+        assert!(
+            discard.is_err(),
+            "{point:?}: a staging bound by an admitted commit was discarded"
+        );
+        got.unwrap_or_else(|x| panic!("{point:?}: the paused commit failed: {x:?}"));
+        assert_eq!(
+            record_content(&e, "p"),
+            Some(yb),
+            "{point:?}: committed content"
+        );
+        let again = StagedContent {
+            content: y.handle.content,
+            token: y.handle.token.clone(),
+        };
+        assert!(
+            e.store().discard_staged(again).is_err(),
+            "{point:?}: a consumed staging was discarded"
+        );
+        audit(&e, &format!("the commit paused at {point:?}"));
+        ownership_check(&e, &format!("the commit paused at {point:?}"));
+    }
+}
+
+/// The publication record's write fails while a staging is made across the pause: the commit's
+/// outcome is unknown and the store is fenced; the staging still owns intact bytes; after a
+/// reopen the store runs on the publication actually selected, nothing is owned, and the
+/// interrupted request decides afresh and commits.
+#[test]
+fn a_failed_publication_with_a_staging_across_it_recovers_on_the_selected_publication() {
+    let (mut e, _xb, yb) = schedule_store();
+    let zb = bytes_of(10, 2500);
+    let y = e.staged.pop().expect("y");
+    let y_handle = &y.handle;
+    let tap = e.tap().expect("tap").clone();
+    let sim = sim_of(&e).clone();
+    let (got, z, progress) = across_pause(
+        &e,
+        Point::Publish,
+        move |store| put_record(store, "paused", "p", Some(y_handle)),
+        |store| {
+            tap.writes.lock().unwrap().clear();
+            let z = store.stage_content(&mut &zb[..]);
+            let owns = std::mem::take(&mut *tap.writes.lock().unwrap());
+            // The next mutating operation is the paused publication write.
+            sim.fail_nth_op(1);
+            z.map(|handle| Staged {
+                handle,
+                owns,
+                rejected: 0,
+            })
+        },
+    );
+    assert_eq!(
+        progress,
+        Progress::DuringPause,
+        "staging waited for the paused publication"
+    );
+    assert!(
+        matches!(got, Err(CommitError::Indeterminate(_))),
+        "a failed publication write: {got:?}"
+    );
+    let z = z.unwrap_or_else(|x| panic!("staging across the publication: {x:?}"));
+    assert_eq!(
+        e.store().outcome(&attempt("paused")).expect("outcome"),
+        AttemptOutcome::Unknown
+    );
+    e.staged.push(z);
+    ownership_check(&e, "a failed publication");
+    let prior: Vec<(u64, u64)> = e.staged.iter().flat_map(Staged::ranges).collect();
+    e.staged.clear();
+    e.held.clear();
+    drop(e.store.take());
+    let e = open_image(&sim.after_process_exit(), "after the failed publication");
+    recovered_ownership_check(&e, &prior);
+    audit(&e, "recovery after the failed publication");
+    // The write failed, so the previous publication was selected and the attempt is absent.
+    assert_eq!(
+        e.store().outcome(&attempt("paused")).expect("outcome"),
+        AttemptOutcome::Absent
+    );
+    assert_eq!(record_content(&e, "p"), None);
+    let y2 = e.stage(&yb);
+    put_record(e.store(), "paused", "p", Some(&y2.handle))
+        .unwrap_or_else(|x| panic!("the retried request after recovery: {x:?}"));
+    assert_eq!(record_content(&e, "p"), Some(yb));
+    audit(&e, "the retry after recovery");
 }
