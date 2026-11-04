@@ -172,6 +172,10 @@ if its ticket or caller goes away, and until it resolves `outcome` reports `Pend
 The queue in front of the worker is bounded (64 by default); when it is full, `submit` and `commit`
 fail with `Busy` without admitting anything, and reads continue normally.
 
+`close` stops admission first (later `submit`/`commit` calls fail with a store-state error saying the
+store is closing), then waits until every admitted commit has resolved, so no commit publishes after
+`close` has returned.
+
 ## Ownership
 
 One process owns a store at a time, through an exclusive lock on `LOCK` taken at open and held until

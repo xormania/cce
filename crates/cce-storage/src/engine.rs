@@ -12,8 +12,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
@@ -124,7 +124,7 @@ pub(crate) struct Inner {
     io: Box<dyn Io>,
     store: StoreId,
     instance: u64,
-    state: Mutex<State>,
+    state: Recorded<State>,
     /// Serializes commits (one publication order per store).
     writer: Mutex<()>,
     /// Content-file allocation cursor; held while streaming an allocation.
@@ -135,7 +135,9 @@ pub(crate) struct Inner {
     /// Sender to the commit worker.
     worker: Mutex<Option<mpsc::SyncSender<Job>>>,
     /// Attempts admitted to the worker and not yet resolved.
-    pending: Mutex<HashMap<AttemptId, u32>>,
+    pending: Recorded<HashMap<AttemptId, u32>>,
+    /// Set (under the `pending` lock) once `close` began: new commits are refused from then on.
+    closing: AtomicBool,
     /// Live reader pins: committed generation -> number of views and content readers reading it.
     /// Space a pinned generation can reach must not be reused.
     pins: Mutex<BTreeMap<u64, u32>>,
@@ -144,9 +146,6 @@ pub(crate) struct Inner {
     /// Makes the next commit panic inside the worker (tests of worker robustness only).
     #[cfg(test)]
     panic_next_commit: std::sync::atomic::AtomicBool,
-    /// The lookups `outcome` performed, in order (tests of answer ordering only).
-    #[cfg(test)]
-    outcome_trace: Mutex<Vec<&'static str>>,
     /// Largest number of segments one content stream may have.
     max_segments: usize,
     /// Largest variable-length request field or list (see `Options::max_request_field`).
@@ -158,9 +157,67 @@ pub(crate) struct Inner {
     pub diagnostics: Vec<String>,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+/// Engine locks. `Recorded` keeps its mutex private to this module, so engine code can reach a
+/// recorded lock only through `lock()` (a bypass would not compile).
+mod locks {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Anything that hands out a mutex guard; a poisoned mutex is still usable (its owner panicked,
+    /// and the commit worker fences writes in that case).
+    pub(super) trait Lockable<T> {
+        fn acquire(&self) -> MutexGuard<'_, T>;
+    }
+
+    impl<T> Lockable<T> for Mutex<T> {
+        fn acquire(&self) -> MutexGuard<'_, T> {
+            self.lock().unwrap_or_else(|p| p.into_inner())
+        }
+    }
+
+    /// A mutex whose acquisitions are recorded per thread in tests, so the order in which an
+    /// operation consults engine state can be checked whatever way the code reaches it.
+    pub(super) struct Recorded<T> {
+        mutex: Mutex<T>,
+        #[cfg_attr(not(test), allow(dead_code))]
+        name: &'static str,
+    }
+
+    impl<T> Recorded<T> {
+        pub(super) fn new(name: &'static str, value: T) -> Self {
+            Self {
+                mutex: Mutex::new(value),
+                name,
+            }
+        }
+    }
+
+    impl<T> Lockable<T> for Recorded<T> {
+        fn acquire(&self) -> MutexGuard<'_, T> {
+            #[cfg(test)]
+            LOCK_TRACE.with(|t| t.borrow_mut().push(self.name));
+            self.mutex.acquire()
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static LOCK_TRACE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Test hook: the recorded mutexes this thread acquired since the last call, in order.
+    #[cfg(test)]
+    pub(crate) fn take_lock_trace_for_test() -> Vec<&'static str> {
+        LOCK_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
+    }
+
+    pub(super) fn lock<T>(m: &impl Lockable<T>) -> MutexGuard<'_, T> {
+        m.acquire()
+    }
 }
+
+#[cfg(test)]
+pub(crate) use locks::take_lock_trace_for_test;
+use locks::{Recorded, lock};
 
 fn sha256(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
@@ -336,12 +393,15 @@ impl Inner {
             store: desc.store,
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             alloc: Mutex::new(desc.content_len),
-            state: Mutex::new(State {
-                current: desc,
-                staged: HashMap::new(),
-                next_stage: 1,
-                fenced: None,
-            }),
+            state: Recorded::new(
+                "state",
+                State {
+                    current: desc,
+                    staged: HashMap::new(),
+                    next_stage: 1,
+                    fenced: None,
+                },
+            ),
             writer: Mutex::new(()),
             cache: Mutex::new(NodeCache {
                 map: HashMap::new(),
@@ -349,14 +409,13 @@ impl Inner {
                 capacity: opts.cache_nodes,
             }),
             worker: Mutex::new(None),
-            pending: Mutex::new(HashMap::new()),
+            pending: Recorded::new("pending", HashMap::new()),
+            closing: AtomicBool::new(false),
             pins: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             gate: Mutex::new(()),
             #[cfg(test)]
             panic_next_commit: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            outcome_trace: Mutex::new(Vec::new()),
             conflicts: Mutex::new(ConflictLog {
                 floor: desc.history_pos,
                 entries: VecDeque::new(),
@@ -378,14 +437,8 @@ impl Inner {
 
     /// Test hook: holds the commit worker before its next job until the guard is dropped.
     #[cfg(test)]
-    pub(crate) fn pause_worker_for_test(&self) -> MutexGuard<'_, ()> {
+    pub(crate) fn pause_worker_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
         lock(&self.gate)
-    }
-
-    /// Test hook: the lookups `outcome` performed since the last call, in order.
-    #[cfg(test)]
-    pub(crate) fn take_outcome_trace_for_test(&self) -> Vec<&'static str> {
-        std::mem::take(&mut *lock(&self.outcome_trace))
     }
 
     /// Starts the store's commit worker: the single thread that orders publications. The worker
@@ -439,7 +492,17 @@ impl Inner {
         let tx = lock(&self.worker).clone().ok_or_else(|| {
             rejected(StorageError::StoreState("commit worker not running".into()))
         })?;
-        *lock(&self.pending).entry(attempt.clone()).or_default() += 1;
+        {
+            // Checked under the same lock `close` sets it under, so `close` never misses an
+            // admission that raced with it.
+            let mut pending = lock(&self.pending);
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(rejected(StorageError::StoreState(
+                    "store is closing; no new commits are admitted".into(),
+                )));
+            }
+            *pending.entry(attempt.clone()).or_default() += 1;
+        }
         let job = Job {
             inner: self.clone(),
             attempt: attempt.clone(),
@@ -907,13 +970,9 @@ impl Inner {
     pub fn outcome(&self, attempt: &AttemptId) -> Result<AttemptOutcome, StorageError> {
         // Order matters: an attempt leaves `pending` only after its publication, so checking
         // `pending` first and the published state second can never miss a finishing commit.
-        #[cfg(test)]
-        lock(&self.outcome_trace).push("pending");
         if lock(&self.pending).contains_key(attempt) {
             return Ok(AttemptOutcome::Pending);
         }
-        #[cfg(test)]
-        lock(&self.outcome_trace).push("state");
         let st = lock(&self.state);
         if st
             .fenced
@@ -935,7 +994,16 @@ impl Inner {
         )
     }
 
+    /// Stops admitting commits, waits until every admitted commit has resolved (published,
+    /// refused or failed), then returns. Reads stay available on existing handles.
     pub fn close(&self) -> Result<(), StorageError> {
+        {
+            let _pending = lock(&self.pending);
+            self.closing.store(true, Ordering::SeqCst);
+        }
+        while !lock(&self.pending).is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         let _w = lock(&self.writer);
         Ok(())
     }
