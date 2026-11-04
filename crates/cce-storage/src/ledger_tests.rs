@@ -4,7 +4,7 @@
 //! extent or reservation is exactly one record. Two planted mismatches show the check finds both
 //! directions.
 
-use cce_core::storage::{Change, ChangeSet, ContentBinding, Precondition, StorageEngine};
+use cce_core::storage::{Change, ChangeSet, ContentBinding, Precondition, ReadView, StorageEngine};
 
 use crate::NativeStore;
 use crate::engine::CONTENT_CHUNK;
@@ -113,6 +113,165 @@ fn the_pool_matches_the_retirement_records_after_every_step() {
     let s = open_on(Box::new(sim.clone()), Default::default()).unwrap();
     ledger(&s, "reopen");
     put_content(&s, "f", "F", &bytes_of(7, CONTENT_CHUNK + 1));
+}
+
+/// Content-file extents the published state reaches.
+fn reached(sim: &SimIo, s: &NativeStore) -> Vec<(u64, u64)> {
+    let r = crate::audit::reach(sim, &s.inner.snapshot().unwrap().desc).unwrap();
+    r.manifests
+        .iter()
+        .chain(&r.content_segments)
+        .copied()
+        .collect()
+}
+
+/// A discard that lands after a commit copied the queue of extents awaiting retirement, and
+/// before its check: that publication retires only what it copied, the new extents stay queued,
+/// and the next publication retires them with records.
+#[test]
+fn a_discard_during_a_commit_stays_queued_for_the_next_publication() {
+    let sim = SimIo::new();
+    let s = with_retired(&sim);
+    // Larger than the retired space, so part of it is freshly written and must be queued.
+    let p = s
+        .stage_content(&mut &bytes_of(9, 6 * CONTENT_CHUNK)[..])
+        .unwrap();
+    let own: Vec<(u64, u64)> = s.inner.staged_extents_for_test(&p).unwrap();
+    let inner = s.inner.clone();
+    let discarded = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = discarded.clone();
+    s.inner.set_journal_hook_for_test(Box::new(move |_, _| {
+        *seen.lock().unwrap() = Some(inner.discard_staged(p));
+    }));
+    advance(&s, "during");
+    assert_eq!(*discarded.lock().unwrap(), Some(Ok(())), "the discard ran");
+    // Each of the discarded staging's extents is free again (it was reserved space) or still
+    // queued: the publication that ran meanwhile retired only what it had copied.
+    let queued = s.inner.queued_for_test();
+    let free: Vec<(u64, u64)> = s.inner.reusable_for_test().unwrap().1;
+    for x in &own {
+        assert!(
+            queued.contains(x) || free.iter().any(|f| f.0 == x.0),
+            "extent {x:?} of the discarded staging is neither free nor queued (queue {queued:?})"
+        );
+    }
+    assert!(
+        own.iter().any(|x| queued.contains(x)),
+        "nothing of the discarded staging stayed queued: {queued:?}"
+    );
+    advance(&s, "after");
+    ledger(&s, "after the next publication");
+    let retired = crate::audit::reach(&sim, &s.inner.snapshot().unwrap().desc)
+        .unwrap()
+        .retired_extents;
+    for x in own.iter().filter(|x| queued.contains(x)) {
+        assert_eq!(
+            retired.get(&x.0).map(|(_, len)| *len),
+            Some(x.1),
+            "queued extent {x:?} was not retired by the next publication"
+        );
+    }
+    assert!(
+        s.inner.queued_for_test().is_empty(),
+        "the queue was not emptied"
+    );
+}
+
+/// Between a commit's publication and its update of the pool, another staging is discarded
+/// and a new one takes space: the commit frees what it retired, the discarded reservations are
+/// free again, the new staging keeps its own, nothing is accounted twice, and every content
+/// reads back exactly.
+#[test]
+fn staging_and_discard_between_publication_and_the_pool_update_keep_both_changes() {
+    let sim = SimIo::new();
+    let s = with_retired(&sim);
+    put_content(&s, "k", "K", &bytes_of(10, CONTENT_CHUNK + 700));
+    advance(&s, "k-advance-1");
+    advance(&s, "k-advance-2");
+    let p = s
+        .stage_content(&mut &bytes_of(11, CONTENT_CHUNK)[..])
+        .unwrap();
+    let (held_p, _) = s.inner.reserved_bytes_for_test();
+    assert!(held_p > 0, "the discarded staging reserved nothing");
+    // The interleaved commit also binds a staging of its own, so it consumes reservations while
+    // the new staging holds some.
+    let r = s
+        .stage_content(&mut &bytes_of(13, CONTENT_CHUNK / 2)[..])
+        .unwrap();
+    assert!(
+        s.inner.reserved_bytes_for_test().0 > held_p,
+        "the committed staging reserved nothing"
+    );
+    let k_before: Vec<(u64, u64)> = reached(&sim, &s);
+    let inner = s.inner.clone();
+    let q_bytes = bytes_of(12, CONTENT_CHUNK + 5);
+    let q_data = q_bytes.clone();
+    let out = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let put = out.clone();
+    s.inner.set_apply_hook_for_test(Box::new(move || {
+        let d = inner.discard_staged(p);
+        let q = inner.stage_checked(&mut &q_data[..], None);
+        *put.lock().unwrap() = Some((d, q));
+    }));
+    commit(
+        &s,
+        "k-removed",
+        ChangeSet {
+            changes: vec![
+                Change::RemoveContext {
+                    id: cid("K"),
+                    expect: Precondition::Any,
+                },
+                put_context("R", Precondition::Any, b"R", Some(0)),
+            ],
+            content: vec![ContentBinding::from(&r)],
+            ..ChangeSet::default()
+        },
+    );
+    let (d, q) = out.lock().unwrap().take().expect("the hook ran");
+    assert_eq!(d, Ok(()), "the discard between publication and pool update");
+    let q = q.expect("the staging between publication and pool update");
+    assert!(
+        s.inner.reserved_bytes_for_test().0 > 0,
+        "the new staging's reservations did not survive the commit's pool update"
+    );
+    // K's extents, retired by the commit, are free now (or reserved by the new staging).
+    let k_gone: Vec<(u64, u64)> = k_before
+        .iter()
+        .copied()
+        .filter(|x| !reached(&sim, &s).contains(x))
+        .collect();
+    assert!(!k_gone.is_empty(), "the commit retired nothing");
+    ledger(&s, "after the interleaved commit");
+    commit(
+        &s,
+        "q",
+        ChangeSet {
+            changes: vec![put_context("Q", Precondition::Any, b"Q", Some(0))],
+            content: vec![ContentBinding::from(&q)],
+            ..ChangeSet::default()
+        },
+    );
+    let c = s
+        .begin()
+        .unwrap()
+        .context(&cid("Q"))
+        .unwrap()
+        .unwrap()
+        .content
+        .unwrap();
+    let mut got = Vec::new();
+    std::io::Read::read_to_end(&mut s.begin().unwrap().content(&c).unwrap(), &mut got).unwrap();
+    assert_eq!(
+        got, q_bytes,
+        "the staging taken between publication and pool update"
+    );
+    advance(&s, "final");
+    assert_eq!(crate::audit::check_retirement(&sim), Ok(()));
+    drop(s);
+    sim.release();
+    let s = open_on(Box::new(sim.clone()), Default::default()).unwrap();
+    ledger(&s, "reopen");
 }
 
 /// The check refuses to judge a store while a staging is taking space: what it has taken is
