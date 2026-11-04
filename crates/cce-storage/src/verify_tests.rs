@@ -454,6 +454,18 @@ fn a_history_marker_naming_another_attempt_is_an_attempt_finding() {
 }
 
 #[test]
+fn a_history_marker_naming_an_attempt_recorded_at_another_position_is_an_attempt_finding() {
+    // Position 1's marker names "three" (retained at position 3), and no attempt record points at
+    // position 1 any more: only the marker's own pairing check can see it.
+    let sim = with_removed_history();
+    edit_tree(&sim, |t| {
+        t.put(removed_history_key(1), b"three".to_vec()).unwrap();
+        t.delete(&key(P_ATTEMPT, &[b"one"])).unwrap();
+    });
+    assert_only(&verify(&sim), "attempt");
+}
+
+#[test]
 fn a_position_both_retained_and_removed_is_a_history_finding() {
     let sim = rich();
     edit_tree(&sim, |t| {
