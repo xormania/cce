@@ -3,15 +3,22 @@
 //! The model below knows the logical contract only: records, relationships navigated in both
 //! directions, content bytes, retained history, attempt outcomes, read-basis conflicts and view
 //! isolation. It never calls the engine. Each generated step is resolved by the model into a
-//! concrete request and the result it predicts; the engine (production code on the simulator)
+//! concrete request and the result it predicts; the engine (production code on the simulator,
+//! and in a smaller run on real files)
 //! executes the same request and every observation is compared.
 //!
-//! Budget: `CCE_MODEL_CASES` sequences (default 32) of 64 to 80 attempted operations, from the
-//! fixed seed `CCE_MODEL_SEED` (default [`ROUTINE_SEED`]). Minimized failures are saved under
-//! `proptest-regressions/` and replayed first on later runs.
+//! Budget: `CCE_MODEL_CASES` sequences on the simulator (default 32) and `CCE_MODEL_FS_CASES` on
+//! real files (default 4), each of 64 to 80 attempted operations, from the fixed seed
+//! `CCE_MODEL_SEED` (default [`ROUTINE_SEED`]). Larger campaigns set these variables; each run
+//! prints one `model report:` JSON line with its seed, budget, executed counts and the operations
+//! and outcomes it exercised. Minimized failures are saved under `proptest-regressions/` and
+//! replayed first on later runs.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cce_core::storage::{
@@ -28,12 +35,14 @@ use sha2::{Digest, Sha256};
 
 use crate::engine::Inner;
 use crate::format::StoreId;
+use crate::io::{FsIo, Io};
 use crate::sim::SimIo;
 use crate::{NativeStore, NativeView};
 
 /// Seed of the routine run. Changing it changes the generated sequences.
 const ROUTINE_SEED: u64 = 0x5eed_0001_cce0_0001;
 const ROUTINE_CASES: u32 = 32;
+const ROUTINE_FS_CASES: u32 = 4;
 const MIN_OPS: usize = 64;
 const MAX_OPS: usize = 80;
 
@@ -941,15 +950,70 @@ impl ReferenceStateMachine for ModelMachine {
 // The engine under test, and the comparison.
 // ---------------------------------------------------------------------------------------------
 
-/// Counts of what the generated sequences exercised (reported by the test).
-static STATS: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
+// Counts of what the generated sequences exercised (reported by the test).
+thread_local! {
+    // The runner executes every case on the test's own thread, so each test counts its own.
+    static STATS: RefCell<BTreeMap<String, u64>> = const { RefCell::new(BTreeMap::new()) };
+}
 
-fn count(what: &'static str) {
-    *STATS.lock().unwrap().entry(what).or_default() += 1;
+fn count(what: &str) {
+    STATS.with(|s| *s.borrow_mut().entry(what.to_string()).or_default() += 1);
+}
+
+fn op_name(op: &Op) -> &'static str {
+    match op {
+        Op::Commit(_) => "commit",
+        Op::CommitFromHeld { .. } => "commit from held",
+        Op::SubmitAndPoll(_) => "submit and poll",
+        Op::Retry { .. } => "retry",
+        Op::Hold(_) => "hold",
+        Op::ReadHeld { .. } => "read held",
+        Op::Release(_) => "release",
+        Op::Stage(_) => "stage",
+        Op::Discard { .. } => "discard",
+        Op::Check => "check",
+        Op::Reopen => "reopen",
+    }
+}
+
+/// Where the store under test lives.
+enum Backend {
+    Sim(SimIo),
+    /// A fresh directory on the real filesystem, removed after a passing sequence.
+    Files(PathBuf),
+}
+
+impl Backend {
+    fn new(files: bool) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        if files {
+            let dir = std::env::temp_dir().join(format!(
+                "cce-model-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            Backend::Files(dir)
+        } else {
+            Backend::Sim(SimIo::new())
+        }
+    }
+
+    /// An adapter for the next create or open. On the simulator the previous handle's ownership
+    /// ends first (its "process" exited); on real files closing the handle released it.
+    fn io(&self) -> Box<dyn Io> {
+        match self {
+            Backend::Sim(sim) => {
+                sim.release();
+                Box::new(sim.clone())
+            }
+            Backend::Files(dir) => Box::new(FsIo::new(dir)),
+        }
+    }
 }
 
 struct Engine {
-    sim: SimIo,
+    backend: Backend,
     store: Option<NativeStore>,
     held: Vec<NativeView>,
     staged: Vec<StagedContent>,
@@ -1130,13 +1194,13 @@ fn check_result(got: &Result<CommitReceipt, CommitError>, req: &Request, expecte
     }
 }
 
-struct EngineTest;
+/// The engine on the simulator (`FILES == false`) or on real files.
+struct EngineTest<const FILES: bool>;
 
-/// Opens the store again after the previous handle closed (the simulated owner ended).
-fn open(sim: &SimIo) -> NativeStore {
-    sim.release();
+/// Opens the store again after the previous handle closed.
+fn open(backend: &Backend) -> NativeStore {
     NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Default::default()).expect("open"),
+        inner: Inner::open(backend.io(), Default::default()).expect("open"),
     }
 }
 
@@ -1146,17 +1210,17 @@ fn reads_through(view: &mut NativeView, reads: &[ReadResult]) {
     }
 }
 
-impl StateMachineTest for EngineTest {
+impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
     type SystemUnderTest = Engine;
     type Reference = ModelMachine;
 
     fn init_test(_: &Model) -> Engine {
-        let sim = SimIo::new();
+        let backend = Backend::new(FILES);
         let store = NativeStore {
-            inner: Inner::create(Box::new(sim.clone()), STORE, Default::default()).expect("create"),
+            inner: Inner::create(backend.io(), STORE, Default::default()).expect("create"),
         };
         Engine {
-            sim,
+            backend,
             store: Some(store),
             held: Vec::new(),
             staged: Vec::new(),
@@ -1164,7 +1228,8 @@ impl StateMachineTest for EngineTest {
         }
     }
 
-    fn apply(mut e: Engine, m: &Model, _: Op) -> Engine {
+    fn apply(mut e: Engine, m: &Model, op: Op) -> Engine {
+        count(&format!("op {}", op_name(&op)));
         match &m.action {
             Action::Nothing => count("op without effect"),
             Action::Commit {
@@ -1296,7 +1361,7 @@ impl StateMachineTest for EngineTest {
                 e.held.clear();
                 e.refused.append(&mut e.staged);
                 e.store.take().expect("store").close().expect("clean close");
-                e.store = Some(open(&e.sim));
+                e.store = Some(open(&e.backend));
             }
         }
         e
@@ -1309,8 +1374,12 @@ impl StateMachineTest for EngineTest {
         e.staged.clear();
         e.refused.clear();
         e.store.take().expect("store").close().expect("clean close");
-        e.store = Some(open(&e.sim));
+        e.store = Some(open(&e.backend));
         main_check(&e, &snap);
+        e.store.take().expect("store").close().expect("clean close");
+        if let Backend::Files(dir) = &e.backend {
+            std::fs::remove_dir_all(dir).expect("remove the test store");
+        }
     }
 }
 
@@ -1324,10 +1393,8 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-#[test]
-fn generated_operation_sequences_match_the_logical_model() {
-    let cases: u32 = env_or("CCE_MODEL_CASES", ROUTINE_CASES);
-    let seed: u64 = env_or("CCE_MODEL_SEED", ROUTINE_SEED);
+/// Runs one budget of generated sequences and prints its report.
+fn run_model<const FILES: bool>(backend: &str, cases: u32, seed: u64) {
     let config = Config {
         cases,
         rng_seed: RngSeed::Fixed(seed),
@@ -1337,6 +1404,7 @@ fn generated_operation_sequences_match_the_logical_model() {
         source_file: Some(file!()),
         ..Config::default()
     };
+    STATS.with(|s| s.borrow_mut().clear());
     let mut runner = TestRunner::new(config.clone());
     let attempted = Arc::new(Mutex::new((0u64, 0u64)));
     let counter = attempted.clone();
@@ -1348,17 +1416,42 @@ fn generated_operation_sequences_match_the_logical_model() {
                 c.0 += 1;
                 c.1 += transitions.len() as u64;
             }
-            EngineTest::test_sequential(config.clone(), initial, transitions, seen);
+            EngineTest::<FILES>::test_sequential(config.clone(), initial, transitions, seen);
             Ok(())
         },
     );
     let (sequences, ops) = *attempted.lock().unwrap();
-    let stats = STATS.lock().unwrap().clone();
-    println!(
-        "model campaign: seed {seed:#x}, cases {cases}, sequences run {sequences}, \
-         attempted operations {ops}, observed {stats:?}"
-    );
+    let report = serde_json::json!({
+        "backend": backend,
+        "seed": format!("{seed:#x}"),
+        "cases": cases,
+        "operations_per_sequence": [MIN_OPS, MAX_OPS],
+        // Includes shrinking attempts when a case failed.
+        "sequences_run": sequences,
+        "attempted_operations": ops,
+        "passed": result.is_ok(),
+        "observed": STATS.with(|s| s.borrow().clone()),
+    });
+    println!("model report: {report}");
     if let Err(e) = result {
         panic!("{e}");
     }
+}
+
+#[test]
+fn generated_operation_sequences_match_the_logical_model() {
+    run_model::<false>(
+        "simulator",
+        env_or("CCE_MODEL_CASES", ROUTINE_CASES),
+        env_or("CCE_MODEL_SEED", ROUTINE_SEED),
+    );
+}
+
+#[test]
+fn generated_operation_sequences_on_real_files_match_the_logical_model() {
+    run_model::<true>(
+        "files",
+        env_or("CCE_MODEL_FS_CASES", ROUTINE_FS_CASES),
+        env_or("CCE_MODEL_SEED", ROUTINE_SEED),
+    );
 }
