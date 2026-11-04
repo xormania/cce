@@ -2057,8 +2057,6 @@ impl Inner {
         Ok(())
     }
 
-    /// Fences writes until reopen. The pool learns of it under its own lock, so no staging
-    /// takes reusable space afterwards.
     /// Counts the retired space a publication consumed as reused (reservations returned to the pool
     /// never count).
     fn count_reused(&self, consumed: &[Reuse]) {
@@ -2068,6 +2066,8 @@ impl Inner {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Fences writes until reopen. The pool learns of it under its own lock, so no staging
+    /// takes reusable space afterwards.
     fn fence(&self, fence: Fence) {
         lock(&self.state).fenced = Some(fence);
         lock(&self.pool).fenced = true;
