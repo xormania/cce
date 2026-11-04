@@ -1889,6 +1889,38 @@ fn a_staging_bound_twice_in_one_commit_is_installed_once_and_never_retired() {
 }
 
 #[test]
+fn a_staging_bound_twice_in_a_refused_commit_can_still_be_discarded() {
+    let sim = SimIo::new();
+    let s = sim_create(&sim);
+    let bytes = payload(7, CONTENT_CHUNK + 300);
+    let staged = s.stage_content(&mut &bytes[..]).unwrap();
+    // The basis reads D as absent; a newer commit then writes D, so the commit conflicts.
+    let mut basis = s.begin().unwrap();
+    assert_eq!(basis.context(&cid("D")).map(|r| r.is_none()), Ok(true));
+    put_body(&s, "d", "D", "D");
+    let refused = s.commit(
+        AttemptId::new(*b"twice").unwrap(),
+        basis,
+        ChangeSet {
+            changes: vec![Change::PutContext {
+                id: cid("D"),
+                expect: Precondition::Any,
+                body: b"D".to_vec(),
+                content: Some(1),
+            }],
+            content: vec![ContentBinding::from(&staged), ContentBinding::from(&staged)],
+            ..ChangeSet::default()
+        },
+    );
+    assert!(
+        matches!(refused, Err(CommitError::Conflict(_))),
+        "the commit did not conflict: {refused:?}"
+    );
+    // Both bindings' admissions are released: nothing still holds the staging.
+    assert_eq!(s.discard_staged(staged), Ok(()));
+}
+
+#[test]
 fn two_stagings_of_the_same_bytes_in_one_commit_keep_one_and_retire_the_other() {
     let len = CONTENT_CHUNK + 300;
     for users in [&[0][..], &[1], &[0, 1]] {
