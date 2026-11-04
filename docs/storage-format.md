@@ -113,7 +113,9 @@ tuple order of the raw components.
 
 Retirement keys are fixed-width, not escaped components, so they sort by retiring generation.
 History keys (`05`) and history markers (`09`) are fixed-width too; a position is held by at most
-one of them.
+one of them. Markers have a family of their own rather than a second value form under `05`: a `05`
+value is an extent of fixed length, and a marker holding an attempt id of the same encoded length
+could not be told apart from it.
 
 An extent is `offset: u64, length: u64, sha256: [u8; 32]` into `content.cce`.
 
