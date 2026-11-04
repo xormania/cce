@@ -266,6 +266,16 @@ fn ops_seed_sources() -> Vec<(&'static str, ByteRun, Vec<Op>)> {
             double.clone(),
         ),
         ("staging-lifecycle", ByteRun::Complete, staging_lifecycle()),
+        // The first commit's data barrier fails and drops its writes; the store keeps running.
+        (
+            "lossy-barrier-failure",
+            ByteRun::Failure {
+                cut: 6,
+                lossy: true,
+                live: true,
+            },
+            staging_lifecycle(),
+        ),
         (
             "crash-in-merge-skip",
             ByteRun::Crash { cut: 37 },
