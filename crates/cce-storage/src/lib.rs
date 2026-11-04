@@ -26,6 +26,7 @@ mod fs_seam_tests;
 mod io;
 #[cfg(test)]
 mod key_bounds_tests;
+mod ledger;
 #[cfg(test)]
 mod ledger_tests;
 #[cfg(test)]

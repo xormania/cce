@@ -115,6 +115,54 @@ fn the_pool_matches_the_retirement_records_after_every_step() {
     put_content(&s, "f", "F", &bytes_of(7, CONTENT_CHUNK + 1));
 }
 
+/// The check refuses to judge a store while a staging is taking space: what it has taken is
+/// neither free nor reserved until it registers.
+#[test]
+fn the_check_refuses_while_a_staging_is_taking_space() {
+    let sim = SimIo::new();
+    let s = with_retired(&sim);
+    struct CheckMidway<'a> {
+        bytes: Vec<u8>,
+        at: usize,
+        s: &'a NativeStore,
+        seen: Option<Result<(), String>>,
+    }
+    impl std::io::Read for CheckMidway<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.at == CONTENT_CHUNK && self.seen.is_none() {
+                self.seen = Some(self.s.inner.ledger_check_for_test());
+            }
+            let end = self
+                .bytes
+                .len()
+                .min(self.at + out.len())
+                .min(if self.at < CONTENT_CHUNK {
+                    CONTENT_CHUNK
+                } else {
+                    usize::MAX
+                });
+            let n = end - self.at;
+            out[..n].copy_from_slice(&self.bytes[self.at..end]);
+            self.at = end;
+            Ok(n)
+        }
+    }
+    let mut source = CheckMidway {
+        bytes: bytes_of(8, 2 * CONTENT_CHUNK),
+        at: 0,
+        s: &s,
+        seen: None,
+    };
+    let staged = s.stage_content(&mut source).unwrap();
+    let seen = source.seen.take().expect("checked while staging");
+    assert!(
+        seen.as_ref().is_err_and(|m| m.contains("not quiescent")),
+        "{seen:?}"
+    );
+    drop(staged);
+    ledger(&s, "after the staging registered");
+}
+
 #[test]
 fn a_free_extent_without_a_record_is_found() {
     let sim = SimIo::new();
