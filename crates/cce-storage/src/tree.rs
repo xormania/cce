@@ -390,9 +390,16 @@ impl<'a> TreeTxn<'a> {
     }
 
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), StorageError> {
-        if key.len() > MAX_KEY || key.len() + value.len() > MAX_ENTRY {
+        if key.len() > MAX_KEY {
             return Err(StorageError::InvalidRequest(format!(
-                "record too large for metadata: key {} + value {} bytes (limit {MAX_ENTRY})",
+                "record too large for metadata: key of {} bytes exceeds the {MAX_KEY}-byte key limit",
+                key.len()
+            )));
+        }
+        if key.len() + value.len() > MAX_ENTRY {
+            return Err(StorageError::InvalidRequest(format!(
+                "record too large for metadata: key {} + value {} bytes exceed the {MAX_ENTRY}-byte \
+                 entry limit",
                 key.len(),
                 value.len()
             )));

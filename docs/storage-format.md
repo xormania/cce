@@ -89,6 +89,24 @@ tuple order of the raw components.
 
 An extent is `offset: u64, length: u64, sha256: [u8; 32]` into `content.cce`.
 
+### Key and record limits
+
+A key is 1 byte of prefix plus, per component, its length in bytes plus one more byte for each
+zero byte (escaped as `00 FF`) plus the two-byte terminator. Keys longer than 1024 bytes are
+refused, and so are key plus value longer than 1800 bytes.
+
+- Context, relationship and attempt keys hold one identifier of at most 255 bytes: at most 513
+  bytes even when every byte is zero, so they always fit.
+- A relationship's outgoing and incoming index keys (`03`, `04`) hold its source, kind, target and
+  id: 1 + Σ(length + zero bytes + 2). They fit only while the four identifiers' lengths plus their
+  zero bytes total at most 1015 bytes. Four identifiers without zero bytes can total up to 1020, so
+  long identifiers, and zero-rich ones much sooner, can exceed this. Such a relationship is refused
+  before anything of its request is applied, with `InvalidRequest` naming the relationship, its key
+  length and the key limit.
+- A context record's value holds its body, so the largest accepted body is 1800 bytes minus the key
+  (1 + id length + zero bytes in the id + 2) and the value's fixed fields. It shrinks by up to 255
+  bytes for a zero-rich id; larger data belongs in content.
+
 ## Content
 
 Content is stored as segments of at most 65536 bytes, each written to its own allocation in
