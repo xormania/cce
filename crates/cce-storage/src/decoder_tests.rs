@@ -195,10 +195,9 @@ fn descriptor() -> Descriptor {
     }
 }
 
-/// Publication record layout: magic 0..4, version 4..6, store 6..22, generation 22..30, root page
-/// 30..38, root incarnation 38..46, next page 46..54, content length 54..62, history position
-/// 62..70, checksum 70..74.
-/// Recomputes a publication record's checksum, in the current layout.
+/// Recomputes a publication record's checksum, in the current layout: magic 0..4, version 4..6,
+/// required features 6..10, store 10..26, generation 26..34, root page 34..42, root incarnation
+/// 42..50, next page 50..58, content length 58..66, history position 66..74, checksum 74..78.
 fn reseal_slot(s: &mut [u8]) {
     let n = crate::format::DESC_LEN - 4;
     let crc = crc32fast::hash(&s[..n]);

@@ -386,7 +386,7 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
     e.buf
 }
 
-/// Exact length of `encode_request(changes)`, computed without encoding (checked in debug builds).
+/// Exact length of `encode_request(changes)`, computed without encoding (checked by every encoding).
 pub(crate) fn encoded_request_len(changes: &ChangeSet) -> u64 {
     let field = |len: usize| 4 + len as u64;
     let expect = |p: &Precondition| match p {
