@@ -160,6 +160,174 @@ impl Files {
     }
 }
 
+/// The positional calls the adapter makes on a store file. Each may transfer fewer bytes than
+/// asked or be interrupted; [`read_full`] and [`write_full`] handle that.
+trait Positional {
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize>;
+    fn pwrite(&self, data: &[u8], offset: u64) -> std::io::Result<usize>;
+    fn fsync(&self) -> std::io::Result<()>;
+}
+
+impl Positional for File {
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        FileExt::read_at(self, buf, offset)
+    }
+    fn pwrite(&self, data: &[u8], offset: u64) -> std::io::Result<usize> {
+        FileExt::write_at(self, data, offset)
+    }
+    fn fsync(&self) -> std::io::Result<()> {
+        self.sync_all()
+    }
+}
+
+/// Reads all of `buf` at `offset`. A call interrupted by a signal is repeated and a short read
+/// continues where it stopped; a call that reads nothing has reached the end of the file
+/// (`UnexpectedEof`). Any other error is returned as it is, without retrying.
+fn read_full(h: &dyn Positional, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match h.pread(buf, offset) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Writes all of `data` at `offset`. A call interrupted by a signal is repeated and a short write
+/// continues where it stopped; a call that writes nothing is an error (`WriteZero`). Any other
+/// error, such as a full disk, is returned as it is, without retrying; the bytes written before
+/// it stay written.
+fn write_full(h: &dyn Positional, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+    while !data.is_empty() {
+        match h.pwrite(data, offset) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                data = &data[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// A fault the test seam makes one positional call return instead of (or before) the real call.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// The call fails as interrupted by a signal before transferring anything.
+    Interrupted,
+    /// The real call is made for at most this many bytes.
+    Short(usize),
+    /// The call transfers nothing and reports zero bytes.
+    Zero,
+    /// The call fails with this operating-system error number.
+    Os(i32),
+}
+
+/// Which positional call the seam is asked about.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Call {
+    Read,
+    Write,
+    Sync,
+}
+
+/// Decides, for each positional call (file, call, bytes asked), whether to inject a fault.
+#[cfg(test)]
+pub(crate) type Injector = Box<dyn FnMut(FileId, Call, usize) -> Option<Fault> + Send>;
+
+/// One positional call seen by the seam: file, call, bytes asked and the fault injected, if any.
+#[cfg(test)]
+pub(crate) type SeamCall = (FileId, Call, usize, Option<Fault>);
+
+/// The test seam under the adapter's file handles: every positional call is offered to the
+/// injector first; calls it leaves alone, and the rest of a short one, go to the real file.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Faults {
+    injector: Mutex<Option<Injector>>,
+    /// Every positional call made while an injector was set, with the fault injected, if any.
+    pub calls: Mutex<Vec<SeamCall>>,
+}
+
+#[cfg(test)]
+impl Faults {
+    pub fn set(&self, injector: Injector) {
+        *self.injector.lock().expect("injector") = Some(injector);
+    }
+
+    pub fn clear(&self) {
+        *self.injector.lock().expect("injector") = None;
+    }
+
+    fn decide(&self, file: FileId, call: Call, len: usize) -> Option<Fault> {
+        let mut injector = self.injector.lock().expect("injector");
+        let i = injector.as_mut()?;
+        let fault = i(file, call, len);
+        self.calls
+            .lock()
+            .expect("calls")
+            .push((file, call, len, fault));
+        fault
+    }
+}
+
+/// A store file as the adapter uses it: the real file, under the test seam in test builds.
+struct Handle<'a> {
+    file: &'a File,
+    #[cfg(test)]
+    id: FileId,
+    #[cfg(test)]
+    faults: &'a Faults,
+}
+
+impl Positional for Handle<'_> {
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        #[cfg(test)]
+        match self.faults.decide(self.id, Call::Read, buf.len()) {
+            Some(Fault::Interrupted) => return Err(ErrorKind::Interrupted.into()),
+            Some(Fault::Short(n)) => {
+                let n = n.min(buf.len());
+                return self.file.pread(&mut buf[..n], offset);
+            }
+            Some(Fault::Zero) => return Ok(0),
+            Some(Fault::Os(e)) => return Err(std::io::Error::from_raw_os_error(e)),
+            None => {}
+        }
+        self.file.pread(buf, offset)
+    }
+
+    fn pwrite(&self, data: &[u8], offset: u64) -> std::io::Result<usize> {
+        #[cfg(test)]
+        match self.faults.decide(self.id, Call::Write, data.len()) {
+            Some(Fault::Interrupted) => return Err(ErrorKind::Interrupted.into()),
+            Some(Fault::Short(n)) => return self.file.pwrite(&data[..n.min(data.len())], offset),
+            Some(Fault::Zero) => return Ok(0),
+            Some(Fault::Os(e)) => return Err(std::io::Error::from_raw_os_error(e)),
+            None => {}
+        }
+        self.file.pwrite(data, offset)
+    }
+
+    fn fsync(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        match self.faults.decide(self.id, Call::Sync, 0) {
+            Some(Fault::Interrupted) => return Err(ErrorKind::Interrupted.into()),
+            Some(Fault::Os(e)) => return Err(std::io::Error::from_raw_os_error(e)),
+            Some(Fault::Short(_) | Fault::Zero) | None => {}
+        }
+        self.file.fsync()
+    }
+}
+
 /// Real filesystem adapter for one store directory.
 pub(crate) struct FsIo {
     dir: PathBuf,
@@ -167,6 +335,9 @@ pub(crate) struct FsIo {
     /// Directories this adapter synced, in order (test observation only).
     #[cfg(test)]
     synced_dirs: Mutex<Vec<PathBuf>>,
+    /// The test seam under the file handles.
+    #[cfg(test)]
+    faults: Arc<Faults>,
 }
 
 impl FsIo {
@@ -176,6 +347,27 @@ impl FsIo {
             files: Mutex::new(None),
             #[cfg(test)]
             synced_dirs: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            faults: Arc::default(),
+        }
+    }
+
+    /// An adapter whose positional calls go through `faults` first.
+    #[cfg(test)]
+    pub(crate) fn with_faults(dir: &Path, faults: Arc<Faults>) -> Self {
+        Self {
+            faults,
+            ..Self::new(dir)
+        }
+    }
+
+    fn handle<'a>(&'a self, files: &'a Files, f: FileId) -> Handle<'a> {
+        Handle {
+            file: pick(files, f),
+            #[cfg(test)]
+            id: f,
+            #[cfg(test)]
+            faults: &self.faults,
         }
     }
 
@@ -426,24 +618,20 @@ impl Io for FsIo {
 
     fn read_at(&self, file: FileId, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
         let (files, f) = self.file(file)?;
-        pick(&files, f)
-            .read_exact_at(buf, offset)
-            .map_err(|e| match e.kind() {
-                ErrorKind::UnexpectedEof => StorageError::Integrity(format!(
-                    "{}: read past end at {offset}+{}",
-                    file.name(),
-                    buf.len()
-                )),
-                _ => io_err(file.name(), e),
-            })
+        read_full(&self.handle(&files, f), buf, offset).map_err(|e| match e.kind() {
+            ErrorKind::UnexpectedEof => StorageError::Integrity(format!(
+                "{}: read past end at {offset}+{}",
+                file.name(),
+                buf.len()
+            )),
+            _ => io_err(file.name(), e),
+        })
     }
 
     fn write_at(&self, file: FileId, offset: u64, data: &[u8]) -> Result<(), StorageError> {
         let (files, f) = self.file(file)?;
         files.writable()?;
-        pick(&files, f)
-            .write_all_at(data, offset)
-            .map_err(|e| io_err(file.name(), e))
+        write_full(&self.handle(&files, f), data, offset).map_err(|e| io_err(file.name(), e))
     }
 
     fn len(&self, file: FileId) -> Result<u64, StorageError> {
@@ -457,8 +645,9 @@ impl Io for FsIo {
     fn sync(&self, file: FileId) -> Result<(), StorageError> {
         let (files, f) = self.file(file)?;
         files.writable()?;
-        pick(&files, f)
-            .sync_all()
+        // A failed sync is never retried, an interrupted one included: the error is reported.
+        self.handle(&files, f)
+            .fsync()
             .map_err(|e| io_err(file.name(), e))
     }
 
@@ -501,11 +690,40 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    fn scratch(name: &str) -> PathBuf {
+    /// A fresh scratch directory, removed when the test passes and kept (path printed) when it fails.
+    fn scratch(name: &str) -> Scratch {
         let d = std::env::temp_dir().join(format!("cce-io-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
-        d
+        Scratch(d)
+    }
+
+    struct Scratch(PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!(
+                    "scratch directory kept for inspection: {}",
+                    self.0.display()
+                );
+            } else {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
     }
 
     #[test]
@@ -551,7 +769,7 @@ mod tests {
 
     #[test]
     fn creating_refuses_a_directory_that_already_holds_other_files() {
-        let names = |d: &PathBuf| {
+        let names = |d: &Path| {
             let mut v: Vec<String> = fs::read_dir(d)
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())

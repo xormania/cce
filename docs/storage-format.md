@@ -1,6 +1,7 @@
-# Storage format (version 1)
+# Storage format (version 5)
 
-This describes the bytes the `cce-storage` engine writes today. It changes with the code; a
+This describes the bytes the `cce-storage` engine writes today, in the format version of the title,
+which pages and publication records carry as their "format version". It changes with the code; a
 change that alters how existing bytes are read must change the version and either migrate or refuse
 older stores without modifying them.
 
@@ -24,7 +25,7 @@ Node page header (48 bytes), followed by the payload and zero padding:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `CCEP` |
-| 4 | 2 | format version (5) |
+| 4 | 2 | format version |
 | 6 | 1 | page kind (1 = leaf) |
 | 7 | 1 | reserved (0) |
 | 8 | 16 | store identity |
@@ -49,20 +50,21 @@ The metadata tree is a copy-on-write B+tree. A commit copies only the nodes on t
 writes each of them to a fresh page (children before parents) and shares every untouched subtree
 with the previous generation. Nodes split by encoded size; the root grows when it splits. Deletion
 removes empty nodes, merges a leaf under a quarter full into an adjacent sibling when the merged leaf
-fits, and collapses a root branch with one child; there is no other minimum-occupancy rule. A key is
-at most 1024 bytes and a key plus value at most 1800 bytes, so every leaf holds at least two
-entries. Readers walk from the root with a cursor that keeps one root-to-leaf path and loads leaves
+fits, and collapses a root branch with one child; there is no other minimum-occupancy rule. A key, and
+a key plus value, are at most 1800 bytes, so every leaf holds at least two entries and a branch
+holds at least two full-length separators before it splits. Readers walk from the root with a cursor that keeps one root-to-leaf path and loads leaves
 as it reaches them; trees deeper than 32 levels are rejected as damaged.
 
 ## Publication records (slots 0 and 1)
 
 Generation `g` is written to slot `g mod 2`, so the previous generation's record is never
-overwritten by the next commit. Record layout (76 bytes, rest of the page zero):
+overwritten by the next commit. Record layout (78 bytes, rest of the page zero):
 
 | Field | Size |
 |---|---|
 | magic `CCED` | 4 |
 | format version | 2 |
+| required features | 4 |
 | store identity | 16 |
 | generation | 8 |
 | root page, root incarnation | 8 + 8 |
@@ -70,6 +72,19 @@ overwritten by the next commit. Record layout (76 bytes, rest of the page zero):
 | committed content length | 8 |
 | last history position | 8 |
 | CRC-32 of the preceding fields | 4 |
+
+A record is checked in this order: its checksum (a mismatch makes the slot damaged), its magic, its
+format version, and its required features, a bit set of features a reader must implement to read
+the store. No feature is defined yet and writers set none; a record that requires any feature this
+build does not implement is unsupported, exactly like an unknown format version. Records of earlier
+versions had no required features, so their checksum ends 4 bytes earlier; such an intact record is
+reported as its unsupported version rather than as a damaged slot.
+
+Every later version keeps bytes 0 to 78 of the record as they are here: the magic, the format
+version, the required features and the other fields at the same offsets, and the CRC-32 at byte 74
+over bytes 0 to 74. Anything a later version adds follows byte 78, with its own check. The bytes after
+the record are not required to be zero, so this build reads such a record's intact first 78 bytes,
+finds a version it does not support, and refuses the store as unsupported rather than as damaged.
 
 ## Logical key space
 
@@ -92,6 +107,24 @@ tuple order of the raw components.
 Retirement keys are fixed-width, not escaped components, so they sort by retiring generation.
 
 An extent is `offset: u64, length: u64, sha256: [u8; 32]` into `content.cce`.
+
+### Key and record limits
+
+A key is 1 byte of prefix plus, per component, its length in bytes plus one more byte for each
+zero byte (escaped as `00 FF`) plus the two-byte terminator. Keys longer than 1800 bytes are
+refused, and so are key plus value longer than 1800 bytes.
+
+- Context, relationship and attempt keys hold one identifier of at most 255 bytes: at most 513
+  bytes even when every byte is zero, so they always fit.
+- A relationship's outgoing and incoming index keys (`03`, `04`) hold its source, kind, target and
+  id: 1 + Σ(length + zero bytes + 2). They fit while the four identifiers' lengths plus their zero
+  bytes total at most 1791 bytes. Identifiers without zero bytes (at most 1020) always fit; only
+  identifiers with many zero bytes can exceed it (four all-zero 255-byte identifiers total 2040, a 2049-byte key). Such a
+  relationship is refused before anything of its request is applied, with `InvalidRequest` naming
+  the relationship, its key length and the key limit.
+- A context record's value holds its body, so the largest accepted body is 1800 bytes minus the key
+  (1 + id length + zero bytes in the id + 2) and the value's fixed fields. It shrinks by up to 255
+  bytes for a zero-rich id; larger data belongs in content.
 
 ## Content
 
