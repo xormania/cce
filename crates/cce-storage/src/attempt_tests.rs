@@ -645,27 +645,39 @@ fn outcome_moves_from_pending_to_committed_without_passing_through_absent() {
 
 #[test]
 fn outcome_looks_at_pending_attempts_before_the_published_state() {
-    // An attempt leaves `pending` only after its publication. Checking pending first and the
-    // published state second is what makes a finishing commit impossible to miss, so the order
-    // itself is pinned here (no schedule can expose a reversed order reliably).
+    // An attempt leaves `pending` only after its publication. Consulting pending first and the
+    // published state second is what makes a finishing commit impossible to miss; no schedule
+    // can reliably expose the reverse, so the order of the lock acquisitions themselves is
+    // checked (recorded inside the locks, whatever code path takes them).
+    use crate::engine::take_lock_trace_for_test as trace;
+    // `pending` exactly once and first; afterwards only the published state (the tree lookup
+    // consults it again for page bounds).
+    let pending_then_state = |t: Vec<&str>| {
+        assert!(
+            t.len() >= 2 && t[0] == "pending" && t[1..].iter().all(|x| *x == "state"),
+            "lookup order {t:?}"
+        )
+    };
     let (s, gate) = gated_store();
     let a = attempt("x");
     let cs = request(&s, Variant::Identical);
     gate.arm();
     let ticket = s.submit(a.clone(), s.begin().unwrap(), cs).unwrap();
     wait_until("commit at its data barrier", || gate.reached());
-    s.inner.take_outcome_trace_for_test();
     // In flight: answered from `pending` alone.
+    trace();
     assert_eq!(s.outcome(&a).unwrap(), AttemptOutcome::Pending);
-    assert_eq!(s.inner.take_outcome_trace_for_test(), ["pending"]);
+    assert_eq!(trace(), ["pending"]);
     gate.release();
     let receipt = ticket.wait().unwrap();
     // Finished, and never seen: pending first, then the published state.
+    trace();
     assert_eq!(s.outcome(&a).unwrap(), AttemptOutcome::Committed(receipt));
-    assert_eq!(s.inner.take_outcome_trace_for_test(), ["pending", "state"]);
+    pending_then_state(trace());
+    trace();
     assert_eq!(
         s.outcome(&attempt("never")).unwrap(),
         AttemptOutcome::Absent
     );
-    assert_eq!(s.inner.take_outcome_trace_for_test(), ["pending", "state"]);
+    pending_then_state(trace());
 }
