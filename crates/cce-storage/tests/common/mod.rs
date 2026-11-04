@@ -83,11 +83,12 @@ impl Driver {
     }
 
     /// Spawns the driver through `bash` with `setup` run first (for example a resource limit);
-    /// `exec` keeps the driver as the child the harness talks to and kills.
+    /// `exec` keeps the driver as the child the harness talks to and kills. A failing setup
+    /// fails closed: the shell exits and the driver never starts.
     pub fn spawn_with_shell(setup: &str) -> Self {
         let mut cmd = Command::new("bash");
         cmd.arg("-c")
-            .arg(format!("{setup}; exec \"$0\""))
+            .arg(format!("set -e; {setup}; exec \"$0\""))
             .arg(DRIVER);
         Self::spawn_command(cmd)
     }
@@ -235,6 +236,21 @@ pub fn proc_usage(pid: u32) -> (u64, u64, usize) {
         .expect("process fds")
         .count();
     (kib("VmHWM:"), kib("VmRSS:"), fds)
+}
+
+/// A live process's soft resource limit as Linux `/proc/<pid>/limits` reports it, read by the
+/// parent; `None` when it is unlimited.
+pub fn proc_limit(pid: u32, name: &str) -> Option<u64> {
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).expect("process limits");
+    let soft = limits
+        .lines()
+        .find_map(|l| l.strip_prefix(name))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no {name} in /proc/{pid}/limits"));
+    (soft != "unlimited").then(|| {
+        soft.parse()
+            .unwrap_or_else(|_| panic!("{name} soft limit {soft}"))
+    })
 }
 
 pub fn hex(bytes: &[u8]) -> String {

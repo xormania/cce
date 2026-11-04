@@ -9,14 +9,15 @@
 //!
 //! Each prints one `WORKLOAD {json}` line with what it measured. Sizes are derived from the
 //! store's reported default capacities. Every driver runs under an address-space and an open-file
-//! limit set by the parent. Timings are recorded, never asserted.
+//! limit set by the parent, which reads both back from the running driver before using it.
+//! Timings are recorded, never asserted.
 
 mod common;
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use common::{Driver, answered, gen_bytes, hex, proc_usage, sha256, test_dir};
+use common::{Driver, answered, gen_bytes, hex, proc_limit, proc_usage, sha256, test_dir};
 
 /// The documented largest content segment, which bounds a content stream's buffer.
 const SEGMENT: u64 = 65_536;
@@ -24,9 +25,45 @@ const SEGMENT: u64 = 65_536;
 const PAGE: u64 = 4096;
 /// Limits for every workload driver: 1 GiB of address space, 64 open files.
 const LIMITS: &str = "ulimit -v 1048576 -n 64";
+const ADDRESS_SPACE: u64 = 1 << 30;
+const OPEN_FILES: u64 = 64;
 
 fn driver() -> Driver {
-    Driver::spawn_with_shell(LIMITS)
+    limited_driver(LIMITS)
+}
+
+/// A driver started under `setup`, once it is running and the parent has read that the workload
+/// limits are applied to it.
+fn limited_driver(setup: &str) -> Driver {
+    let mut d = Driver::spawn_with_shell(setup);
+    answered(d.step("probe ok"), "probe");
+    for (name, want) in [
+        ("Max address space", ADDRESS_SPACE),
+        ("Max open files", OPEN_FILES),
+    ] {
+        assert_eq!(
+            proc_limit(d.pid(), name),
+            Some(want),
+            "{setup}: {name} is not applied to the driver"
+        );
+    }
+    d
+}
+
+/// No driver runs without the limits it was asked for: a setup that fails, or that applies
+/// other limits, is refused rather than measured unbounded.
+#[test]
+fn a_driver_without_its_limits_is_refused() {
+    for setup in [
+        "ulimit -v 1048576 -n bogus",
+        "true",
+        "ulimit -v 2097152 -n 64",
+        "ulimit -v 1048576 -n 128",
+    ] {
+        let ran = std::panic::catch_unwind(|| limited_driver(setup)).is_ok();
+        assert!(!ran, "{setup}: the driver ran without its limits");
+    }
+    drop(limited_driver(LIMITS));
 }
 
 fn fields(line: &str) -> BTreeMap<String, u64> {
