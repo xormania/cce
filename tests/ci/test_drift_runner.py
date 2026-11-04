@@ -232,10 +232,6 @@ class ExecutionEvidenceTests(unittest.TestCase):
                  'run_attempt': 1, 'status': 'completed'}]
         for row in runs:
             row.update(conclusion='success', head_branch='feature', pull_requests=[])
-        runs.append({'id':13, 'name':'leak-guard', 'path':'.github/workflows/leak-guard.yml',
-                     'head_sha':HEAD, 'head_repository':{'full_name':REPOSITORY}, 'event':'pull_request',
-                     'run_number':3, 'run_attempt':1, 'status':'completed', 'conclusion':'success',
-                     'pull_requests':[{'number':9,'head':{'sha':HEAD},'base':{'sha':BASE}}]})
         return FakeApi({
             '/actions/runs?head_sha=' + HEAD + '&per_page=50': {'workflow_runs': runs},
             '/pulls/9':{'state':'open','head':{'sha':HEAD},'base':{'sha':BASE},'merge_commit_sha':TRUSTED},
@@ -245,13 +241,20 @@ class ExecutionEvidenceTests(unittest.TestCase):
                 {'name': 'Format', 'conclusion': 'success'},
                 {'name': 'Clippy', 'conclusion': 'success'},
                 {'name': 'Test', 'conclusion': test_status}]}]},
-            '/actions/runs/13/jobs?per_page=50':{'jobs':[{'id':113,'conclusion':'success','steps':[
-                {'name':'Scan PR text, commits and diff','conclusion':'success'}]}]},
-        }, files={'.github/workflows/'+name+'.yml':(ROOT/'.github/workflows'/(name+'.yml')).read_text()
-                  for name in ('drift-input','rust','leak-guard')},
+            '/commits/' + HEAD + '/check-runs?check_name=scan&per_page=100': {'check_runs': [{
+                'id': 501, 'app': {'id': 15368}, 'status': 'completed', 'conclusion': 'success',
+                'started_at': '2026-11-04T10:00:00Z',
+                'details_url': 'https://github.com/' + REPOSITORY + '/actions/runs/13',
+                'output': {'summary': 'no private markers in PR text, commit messages, added lines or file names'}}]},
+            '/actions/runs/13': {'id': 13, 'name': 'leak-scan', 'path': '.github/workflows/leak-scan.yml',
+                                 'event': 'workflow_run', 'head_sha': TRUSTED,
+                                 'head_repository': {'full_name': REPOSITORY}, 'status': 'completed',
+                                 'conclusion': 'success', 'run_attempt': 1},
+        }, files={path: (ROOT / path).read_text() for path in
+                  ['.github/workflows/' + name + '.yml' for name in ('drift-input', 'rust', 'leak-scan')]
+                  + ['tools/ci/leak_scan_trusted.sh', 'tools/ci/leak_scan.sh']},
            logs={111: 'Ran 27 tests in 0.3s\nOK\n',
-                 112: 'test result: ok. 10 passed; 0 failed; 0 ignored\n',
-                 113:'[command]/usr/bin/git log -1 --format=%H\n'+TRUSTED+'\nScan finished\n'})
+                 112: 'test result: ok. 10 passed; 0 failed; 0 ignored\n'})
 
     def test_successful_steps_are_identified_by_actual_candidate(self):
         checks, limits, waiting = runner.execution_checks(self.api_for(), source(), False)
@@ -270,11 +273,12 @@ class ExecutionEvidenceTests(unittest.TestCase):
         api = self.api_for()
         checks, _, waiting = runner.execution_checks(api, source(), True)
         self.assertFalse(waiting)
-        self.assertEqual([row['id'] for row in checks], ['Unit and replay tests','Scan PR text, commits and diff'])
+        self.assertEqual([row['id'] for row in checks], ['Unit and replay tests','Trusted leak scan'])
         self.assertFalse(any(call[0].startswith('/actions/runs/12/jobs') for call in api.calls))
 
     def test_absent_required_execution_does_not_become_success(self):
-        api = FakeApi({'/actions/runs?head_sha=' + HEAD + '&per_page=50': {'workflow_runs': []}})
+        api = FakeApi({'/actions/runs?head_sha=' + HEAD + '&per_page=50': {'workflow_runs': []},
+                       '/commits/' + HEAD + '/check-runs?check_name=scan&per_page=100': {'check_runs': []}})
         checks, limits, waiting = runner.execution_checks(api, source(), False)
         self.assertTrue(waiting or evaluate({'source':source(),'checks':checks})['violations'])
         self.assertIn('producer_definition_unverified', limits)

@@ -225,6 +225,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("MARKERS: ${{ secrets.PRIVATE_MARKERS }}", text)
         self.assertNotIn("cancel-in-progress: true", text)
 
+    def test_pull_request_workflow_holds_no_secret_and_cannot_produce_scan(self):
+        text = (ROOT / ".github/workflows/leak-guard.yml").read_text()
+        self.assertNotIn("secrets.", text)
+        self.assertIn("permissions: {}", text)
+        self.assertNotRegex(text, r"(?m)^  scan:|^\s+name:\s*scan\s*$")
+        self.assertNotIn("check-runs", text)
+
 
 if __name__ == "__main__":
     unittest.main()

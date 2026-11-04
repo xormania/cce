@@ -9,7 +9,8 @@ The pattern lives in the `PRIVATE_MARKERS` repository secret.
 `.github/workflows/leak-scan.yml` produces `scan` for same-repository pull
 requests. It runs on `workflow_run` after the `leak-guard` pull request workflow
 completes, so it always runs the default branch's code, never the pull
-request's. `tools/ci/leak_scan_trusted.sh` then:
+request's. `leak-guard` itself only starts it: it runs the pull request's own
+definition, so it uses no secrets and produces no `scan` check. `tools/ci/leak_scan_trusted.sh` then:
 
 1. reads the pull request's current title, body, head and base through the API;
 2. creates the `scan` check on that head as in progress;
@@ -40,6 +41,21 @@ the next run.
 - PR comments and review comments are not scanned.
 - A workflow file added or changed by a pull request takes effect for scans only
   after it is merged.
+
+## Drift evidence
+
+The drift observer treats the latest `scan` check from GitHub Actions on the
+candidate head as the leak scan's evidence. The check must:
+
+- link to a completed `leak-scan` `workflow_run` in this repository;
+- come from a run whose workflow definition and scan scripts, at the commit it
+  ran, equal the trusted ones.
+
+A pass counts as executed only when the check reports a clean scan, and a failure
+only when it reports a match. An observer run that starts before the scan has
+finished waits for a later recheck. The Checks API cannot tie a check to the run
+that created it, so a check from the same app that copies a genuine run link is
+not detected.
 
 ## Tests
 

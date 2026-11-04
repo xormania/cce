@@ -25,8 +25,9 @@ an older consumer cannot clear a newer candidate or overwrite a newer analysis.
 Producer names and printed test counts alone are insufficient. The collector
 compares producer workflow contents with the trusted checkout before accepting
 execution. PR producers also identify the checked-out merge commit and current
-base. The applicable PR leak scan is evaluated alongside tooling and Rust tests;
-an emitted skipped-scan message cannot certify execution.
+base. For a pull request, the trusted leak scan's `scan` check is evaluated
+alongside tooling and Rust tests (see `docs/ci-leak-scan.md`). A scan that
+reports it could not run cannot certify execution.
 
 For a Markdown follow-up to a mixed PR, an earlier Rust push run can supply evidence
 only when a bounded ancestor comparison proves every intervening changed and

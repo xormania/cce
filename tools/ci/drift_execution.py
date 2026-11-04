@@ -25,8 +25,17 @@ _KINDS = {
     "drift-input": {"unittest": r"python3?\s+-m\s+unittest\s+discover\b"},
     "rust": {"format": r"cargo\s+fmt\b", "clippy": r"cargo\s+clippy\b",
              "test": r"cargo\s+test\b"},
-    "leak-guard": {"scan": r"git\s+diff\b"},
 }
+# The required leak scan for a pull request is the `scan` check that the trusted leak-scan workflow
+# (workflow_run, default-branch code) publishes on the candidate head. Its producer is identified by
+# the check's run link; the definition and scripts at that run's commit must equal the trusted ones.
+SCAN_CHECK = "scan"
+SCAN_TITLE = "Trusted leak scan"
+SCAN_PATH = ".github/workflows/leak-scan.yml"
+SCAN_SCRIPTS = ("tools/ci/leak_scan_trusted.sh", "tools/ci/leak_scan.sh")
+ACTIONS_APP = 15368
+SCAN_CLEAN = "no private markers in PR text, commit messages, added lines or file names"
+SCAN_MATCH = "private marker found in PR "
 
 
 def _row(identity, status="unknown", executed=False, source_sha=None, **metadata):
@@ -212,9 +221,58 @@ def _emitted_lines(logs):
         yield line
 
 
-def _scan_skipped(logs):
-    return any(re.search(r"(?:PRIVATE_MARKERS.*(?:skipping|not available|not set|invalid)|nothing was scanned)", line, re.I)
-               for line in _emitted_lines(logs))
+def _trusted_scan(api, source, root):
+    """Return (check rows, limits, waiting) for the trusted leak scan of a pull request candidate.
+
+    The latest `scan` check from GitHub Actions on the candidate head is evidence only when its run
+    link names a completed leak-scan workflow_run in this repository whose definition and scripts,
+    at the commit it ran, equal the trusted ones. A pass counts as executed only when the check
+    reports a clean scan; a failure only when it reports a match. Anything else did not scan.
+    Binding a check to the run that created it is not possible through the Checks API, so a
+    same-app check that copies a genuine run link is not detected here.
+    """
+    head = source["head_sha"]
+    try:
+        listing = api.api("/commits/" + head + "/check-runs?check_name=" + SCAN_CHECK + "&per_page=100")
+        if not isinstance(listing, dict):
+            raise ValueError("execution_inventory_unavailable")
+    except (ValueError, KeyError, OSError, urllib.error.URLError):
+        return [], ["required_execution_unavailable"], True
+    runs = [row for row in listing.get("check_runs", [])
+            if isinstance(row, dict) and (row.get("app") or {}).get("id") == ACTIONS_APP]
+    if not runs:
+        return [], ["required_execution_unavailable"], True
+    check = max(runs, key=lambda row: (str(row.get("started_at") or ""), row.get("id") or 0))
+    if check.get("status") != "completed":
+        return [], [], True
+    link = re.fullmatch(r"https://[^/]+/" + re.escape(api.repository) + r"/actions/runs/(\d+)",
+                        str(check.get("details_url") or ""))
+    trusted = (root / SCAN_PATH).read_text()
+    try:
+        if not link:
+            raise ValueError("leak_scan_producer_unverified")
+        run = api.api("/actions/runs/" + link[1])
+        if (not isinstance(run, dict) or run.get("path") != SCAN_PATH or run.get("event") != "workflow_run"
+                or (run.get("head_repository") or {}).get("full_name") != api.repository
+                or run.get("status") != "completed" or not _SHA.fullmatch(str(run.get("head_sha") or ""))):
+            raise ValueError("leak_scan_producer_unverified")
+        ref = run["head_sha"]
+        if api.file(SCAN_PATH, ref) != trusted or any(
+                api.file(path, ref) != (root / path).read_text() for path in SCAN_SCRIPTS):
+            raise ValueError("leak_scan_producer_unverified")
+    except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError):
+        return ([_row("leak-scan:trusted-producer", source_sha=head, reason="leak_scan_producer_unverified",
+                      check_run_id=check.get("id"))],
+                ["producer_definition_unverified", "leak_scan_producer_unverified"], False)
+    summary = str((check.get("output") or {}).get("summary") or "")
+    conclusion = check.get("conclusion")
+    executed = ((conclusion == "success" and SCAN_CLEAN in summary)
+                or (conclusion == "failure" and SCAN_MATCH in summary))
+    status = "pass" if conclusion == "success" else "fail" if conclusion == "failure" else "skipped"
+    return ([_row(SCAN_TITLE, status, executed, head, run_id=run["id"], check_run_id=check.get("id"),
+                  attempt=run.get("run_attempt", 1), workflow_ref=ref,
+                  workflow_sha256=hashlib.sha256(trusted.encode("utf-8")).hexdigest(), equivalent=False,
+                  producer_acceptance=None)], [], False)
 
 
 def _excerpt(logs):
@@ -240,8 +298,6 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
     rust_text = (root / ".github/workflows/rust.yml").read_text()
     rust_pr_required = bool(source.get("pulls")) and not _markdown_filtered(rust_text, "pull_request")
     producers = ["drift-input"] + (["rust"] if not markdown_only or rust_pr_required else [])
-    if source.get("pulls"):
-        producers.append("leak-guard")
     for producer in producers:
         try:
             path, trusted, expected, acceptance = _definition(api, source, producer, root)
@@ -254,7 +310,7 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
             limits.append("producer_definition_owner_accepted_" + producer.replace("-", "_"))
         candidates = [r for r in runs if _candidate_run(r, source, api, producer)
                       and (r.get("event") == "pull_request"
-                           if producer == "leak-guard" or producer == "rust" and rust_pr_required else True)]
+                           if producer == "rust" and rust_pr_required else True)]
         equivalent = False
         if candidates:
             run = max(candidates, key=lambda r: (r.get("run_number", 0), r.get("run_attempt", 1)))
@@ -335,10 +391,13 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
                     ran = any(int(n) > 0 for n in re.findall(r"test result: ok\. (\d+) passed", witness))
                 elif kind == "unittest":
                     ran = any(int(n) > 0 for n in re.findall(r"Ran (\d+) tests?", witness))
-                elif kind == "scan":
-                    ran = ran and not _scan_skipped(witness)
             checks.append(_row(title, "pass" if status == "success" else "fail" if status == "failure" else "skipped",
                 ran, run["head_sha"], equivalent=equivalent, run_id=run["id"], job_id=job_id, attempt=run.get("run_attempt", 1),
                 workflow_ref=workflow_ref, workflow_sha256=hashlib.sha256(trusted.encode("utf-8")).hexdigest(),
                 producer_acceptance=acceptance))
+    if source.get("pulls"):
+        rows, scan_limits, scan_waiting = _trusted_scan(api, source, root)
+        checks += rows
+        limits += scan_limits
+        waiting = waiting or scan_waiting
     return checks, sorted(set(limits)), waiting
