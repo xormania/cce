@@ -281,8 +281,6 @@ pub enum AttemptOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StorageError {
-    /// The operation is not implemented yet.
-    NotImplemented(&'static str),
     InvalidRequest(String),
     /// A store already exists, or a required store is missing.
     StoreState(String),
