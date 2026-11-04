@@ -15,41 +15,52 @@ sys.path.insert(0, str(ROOT / "tools/ci"))
 import drift_ledger as ledger
 
 BASE = """
-version = 1
+version = 2
 [[question]]
 id = "Q1"
+rev = 1
 title = "Read-only mode"
 asked = "questions.md#1"
 [[question]]
 id = "Q2"
+rev = 1
 title = "Naming contract"
 asked = "questions.md#2"
 [[question]]
 id = "Q3"
+rev = 1
 title = "Bulk export"
 asked = "questions.md#3"
 affects = "the export request interface"
 [[question]]
 id = "Q4"
+rev = 1
 title = "Gate identity"
 asked = "questions.md#4"
 affects = "making the gate a required check"
 [[question]]
 id = "Q5"
+rev = 1
 title = "CI cadence"
 asked = "questions.md#5"
 [[answer]]
 id = "D1"
+rev = 1
 questions = ["Q1"]
 authority = "owner"
+recorded_by = "agent-r"
+quote = "owner words"
 outcome = "decided"
 given = "day 1"
 source = "decisions/one.md #1"
 summary = "Accept read-only mode"
 [[answer]]
 id = "D2"
+rev = 1
 questions = ["Q2"]
 authority = "owner"
+recorded_by = "agent-r"
+quote = "owner words"
 outcome = "deferred"
 given = "day 1"
 source = "decisions/one.md #2"
@@ -57,8 +68,11 @@ summary = "Deferred; compatible repairs proceed"
 forbids = ["ban punctuation in names", "shorter name limits"]
 [[answer]]
 id = "D5"
+rev = 1
 questions = ["Q5"]
 authority = "owner"
+recorded_by = "agent-r"
+quote = "owner words"
 outcome = "decided"
 given = "day 1"
 source = "decisions/one.md #5"
@@ -68,14 +82,17 @@ summary = "Run CI on every push"
 REQUIRED = """
 [[answer]]
 id = "R3"
+rev = 1
 questions = ["Q3"]
 authority = "requirement"
+recorded_by = "agent-r"
 outcome = "required"
 given = "brief"
 source = "brief S7"
 summary = "Bulk export is required"
 [[work]]
 id = "W3"
+rev = 1
 answer = "R3"
 summary = "Implement bulk export"
 owner = "agent-a"
@@ -136,13 +153,13 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual([(f["question"], f["line"]) for f in findings], [("Q1", 1)])
 
     def test_supersession_must_share_a_question(self):
-        text = BASE + '[[answer]]\nid="D9"\nquestions=["Q5"]\nauthority="owner"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\nsupersedes=["D1"]\n'
+        text = BASE + '[[answer]]\nid="D9"\nrev=1\nquestions=["Q5"]\nauthority="owner"\nrecorded_by="r"\nquote="q"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\nsupersedes=["D1"]\n'
         with self.assertRaises(ledger.LedgerError) as raised:
             ledger.load(text)
         self.assertTrue(str(raised.exception).startswith("supersession_across_questions"))
 
     def test_adoption_must_come_from_an_answer_to_that_question(self):
-        text = BASE + '[[proposal]]\nid="P4"\nquestions=["Q4"]\nby="a"\nsummary="s"\nstate="adopted"\nadopted_by=["D1"]\n'
+        text = BASE + '[[proposal]]\nid="P4"\nrev=1\nquestions=["Q4"]\nby="a"\nsummary="s"\nstate="adopted"\nadopted_by=["D1"]\n'
         current, findings = view(text)
         self.assertIn("proposal_adopted_without_answer", codes(findings))
         self.assertIn("Q4", questions(current["missing"]))
@@ -162,6 +179,7 @@ class ReplayTests(unittest.TestCase):
         text = BASE + """
 [[proposal]]
 id = "P2"
+rev = 1
 questions = ["Q2"]
 by = "agent-a"
 summary = "Forbid punctuation in names"
@@ -179,12 +197,14 @@ restricts = ["ban punctuation in names"]
         text = BASE + """
 [[work]]
 id = "W2"
+rev = 1
 answer = "D2"
 summary = "Precise errors and boundary tests"
 owner = "agent-a"
 state = "open"
 [[proposal]]
 id = "P2b"
+rev = 1
 questions = ["Q2"]
 by = "agent-a"
 summary = "Better error text"
@@ -198,6 +218,7 @@ state = "open"
         bad = BASE + """
 [[proposal]]
 id = "P4"
+rev = 1
 questions = ["Q4"]
 by = "agent-a"
 summary = "Bind to an app identity"
@@ -226,6 +247,7 @@ state = "adopted"
         text = BASE + """
 [[proposal]]
 id = "P4"
+rev = 1
 questions = ["Q4"]
 by = "agent-a"
 summary = "Recommend an app identity"
@@ -247,8 +269,11 @@ state = "open"
         later = """
 [[answer]]
 id = "D5b"
+rev = 1
 questions = ["Q5"]
 authority = "owner"
+recorded_by = "agent-r"
+quote = "owner words"
 outcome = "decided"
 given = "day 2"
 source = "board"
@@ -256,6 +281,7 @@ summary = "Run CI on pushes and fork pull requests only"
 supersedes = ["D5"]
 [[work]]
 id = "W5"
+rev = 1
 answer = "D5"
 summary = "Old CI rework"
 owner = "agent-a"
@@ -271,8 +297,11 @@ state = "open"
         later = """
 [[answer]]
 id = "D5b"
+rev = 1
 questions = ["Q5"]
 authority = "owner"
+recorded_by = "agent-r"
+quote = "owner words"
 outcome = "decided"
 given = "day 2"
 source = "board"
@@ -287,13 +316,17 @@ summary = "Run CI on pushes and fork pull requests only"
 class StructureTests(unittest.TestCase):
     def test_structural_defects_are_refused(self):
         cases = {
-            "unknown_question": BASE + '[[answer]]\nid="X"\nquestions=["Q9"]\nauthority="owner"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\n',
-            "supersession_cycle": BASE + '[[answer]]\nid="D5c"\nquestions=["Q5"]\nauthority="owner"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\nsupersedes=["D5d"]\n'
-                                  '[[answer]]\nid="D5d"\nquestions=["Q5"]\nauthority="owner"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\nsupersedes=["D5c"]\n',
-            "invalid_answer": BASE.replace('authority = "owner"\noutcome = "decided"\ngiven = "day 1"\nsource = "decisions/one.md #1"',
-                                           'authority = "owner"\noutcome = "required"\ngiven = "day 1"\nsource = "decisions/one.md #1"'),
-            "duplicate_identity": BASE + '[[question]]\nid="Q1"\ntitle="t"\nasked="a"\n',
-            "invalid_field:evidence": BASE + '[[work]]\nid="W9"\nanswer="D1"\nsummary="s"\nowner="o"\nstate="done"\n',
+            "unknown_question": BASE + '[[answer]]\nid="X"\nrev=1\nquestions=["Q9"]\nauthority="owner"\nrecorded_by="r"\nquote="q"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\n',
+            "supersession_cycle": BASE + '[[answer]]\nid="D5c"\nrev=1\nquestions=["Q5"]\nauthority="owner"\nrecorded_by="r"\nquote="q"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\nsupersedes=["D5d"]\n'
+                                  '[[answer]]\nid="D5d"\nrev=1\nquestions=["Q5"]\nauthority="owner"\nrecorded_by="r"\nquote="q"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\nsupersedes=["D5c"]\n',
+            "invalid_answer": BASE.replace('quote = "owner words"\noutcome = "decided"\ngiven = "day 1"\nsource = "decisions/one.md #1"',
+                                           'quote = "owner words"\noutcome = "required"\ngiven = "day 1"\nsource = "decisions/one.md #1"'),
+            "duplicate_identity": BASE + '[[question]]\nid="Q1"\nrev=1\ntitle="t"\nasked="a"\n',
+            "invalid_field:evidence": BASE + '[[work]]\nid="W9"\nrev=1\nanswer="D1"\nsummary="s"\nowner="o"\nstate="done"\n',
+            "invalid_revision": BASE + '[[question]]\nid="Q9"\ntitle="t"\nasked="a"\n',
+            "owner_words_missing": BASE + '[[answer]]\nid="D9"\nrev=1\nquestions=["Q4"]\nauthority="owner"\nrecorded_by="r"\noutcome="decided"\ngiven="d"\nsource="s"\nsummary="s"\n',
+            "invalid_field:reason": BASE + '[[work]]\nid="W9"\nrev=1\nanswer="D1"\nsummary="s"\nowner="o"\nstate="withdrawn"\n',
+            "invalid_work_successor": BASE + '[[work]]\nid="W9"\nrev=1\nanswer="D1"\nsummary="s"\nowner="o"\nstate="superseded"\nsuperseded_by="W9"\n',
         }
         for code, text in cases.items():
             with self.subTest(code=code):
@@ -316,6 +349,174 @@ class StructureTests(unittest.TestCase):
                                   "--root", str(root), "--ledger", "missing.toml"], capture_output=True, text=True)
             self.assertEqual(bad.returncode, 2)
             self.assertIn("ask the owner", bad.stdout)
+
+
+WORK = """
+[[work]]
+id = "W1"
+rev = 1
+answer = "D1"
+summary = "Implement read-only mode"
+owner = "agent-a"
+state = "open"
+"""
+
+
+def entry(text, eid):
+    return ledger._entries(ledger.load(text))[eid][1]
+
+
+class RecordTests(unittest.TestCase):
+    def test_open_work_under_a_replaced_answer_closes_without_deleting_history(self):
+        replaced = BASE + """
+[[answer]]
+id = "D5b"
+rev = 1
+questions = ["Q5"]
+authority = "owner"
+recorded_by = "agent-r"
+quote = "pushes and forks only"
+outcome = "decided"
+given = "day 2"
+source = "board"
+summary = "Run CI on pushes and fork pull requests only"
+supersedes = ["D5"]
+[[work]]
+id = "W5"
+rev = 1
+answer = "D5"
+summary = "Old CI rework"
+owner = "agent-a"
+state = "open"
+"""
+        _, findings = view(replaced)
+        self.assertIn("work_under_superseded_answer", codes(findings))
+        withdrawn = replaced.replace('state = "open"', 'state = "withdrawn"\nreason = "direction changed"')
+        current, findings = view(withdrawn)
+        self.assertEqual(findings, [])
+        self.assertEqual([(r["work"], r["state"]) for r in current["closed"]], [("W5", "withdrawn")])
+        successor = replaced.replace('state = "open"', 'state = "superseded"\nsuperseded_by = "W5b"') + """
+[[work]]
+id = "W5b"
+rev = 1
+answer = "D5b"
+summary = "CI rework for the new direction"
+owner = "agent-a"
+state = "open"
+"""
+        current, findings = view(successor)
+        self.assertEqual(findings, [])
+        self.assertEqual([r["work"] for r in current["work"]], ["W5b"])
+        self.assertEqual([(r["work"], r["why"]) for r in current["closed"]], [("W5", "W5b")])
+
+    def test_owner_answers_show_who_recorded_them_and_whether_the_words_survive(self):
+        text = BASE.replace('quote = "owner words"\noutcome = "decided"\ngiven = "day 1"\nsource = "decisions/one.md #1"',
+                            'quote_unavailable = "only the summary was kept"\noutcome = "decided"\ngiven = "day 1"\n'
+                            'source = "decisions/one.md #1"') + REQUIRED
+        current, findings = view(text)
+        self.assertEqual(findings, [])
+        out = ledger.render(current, findings, "test")
+        self.assertIn("recorded by agent-r; transcription only]", out.splitlines()[[i for i, l in enumerate(out.splitlines()) if l.startswith("- Q1 ")][0]])
+        self.assertNotIn("transcription only", [l for l in out.splitlines() if l.startswith("- Q5 ")][0])
+        both = BASE.replace('quote = "owner words"\noutcome = "decided"\ngiven = "day 1"\nsource = "decisions/one.md #1"',
+                            'quote = "owner words"\nquote_unavailable = "x"\noutcome = "decided"\ngiven = "day 1"\n'
+                            'source = "decisions/one.md #1"')
+        with self.assertRaises(ledger.LedgerError):
+            ledger.load(both)
+
+
+class UpdateTests(unittest.TestCase):
+    """A writer's change is applied onto the latest ledger by entry identity and revision."""
+
+    def merged(self, base, current, proposed):
+        text, conflicts = ledger.update(base, current, proposed)
+        self.assertEqual(conflicts, [])
+        return text
+
+    def conflict(self, base, current, proposed):
+        text, conflicts = ledger.update(base, current, proposed)
+        self.assertIsNone(text)
+        return [c["code"] for c in conflicts]
+
+    def test_unrelated_changes_by_two_writers_both_survive(self):
+        base = BASE + WORK
+        theirs = base + REQUIRED
+        ours = base.replace('state = "open"', 'state = "done"\nevidence = "pr 1"').replace('id = "W1"\nrev = 1', 'id = "W1"\nrev = 2')
+        text = self.merged(base, theirs, ours)
+        self.assertEqual(entry(text, "W1")["state"], "done")
+        self.assertIn("W3", ledger._entries(ledger.load(text)))
+        current, findings = view(text)
+        self.assertEqual(findings, [])
+
+    def test_stale_revision_is_refused_even_when_the_value_changed_back(self):
+        base = BASE + WORK
+        # Another writer changed W1 and changed it back (A -> B -> A): same visible value, newer revision.
+        theirs = base.replace('id = "W1"\nrev = 1', 'id = "W1"\nrev = 3')
+        ours = base.replace('state = "open"', 'state = "withdrawn"\nreason = "r"').replace('id = "W1"\nrev = 1', 'id = "W1"\nrev = 2')
+        self.assertEqual(self.conflict(base, theirs, ours), ["stale_revision"])
+        # Remedy: re-read the current ledger and reapply.
+        again = theirs.replace('state = "open"', 'state = "withdrawn"\nreason = "r"').replace('id = "W1"\nrev = 3', 'id = "W1"\nrev = 4')
+        self.assertEqual(entry(self.merged(theirs, theirs, again), "W1")["state"], "withdrawn")
+
+    def test_a_change_must_advance_the_revision(self):
+        base = BASE + WORK
+        ours = base.replace('state = "open"', 'state = "withdrawn"\nreason = "r"')
+        self.assertEqual(self.conflict(base, base, ours), ["revision_not_advanced"])
+
+    def test_answers_are_replaced_by_supersession_not_edited(self):
+        edited = BASE.replace('summary = "Accept read-only mode"', 'summary = "Decline read-only mode"')
+        self.assertEqual(self.conflict(BASE, BASE, edited), ["answer_modified"])
+        replacement = BASE + """
+[[answer]]
+id = "D1b"
+rev = 1
+questions = ["Q1"]
+authority = "owner"
+recorded_by = "agent-r"
+quote = "decline it"
+outcome = "decided"
+given = "day 2"
+source = "session"
+summary = "Decline read-only mode"
+supersedes = ["D1"]
+"""
+        current, _ = view(self.merged(BASE, BASE, replacement))
+        self.assertEqual([r["answer"] for r in current["decisions"] if r["question"] == "Q1"], ["D1b"])
+        self.assertEqual([h["answer"] for h in current["historical"]], ["D1"])
+
+    def test_entries_are_never_removed(self):
+        self.assertEqual(self.conflict(BASE + WORK, BASE + WORK, BASE), ["entry_removed"])
+
+    def test_retry_after_a_lost_response_is_a_no_op_and_a_reused_identity_is_refused(self):
+        published = self.merged(BASE, BASE, BASE + WORK)
+        self.assertEqual(ledger.load(self.merged(BASE, published, BASE + WORK)), ledger.load(published))
+        other = BASE + WORK.replace("Implement read-only mode", "Something else")
+        self.assertEqual(self.conflict(BASE, published, other), ["identity_reused"])
+        self.assertEqual(self.conflict(BASE, BASE, BASE + WORK.replace("rev = 1", "rev = 2")), ["new_entry_revision"])
+
+    def test_serialized_ledger_reads_back_identically(self):
+        text = BASE + REQUIRED + WORK + '[[question]]\nid = "Q8"\nrev = 1\ntitle = "Quote \\" and \\\\ and \\u00e9"\nasked = "a"\n'
+        model = ledger.load(text)
+        again = ledger.load(ledger.serialize(list(ledger._entries(model).values()), "# kept header"))
+        self.assertEqual(again, model)
+
+    def test_command_line_update_reports_conflicts_and_no_ops(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "base.toml").write_text(BASE + WORK)
+            (root / "current.toml").write_text((BASE + WORK).replace('id = "W1"\nrev = 1', 'id = "W1"\nrev = 2'))
+            (root / "ours.toml").write_text((BASE + WORK).replace('state = "open"', 'state = "withdrawn"\nreason = "r"')
+                                            .replace('id = "W1"\nrev = 1', 'id = "W1"\nrev = 2'))
+            command = [sys.executable, "-I", "-B", str(ROOT / "tools/ci/drift_ledger.py"), "update",
+                       "--base", str(root / "base.toml"), "--current", str(root / "current.toml"),
+                       "--proposed", str(root / "ours.toml"), "--out", str(root / "out.toml")]
+            stale = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(stale.returncode, 3)
+            self.assertIn("code=stale_revision, id=W1, expected_rev=1, found=rev 2", stale.stdout)
+            self.assertFalse((root / "out.toml").exists())
+            (root / "current.toml").write_text((root / "ours.toml").read_text())
+            done = subprocess.run(command, capture_output=True, text=True, check=True)
+            self.assertEqual(done.stdout.strip(), "unchanged")
 
 
 if __name__ == "__main__":

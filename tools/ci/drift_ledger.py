@@ -7,14 +7,28 @@ it never decides anything, never treats an agent proposal as an answer and never
 picks between answers by date. A later answer replaces an earlier one only when
 it names it in ``supersedes``.
 
-Command line (prints the current view):
+Every entry carries a revision ``rev`` that advances by one on each change, so a
+writer who read an older revision cannot overwrite a newer one even when the
+visible value looks the same. Answers are never edited: a change of direction is a
+new answer that names the old one in ``supersedes``. An owner answer recorded by
+someone else carries the owner's words (``quote``) or says why only a
+transcription survives (``quote_unavailable``).
+
+Command line:
 
     python3 -I drift_ledger.py view --root DIR --ledger PATH [--scan PATH ...]
+    python3 -I drift_ledger.py update --base FILE --current FILE --proposed FILE --out FILE
+
+``update`` applies a writer's changes (``proposed`` against the ``base`` they read)
+onto the ``current`` published ledger. Unrelated changes by others are kept, a
+change to an entry someone else changed since ``base`` is refused as stale, and
+re-applying changes that are already published is a no-op.
 """
 from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import re
 import sys
@@ -22,7 +36,11 @@ import tomllib
 
 AUTHORITIES = frozenset({"owner", "requirement"})
 OUTCOMES = frozenset({"decided", "deferred", "declined", "required"})
-WORK_STATES = frozenset({"open", "done"})
+VERSION = 2
+KINDS = (("question", "questions"), ("answer", "answers"), ("work", "work"), ("proposal", "proposals"))
+# Work leaves "open" by completion (with evidence), withdrawal (with a reason) or replacement (naming
+# its successor); no state is a dead end and none needs history to be deleted.
+WORK_STATES = frozenset({"open", "done", "withdrawn", "superseded"})
 PROPOSAL_STATES = frozenset({"open", "withdrawn", "adopted"})
 MAX_ITEMS = 500
 MAX_TEXT = 2000
@@ -75,10 +93,10 @@ def load(text):
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         raise LedgerError("invalid_toml") from error
-    if data.get("version") != 1:
+    if data.get("version") != VERSION:
         raise LedgerError("unsupported_version")
     model = {"questions": {}, "answers": {}, "work": {}, "proposals": {}}
-    for kind, key in (("question", "questions"), ("answer", "answers"), ("work", "work"), ("proposal", "proposals")):
+    for kind, key in KINDS:
         rows = data.get(kind, [])
         if not isinstance(rows, list) or len(rows) > MAX_ITEMS:
             raise LedgerError("invalid_section:" + kind)
@@ -87,6 +105,9 @@ def load(text):
                 raise LedgerError("invalid_identity:" + kind)
             if any(row["id"] in model[other] for other in model):
                 raise LedgerError("duplicate_identity:" + row["id"])
+            rev = row.get("rev")
+            if type(rev) is not int or not 1 <= rev <= 1_000_000:
+                raise LedgerError("invalid_revision:" + row["id"])
             model[key][row["id"]] = row
     for q in model["questions"].values():
         _text(q, "title")
@@ -98,8 +119,12 @@ def load(text):
             raise LedgerError("invalid_answer:" + a["id"])
         if a["outcome"] == "required" and a["authority"] != "requirement":
             raise LedgerError("invalid_answer:" + a["id"])
-        for key in ("given", "source", "summary"):
+        for key in ("given", "source", "summary", "recorded_by"):
             _text(a, key)
+        quote, unavailable = _text(a, "quote", required=False), _text(a, "quote_unavailable", required=False)
+        if a["authority"] == "owner" and bool(quote.strip()) == bool(unavailable.strip()):
+            # The owner's own words, or an explicit statement that only a transcription survives.
+            raise LedgerError("owner_words_missing:" + a["id"])
         _terms(a, "forbids")
         if not _ids(a, "questions"):
             raise LedgerError("answer_without_question:" + a["id"])
@@ -118,6 +143,11 @@ def load(text):
         for key in ("summary", "owner"):
             _text(w, key)
         _text(w, "evidence", required=w["state"] == "done")
+        _text(w, "reason", required=w["state"] == "withdrawn")
+        successor = w.get("superseded_by")
+        if w["state"] == "superseded" or successor is not None:
+            if w["state"] != "superseded" or successor not in model["work"] or successor == w["id"]:
+                raise LedgerError("invalid_work_successor:" + w["id"])
     for p in model["proposals"].values():
         if p.get("state") not in PROPOSAL_STATES:
             raise LedgerError("invalid_proposal:" + p["id"])
@@ -157,7 +187,7 @@ def resolve(model):
     superseded = {old for a in answers.values() for old in a.get("supersedes", [])}
     current = {qid: [a for a in answers.values() if qid in a["questions"] and a["id"] not in superseded]
                for qid in model["questions"]}
-    view = {"decisions": [], "required": [], "work": [], "done": [], "proposals": [],
+    view = {"decisions": [], "required": [], "work": [], "done": [], "closed": [], "proposals": [],
             "missing": [], "historical": [], "conflicts": []}
     for qid, question in model["questions"].items():
         live = current[qid]
@@ -182,6 +212,7 @@ def resolve(model):
         row = {"question": qid, "title": question["title"], "answer": answer["id"],
                "authority": answer["authority"], "outcome": answer["outcome"], "summary": answer["summary"],
                "given": answer["given"], "source": answer["source"], "forbids": answer.get("forbids", []),
+               "recorded_by": answer["recorded_by"], "quoted": bool(answer.get("quote", "").strip()),
                "supersedes": answer.get("supersedes", [])}
         (view["required"] if answer["authority"] == "requirement" else view["decisions"]).append(row)
     for aid in sorted(superseded):
@@ -190,11 +221,13 @@ def resolve(model):
         view["historical"].append({"answer": aid, "questions": a["questions"], "summary": a["summary"],
                                    "superseded_by": by})
     for w in model["work"].values():
-        if w["answer"] in superseded:
+        if w["state"] == "open" and w["answer"] in superseded:
+            # Open work under a replaced answer: finish, withdraw or supersede it explicitly.
             findings.append({"code": "work_under_superseded_answer", "work": w["id"], "answer": w["answer"]})
-        (view["work"] if w["state"] == "open" else view["done"]).append(
-            {"work": w["id"], "answer": w["answer"], "summary": w["summary"], "owner": w["owner"],
-             "evidence": w.get("evidence", "")})
+        row = {"work": w["id"], "answer": w["answer"], "summary": w["summary"], "owner": w["owner"],
+               "evidence": w.get("evidence", ""), "state": w["state"],
+               "why": w.get("reason", "") or w.get("superseded_by", "")}
+        {"open": view["work"], "done": view["done"]}.get(w["state"], view["closed"]).append(row)
     for p in model["proposals"].values():
         if p["state"] == "withdrawn":
             continue
@@ -281,8 +314,9 @@ def render(view, findings, provenance):
         out.extend("- " + fmt(row) for row in rows) if rows else out.append("- none")
         out.append("")
 
-    section("Owner decisions", view["decisions"], lambda r: "{q} {o} by {a} ({g}): {s} [{src}]{f}".format(
+    section("Owner decisions", view["decisions"], lambda r: "{q} {o} by {a} ({g}): {s} [{src}; recorded by {rb}{t}]{f}".format(
         q=r["question"], o=r["outcome"], a=r["answer"], g=r["given"], s=r["summary"], src=r["source"],
+        rb=r["recorded_by"], t="" if r["quoted"] else "; transcription only",
         f=(" Must not become: " + "; ".join(r["forbids"])) if r["forbids"] else ""))
     section("Required by the owner's requirements (implement; no approval needed)", view["required"],
             lambda r: "{q} {a}: {s} [{src}]".format(q=r["question"], a=r["answer"], s=r["summary"], src=r["source"]))
@@ -300,9 +334,109 @@ def render(view, findings, provenance):
         a=r["answer"], q=", ".join(r["questions"]), b=", ".join(r["superseded_by"]), s=r["summary"]))
     section("Completed work", view["done"], lambda r: "{w} ({a}): {s} [{e}]".format(
         w=r["work"], a=r["answer"], s=r["summary"], e=r["evidence"]))
+    section("Closed work (withdrawn or superseded)", view["closed"], lambda r: "{w} ({a}) {st}: {s} [{y}]".format(
+        w=r["work"], a=r["answer"], st=r["state"], s=r["summary"], y=r["why"]))
     section("Record findings", findings, lambda r: ", ".join(k + "=" + (",".join(v) if isinstance(v, list) else str(v))
                                                             for k, v in r.items()))
     return "\n".join(out)
+
+
+def _entries(model):
+    """Map each identity to (kind, row), in file order within each kind."""
+    return {row["id"]: (kind, row) for kind, key in KINDS for row in model[key].values()}
+
+
+def _value(value):
+    if isinstance(value, bool) or not isinstance(value, (str, int, list)):
+        raise LedgerError("unserializable_value")
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_value(v) for v in value) + "]"
+    # A JSON string is a valid TOML basic string (same escapes, \uXXXX for control characters).
+    return json.dumps(value, ensure_ascii=False)
+
+
+def serialize(entries, header=""):
+    """Write entries (kind, row) as a ledger; parsing the result gives the same rows back."""
+    out = [header.rstrip("\n")] if header.strip() else []
+    out.append("version = " + str(VERSION))
+    for kind, _ in KINDS:
+        for k, row in entries:
+            if k != kind:
+                continue
+            out.append("")
+            out.append("[[" + kind + "]]")
+            out.extend(key + " = " + _value(val) for key, val in row.items())
+    return "\n".join(out) + "\n"
+
+
+def _header(text):
+    lines = []
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def update(base_text, current_text, proposed_text):
+    """Apply a writer's changes onto the current ledger.
+
+    ``base`` is the ledger the writer read, ``proposed`` the writer's edited copy of it and
+    ``current`` the latest published ledger. Returns (merged text, conflicts). With conflicts the
+    merged text is None and nothing may be published; each conflict names the entry and remedy.
+    The comparison is by entry identity and full content, including ``rev``, so an entry that
+    changed and changed back (A -> B -> A) still counts as changed.
+    """
+    base, current, proposed = (_entries(load(t)) for t in (base_text, current_text, proposed_text))
+    conflicts = []
+    changed = {}
+    for eid in list(base) + [e for e in proposed if e not in base]:
+        b, p = base.get(eid), proposed.get(eid)
+        if b == p:
+            continue
+        c = current.get(eid)
+        if p is None:
+            conflicts.append({"code": "entry_removed", "id": eid,
+                              "remedy": "keep the entry; close it with a state or supersede it"})
+            continue
+        if b is None:
+            if p[1]["rev"] != 1:
+                conflicts.append({"code": "new_entry_revision", "id": eid, "remedy": "a new entry starts at rev 1"})
+            elif c is not None and c != p:
+                conflicts.append({"code": "identity_reused", "id": eid,
+                                  "remedy": "the identity is already published with other content; use a new one"})
+            else:
+                changed[eid] = p
+            continue
+        if b[0] != p[0]:
+            conflicts.append({"code": "kind_changed", "id": eid, "remedy": "record a new entry"})
+        elif b[0] == "answer":
+            conflicts.append({"code": "answer_modified", "id": eid,
+                              "remedy": "record a new answer that names this one in supersedes"})
+        elif p[1]["rev"] != b[1]["rev"] + 1:
+            conflicts.append({"code": "revision_not_advanced", "id": eid,
+                              "remedy": "set rev to " + str(b[1]["rev"] + 1)})
+        elif c == p:
+            changed[eid] = p
+        elif c != b:
+            conflicts.append({"code": "stale_revision", "id": eid, "expected_rev": b[1]["rev"],
+                              "found": "removed" if c is None else "rev " + str(c[1]["rev"]),
+                              "remedy": "re-read the current ledger and reapply this change"})
+        else:
+            changed[eid] = p
+    if conflicts:
+        return None, conflicts
+    merged = [changed.get(eid, entry) for eid, entry in current.items()]
+    merged += [changed[eid] for eid in changed if eid not in current]
+    text = serialize(merged, _header(current_text) or _header(proposed_text))
+    try:
+        resolve(load(text))
+    except LedgerError as error:
+        return None, [{"code": "merged_ledger_invalid", "id": str(error),
+                       "remedy": "re-read the current ledger; a change you rely on was altered"}]
+    return text, []
 
 
 def _inside(root, path):
@@ -318,7 +452,12 @@ def main(argv=None):
     view_cmd.add_argument("--ledger", required=True)
     view_cmd.add_argument("--scan", action="append", default=[])
     view_cmd.add_argument("--provenance", default="")
+    update_cmd = sub.add_parser("update")
+    for name in ("--base", "--current", "--proposed", "--out"):
+        update_cmd.add_argument(name, required=True)
     args = parser.parse_args(argv)
+    if args.command == "update":
+        return _update_command(args)
     ledger = _inside(args.root, args.ledger)
     if not ledger:
         parser.error("ledger must be inside --root")
@@ -337,6 +476,25 @@ def main(argv=None):
     view, findings = resolve(model)
     findings += scan(model, view, documents)
     print(render(view, findings, args.provenance or "Source: " + args.ledger))
+    return 0
+
+
+def _update_command(args):
+    """Exit 0: merged ledger written ("updated", or "unchanged" when already published); 3: conflicts; 2: invalid input."""
+    try:
+        texts = [open(path, encoding="utf-8").read() for path in (args.base, args.current, args.proposed)]
+        merged, conflicts = update(*texts)
+    except (OSError, LedgerError) as error:
+        print("invalid ledger input: " + str(error))
+        return 2
+    if conflicts:
+        for c in conflicts:
+            print("conflict: " + ", ".join(k + "=" + str(v) for k, v in c.items()))
+        return 3
+    with open(args.out, "w", encoding="utf-8") as stream:
+        stream.write(merged)
+    # A retry after a lost publication response finds its changes already present.
+    print("unchanged" if tomllib.loads(merged) == tomllib.loads(texts[1]) else "updated")
     return 0
 
 

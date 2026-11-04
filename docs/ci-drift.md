@@ -212,6 +212,27 @@ never an answer, a proposal that would impose a restriction a deferral excludes
 is flagged, and an unanswered question must name the operation it blocks. The
 same module prints the current view for agents (`drift_ledger.py view`).
 
+Ledger format 2 records who recorded each answer (`recorded_by`). An owner answer
+also carries the owner's words (`quote`), or says why only a transcription
+survives (`quote_unavailable`). Work closes as `done` (with evidence),
+`withdrawn` (with a reason) or `superseded` (naming its successor). Open work
+under a replaced answer is reported, so it is never left behind silently.
+
+Every entry has a revision `rev`. Writers publish through
+`drift_ledger.py update --base READ --current LATEST --proposed EDITED --out FILE`.
+It applies the writer's changes onto the latest ledger by entry identity and
+keeps other writers' unrelated changes. It refuses:
+
+- a change to an entry that someone else changed since it was read (stale
+  revision, even if the value was changed back);
+- a change that does not advance `rev` by one;
+- an edited answer (record a new answer that supersedes it instead);
+- a removed entry;
+- an identity reused with different content.
+
+Re-applying changes that are already published reports `unchanged`, so a retry
+after a lost response has no duplicate effect.
+
 Each finding (for example a document line presenting a settled question as still
 waiting for the owner) becomes one private packet. It contains only:
 

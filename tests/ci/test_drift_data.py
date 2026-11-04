@@ -251,28 +251,36 @@ if __name__ == "__main__":
 
 
 LEDGER = """
-version = 1
+version = 2
 [[question]]
 id = "Q1"
+rev = 1
 title = "Read-only mode"
 asked = "records/questions.md#1"
 [[question]]
 id = "Q2"
+rev = 1
 title = "Gate identity"
 asked = "records/questions.md#2"
 affects = "making the gate required"
 [[answer]]
 id = "D1"
+rev = 1
 questions = ["Q1"]
 authority = "owner"
+recorded_by = "agent-r"
+quote = "owner words"
 outcome = "decided"
 given = "day 1"
 source = "records/decisions.md #1"
 summary = "Decline read-only mode"
 [[answer]]
 id = "D1b"
+rev = 1
 questions = ["Q1"]
 authority = "owner"
+recorded_by = "agent-r"
+quote = "owner words"
 outcome = "decided"
 given = "day 2"
 source = "records/board.md"
