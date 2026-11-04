@@ -2823,3 +2823,488 @@ pub(crate) fn sampled_cuts(transitions: &[Op], bounds: &[u64], n: u64, seed: u64
         })
         .collect()
 }
+
+// ---------------------------------------------------------------------------------------------
+// Operation sequences from bytes: the `ops` fuzz target.
+//
+// The first byte selects how the sequence is run: to completion, or interrupted once like the
+// crash and I/O-failure campaigns (a crash after a mutating operation, a failing operation with
+// sync failures lossy or not, or a failing staging write right after a publication), with the
+// operation chosen by the next two bytes. The rest is a sequence of at most `BYTE_OPS` steps: a
+// tag byte picks the step with the weights of the mixed generator, and its fields follow, each one
+// byte drawn from the same ranges. Exhausted input reads as zeros and ends the sequence at the
+// next tag. Every step runs the same checks as the generated sequences.
+// ---------------------------------------------------------------------------------------------
+
+/// Most steps one input runs.
+pub(crate) const BYTE_OPS: usize = 64;
+
+/// How an input's sequence is run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ByteRun {
+    Complete,
+    /// A crash after the selected mutating operation (modulo the sequence's total).
+    Crash {
+        cut: u16,
+    },
+    /// The operation after the selected one fails, then the store keeps running (`live`).
+    Failure {
+        cut: u16,
+        lossy: bool,
+        live: bool,
+    },
+    /// A staging write right after the selected publication fails.
+    AfterPublication {
+        pick: u16,
+        live: bool,
+    },
+}
+
+struct ByteReader<'a>(&'a [u8]);
+
+impl ByteReader<'_> {
+    fn next(&mut self) -> Option<u8> {
+        let (b, rest) = self.0.split_first()?;
+        self.0 = rest;
+        Some(*b)
+    }
+
+    fn byte(&mut self) -> u8 {
+        self.next().unwrap_or(0)
+    }
+
+    fn u16(&mut self) -> u16 {
+        u16::from_le_bytes([self.byte(), self.byte()])
+    }
+
+    fn below(&mut self, n: usize) -> u8 {
+        (self.byte() as usize % n) as u8
+    }
+
+    fn expect(&mut self) -> ExpectSpec {
+        match self.byte() % 12 {
+            0..=5 => ExpectSpec::Any,
+            6 | 7 => ExpectSpec::Absent,
+            8..=10 => ExpectSpec::Current,
+            _ => ExpectSpec::Wrong,
+        }
+    }
+
+    fn content_spec(&mut self) -> ContentSpec {
+        ContentSpec {
+            seed: self.below(12),
+            size: self.byte(),
+        }
+    }
+
+    fn content_pick(&mut self) -> ContentPick {
+        match self.byte() % 7 {
+            0..=3 => ContentPick::Fresh(self.content_spec()),
+            4 => ContentPick::SameStaging(self.byte()),
+            _ => ContentPick::Staged(self.byte()),
+        }
+    }
+
+    fn change(&mut self) -> ChangeSpec {
+        let n = CONTEXTS.len();
+        match self.byte() % 13 {
+            0..=4 => ChangeSpec::PutContext {
+                ctx: self.below(n),
+                expect: self.expect(),
+                body: self.byte(),
+                content: (self.byte() % 10 < 4).then(|| self.content_pick()),
+            },
+            5 | 6 => ChangeSpec::RemoveContext {
+                ctx: self.below(n),
+                expect: self.expect(),
+            },
+            7..=10 => ChangeSpec::PutRelationship {
+                rel: self.below(RELATIONSHIPS),
+                expect: self.expect(),
+                kind: self.below(KINDS.len()),
+                source: self.below(n),
+                target: self.below(n),
+            },
+            _ => ChangeSpec::RemoveRelationship {
+                rel: self.below(RELATIONSHIPS),
+                expect: self.expect(),
+            },
+        }
+    }
+
+    fn read(&mut self) -> ReadSpec {
+        let n = CONTEXTS.len();
+        match self.byte() % 6 {
+            0 | 1 => ReadSpec::Context(self.below(n)),
+            2..=4 => ReadSpec::Relationships {
+                from: self.below(n),
+                outgoing: self.byte() & 1 == 1,
+                kind: match self.byte() as usize % (KINDS.len() + 1) {
+                    0 => None,
+                    k => Some((k - 1) as u8),
+                },
+                page: self.below(4),
+            },
+            _ => ReadSpec::Content(self.below(n)),
+        }
+    }
+
+    fn reads(&mut self, most: usize) -> Vec<ReadSpec> {
+        (0..self.byte() as usize % (most + 1))
+            .map(|_| self.read())
+            .collect()
+    }
+
+    fn request(&mut self) -> RequestSpec {
+        RequestSpec {
+            changes: (0..1 + self.byte() as usize % 3)
+                .map(|_| self.change())
+                .collect(),
+            evidence: (0..self.byte() as usize % 3).map(|_| self.byte()).collect(),
+            quiesce: self.byte().is_multiple_of(10),
+            reads: self.reads(2),
+        }
+    }
+
+    fn op(&mut self, tag: u8) -> Op {
+        match tag % OP_WEIGHTS {
+            0..=11 => Op::Commit(self.request()),
+            12..=16 => Op::CommitFromHeld {
+                slot: self.byte(),
+                request: self.request(),
+            },
+            17 | 18 => Op::SubmitAndPoll(self.request()),
+            19 | 20 => Op::Retry {
+                pick: self.byte(),
+                identical: self.byte() & 1 == 1,
+            },
+            21..=24 => Op::Hold(self.reads_nonempty(3)),
+            25 | 26 => Op::ReadHeld {
+                slot: self.byte(),
+                reads: self.reads_nonempty(2),
+            },
+            27 => Op::Release(self.byte()),
+            28 | 29 => Op::Stage(self.content_spec()),
+            30 | 31 => Op::Discard {
+                pick: self.byte(),
+                refused: self.byte() % 10 < 3,
+            },
+            32..=34 => Op::Check,
+            _ => Op::Reopen,
+        }
+    }
+
+    fn reads_nonempty(&mut self, most: usize) -> Vec<ReadSpec> {
+        (0..1 + self.byte() as usize % most)
+            .map(|_| self.read())
+            .collect()
+    }
+}
+
+/// The sum of the step weights (the tag ranges in `ByteReader::op`).
+const OP_WEIGHTS: u8 = 36;
+
+/// Decodes an input into how to run it and its steps.
+pub(crate) fn ops_from_bytes(data: &[u8]) -> (ByteRun, Vec<Op>) {
+    let mut r = ByteReader(data);
+    let mode = r.byte();
+    let live = mode & 8 != 0;
+    let run = match mode % 8 {
+        0..=3 => ByteRun::Complete,
+        4 => ByteRun::Crash { cut: r.u16() },
+        5 | 6 => ByteRun::Failure {
+            cut: r.u16(),
+            lossy: mode % 8 == 6,
+            live,
+        },
+        _ => ByteRun::AfterPublication {
+            pick: r.u16(),
+            live,
+        },
+    };
+    let mut ops = Vec::new();
+    while ops.len() < BYTE_OPS {
+        let Some(tag) = r.next() else { break };
+        ops.push(r.op(tag));
+    }
+    (run, ops)
+}
+
+/// Encodes a run and steps as an input that `ops_from_bytes` decodes to the same (for seeds).
+pub(crate) fn ops_to_bytes(run: ByteRun, ops: &[Op]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let live = |l: bool| if l { 8 } else { 0 };
+    match run {
+        ByteRun::Complete => out.push(0),
+        ByteRun::Crash { cut } => {
+            out.push(4);
+            out.extend(cut.to_le_bytes());
+        }
+        ByteRun::Failure {
+            cut,
+            lossy,
+            live: l,
+        } => {
+            out.push(if lossy { 6 } else { 5 } | live(l));
+            out.extend(cut.to_le_bytes());
+        }
+        ByteRun::AfterPublication { pick, live: l } => {
+            out.push(7 | live(l));
+            out.extend(pick.to_le_bytes());
+        }
+    }
+    for op in ops.iter().take(BYTE_OPS) {
+        put_op(&mut out, op);
+    }
+    out
+}
+
+fn put_expect(out: &mut Vec<u8>, e: ExpectSpec) {
+    out.push(match e {
+        ExpectSpec::Any => 0,
+        ExpectSpec::Absent => 6,
+        ExpectSpec::Current => 8,
+        ExpectSpec::Wrong => 11,
+    });
+}
+
+fn put_content_spec(out: &mut Vec<u8>, c: ContentSpec) {
+    out.extend([c.seed, c.size]);
+}
+
+fn put_change(out: &mut Vec<u8>, c: &ChangeSpec) {
+    match c {
+        ChangeSpec::PutContext {
+            ctx,
+            expect,
+            body,
+            content,
+        } => {
+            out.push(0);
+            out.push(*ctx);
+            put_expect(out, *expect);
+            out.push(*body);
+            match content {
+                None => out.push(9),
+                Some(p) => {
+                    out.push(0);
+                    match p {
+                        ContentPick::Fresh(s) => {
+                            out.push(0);
+                            put_content_spec(out, *s);
+                        }
+                        ContentPick::SameStaging(k) => out.extend([4, *k]),
+                        ContentPick::Staged(k) => out.extend([5, *k]),
+                    }
+                }
+            }
+        }
+        ChangeSpec::RemoveContext { ctx, expect } => {
+            out.extend([5, *ctx]);
+            put_expect(out, *expect);
+        }
+        ChangeSpec::PutRelationship {
+            rel,
+            expect,
+            kind,
+            source,
+            target,
+        } => {
+            out.extend([7, *rel]);
+            put_expect(out, *expect);
+            out.extend([*kind, *source, *target]);
+        }
+        ChangeSpec::RemoveRelationship { rel, expect } => {
+            out.extend([11, *rel]);
+            put_expect(out, *expect);
+        }
+    }
+}
+
+fn put_read(out: &mut Vec<u8>, r: &ReadSpec) {
+    match r {
+        ReadSpec::Context(c) => out.extend([0, *c]),
+        ReadSpec::Relationships {
+            from,
+            outgoing,
+            kind,
+            page,
+        } => out.extend([
+            2,
+            *from,
+            u8::from(*outgoing),
+            kind.map_or(0, |k| k + 1),
+            *page,
+        ]),
+        ReadSpec::Content(c) => out.extend([5, *c]),
+    }
+}
+
+fn put_request(out: &mut Vec<u8>, r: &RequestSpec) {
+    out.push(r.changes.len().clamp(1, 3) as u8 - 1);
+    for c in r.changes.iter().take(3) {
+        put_change(out, c);
+    }
+    out.push(r.evidence.len().min(2) as u8);
+    out.extend(r.evidence.iter().take(2));
+    out.push(if r.quiesce { 0 } else { 1 });
+    out.push(r.reads.len().min(2) as u8);
+    for x in r.reads.iter().take(2) {
+        put_read(out, x);
+    }
+}
+
+fn put_reads_nonempty(out: &mut Vec<u8>, reads: &[ReadSpec], most: usize) {
+    let n = reads.len().clamp(1, most);
+    out.push(n as u8 - 1);
+    for x in reads.iter().take(n) {
+        put_read(out, x);
+    }
+    // An empty list cannot be encoded: it reads as one context read.
+    if reads.is_empty() {
+        put_read(out, &ReadSpec::Context(0));
+    }
+}
+
+fn put_op(out: &mut Vec<u8>, op: &Op) {
+    match op {
+        Op::Commit(r) => {
+            out.push(0);
+            put_request(out, r);
+        }
+        Op::CommitFromHeld { slot, request } => {
+            out.extend([12, *slot]);
+            put_request(out, request);
+        }
+        Op::SubmitAndPoll(r) => {
+            out.push(17);
+            put_request(out, r);
+        }
+        Op::Retry { pick, identical } => out.extend([19, *pick, u8::from(*identical)]),
+        Op::Hold(reads) => {
+            out.push(21);
+            put_reads_nonempty(out, reads, 3);
+        }
+        Op::ReadHeld { slot, reads } => {
+            out.extend([25, *slot]);
+            put_reads_nonempty(out, reads, 2);
+        }
+        Op::Release(s) => out.extend([27, *s]),
+        Op::Stage(c) => {
+            out.push(28);
+            put_content_spec(out, *c);
+        }
+        Op::Discard { pick, refused } => out.extend([30, *pick, if *refused { 0 } else { 9 }]),
+        Op::Check => out.push(32),
+        Op::Reopen => out.push(35),
+    }
+}
+
+/// The `ops` fuzz target: decodes `data` and runs its sequence against the model, completely or
+/// interrupted once; any disagreement panics.
+pub(crate) fn run_bytes(data: &[u8]) {
+    let (run, ops) = ops_from_bytes(data);
+    if run == ByteRun::Complete {
+        let mut m = Model::default();
+        let mut e = Engine::init(false);
+        for op in ops {
+            m = Model::apply(m, &op);
+            e = Engine::apply(e, &m, op);
+        }
+        Engine::teardown(e, m);
+        return;
+    }
+    let bounds = boundaries(&ops);
+    let total = bounds.last().copied().unwrap_or(0);
+    if total == 0 {
+        return;
+    }
+    match run {
+        ByteRun::Complete => unreachable!("handled above"),
+        ByteRun::Crash { cut } => crash_at(&ops, &bounds, u64::from(cut) % total),
+        ByteRun::Failure { cut, lossy, live } => {
+            fail_at(&ops, &bounds, u64::from(cut) % total, lossy, live, false)
+        }
+        ByteRun::AfterPublication { pick, live } => {
+            let ends = publication_ends(&ops, &bounds, None);
+            if let Some(&cut) = ends.get(usize::from(pick) % ends.len().max(1)) {
+                fail_at(&ops, &bounds, cut, false, live, true);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exact regressions: shrunk counterexamples, replayed by the model tests and saved as seeds of
+// the `ops` fuzz target.
+// ---------------------------------------------------------------------------------------------
+
+pub(crate) fn put(ctx: u8, body: u8) -> ChangeSpec {
+    ChangeSpec::PutContext {
+        ctx,
+        expect: ExpectSpec::Any,
+        body,
+        content: None,
+    }
+}
+
+pub(crate) fn remove(ctx: u8) -> ChangeSpec {
+    ChangeSpec::RemoveContext {
+        ctx,
+        expect: ExpectSpec::Any,
+    }
+}
+
+pub(crate) fn plain(changes: Vec<ChangeSpec>) -> RequestSpec {
+    RequestSpec {
+        changes,
+        evidence: Vec::new(),
+        quiesce: false,
+        reads: Vec::new(),
+    }
+}
+
+/// A removal leaves a small leaf beside a sibling too large to merge with.
+pub(crate) fn merge_skip_sequence() -> Vec<Op> {
+    vec![
+        Op::Commit(plain(vec![put(2, 3), put(6, 3), put(8, 0), put(9, 3)])),
+        Op::Commit(plain(vec![
+            put(2, 0),
+            ChangeSpec::PutRelationship {
+                rel: 0,
+                expect: ExpectSpec::Any,
+                kind: 0,
+                source: 0,
+                target: 3,
+            },
+        ])),
+        Op::CommitFromHeld {
+            slot: 126,
+            request: plain(vec![put(0, 227), remove(2), put(4, 114), put(7, 151)]),
+        },
+        Op::Commit(plain(vec![put(4, 239)])),
+        Op::Commit(plain(vec![put(2, 142)])),
+        Op::CommitFromHeld {
+            slot: 118,
+            request: plain(vec![remove(0), put(1, 75), remove(7)]),
+        },
+    ]
+}
+
+/// One commit binds the same staging twice (two records, one handle).
+pub(crate) fn double_binding_sequence() -> Vec<Op> {
+    vec![Op::Commit(plain(vec![
+        ChangeSpec::PutContext {
+            ctx: 0,
+            expect: ExpectSpec::Any,
+            body: 0,
+            content: Some(ContentPick::Fresh(ContentSpec { seed: 0, size: 0 })),
+        },
+        ChangeSpec::PutContext {
+            ctx: 1,
+            expect: ExpectSpec::Any,
+            body: 0,
+            content: Some(ContentPick::SameStaging(0)),
+        },
+    ]))]
+}

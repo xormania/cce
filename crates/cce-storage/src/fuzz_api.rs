@@ -1,5 +1,6 @@
-//! Fuzzing harness: one entry point per decoder of stored bytes, and one that opens a whole store
-//! image read-only and reads everything it can reach. For any input each entry point must return —
+//! Fuzzing harness: one entry point per decoder of stored bytes, one that opens a whole store
+//! image read-only and reads everything it can reach, and one that runs operation sequences
+//! against the logical model. For any input each entry point must return —
 //! with or without an error — and never panic, hang or allocate beyond what its input bounds.
 //! Decoders that accept an input must also re-encode it to an equal value.
 //!
@@ -46,6 +47,7 @@ pub const TARGETS: &[(&str, Harness)] = &[
     ("history", history),
     ("records", records),
     ("image", image),
+    ("ops", ops),
 ];
 
 fn le_u64(data: &[u8], at: usize) -> u64 {
@@ -223,4 +225,11 @@ fn read_context(v: &mut NativeView, id: &ContextId, budget: &mut usize) {
             for _ in rels.take(MAX_LISTED) {}
         }
     }
+}
+
+/// An operation sequence decoded from the input and run on the simulator against the logical
+/// model, completely or interrupted once by a crash or an I/O failure, with the model's checks
+/// after every step and every recovery.
+pub fn ops(data: &[u8]) {
+    crate::model::run_bytes(data);
 }

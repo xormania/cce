@@ -327,80 +327,20 @@ fn replay(ops: Vec<Op>) {
     EngineTest::<false>::teardown(e, m);
 }
 
-fn put(ctx: u8, body: u8) -> ChangeSpec {
-    ChangeSpec::PutContext {
-        ctx,
-        expect: ExpectSpec::Any,
-        body,
-        content: None,
-    }
-}
-
-fn remove(ctx: u8) -> ChangeSpec {
-    ChangeSpec::RemoveContext {
-        ctx,
-        expect: ExpectSpec::Any,
-    }
-}
-
-fn plain(changes: Vec<ChangeSpec>) -> RequestSpec {
-    RequestSpec {
-        changes,
-        evidence: Vec::new(),
-        quiesce: false,
-        reads: Vec::new(),
-    }
-}
-
 /// A removal leaves a small leaf beside a sibling too large to merge with: the sibling must not
 /// be retired while the published tree still reaches it. Bodies ending in 3 are 1650 bytes
 /// longer, in 2 700 bytes, in 0 short (`body_bytes`); "held" commits without a held view run
 /// from a fresh one.
 #[test]
 fn a_removal_beside_a_sibling_too_large_to_merge_retires_nothing_reachable() {
-    replay(vec![
-        Op::Commit(plain(vec![put(2, 3), put(6, 3), put(8, 0), put(9, 3)])),
-        Op::Commit(plain(vec![
-            put(2, 0),
-            ChangeSpec::PutRelationship {
-                rel: 0,
-                expect: ExpectSpec::Any,
-                kind: 0,
-                source: 0,
-                target: 3,
-            },
-        ])),
-        Op::CommitFromHeld {
-            slot: 126,
-            request: plain(vec![put(0, 227), remove(2), put(4, 114), put(7, 151)]),
-        },
-        Op::Commit(plain(vec![put(4, 239)])),
-        Op::Commit(plain(vec![put(2, 142)])),
-        Op::CommitFromHeld {
-            slot: 118,
-            request: plain(vec![remove(0), put(1, 75), remove(7)]),
-        },
-    ]);
+    replay(merge_skip_sequence());
 }
 
 /// One commit binds the same staging twice (two records, one handle): its content must be
 /// installed once and neither binding's space retired while the records reach it.
 #[test]
 fn one_staging_bound_twice_in_a_commit_is_installed_once_and_never_retired() {
-    replay(vec![Op::Commit(plain(vec![
-        ChangeSpec::PutContext {
-            ctx: 0,
-            expect: ExpectSpec::Any,
-            body: 0,
-            content: Some(ContentPick::Fresh(ContentSpec { seed: 0, size: 0 })),
-        },
-        ChangeSpec::PutContext {
-            ctx: 1,
-            expect: ExpectSpec::Any,
-            body: 0,
-            content: Some(ContentPick::SameStaging(0)),
-        },
-    ]))]);
+    replay(double_binding_sequence());
 }
 
 /// Routine tier of the tree-reshaping profile; the retirement audit after every step is what

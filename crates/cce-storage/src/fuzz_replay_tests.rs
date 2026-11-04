@@ -20,6 +20,10 @@ use crate::engine::{Inner, Options};
 use crate::format::{Descriptor, PageKind, PageRef, StoreId, decode_slot, encode_page};
 use crate::fuzz_api::{self, TARGETS, join_image, split_image};
 use crate::io::FileId;
+use crate::model::{
+    ByteRun, ChangeSpec, ContentPick, ContentSpec, ExpectSpec, Op, ReadSpec,
+    double_binding_sequence, merge_skip_sequence, ops_from_bytes, ops_to_bytes, plain,
+};
 use crate::records::{AttemptValue, ContextValue, ExtentRef, Manifest, RelValue, encode_history};
 use crate::sim::SimIo;
 use crate::tree::Node;
@@ -239,7 +243,111 @@ fn seeds() -> BTreeMap<(&'static str, String), Vec<u8>> {
     add("image", "empty-store", image_of(&empty));
     add("image", "rich-store", image_of(&rich));
     add("image", "branching-store", image_of(&branching_store()));
+
+    let merge_skip = merge_skip_sequence();
+    let double = double_binding_sequence();
+    add(
+        "ops",
+        "merge-skip-regression",
+        ops_to_bytes(ByteRun::Complete, &merge_skip),
+    );
+    add(
+        "ops",
+        "double-binding-regression",
+        ops_to_bytes(ByteRun::Complete, &double),
+    );
+    add(
+        "ops",
+        "staging-lifecycle",
+        ops_to_bytes(ByteRun::Complete, &staging_lifecycle()),
+    );
+    add(
+        "ops",
+        "crash-in-merge-skip",
+        ops_to_bytes(ByteRun::Crash { cut: 37 }, &merge_skip),
+    );
+    let failure = ByteRun::Failure {
+        cut: 21,
+        lossy: false,
+        live: true,
+    };
+    add(
+        "ops",
+        "failure-in-merge-skip",
+        ops_to_bytes(failure, &merge_skip),
+    );
+    let after = ByteRun::AfterPublication {
+        pick: 0,
+        live: true,
+    };
+    add(
+        "ops",
+        "failure-after-publication",
+        ops_to_bytes(after, &double),
+    );
     out
+}
+
+/// Stages, binds earlier stagings, holds and reads views, submits, retries, discards and
+/// reopens: every kind of step at least once.
+fn staging_lifecycle() -> Vec<Op> {
+    let with_staged = |ctx: u8, k: u8| ChangeSpec::PutContext {
+        ctx,
+        expect: ExpectSpec::Any,
+        body: 1,
+        content: Some(ContentPick::Staged(k)),
+    };
+    vec![
+        Op::Stage(ContentSpec { seed: 3, size: 5 }),
+        Op::Stage(ContentSpec { seed: 4, size: 0 }),
+        Op::Commit(plain(vec![
+            with_staged(1, 0),
+            ChangeSpec::PutRelationship {
+                rel: 1,
+                expect: ExpectSpec::Absent,
+                kind: 0,
+                source: 1,
+                target: 2,
+            },
+        ])),
+        Op::Hold(vec![
+            ReadSpec::Context(1),
+            ReadSpec::Relationships {
+                from: 1,
+                outgoing: true,
+                kind: None,
+                page: 1,
+            },
+        ]),
+        Op::SubmitAndPoll(plain(vec![crate::model::put(2, 2)])),
+        Op::ReadHeld {
+            slot: 0,
+            reads: vec![ReadSpec::Content(1)],
+        },
+        Op::CommitFromHeld {
+            slot: 0,
+            request: plain(vec![crate::model::put(1, 6)]),
+        },
+        Op::Retry {
+            pick: 0,
+            identical: true,
+        },
+        Op::Retry {
+            pick: 1,
+            identical: false,
+        },
+        Op::Discard {
+            pick: 0,
+            refused: true,
+        },
+        Op::Discard {
+            pick: 0,
+            refused: false,
+        },
+        Op::Release(0),
+        Op::Reopen,
+        Op::Check,
+    ]
 }
 
 fn files_in(dir: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -318,6 +426,11 @@ fn seeds_are_valid_inputs_for_their_targets() {
                 );
                 assert!(opened.is_ok(), "{what}: {:?}", opened.err());
             }
+            "ops" => {
+                let (run, ops) = ops_from_bytes(&bytes);
+                assert!(!ops.is_empty(), "{what}: no steps");
+                assert_eq!(ops_to_bytes(run, &ops), bytes, "{what}: not canonical");
+            }
             other => panic!("seed for unknown target {other}"),
         }
     }
@@ -340,7 +453,7 @@ fn every_seed_and_saved_finding_replays_through_its_harness() {
     assert_eq!(
         TARGETS.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
         [
-            "page", "slots", "node", "manifest", "history", "records", "image"
+            "page", "slots", "node", "manifest", "history", "records", "image", "ops"
         ]
     );
 }
@@ -465,4 +578,57 @@ fn write_seeds() {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(name), bytes).unwrap();
     }
+}
+
+/// Seeded pseudo-random inputs (xorshift), so the `ops` decoder and harness are exercised on
+/// stable without a fuzzing toolchain.
+fn random_inputs(seed: u64, n: usize, most: usize) -> Vec<Vec<u8>> {
+    let mut r = seed | 1;
+    let mut next = move || {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        r
+    };
+    (0..n)
+        .map(|_| {
+            let len = (next() % (most as u64 + 1)) as usize;
+            (0..len).map(|_| next() as u8).collect()
+        })
+        .collect()
+}
+
+#[test]
+fn ops_inputs_decode_to_steps_their_encoding_reproduces() {
+    for data in random_inputs(0x0b5e_ed00_0000_0001, 2_000, 400) {
+        let (run, ops) = ops_from_bytes(&data);
+        let again = ops_to_bytes(run, &ops);
+        let (run2, ops2) = ops_from_bytes(&again);
+        assert_eq!(run, run2, "{data:?}");
+        assert_eq!(format!("{ops:?}"), format!("{ops2:?}"), "{data:?}");
+        assert_eq!(ops_to_bytes(run2, &ops2), again, "{data:?}");
+    }
+}
+
+/// Budget: `CCE_OPS_SWEEP_CASES` inputs (default 200) from the seed `CCE_OPS_SWEEP_SEED`.
+#[test]
+fn seeded_random_operation_inputs_run_through_the_ops_harness() {
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .map(|v| {
+                v.parse()
+                    .unwrap_or_else(|_| panic!("{name} must be a number"))
+            })
+            .unwrap_or(default)
+    };
+    let cases = env("CCE_OPS_SWEEP_CASES", 200) as usize;
+    let seed = env("CCE_OPS_SWEEP_SEED", 0x0b5e_ed00_0000_0002);
+    let mut steps = 0;
+    for data in random_inputs(seed, cases, 300) {
+        steps += ops_from_bytes(&data).1.len();
+        fuzz_api::run("ops", &data);
+    }
+    println!("ops sweep: {{\"cases\":{cases},\"seed\":\"{seed:#x}\",\"steps\":{steps}}}");
+    assert!(steps > cases, "the sweep ran almost no steps");
 }
