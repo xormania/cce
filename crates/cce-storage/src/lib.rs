@@ -226,7 +226,8 @@ impl NativeStore {
         Ok(Self { inner })
     }
 
-    /// Like [`NativeStore::open`], with explicit tuning options.
+    /// Like [`NativeStore::open`], with explicit tuning options; refused with `Busy` in the same
+    /// cases, including the transient one described there.
     pub fn open_with(dir: &Path, options: StoreOptions) -> Result<Self, StorageError> {
         let opts: Options = options.into();
         let inner = Inner::open(Box::new(io::FsIo::new(dir)), opts)?;
@@ -271,18 +272,22 @@ impl NativeStore {
     ///
     /// Fails with [`StorageError::Busy`] while another handle owns the store. Right after a handle
     /// closes, `Busy` can also be transient: a child process being started at that moment still
-    /// holds a copy of the lock until it starts its program (see the failure model). Retrying is
-    /// safe.
+    /// holds a copy of the lock until it starts its program, and a child created without starting
+    /// another program holds it for its whole life (see the failure model's ownership section).
+    /// Retrying is safe.
     pub fn open(dir: &Path) -> Result<Self, StorageError> {
         Self::open_with(dir, StoreOptions::default())
     }
 
-    /// Opens an existing store in `dir` for read-only inspection. See [`NativeReadOnly`].
+    /// Opens an existing store in `dir` for read-only inspection. See [`NativeReadOnly`]. Refused
+    /// with `Busy` while a process owns the store, including transiently right after an owner
+    /// closes, as described for [`NativeStore::open`].
     pub fn open_read_only(dir: &Path) -> Result<NativeReadOnly, StorageError> {
         Self::open_read_only_with(dir, StoreOptions::default())
     }
 
-    /// Like [`NativeStore::open_read_only`], with explicit tuning options.
+    /// Like [`NativeStore::open_read_only`], with explicit tuning options; refused with `Busy` in the
+    /// same cases.
     pub fn open_read_only_with(
         dir: &Path,
         options: StoreOptions,

@@ -19,6 +19,8 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Spawns `cce-verify`. Call it only while holding [`serial`]: a spawn that overlaps another test's
+/// store lifecycle can keep that store locked after it closes.
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cce-verify"))
         .args(args)
