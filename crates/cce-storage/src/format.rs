@@ -21,7 +21,7 @@ pub(crate) const FIRST_NODE_PAGE: u64 = 2;
 pub(crate) const PAGE_HEADER_LEN: usize = 48;
 pub(crate) const PAGE_PAYLOAD_MAX: usize = PAGE_SIZE - PAGE_HEADER_LEN;
 /// magic 4 + version 2 + required features 4 + store 16 + six counters 8 each + crc 4.
-const DESC_LEN: usize = 4 + 2 + 4 + 16 + 8 * 6 + 4;
+pub(crate) const DESC_LEN: usize = 4 + 2 + 4 + 16 + 8 * 6 + 4;
 /// Length of the publication record of format versions before 5, which had no required features.
 const EARLIER_DESC_LEN: usize = 4 + 2 + 16 + 8 * 6 + 4;
 /// Required features this build implements: none yet. A publication record that requires any
@@ -96,14 +96,8 @@ pub(crate) fn decode_page(
         return Err(corrupt(format!("page {}: bad magic", at.page)));
     }
     let version = d.u16()?;
-    if version != FORMAT_VERSION {
-        return Err(StorageError::Unsupported(format!(
-            "page {}: format version {version}",
-            at.page
-        )));
-    }
     let k = d.u8()?;
-    let _reserved = d.u8()?;
+    let reserved = d.u8()?;
     let s = d.array::<16>()?;
     let page = d.u64()?;
     let inc = d.u64()?;
@@ -112,10 +106,24 @@ pub(crate) fn decode_page(
     if len > PAGE_PAYLOAD_MAX {
         return Err(corrupt(format!("page {}: payload length {len}", at.page)));
     }
+    // The checksum covers the whole header: only an intact page can claim another encoding, and a
+    // damaged version or reserved byte is reported as damage.
     let mut check = bytes[..PAGE_HEADER_LEN + len].to_vec();
     check[PAGE_HEADER_LEN - 4..PAGE_HEADER_LEN].fill(0);
     if crc32fast::hash(&check) != crc {
         return Err(corrupt(format!("page {}: checksum mismatch", at.page)));
+    }
+    if version != FORMAT_VERSION {
+        return Err(StorageError::Unsupported(format!(
+            "page {}: format version {version}",
+            at.page
+        )));
+    }
+    if reserved != 0 {
+        return Err(StorageError::Unsupported(format!(
+            "page {}: reserved header byte {reserved:#04x} is set",
+            at.page
+        )));
     }
     if s != store.0 {
         return Err(corrupt(format!(
