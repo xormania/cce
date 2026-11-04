@@ -57,13 +57,12 @@ jobs:
             target
           key: cargo-clippy-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: cargo-clippy-${{ runner.os }}-
+      # The fuzzing harness is compiled only with the fuzz-api feature; the fuzz targets themselves
+      # live outside the workspace and need a nightly toolchain.
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- --deny warnings
-
-      # The fuzzing harness is compiled only with this feature; the fuzz targets themselves live
-      # outside the workspace and need a nightly toolchain.
-      - name: Clippy (fuzz-api feature)
-        run: cargo clippy --locked -p cce-storage --features fuzz-api --all-targets -- --deny warnings
+        run: |
+          cargo clippy --locked --workspace --all-targets -- --deny warnings
+          cargo clippy --locked -p cce-storage --features fuzz-api --all-targets -- --deny warnings
 
   test:
     name: test
