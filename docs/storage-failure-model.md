@@ -162,8 +162,11 @@ The tests do **not** explore:
 ## Store files on disk
 
 The store directory is created with mode `0700` and its files with `0600`; the parent of every
-directory the engine creates is synced. Store files must be regular files: a symlink or special file
-in their place is refused before it is opened, and the opened handle must be the file at that path.
+directory the engine creates is synced. The final store-directory entry may not be a symlink. Its
+opened handle is retained so later directory syncs cannot be redirected by renaming the pathname.
+At open, store leaves must be singly linked regular files. Leaf opens neither follow a final symlink
+nor wait on a special file, and the opened handle must still be the file at that path. Symlinks,
+hardlinks, FIFOs, sockets and directories in place of `LOCK`, `meta.cce` or `content.cce` are refused.
 
 Reads stay within the committed content length and require a content record to match the requested
 digest and length. Commits refuse to continue when the generation or page counter would overflow.
@@ -221,15 +224,17 @@ sync) keeps `close` waiting with it.
 
 ## Ownership
 
-One process owns a store at a time, through an exclusive lock on `LOCK` taken at open and held until
-the store handle and every view and content reader derived from it are dropped. A second opener gets
-`Busy`. A read-write open creates `LOCK` if it is missing; creating a store creates it before the
-data files.
+One process owns a store at a time, through exclusive advisory locks on `LOCK`, `meta.cce` and
+`content.cce` taken at open and held until the store handle and every view and content reader derived
+from it are dropped. Locking the opened data files preserves ownership if `LOCK` is replaced or a
+data inode is renamed or moved after open; hardlinks present at open are refused. A second opener
+gets `Busy`. A read-write open creates `LOCK` if it is missing; creating a store creates and locks it
+before the data files.
 
 ### Read-only inspection open
 
-`NativeStore::open_read_only` opens a store that no process owns for reading only. It takes the
-lock on `LOCK` in shared mode and opens the data files without write access:
+`NativeStore::open_read_only` opens a store that no process owns for reading only. It takes shared
+locks on `LOCK` and both data files, and opens the data files without write access:
 
 - While a process owns the store, a read-only open fails with `Busy`, as a read-write open does.
 - While a read-only handle, or any view or content reader derived from it, is alive, read-write opens
@@ -248,8 +253,11 @@ it, but does not sync it, so a power loss before the next read-write open can st
 read-write open makes the recovered state durable. This is why a read-only handle does not answer
 attempt outcomes.
 
-The lock is an advisory `flock` lock: it excludes processes that use this engine, on local
-filesystems. Network filesystems may not provide it.
+The locks are advisory `flock` locks: they exclude processes that use this engine, on local
+filesystems. They do not defend against another process with write permission to the store files or
+their containing namespace; such a process can write an opened file directly or replace path
+components while an open is in progress. Network filesystems may not provide the same locking
+behavior.
 
 ## Removal and live readers
 
