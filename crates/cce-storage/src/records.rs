@@ -10,7 +10,9 @@
 //! | `0x04` | target, kind, source, relationship id    | empty (incoming index)    |
 //! | `0x05` | history position (u64 big-endian)        | [`ExtentRef`] of entry    |
 //! | `0x06` | attempt id                               | [`AttemptValue`]          |
-//! | `0x07` | content digest                           | [`ExtentRef`] of its [`Manifest`] |
+//! | `0x07` | content digest                           | [`ContentEntry`]: its [`Manifest`] extent and users, or no longer retained |
+//! | `0x08` | retiring generation, kind, page or offset (fixed width) | retired page's incarnation or extent's length |
+//! | `0x09` | history position (u64 big-endian)        | attempt id of the removed entry (marker) |
 //!
 //! Components use the order-preserving encoding in `codec::key_component`.
 
