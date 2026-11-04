@@ -1378,7 +1378,10 @@ fn relocate_around(s: &NativeStore, between: impl FnOnce()) -> crate::Maintenanc
         }
         between();
         go_tx.send(()).unwrap();
-        worker.join().unwrap().unwrap()
+        worker
+            .join()
+            .unwrap()
+            .unwrap_or_else(|e| panic!("the relocation must publish: {e:?}"))
     })
 }
 
