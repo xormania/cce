@@ -43,12 +43,17 @@ jobs:
           # additions such as a source line that itself starts with "++". --text and the two --no-*
           # flags make every added line visible even if attributes mark a file binary or filter it.
           git diff --text --no-ext-diff --no-textconv --output-indicator-new='>' "$BASE...$HEAD" -U0 > /tmp/diff.txt
-          rc=0; grep '^>' /tmp/diff.txt | cut -c2- > /tmp/added.txt || rc=$?
+          # -a: a diff containing binary content (NUL bytes) must still be read line by line; without
+          # it grep reports only "binary file matches" and extracts nothing, so nothing is scanned.
+          rc=0; grep -a '^>' /tmp/diff.txt | cut -c2- > /tmp/added.txt || rc=$?
           if [ "$rc" -ge 2 ]; then echo "::error::could not extract added lines (grep exit $rc)"; exit 1; fi
+          if [ "$(grep -ac '^>' /tmp/diff.txt || true)" -gt 0 ] && [ ! -s /tmp/added.txt ]; then
+            echo "::error::the diff adds lines but none were extracted; nothing was scanned"; exit 1
+          fi
           git diff --name-only "$BASE...$HEAD" > /tmp/files.txt
           fail=0
           for f in pr commits added files; do
-            rc=0; grep -nEi -- "$MARKERS" "/tmp/$f.txt" > "/tmp/$f.hits" || rc=$?
+            rc=0; grep -naEi -- "$MARKERS" "/tmp/$f.txt" > "/tmp/$f.hits" || rc=$?
             if [ "$rc" -eq 0 ]; then
               echo "::error::private marker found in PR $f (rewrite it; matches not echoed)"
               wc -l < "/tmp/$f.hits"

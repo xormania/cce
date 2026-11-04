@@ -1,5 +1,7 @@
 //! Content lifecycle tests: segmented streaming, staging validation, integrity on read.
 
+use crate::test_support::{create_on, open_on};
+
 use std::io::{self, Read};
 
 use cce_core::storage::{
@@ -12,9 +14,7 @@ use crate::format::StoreId;
 use crate::sim::SimIo;
 
 pub(crate) fn sim_store(sim: &SimIo) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), StoreId([4; 16]), Default::default()).unwrap(),
-    }
+    create_on(Box::new(sim.clone()), StoreId([4; 16]), Default::default()).unwrap()
 }
 
 pub(crate) fn bytes(n: usize, seed: u8) -> Vec<u8> {
@@ -219,9 +219,7 @@ use crate::sim::Persist;
 
 fn reopen(sim: &SimIo) -> NativeStore {
     sim.release();
-    NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Default::default()).expect("open"),
-    }
+    open_on(Box::new(sim.clone()), Default::default()).expect("open")
 }
 
 #[test]
@@ -308,9 +306,7 @@ fn staging_handles_are_bound_to_their_store_and_open_instance() {
     let a = SimIo::new();
     let store_a = sim_store(&a);
     let b = SimIo::new();
-    let store_b = NativeStore {
-        inner: Inner::create(Box::new(b.clone()), StoreId([5; 16]), Default::default()).unwrap(),
-    };
+    let store_b = create_on(Box::new(b.clone()), StoreId([5; 16]), Default::default()).unwrap();
     let payload = b"payload".to_vec();
     let from_a = store_a.stage_content(&mut &payload[..]).unwrap();
     let put = |id: &str| Change::PutContext {
@@ -362,9 +358,7 @@ fn an_acknowledged_create_survives_power_loss() {
     let sim = SimIo::new();
     drop(sim_store(&sim));
     let after = sim.after_crash(Persist::None);
-    let s = NativeStore {
-        inner: Inner::open(Box::new(after), Default::default()).expect("created store lost"),
-    };
+    let s = open_on(Box::new(after), Default::default()).expect("created store lost");
     assert!(s.begin().is_ok());
 }
 
