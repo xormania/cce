@@ -96,9 +96,9 @@ Configure project identity as `cce`; bind activation to the actual checkout or
 worktree. Keep generated indexes, caches, transient memories, logs, and fixture
 output out of commits. Preserve useful existing configuration when upgrading.
 
-Do not copy the old Xorder PHP-specific Serena configuration into this Rust
-project. Xorder may provide useful conventions, but it is not a mandatory runtime
-or source of fixed versions for this native setup.
+Do not copy another project's language-specific Serena configuration into this Rust
+project; other projects may offer useful conventions, but they are not a mandatory runtime
+or a source of fixed versions for this native setup.
 
 Serena and rust-analyzer must see the same source paths and the intended Rust
 toolchain. If indexing reports no Cargo project before implementation exists,
@@ -183,7 +183,7 @@ Use the approved local execution mechanism. Restore the fixture after deliberate
 faults, rerun the checks, and confirm that setup left no fixture or generated
 output staged for the production repository.
 
-If xor supplies an implementation brief with additional tool requirements,
+If xor supplies additional tool requirements,
 identify and prepare them before claiming readiness for those checks. Tools
 that need a separately pinned toolchain (for example, nightly-only tooling)
 stay isolated from product builds, which use stable. Record such capabilities

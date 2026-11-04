@@ -45,7 +45,7 @@
 - Use the established human or neutral automation Git identity. Do not add
   assistant/model co-authorship or generated-by signatures.
 - Do parallel work in git worktrees outside the checkout, one branch per
-  worktree: `git worktree add ~/worktrees/cce/<branch> -b <branch> origin/master`.
+  worktree: `git worktree add <path-outside-the-checkout> -b <branch> origin/master`.
   Remove the worktree after its PR merges.
 
 ## Public text
