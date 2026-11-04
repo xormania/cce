@@ -329,8 +329,10 @@ pub(crate) struct SpaceJournal {
     pub(crate) consumed: Vec<Vec<u8>>,
     /// Keys of the retirement records of the pages it reuses (deleted).
     pub(crate) reused_records: Vec<Vec<u8>>,
-    /// Manifests the new state's entries for the digests this commit touched name.
-    pub(crate) live_manifests: Vec<(u64, u64)>,
+    /// Extents the new published state still reaches (live manifests and segments of touched
+    /// digests; for maintenance, relocation's new extents or reclaim's independent full reach)
+    /// that this publication must not free.
+    pub(crate) still_reachable: Vec<(u64, u64)>,
     /// Serials of the stagings the commit binds (their reservations are its to consume).
     pub(crate) bound: Vec<u64>,
 }
@@ -1529,7 +1531,7 @@ impl Inner {
             remainders: remainders.clone(),
             consumed,
             reused_records: reused.into_iter().map(|(_, k)| k).collect(),
-            live_manifests,
+            still_reachable: live_manifests,
             bound: bound.iter().map(|(serial, _)| *serial).collect(),
         };
         #[cfg(test)]
@@ -1940,7 +1942,7 @@ impl Inner {
         }
         if let Some(x) = freed
             .iter()
-            .find(|x| j.live_manifests.iter().any(|m| overlap(**x, *m)))
+            .find(|x| j.still_reachable.iter().any(|m| overlap(**x, *m)))
         {
             return fail(format!("retired content {x:?} is still referenced"));
         }

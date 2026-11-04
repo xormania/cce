@@ -215,7 +215,7 @@ fn retiring_content_a_touched_live_entry_names_is_rejected() {
         remove_c(),
         Box::new(|j: &mut SpaceJournal, _: &mut TreeTxn<'_>| {
             let m = *j.retired_extents.first().expect("C's content is retired");
-            j.live_manifests.push(m);
+            j.still_reachable.push(m);
         }),
     );
 }
