@@ -1213,3 +1213,118 @@ fn stats_account_for_reused_pages_and_content() {
         .sum();
     assert_eq!(st.reusable_content_bytes, retired);
 }
+
+// ----- discarding staged content ---------------------------------------------------------------
+
+fn copy_of(staged: &cce_core::storage::StagedContent) -> cce_core::storage::StagedContent {
+    cce_core::storage::StagedContent {
+        content: staged.content,
+        token: staged.token.clone(),
+    }
+}
+
+#[test]
+fn discarded_staged_content_is_retired_by_the_next_commit_and_reused() {
+    let sim = SimIo::new();
+    let s = sim_create(&sim);
+    put(&s, "keep", "K", &payload(50, 1000));
+    let size = CONTENT_CHUNK + 300;
+    let a = s.stage_content(&mut &payload(51, size)[..]).unwrap();
+    let a_ext = staged_extents(&s, &a);
+    s.discard_staged(a).unwrap();
+
+    // The next commit retires the discarded staging's space ...
+    put_body(&s, "c1", "advance", "1");
+    crate::audit::check_retirement(&sim).unwrap();
+    let d = desc(&s);
+    let r = reach(&sim, &d).unwrap();
+    for (offset, len) in &a_ext {
+        assert_eq!(
+            r.retired_extents.get(offset),
+            Some(&(d.generation, *len)),
+            "the discarded staging at {offset} was not retired by the next commit"
+        );
+    }
+    // ... and once no publication slot reaches it, staging reuses it.
+    put_body(&s, "c2", "advance", "2");
+    let b = s.stage_content(&mut &payload(52, size)[..]).unwrap();
+    assert!(
+        overlaps(&staged_extents(&s, &b), &a_ext),
+        "the discarded staging's space was not reused"
+    );
+    commit_staged(&s, "b", "B", &b);
+    crate::audit::check_retirement(&sim).unwrap();
+}
+
+#[test]
+fn discarding_a_staging_in_reused_space_returns_that_space_at_once() {
+    let size = CONTENT_CHUNK + 300;
+    let sim = SimIo::new();
+    let (s, _, x_ext) = with_reusable_content(&sim, size);
+    let a = s.stage_content(&mut &payload(53, size)[..]).unwrap();
+    assert!(overlaps(&staged_extents(&s, &a), &x_ext));
+    s.discard_staged(a).unwrap();
+    let b = s.stage_content(&mut &payload(54, size)[..]).unwrap();
+    assert!(
+        overlaps(&staged_extents(&s, &b), &x_ext),
+        "space the discarded staging reused was not returned"
+    );
+    commit_staged(&s, "b", "B", &b);
+    crate::audit::check_retirement(&sim).unwrap();
+}
+
+#[test]
+fn discarding_is_refused_for_pending_committed_repeated_or_foreign_handles() {
+    let sim = SimIo::new();
+    let s = sim_create(&sim);
+    put(&s, "keep", "K", &payload(55, 1000));
+
+    // Pending: an admitted commit binds it.
+    let gate = s.inner.pause_worker_for_test();
+    let c_bytes = payload(56, 5000);
+    let c = s.stage_content(&mut &c_bytes[..]).unwrap();
+    let ticket = s
+        .submit(
+            AttemptId::new(*b"pending").unwrap(),
+            s.begin().unwrap(),
+            ChangeSet {
+                changes: vec![Change::PutContext {
+                    id: cid("C"),
+                    expect: Precondition::Any,
+                    body: b"C".to_vec(),
+                    content: Some(0),
+                }],
+                content: vec![ContentBinding::from(&c)],
+                ..ChangeSet::default()
+            },
+        )
+        .unwrap();
+    match s.discard_staged(copy_of(&c)) {
+        Err(StorageError::InvalidRequest(m)) => assert!(m.contains("admitted"), "{m}"),
+        other => panic!("discarding a pending commit's content: {other:?}"),
+    }
+    drop(gate);
+    ticket.wait().unwrap();
+    let cc = content_of(&s, "C");
+    assert_eq!(read_all(&mut s.begin().unwrap(), &cc).unwrap(), c_bytes);
+
+    // Committed: the index owns its space now.
+    assert_eq!(
+        s.discard_staged(copy_of(&c)),
+        Err(StorageError::ForeignHandle)
+    );
+    // Repeated.
+    let d = s.stage_content(&mut &payload(57, 5000)[..]).unwrap();
+    let again = copy_of(&d);
+    s.discard_staged(d).unwrap();
+    assert_eq!(s.discard_staged(again), Err(StorageError::ForeignHandle));
+    // Another store's handle.
+    let other = sim_create(&SimIo::new());
+    let e = other.stage_content(&mut &payload(58, 5000)[..]).unwrap();
+    assert_eq!(s.discard_staged(e), Err(StorageError::ForeignHandle));
+
+    // None of that disturbed the committed state.
+    put_body(&s, "after", "advance", "1");
+    crate::audit::check_retirement(&sim).unwrap();
+    assert_eq!(read_all(&mut s.begin().unwrap(), &cc).unwrap(), c_bytes);
+}

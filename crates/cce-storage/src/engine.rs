@@ -306,6 +306,11 @@ struct ContentPool {
     /// Held by stagings of this instance, by staging serial, until a commit binding the staging
     /// publishes (consuming them) or the store is reopened (abandoned stagings).
     held: HashMap<u64, Vec<Reuse>>,
+    /// Stagings bound by admitted commits (by serial, with how many); they cannot be discarded.
+    admitted: HashMap<u64, u32>,
+    /// Extents of discarded stagings that no retirement record covers yet; the next commit
+    /// retires them.
+    discarded: Vec<(u64, u64)>,
 }
 
 /// Extents one staging call took from the pool; returned to it unless the staging completes.
@@ -631,6 +636,7 @@ impl Inner {
                         observed,
                         changes,
                         reply,
+                        staged,
                     } = job;
                     #[cfg(test)]
                     drop(lock(&inner.gate));
@@ -648,6 +654,7 @@ impl Inner {
                         });
                         Err(CommitError::Indeterminate(why))
                     });
+                    inner.release_admitted(&staged);
                     #[cfg(test)]
                     let slow = inner.slow_job_release.load(Ordering::SeqCst);
                     // Release this job's hold on the engine before its attempt stops being
@@ -692,6 +699,18 @@ impl Inner {
             }
             *pending.entry(attempt.clone()).or_default() += 1;
         }
+        // Mark the stagings this job binds as admitted, so they cannot be discarded under it.
+        let staged: Vec<u64> = {
+            let st = lock(&self.state);
+            let mut pool = lock(&self.pool);
+            changes
+                .content
+                .iter()
+                .filter_map(|b| self.token_serial(&b.token))
+                .filter(|serial| st.staged.contains_key(serial))
+                .inspect(|serial| *pool.admitted.entry(*serial).or_default() += 1)
+                .collect()
+        };
         let job = Job {
             inner: self.clone(),
             attempt: attempt.clone(),
@@ -699,10 +718,12 @@ impl Inner {
             observed,
             changes,
             reply,
+            staged: staged.clone(),
         };
         match tx.try_send(job) {
             Ok(()) => Ok(rx),
             Err(e) => {
+                self.release_admitted(&staged);
                 self.finish_pending(&attempt);
                 Err(rejected(match e {
                     mpsc::TrySendError::Full(_) => {
@@ -1119,6 +1140,15 @@ impl Inner {
         };
         let retired_content = self.settle_content(&mut txn, &extents, content_refs, generation)?;
         let remainders = self.consume_reuse(&mut txn, &bound)?;
+        // Discarded stagings' own space becomes retired with this commit.
+        let discarded: Vec<(u64, u64)> = lock(&self.pool).discarded.clone();
+        for (offset, len) in &discarded {
+            txn.put(
+                retired_extent_key(generation, *offset),
+                len.to_le_bytes().to_vec(),
+            )
+            .map_err(rejected)?;
+        }
         // Retired pages this commit may reuse: none that either publication slot can still reach
         // while this commit is unpublished (retired at most two generations before it), and none
         // a live reader's generation can reach (retired no later than the oldest pinned one). A
@@ -1215,6 +1245,10 @@ impl Inner {
         for (offset, len, retired_at) in remainders {
             pool.free.insert(offset, (len, retired_at));
         }
+        for (offset, len) in &discarded {
+            pool.free.insert(*offset, (*len, generation));
+        }
+        pool.discarded.retain(|x| !discarded.contains(x));
         drop(pool);
         Ok(CommitReceipt {
             attempt,
@@ -1412,6 +1446,64 @@ impl Inner {
             }
         }
         Ok(())
+    }
+
+    /// Gives up staged content that will not be committed (see the port). Retired content the
+    /// staging took returns to the pool at once (its retirement records were never consumed);
+    /// the staging's own space is retired by the next commit.
+    pub fn discard_staged(&self, staged: StagedContent) -> Result<(), StorageError> {
+        self.refuse_if_read_only("discarding staged content is")?;
+        let (serial, (manifest, _)) = self.staged_extent(&staged.token, &staged.content)?;
+        let m = Manifest::decode(&self.read_written_extent(&manifest)?)?;
+        let extents: Vec<(u64, u64)> = std::iter::once(manifest)
+            .chain(m.segments)
+            .map(|x| (x.offset, x.len))
+            .collect();
+        let mut st = lock(&self.state);
+        if !st.staged.contains_key(&serial) {
+            return Err(StorageError::ForeignHandle);
+        }
+        let mut pool = lock(&self.pool);
+        if pool.admitted.get(&serial).is_some_and(|n| *n > 0) {
+            return Err(StorageError::InvalidRequest(
+                "staged content is bound by an admitted commit; discard it only after that \
+                 commit resolves"
+                    .into(),
+            ));
+        }
+        st.staged.remove(&serial);
+        let held = pool.held.remove(&serial).unwrap_or_default();
+        for r in &held {
+            pool.free.insert(r.offset, (r.record_len, r.retired_at));
+        }
+        pool.discarded.extend(
+            extents
+                .into_iter()
+                .filter(|(offset, _)| !held.iter().any(|r| r.offset == *offset)),
+        );
+        Ok(())
+    }
+
+    /// Marks the stagings of a resolved job as no longer admitted.
+    fn release_admitted(&self, staged: &[u64]) {
+        let mut pool = lock(&self.pool);
+        for serial in staged {
+            if let Some(n) = pool.admitted.get_mut(serial) {
+                *n -= 1;
+                if *n == 0 {
+                    pool.admitted.remove(serial);
+                }
+            }
+        }
+    }
+
+    /// The serial of a staging token this open instance issued, if it is one.
+    fn token_serial(&self, token: &StagingToken) -> Option<u64> {
+        let mut d = Dec::new(&token.0, "staging token");
+        let s: [u8; 16] = d.array().ok()?;
+        let inst = d.u64().ok()?;
+        let serial = d.u64().ok()?;
+        (s == self.store.0 && inst == self.instance).then_some(serial)
     }
 
     /// Total length of retired content extents no staging holds.
@@ -1655,6 +1747,8 @@ pub(crate) struct Job {
     observed: Vec<Observation>,
     changes: ChangeSet,
     reply: mpsc::Sender<Result<CommitReceipt, CommitError>>,
+    /// Stagings this job binds, marked admitted until it resolves.
+    staged: Vec<u64>,
 }
 
 /// A logical read a view made, protected until the view's commit is validated.

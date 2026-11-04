@@ -315,6 +315,10 @@ impl StorageEngine for NativeStore {
         self.inner.stage(bytes)
     }
 
+    fn discard_staged(&self, staged: StagedContent) -> Result<(), StorageError> {
+        self.inner.discard_staged(staged)
+    }
+
     fn stage_content_expecting(
         &self,
         bytes: &mut dyn Read,

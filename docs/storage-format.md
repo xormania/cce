@@ -135,8 +135,14 @@ one generation before the current one (so neither publication slot reaches it wh
 written) and no live view or content reader pins a generation older than `r`. A staging holds the
 extents it took until a commit binding it publishes, which deletes their retirement records; the
 unused rest of a longer extent stays retired under its original generation. Extents held by a
-staging that is never committed (abandoned, or whose commit is still pending) are not handed out
-again in that process; a failed staging returns them at once.
+staging that is not committed (pending, or not yet given up) are not handed out again in that
+process; a failed staging returns them at once.
+
+`discard_staged` gives up staged content that will not be committed. Retired extents the staging
+took return to the pool at once, since their retirement records were never consumed; the extents
+it appended are retired by the next commit, at that commit's generation. Content bound by an
+admitted commit cannot be discarded until that commit resolves (`InvalidRequest`), and committed,
+already discarded or foreign handles are refused (`ForeignHandle`) without effect.
 
 A content entry counts the records that use the content. When a commit leaves it with none (the
 last such record is removed or replaced), the entry becomes a removed entry and the commit retires
@@ -144,10 +150,12 @@ the content's manifest and segments (prefix `08`, kind `01`). A commit that bind
 of content that is already committed, or binds content no change uses, retires that staging too:
 no published state reaches it. Committing the same bytes again later indexes them afresh.
 
-Content staged but not committed lies at the extents it was given. After a restart nothing refers
-to it: staged bytes beyond the committed content length are overwritten later, and retired
-extents a staging was using are still recorded as retired and reused. Staged bytes that a later
-commit's content length came to cover are not reclaimed.
+Content staged but neither committed nor discarded keeps its space for the life of the process.
+After a restart nothing refers to it: staged bytes beyond the committed content length are
+overwritten later, and retired extents a staging was using are still recorded as retired and
+reused. Staged bytes that a later commit's content length came to cover, and the appended space of
+a discarded staging whose retirement no commit published before a crash, are not reclaimed; that
+needs a maintenance pass over the content file, which is not implemented.
 
 Tree pages are allocated from retired pages first, then by advancing the next unallocated page. A
 commit producing generation `n` may reuse a page retired at generation `r` only if `r <= n - 2` and

@@ -376,6 +376,13 @@ pub trait StorageEngine: Send + Sync {
         expected: &ContentRef,
     ) -> Result<StagedContent, StorageError>;
 
+    /// Gives up staged content that will not be committed, so its space can be reused. Consumes
+    /// the handle. Content bound by an admitted commit cannot be discarded until that commit
+    /// resolves; content already committed, already discarded, or staged by another store or open
+    /// instance is refused without effect. Staged content that is neither committed nor
+    /// discarded keeps its space until the store is reopened.
+    fn discard_staged(&self, staged: StagedContent) -> Result<(), StorageError>;
+
     /// Atomically commits one complete change against the given basis.
     fn commit(
         &self,
