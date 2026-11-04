@@ -42,6 +42,8 @@ mod resource_tests;
 #[cfg(test)]
 mod reuse_tests;
 #[cfg(test)]
+mod seal_tests;
+#[cfg(test)]
 mod sim;
 #[cfg(test)]
 mod split_sweep_tests;

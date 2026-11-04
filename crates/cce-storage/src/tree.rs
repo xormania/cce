@@ -721,6 +721,27 @@ impl<'a> TreeTxn<'a> {
         count(&self.arena, self.root)
     }
 
+    /// The committed pages the result refers to directly: the root if nothing changed it,
+    /// otherwise every unchanged child of a changed node the result reaches. Every other committed
+    /// page the result reaches lies below one of these, and a page below one of them was never
+    /// copied (copies are only made from a changed node's slot or the root), so a replaced page
+    /// the result still reached would be one of these.
+    pub fn frontier(&self) -> Vec<PageRef> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.root];
+        while let Some(c) = stack.pop() {
+            match c {
+                Child::Clean(at) => out.push(at),
+                Child::Dirty(i) => {
+                    if let Work::Branch { children, .. } = &self.arena[i] {
+                        stack.extend(children.iter().copied());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Committed pages replaced so far (see `replaced`).
     pub fn replaced(&self) -> &[PageRef] {
         &self.replaced
