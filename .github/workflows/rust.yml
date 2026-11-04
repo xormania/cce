@@ -93,6 +93,7 @@ jobs:
           path: |
             ${{ runner.temp }}/cce-tests/candidate.txt
             ${{ runner.temp }}/cce-tests/cce-repro-*/
+            ${{ runner.temp }}/cce-tests/cce-e2e/
           if-no-files-found: ignore
           retention-days: 7
 

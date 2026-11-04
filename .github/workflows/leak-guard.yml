@@ -40,8 +40,9 @@ jobs:
           jq -r '.pull_request.title, (.pull_request.body // "")' "$GITHUB_EVENT_PATH" > /tmp/pr.txt
           git log --format='%B' "$BASE..$HEAD" > /tmp/commits.txt
           # Mark added lines with '>' so file headers ("+++ b/...") can never be confused with real
-          # additions such as a source line that itself starts with "++".
-          git diff --output-indicator-new='>' "$BASE...$HEAD" -U0 > /tmp/diff.txt
+          # additions such as a source line that itself starts with "++". --text and the two --no-*
+          # flags make every added line visible even if attributes mark a file binary or filter it.
+          git diff --text --no-ext-diff --no-textconv --output-indicator-new='>' "$BASE...$HEAD" -U0 > /tmp/diff.txt
           rc=0; grep '^>' /tmp/diff.txt | cut -c2- > /tmp/added.txt || rc=$?
           if [ "$rc" -ge 2 ]; then echo "::error::could not extract added lines (grep exit $rc)"; exit 1; fi
           git diff --name-only "$BASE...$HEAD" > /tmp/files.txt
