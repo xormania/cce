@@ -37,8 +37,9 @@ use crate::records::{
 };
 use crate::tree::{self, Cursor, MAX_KEY, Node, NodeSink, NodeSource, TreeTxn};
 
-/// Content streaming buffer. Payloads of any length stream through a buffer of this size.
-pub(crate) const CONTENT_CHUNK: usize = 64 * 1024;
+/// Content streaming buffer. Payloads of any length stream through a buffer of this size, and
+/// staging fills one segment per buffer, so it is the format's segment bound.
+pub(crate) const CONTENT_CHUNK: usize = crate::records::SEGMENT_MAX as usize;
 /// Default segment quota per content stream: 2^20 segments of 64 KiB (64 GiB).
 pub(crate) const DEFAULT_MAX_CONTENT_SEGMENTS: usize = 1 << 20;
 /// Default number of decoded tree nodes kept in memory.

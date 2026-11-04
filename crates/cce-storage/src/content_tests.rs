@@ -5,12 +5,14 @@ use crate::test_support::{create_on, open_on};
 use std::io::{self, Read};
 
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, ContentBinding, ContextId, Precondition, ReadView, StorageEngine,
+    AttemptId, Change, ChangeSet, ContentBinding, ContentDigest, ContentRef, ContextId,
+    Precondition, ReadView, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;
 use crate::engine::{CONTENT_CHUNK, Inner};
 use crate::format::StoreId;
+use crate::records::{ExtentRef, Manifest, SEGMENT_MAX};
 use crate::sim::SimIo;
 
 pub(crate) fn sim_store(sim: &SimIo) -> NativeStore {
@@ -47,6 +49,60 @@ pub(crate) fn bind(
     )
     .unwrap();
     staged.content
+}
+
+#[test]
+fn staging_fills_segments_to_exactly_the_length_the_manifest_reader_accepts() {
+    let sim = SimIo::new();
+    let s = sim_store(&sim);
+    let payload = bytes(2 * SEGMENT_MAX as usize + 17, 5);
+    let c = bind(&s, "S", &payload, "s1");
+    let segs = s.inner.content_segments(&s.inner.snapshot().unwrap(), &c);
+    assert!(
+        segs.is_ok(),
+        "the manifest reader must accept the segments staging wrote: {segs:?}"
+    );
+    let segs = segs.unwrap();
+    assert_eq!(
+        segs.iter().map(|x| x.len).collect::<Vec<_>>(),
+        vec![SEGMENT_MAX, SEGMENT_MAX, 17],
+        "staging must fill every segment but the last to the format's segment length"
+    );
+    let mut got = Vec::new();
+    s.begin()
+        .unwrap()
+        .content(&c)
+        .unwrap()
+        .read_to_end(&mut got)
+        .unwrap();
+    assert_eq!(got, payload, "the reader must accept what staging wrote");
+
+    // The manifest reader accepts a segment of exactly that length and refuses one byte more.
+    let manifest = |lens: &[u64]| {
+        Manifest {
+            content: ContentRef {
+                digest: ContentDigest([0; 32]),
+                len: lens.iter().sum(),
+            },
+            segments: lens
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| ExtentRef {
+                    offset: i as u64 * 2 * SEGMENT_MAX,
+                    len,
+                    digest: [0; 32],
+                })
+                .collect(),
+        }
+        .encode()
+    };
+    let full = Manifest::decode(&manifest(&[SEGMENT_MAX, 17]));
+    assert!(full.is_ok(), "a full segment must decode: {full:?}");
+    let over = Manifest::decode(&manifest(&[SEGMENT_MAX + 1]));
+    assert!(
+        matches!(over, Err(StorageError::Integrity(_))),
+        "a segment one byte over must be refused as damage: {over:?}"
+    );
 }
 
 #[test]
