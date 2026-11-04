@@ -123,8 +123,12 @@ The tests do **not** explore:
   single owner; a second owner is refused);
 - survival subsets beyond the 14 per cut: the seeded subsets are a sample, not an enumeration, and
   a surviving write is never cut except after a whole number of its 512-byte sectors;
-- cut sweeps of larger stores: every sweep starts from at most one committed transaction (deeper
-  trees are tested for reopening after power loss, but not cut at every operation);
+- cut sweeps of larger stores: the general sweeps start from at most one committed transaction.
+  Three more sweeps cut commits that reshape the tree, from small fixtures just before the change:
+  one that splits a leaf below the root, one that splits the root branch (the tree grows a level,
+  from a store of a few dozen commits) and one whose deletions shrink the root to a leaf. Deeper
+  trees and larger stores are tested for reopening after power loss, but not cut at every
+  operation;
 - damage to durable bytes beyond the cases listed, such as random or multiple-location corruption,
   damaged interior tree nodes, or writes that are lost or misdirected after a successful sync;
 - other errors of a real filesystem: `EINTR` inside the filesystem adapter, `ENOSPC` from a full

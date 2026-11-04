@@ -29,6 +29,8 @@ mod recovery_tests;
 mod repro_tests;
 #[cfg(test)]
 mod sim;
+#[cfg(test)]
+mod split_sweep_tests;
 mod tree;
 #[cfg(test)]
 mod tree_reopen_tests;
