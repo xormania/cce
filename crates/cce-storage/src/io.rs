@@ -690,11 +690,40 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    fn scratch(name: &str) -> PathBuf {
+    /// A fresh scratch directory, removed when the test passes and kept (path printed) when it fails.
+    fn scratch(name: &str) -> Scratch {
         let d = std::env::temp_dir().join(format!("cce-io-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
-        d
+        Scratch(d)
+    }
+
+    struct Scratch(PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!(
+                    "scratch directory kept for inspection: {}",
+                    self.0.display()
+                );
+            } else {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
     }
 
     #[test]
@@ -740,7 +769,7 @@ mod tests {
 
     #[test]
     fn creating_refuses_a_directory_that_already_holds_other_files() {
-        let names = |d: &PathBuf| {
+        let names = |d: &Path| {
             let mut v: Vec<String> = fs::read_dir(d)
                 .unwrap()
                 .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
