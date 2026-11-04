@@ -14,7 +14,7 @@ use crate::engine::{Inner, Options};
 use crate::format::StoreId;
 use crate::records::Manifest;
 use crate::sim::SimIo;
-use crate::test_support::{changes, cid, create_on, open_on, put_context};
+use crate::test_support::{SETTLE_ROUNDS_BOUND, changes, cid, create_on, open_on, put_context};
 use crate::{MaintenanceBudget, MaintenanceTask, NativeStore};
 
 const STORE: StoreId = StoreId(*b"maintenance-test");
@@ -1944,6 +1944,13 @@ fn relocation_moves_tree_pages_into_lower_retired_pages_and_changes_no_record() 
         .unwrap();
     let (after, e) = tree_pages(&sim);
     assert!(r.pages_moved > 0, "no page moved");
+    // This instance published only the relocation, so its settle rounds are the step's.
+    let rounds = s.inner.allocation_rounds_max();
+    assert!(
+        (1..=SETTLE_ROUNDS_BOUND).contains(&rounds),
+        "relocation took {rounds} rounds to settle its page allocation \
+         (expected 1 to {SETTLE_ROUNDS_BOUND})"
+    );
     assert!(
         after.last() < pages.last(),
         "the highest tree page did not move down: {:?} -> {:?}",
