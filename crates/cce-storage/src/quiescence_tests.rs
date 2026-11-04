@@ -304,3 +304,30 @@ fn the_removal_mode_is_part_of_the_request() {
     );
     assert_eq!(r, Err(CommitError::AttemptMismatch));
 }
+
+#[test]
+fn the_requests_own_basis_view_is_released_before_its_commit_runs() {
+    let sim = SimIo::new();
+    let s = with_target(&sim, b"target bytes");
+    let staged = s.stage_content(&mut &b"bee"[..]).unwrap();
+    // Once the commit is admitted, let the worker finish it before the submitting call returns:
+    // whatever the submitter still holds then is live while the commit checks for readers.
+    let inner = s.inner.clone();
+    assert!(
+        s.inner
+            .set_admitted_hook_for_test(Some(Box::new(move || {
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while inner.pending_attempts_for_test() > 0 {
+                    assert!(std::time::Instant::now() < until, "the commit never ran");
+                    std::thread::yield_now();
+                }
+            })))
+            .is_none()
+    );
+    let r = commit_quiescent(&s, &staged);
+    assert!(
+        r.is_ok(),
+        "the request's own basis view counted as a live reader: {r:?}"
+    );
+    assert_eq!(state(&s), (false, Some(b"bee".to_vec())));
+}

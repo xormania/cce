@@ -172,6 +172,10 @@ pub(crate) struct Inner {
     /// read (tests parking a walker while commits proceed).
     #[cfg(test)]
     walk_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once right after a commit is admitted to the worker's queue, on the submitting thread
+    /// (tests of what the submitter still holds while the commit runs).
+    #[cfg(test)]
+    admitted_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Makes the worker pause after answering each job (tests of shutdown ordering only).
     #[cfg(test)]
     slow_job_release: std::sync::atomic::AtomicBool,
@@ -552,6 +556,8 @@ impl Inner {
             #[cfg(test)]
             walk_hook: Mutex::new(None),
             #[cfg(test)]
+            admitted_hook: Mutex::new(None),
+            #[cfg(test)]
             slow_job_release: std::sync::atomic::AtomicBool::new(false),
             conflicts: Mutex::new(ConflictLog {
                 floor: desc.history_pos,
@@ -608,6 +614,21 @@ impl Inner {
         hook: Option<Box<dyn FnOnce() + Send>>,
     ) -> Option<Box<dyn FnOnce() + Send>> {
         std::mem::replace(&mut *lock(&self.walk_hook), hook)
+    }
+
+    /// Test hook: installs the callback the next admitted commit runs on the submitting thread.
+    #[cfg(test)]
+    pub(crate) fn set_admitted_hook_for_test(
+        &self,
+        hook: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        std::mem::replace(&mut *lock(&self.admitted_hook), hook)
+    }
+
+    /// How many attempts are admitted and not yet resolved.
+    #[cfg(test)]
+    pub(crate) fn pending_attempts_for_test(&self) -> usize {
+        lock(&self.pending).len()
     }
 
     /// Runs the walk hook once, if one is installed (no-op outside tests).
@@ -776,7 +797,16 @@ impl Inner {
             staged: staged.clone(),
         };
         match tx.try_send(job) {
-            Ok(()) => Ok(rx),
+            Ok(()) => {
+                #[cfg(test)]
+                {
+                    let hook = lock(&self.admitted_hook).take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+                Ok(rx)
+            }
             Err(e) => {
                 self.release_admitted(&staged);
                 self.finish_pending(&attempt);

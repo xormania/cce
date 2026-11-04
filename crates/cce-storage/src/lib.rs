@@ -106,10 +106,17 @@ impl NativeStore {
         if !Arc::ptr_eq(&basis.inner, &self.inner) {
             return Err(CommitError::Rejected(StorageError::ForeignHandle));
         }
+        // The basis view is consumed here: release its pin before the commit can run, so a commit
+        // requiring quiescence never counts its own basis as a live reader.
+        let NativeView {
+            snap,
+            observed,
+            pin,
+            ..
+        } = basis;
+        drop(pin);
         Ok(CommitTicket {
-            rx: self
-                .inner
-                .submit(attempt, basis.snap, basis.observed, changes)?,
+            rx: self.inner.submit(attempt, snap, observed, changes)?,
         })
     }
 
