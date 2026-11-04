@@ -1068,8 +1068,16 @@ mod tests {
     fn oversized_records_are_refused_explicitly() {
         let m = Mem::default();
         let mut t = TreeTxn::new(&m, empty(&m));
-        assert!(t.put(vec![1; MAX_KEY + 1], vec![]).is_err());
-        assert!(t.put(vec![1; 10], vec![0; MAX_ENTRY]).is_err());
+        // Each refusal names the limit it exceeds.
+        let message = |r: Result<(), StorageError>| match r {
+            Err(StorageError::InvalidRequest(m)) => m,
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        };
+        let m = message(t.put(vec![1; MAX_KEY + 1], vec![]));
+        assert!(m.contains(&format!("{MAX_KEY}-byte key limit")), "{m}");
+        let m = message(t.put(vec![1; 10], vec![0; MAX_ENTRY]));
+        assert!(m.contains(&format!("{MAX_ENTRY}-byte entry limit")), "{m}");
+        t.put(vec![1; MAX_KEY], vec![]).unwrap();
         t.put(vec![1; 10], vec![0; MAX_ENTRY - 10]).unwrap();
     }
 
