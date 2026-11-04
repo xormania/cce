@@ -13,7 +13,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
@@ -151,57 +151,67 @@ pub(crate) struct Inner {
     pub diagnostics: Vec<String>,
 }
 
-/// Anything that hands out a mutex guard; a poisoned mutex is still usable (its owner panicked,
-/// and the commit worker fences writes in that case).
-trait Lockable<T> {
-    fn acquire(&self) -> MutexGuard<'_, T>;
-}
+/// Engine locks. `Recorded` keeps its mutex private to this module, so engine code can reach a
+/// recorded lock only through `lock()` (a bypass would not compile).
+mod locks {
+    use std::sync::{Mutex, MutexGuard};
 
-impl<T> Lockable<T> for Mutex<T> {
-    fn acquire(&self) -> MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(|p| p.into_inner())
+    /// Anything that hands out a mutex guard; a poisoned mutex is still usable (its owner panicked,
+    /// and the commit worker fences writes in that case).
+    pub(super) trait Lockable<T> {
+        fn acquire(&self) -> MutexGuard<'_, T>;
     }
-}
 
-/// A mutex whose acquisitions are recorded per thread in tests, so the order in which an
-/// operation consults engine state can be checked whatever way the code reaches it.
-struct Recorded<T> {
-    mutex: Mutex<T>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    name: &'static str,
-}
-
-impl<T> Recorded<T> {
-    fn new(name: &'static str, value: T) -> Self {
-        Self {
-            mutex: Mutex::new(value),
-            name,
+    impl<T> Lockable<T> for Mutex<T> {
+        fn acquire(&self) -> MutexGuard<'_, T> {
+            self.lock().unwrap_or_else(|p| p.into_inner())
         }
     }
-}
 
-impl<T> Lockable<T> for Recorded<T> {
-    fn acquire(&self) -> MutexGuard<'_, T> {
-        #[cfg(test)]
-        LOCK_TRACE.with(|t| t.borrow_mut().push(self.name));
-        self.mutex.acquire()
+    /// A mutex whose acquisitions are recorded per thread in tests, so the order in which an
+    /// operation consults engine state can be checked whatever way the code reaches it.
+    pub(super) struct Recorded<T> {
+        mutex: Mutex<T>,
+        #[cfg_attr(not(test), allow(dead_code))]
+        name: &'static str,
+    }
+
+    impl<T> Recorded<T> {
+        pub(super) fn new(name: &'static str, value: T) -> Self {
+            Self {
+                mutex: Mutex::new(value),
+                name,
+            }
+        }
+    }
+
+    impl<T> Lockable<T> for Recorded<T> {
+        fn acquire(&self) -> MutexGuard<'_, T> {
+            #[cfg(test)]
+            LOCK_TRACE.with(|t| t.borrow_mut().push(self.name));
+            self.mutex.acquire()
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static LOCK_TRACE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Test hook: the recorded mutexes this thread acquired since the last call, in order.
+    #[cfg(test)]
+    pub(crate) fn take_lock_trace_for_test() -> Vec<&'static str> {
+        LOCK_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
+    }
+
+    pub(super) fn lock<T>(m: &impl Lockable<T>) -> MutexGuard<'_, T> {
+        m.acquire()
     }
 }
 
 #[cfg(test)]
-thread_local! {
-    static LOCK_TRACE: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Test hook: the recorded mutexes this thread acquired since the last call, in order.
-#[cfg(test)]
-pub(crate) fn take_lock_trace_for_test() -> Vec<&'static str> {
-    LOCK_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
-}
-
-fn lock<T>(m: &impl Lockable<T>) -> MutexGuard<'_, T> {
-    m.acquire()
-}
+pub(crate) use locks::take_lock_trace_for_test;
+use locks::{Recorded, lock};
 
 fn sha256(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
@@ -419,7 +429,7 @@ impl Inner {
 
     /// Test hook: holds the commit worker before its next job until the guard is dropped.
     #[cfg(test)]
-    pub(crate) fn pause_worker_for_test(&self) -> MutexGuard<'_, ()> {
+    pub(crate) fn pause_worker_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
         lock(&self.gate)
     }
 
