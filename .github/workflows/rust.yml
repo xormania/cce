@@ -1,21 +1,22 @@
 name: rust
 
-# Every push to a branch runs the checks, so a branch is green before its PR opens; pull_request
-# runs only for forks, whose pushes do not reach this repository. Superseded runs are cancelled.
+# Branch pushes give early feedback. Pull requests (same-repository and forks) test the merge
+# candidate against the current base, so an integration failure is caught before merge. fmt, clippy
+# and test are independent jobs, so one failing does not hide the others' results; the `ci` job is
+# the single gate result and fails unless all three succeeded. Superseded runs are cancelled.
 # Actions are pinned by commit.
 on:
   push:
     branches: ['**']
     paths-ignore: ['**.md']
   pull_request:
-    paths-ignore: ['**.md']
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: rust-${{ github.ref }}
+  group: rust-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -25,32 +26,89 @@ env:
   CARGO_HOME: ${{ github.workspace }}/.cargo-home
 
 jobs:
-  check:
-    name: fmt, clippy, test
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # rust-toolchain.toml selects the pinned toolchain and components.
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Format
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # rust-toolchain.toml selects the pinned toolchain and components.
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
-
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             .cargo-home/registry/index
             .cargo-home/registry/cache
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Format
-        run: cargo fmt --all -- --check
-
+          key: cargo-clippy-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-clippy-${{ runner.os }}-
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- --deny warnings
 
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Test fixtures and failure reproductions go here, outside the cached target directory.
+      TMPDIR: ${{ runner.temp }}/cce-tests
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cargo-home/registry/index
+            .cargo-home/registry/cache
+            target
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-test-${{ runner.os }}-
       - name: Test
-        run: cargo test --workspace --locked
+        run: |
+          mkdir -p "$TMPDIR"
+          cargo test --workspace --locked
+      - name: Describe the failed candidate
+        if: failure()
+        run: |
+          mkdir -p "$TMPDIR"
+          { echo "sha: $GITHUB_SHA"; echo "ref: $GITHUB_REF"; echo "event: $GITHUB_EVENT_NAME"
+            rustc -vV; cargo -V; } > "$TMPDIR/candidate.txt"
+      - name: Keep reproduction images of failed cases
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failure-reproductions-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/cce-tests/candidate.txt
+            ${{ runner.temp }}/cce-tests/cce-repro-*/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  ci:
+    name: ci
+    if: always()
+    needs: [fmt, clippy, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every check to have run and passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then echo "::error::a required check did not succeed ($r)"; exit 1; fi
+          done
