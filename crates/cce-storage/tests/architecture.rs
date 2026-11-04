@@ -252,6 +252,27 @@ fn storage_exposes_no_physical_modules() {
     );
 }
 
+fn support_is_test_only(source: &str) -> bool {
+    let lines: Vec<_> = source.lines().map(str::trim).collect();
+    let declarations: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == "mod test_support;")
+        .collect();
+    !declarations.is_empty()
+        && declarations
+            .iter()
+            .all(|(i, _)| *i > 0 && lines[i - 1] == "#[cfg(test)]")
+}
+
+#[test]
+fn shared_support_is_compiled_only_for_unit_tests() {
+    assert!(support_is_test_only(&read("src/lib.rs")));
+    assert!(support_is_test_only("#[cfg(test)]\nmod test_support;"));
+    assert!(!support_is_test_only("mod test_support;"));
+    assert!(!support_is_test_only("#[cfg(test)]\npub mod test_support;"));
+}
+
 #[test]
 fn surface_check_rejects_public_physical_modules() {
     assert!(surface_violations("mod tree;\npub struct NativeStore;").is_empty());

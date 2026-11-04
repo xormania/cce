@@ -1204,8 +1204,15 @@ impl Inner {
             ))
         })?;
         let bound = self.resolve_content(&cs)?;
+        // Changes refer to bindings by position, so `extents` keeps one entry per binding. A
+        // staging bound more than once is still one staging: from here on it is settled, consumed
+        // and released once.
         let extents: Vec<BoundContent> = bound.iter().map(|(_, x)| *x).collect();
         let content_refs = apply(&mut txn, &cs, &extents, pos)?;
+        let mut seen = BTreeSet::new();
+        let bound: Vec<(u64, BoundContent)> =
+            bound.into_iter().filter(|(s, _)| seen.insert(*s)).collect();
+        let stagings: Vec<BoundContent> = bound.iter().map(|(_, x)| *x).collect();
         let written: Vec<Vec<u8>> = txn
             .touched()
             .iter()
@@ -1253,7 +1260,7 @@ impl Inner {
                 "generation counter exhausted".into(),
             )));
         };
-        let retired_content = self.settle_content(&mut txn, &extents, content_refs, generation)?;
+        let retired_content = self.settle_content(&mut txn, &stagings, content_refs, generation)?;
         let remainders = self.consume_reuse(&mut txn, &bound)?;
         let (desc, discarded) = self.publish(&cur, txn, generation, pos, Some(&attempt))?;
         lock(&self.conflicts).record(pos, written);
@@ -1420,7 +1427,7 @@ impl Inner {
     /// commit's binding for it; content losing its last user becomes a removed entry and its
     /// manifest and segments are retired at `generation`. Bound content the index does not take
     /// (a second staging of committed bytes, or a binding no change uses) is retired too: no
-    /// published state ever reaches it.
+    /// published state ever reaches it. `bound` names each staging once.
     fn settle_content(
         &self,
         t: &mut TreeTxn,

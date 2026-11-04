@@ -1,10 +1,12 @@
 //! Engine behavior tests through the logical port (simulated I/O unless stated).
 
+use crate::test_support::{attempt, changes, create_on, open_on, put_context as put};
+
 use std::io::Read;
 
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, CommitError, ContentBinding, ContextId, HistoryPosition,
-    Precondition, ReadView, Revision, StorageEngine, StorageError,
+    Change, ChangeSet, CommitError, ContentBinding, ContextId, HistoryPosition, Precondition,
+    ReadView, Revision, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;
@@ -13,34 +15,12 @@ use crate::format::StoreId;
 use crate::sim::SimIo;
 
 fn store() -> NativeStore {
-    NativeStore {
-        inner: Inner::create(Box::new(SimIo::new()), StoreId([3; 16]), Default::default()).unwrap(),
-    }
-}
-
-fn put(id: &str, expect: Precondition, body: &[u8], content: Option<usize>) -> Change {
-    Change::PutContext {
-        id: ContextId::new(id.as_bytes().to_vec()).unwrap(),
-        expect,
-        body: body.to_vec(),
-        content,
-    }
-}
-
-fn attempt(s: &str) -> AttemptId {
-    AttemptId::new(s.as_bytes().to_vec()).unwrap()
+    create_on(Box::new(SimIo::new()), StoreId([3; 16]), Default::default()).unwrap()
 }
 
 fn commit(s: &NativeStore, a: &str, cs: ChangeSet) -> Result<u64, CommitError> {
     s.commit(attempt(a), s.begin().unwrap(), cs)
         .map(|r| r.position.0)
-}
-
-fn changes(c: Vec<Change>) -> ChangeSet {
-    ChangeSet {
-        changes: c,
-        ..ChangeSet::default()
-    }
 }
 
 fn revision(s: &NativeStore, id: &str) -> Option<Revision> {
@@ -233,15 +213,11 @@ use crate::sim::Persist;
 use crate::tree::{Node, NodeSink, TreeTxn};
 
 fn sim_store(sim: &SimIo) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), StoreId([3; 16]), Default::default()).unwrap(),
-    }
+    create_on(Box::new(sim.clone()), StoreId([3; 16]), Default::default()).unwrap()
 }
 
 fn reopen(sim: &SimIo) -> NativeStore {
-    NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Default::default()).expect("open"),
-    }
+    open_on(Box::new(sim.clone()), Default::default()).expect("open")
 }
 
 #[test]
@@ -609,9 +585,7 @@ fn an_oversized_manifest_reference_is_refused_before_allocation() {
         ..Default::default()
     };
     let sim = SimIo::new();
-    let s = NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), StoreId([3; 16]), opts).unwrap(),
-    };
+    let s = create_on(Box::new(sim.clone()), StoreId([3; 16]), opts).unwrap();
     let staged = s.stage_content(&mut &b"bytes"[..]).unwrap();
     let cs = ChangeSet {
         changes: vec![put("B", Precondition::Absent, b"b", Some(0))],
@@ -675,9 +649,7 @@ fn an_oversized_manifest_reference_is_refused_before_allocation() {
     sim.sync(FileId::Meta).unwrap();
     drop(s);
     sim.release();
-    let s = NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), opts).expect("open"),
-    };
+    let s = open_on(Box::new(sim.clone()), opts).expect("open");
     let r = s.begin().unwrap().content(&staged.content).map(|_| ());
     assert!(
         matches!(&r, Err(StorageError::Integrity(m)) if m.contains("manifest") && m.contains("limit")),

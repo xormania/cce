@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use cce_core::storage::{
-    AttemptId, Change, ChangeSet, CommitError, ContentBinding, ContextId, Direction, HistoryEntry,
+    AttemptId, Change, ChangeSet, CommitError, ContentBinding, Direction, HistoryEntry,
     HistoryPosition, Precondition, ReadView, Relationship, RelationshipId, RelationshipKind,
     RelationshipQuery, StorageEngine, StorageError,
 };
@@ -14,46 +14,34 @@ use crate::engine::{Inner, Options};
 use crate::format::StoreId;
 use crate::records::Manifest;
 use crate::sim::SimIo;
+use crate::test_support::{cid, create_on, open_on, put_context};
 use crate::{MaintenanceBudget, MaintenanceTask, NativeStore};
 
 const STORE: StoreId = StoreId(*b"maintenance-test");
 const IDS: [&str; 4] = ["A", "B", "C", "D"];
 
-fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
-}
-
 fn create(sim: &SimIo) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(Box::new(sim.clone()), STORE, Options::default()).unwrap(),
-    }
+    create_on(Box::new(sim.clone()), STORE, Options::default())
+        .unwrap_or_else(|e| panic!("a new store must be created: {e:?}"))
 }
 
 fn open(sim: &SimIo) -> NativeStore {
     sim.release();
-    NativeStore {
-        inner: Inner::open(Box::new(sim.clone()), Options::default()).unwrap_or_else(|e| {
-            panic!("the store must open (after a step or its recovery): {e:?}")
-        }),
-    }
+    open_on(Box::new(sim.clone()), Options::default())
+        .unwrap_or_else(|e| panic!("the store must open (after a step or its recovery): {e:?}"))
 }
 
 fn commit(s: &NativeStore, attempt: &str, cs: ChangeSet) {
     s.commit(
-        AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
+        crate::test_support::attempt(attempt),
         s.begin().unwrap(),
         cs,
     )
-    .unwrap();
+    .unwrap_or_else(|e| panic!("commit {attempt} must succeed: {e:?}"));
 }
 
 fn put(id: &str, body: &str, content: Option<usize>) -> Change {
-    Change::PutContext {
-        id: cid(id),
-        expect: Precondition::Any,
-        body: body.as_bytes().to_vec(),
-        content,
-    }
+    put_context(id, Precondition::Any, body.as_bytes(), content)
 }
 
 /// Everything a store holds over the contexts in [`IDS`], read through the port: records with their

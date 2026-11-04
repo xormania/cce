@@ -4,14 +4,16 @@
 //! Expected states come from an independent run of the same logical requests, never from what
 //! recovery chose.
 
+use crate::test_support::{cid, create_on, open_on};
+
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use cce_core::storage::{
-    AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, ContentBinding, ContextId,
-    Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind,
-    RelationshipQuery, StagedContent, StorageEngine, StorageError,
+    AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, ContentBinding, Direction, Evidence,
+    HistoryPosition, Precondition, ReadView, RelationshipId, RelationshipKind, RelationshipQuery,
+    StagedContent, StorageEngine, StorageError,
 };
 
 use crate::NativeStore;
@@ -24,18 +26,12 @@ use crate::sim::{Persist, SimIo};
 const STORE: StoreId = StoreId(*b"recovery-store-1");
 const IDS: [&str; 4] = ["A", "B", "C", "D"];
 
-fn cid(s: &str) -> ContextId {
-    ContextId::new(s.as_bytes().to_vec()).unwrap()
-}
-
 fn create(io: Box<dyn Io>) -> NativeStore {
-    NativeStore {
-        inner: Inner::create(io, STORE, Default::default()).expect("create"),
-    }
+    create_on(io, STORE, Default::default()).expect("create")
 }
 
 fn try_open(io: Box<dyn Io>) -> Result<NativeStore, StorageError> {
-    Inner::open(io, Default::default()).map(|inner| NativeStore { inner })
+    open_on(io, Default::default())
 }
 
 fn open(io: Box<dyn Io>) -> NativeStore {
