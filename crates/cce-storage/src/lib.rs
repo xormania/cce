@@ -18,6 +18,8 @@ mod engine;
 mod engine_tests;
 mod format;
 mod io;
+#[cfg(test)]
+mod readonly_tests;
 mod records;
 #[cfg(test)]
 mod recovery_tests;
