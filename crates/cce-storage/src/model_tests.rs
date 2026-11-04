@@ -631,6 +631,8 @@ impl Model {
 
     /// Applies a committed request to the model.
     fn apply_commit(&mut self, req: &Request, written: Vec<WriteKey>) {
+        // An attempt refused earlier may commit later (after an I/O failure, for example).
+        self.uncommitted.remove(&req.attempt);
         self.position += 1;
         let pos = self.position;
         let refs = req.refs();
@@ -1457,16 +1459,23 @@ fn generated_operation_sequences_on_real_files_match_the_logical_model() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Crash campaign: the same generated sequences, interrupted.
+// Crash and I/O-failure campaigns: the same generated sequences, interrupted.
 //
 // A sequence is first run to completion to learn how many mutating I/O operations each step
-// performs. For each chosen cut `k`, a fresh store replays the sequence with the simulator
-// crashing after `k` mutating operations: every step that completed before the cut is checked as
-// usual, the step in flight runs without expectations, and the crash image is recovered under
-// several persistence choices. The recovered store must be exactly the model state before or
-// after the step in flight, report that attempt's outcome accordingly, honour a retry of it, and
-// commit and reopen afterwards. A compound case also lets the process exit at the cut, recovers,
-// and then loses power: the recovered state must survive.
+// performs. For each chosen cut `k`, a fresh simulated store replays the sequence; every step that
+// completed before the cut is checked as usual and the step in flight runs without expectations.
+//
+// Crash: the simulator crashes after `k` mutating operations. The image is recovered with pending
+// effects lost, all kept and two seeded torn and reordered subsets; a crash during that recovery
+// is recovered again; and the process may instead exit at the cut, be recovered, and lose power.
+//
+// I/O failure: operation `k + 1` fails (a failed sync keeps or, lossy, drops its pending writes)
+// and the process keeps running: what the store reports about the failed attempt, and every
+// commit it acknowledges afterwards, must fit the model with that step applied or not applied.
+// The process then exits or loses power and the store is recovered.
+//
+// Every recovered store must be exactly one model state the observations allow, report outcomes
+// accordingly, honour a retry of the interrupted request, and commit and reopen afterwards.
 // ---------------------------------------------------------------------------------------------
 
 const CRASH_SEED: u64 = 0x5eed_0002_cce0_0002;
@@ -1477,6 +1486,8 @@ const CRASH_PERSISTS: [Persist; 4] = [
     Persist::Seeded(1),
     Persist::Seeded(2),
 ];
+/// Commit steps the store runs after an I/O failure before the process ends.
+const LIVE_STEPS: usize = 6;
 
 fn sim_engine(sim: SimIo, store: NativeStore) -> Engine {
     Engine {
@@ -1509,44 +1520,58 @@ fn boundaries(transitions: &[Op]) -> Vec<u64> {
     out
 }
 
-/// Executes a step while the store may be failing underneath it: no expectations, no panics on
-/// errors. Returns the request it submitted, if any.
-fn in_flight(e: &mut Engine, action: &Action) -> Option<Request> {
-    let submit = |e: &mut Engine, basis: Option<NativeView>, request: &Request| {
-        let store = e.store.as_ref()?;
-        let basis = match basis {
-            Some(b) => b,
-            None => store.begin().ok()?,
-        };
-        let mut bindings = Vec::new();
-        for b in &request.contents {
-            let s = store.stage_content(&mut &b[..]).ok()?;
-            bindings.push(ContentBinding::from(&s));
-        }
-        let cs = ChangeSet {
-            changes: request.changes.clone(),
-            content: bindings,
-            evidence: request.evidence.clone(),
-            removal: request.removal,
-        };
-        let _ = store.commit(request.attempt.clone(), basis, cs);
-        Some(())
+/// Stages a request's content and commits it from `basis` (a fresh view when `None`), with no
+/// expectations. `prestaged` binds an already staged handle as the request's last content.
+fn submit_tolerant(
+    e: &mut Engine,
+    basis: Option<NativeView>,
+    request: &Request,
+    prestaged: Option<StagedContent>,
+) -> Option<Result<CommitReceipt, CommitError>> {
+    let store = e.store.as_ref()?;
+    let basis = match basis {
+        Some(b) => b,
+        None => store.begin().ok()?,
     };
+    let fresh = request.contents.len() - usize::from(prestaged.is_some());
+    let mut bindings = Vec::new();
+    for b in &request.contents[..fresh] {
+        let s = store.stage_content(&mut &b[..]).ok()?;
+        bindings.push(ContentBinding::from(&s));
+    }
+    bindings.extend(prestaged.as_ref().map(ContentBinding::from));
+    let cs = ChangeSet {
+        changes: request.changes.clone(),
+        content: bindings,
+        evidence: request.evidence.clone(),
+        removal: request.removal,
+    };
+    Some(store.commit(request.attempt.clone(), basis, cs))
+}
+
+/// Executes a step while the store may be failing underneath it: no expectations, no panics on
+/// errors. Returns the request it submitted, if any, and the commit's result if it got one.
+fn in_flight(
+    e: &mut Engine,
+    action: &Action,
+) -> (Option<Request>, Option<Result<CommitReceipt, CommitError>>) {
     match action {
         Action::Commit {
             held_slot, request, ..
         } => {
             let basis = held_slot.map(|s| e.held.remove(s));
-            let _ = submit(e, basis, request);
-            Some(request.clone())
+            let got = submit_tolerant(e, basis, request, None);
+            (Some(request.clone()), got)
         }
         Action::Retry { request, .. } => {
-            let _ = submit(e, None, request);
-            Some(request.clone())
+            let got = submit_tolerant(e, None, request, None);
+            (Some(request.clone()), got)
         }
         Action::Stage(b) => {
-            let _ = e.store().stage_content(&mut &b[..]);
-            None
+            if let Ok(s) = e.store().stage_content(&mut &b[..]) {
+                e.staged.push(s);
+            }
+            (None, None)
         }
         Action::Discard { index, refused } => {
             let h = if *refused {
@@ -1555,7 +1580,7 @@ fn in_flight(e: &mut Engine, action: &Action) -> Option<Request> {
                 e.staged.remove(*index)
             };
             let _ = e.store().discard_staged(h);
-            None
+            (None, None)
         }
         Action::Reopen => {
             e.held.clear();
@@ -1566,10 +1591,10 @@ fn in_flight(e: &mut Engine, action: &Action) -> Option<Request> {
             e.store = Inner::open(e.backend.io(), Default::default())
                 .ok()
                 .map(|inner| NativeStore { inner });
-            None
+            (None, None)
         }
         // Steps without mutating I/O never contain a cut.
-        _ => None,
+        _ => (None, None),
     }
 }
 
@@ -1582,48 +1607,78 @@ fn last_position(store: &NativeStore) -> u64 {
         .unwrap_or(0)
 }
 
-/// Recovers one crash image and checks it against the model before and after the step in flight.
-fn check_recovery(
-    img: SimIo,
-    before: &Model,
-    after: &Model,
-    request: Option<&Request>,
-    retry: bool,
-) {
+/// The model states a recovered store may be in, around one interrupted step.
+#[derive(Clone)]
+struct Allowed {
+    /// The interrupted step's effects absent (`None`: observations ruled this out).
+    without: Option<Model>,
+    /// The interrupted step committed at `position` (`None`: it cannot have committed).
+    with: Option<(Model, u64)>,
+    /// The interrupted request and, when that step was a retry, what the retry must return.
+    request: Option<Request>,
+    retry: Option<Result<u64, ErrKind>>,
+}
+
+impl Allowed {
+    fn around(before: &Model, after: &Model, request: Option<Request>) -> Self {
+        let retry = match &after.action {
+            Action::Retry { expected, .. } => Some(*expected),
+            _ => None,
+        };
+        Allowed {
+            without: Some(before.clone()),
+            with: (after.position == before.position + 1).then(|| (after.clone(), after.position)),
+            request,
+            retry,
+        }
+    }
+
+    /// The state a recovered store with history ending at `last` must equal, and whether the
+    /// interrupted step is in it.
+    fn select(&self, last: u64) -> (Model, bool) {
+        let m = match (&self.without, &self.with) {
+            (Some(w), _) if w.position == last => (w.clone(), false),
+            (_, Some((m, _))) if m.position == last => (m.clone(), true),
+            _ => panic!(
+                "recovered history ends at {last}; the model allows {:?} without the step or {:?} \
+                 with it",
+                self.without.as_ref().map(|m| m.position),
+                self.with.as_ref().map(|(m, _)| m.position),
+            ),
+        };
+        let mut model = m.0;
+        model.held.clear();
+        model.log.clear();
+        model.staged.clear();
+        (model, m.1)
+    }
+}
+
+fn open_image(img: &SimIo, what: &str) -> Engine {
     let store = NativeStore {
         inner: Inner::open(Box::new(img.clone()), Default::default())
-            .expect("recovery must open the store"),
+            .unwrap_or_else(|e| panic!("{what}: recovery must open the store: {e:?}")),
     };
-    let mut e = sim_engine(img, store);
-    let last = last_position(e.store());
-    let applied = if last == before.position {
-        false
-    } else if last == after.position && after.position == before.position + 1 {
-        true
-    } else {
-        panic!(
-            "recovered history ends at {last}; the model allows {} (before) or {} (after)",
-            before.position, after.position
-        );
-    };
+    sim_engine(img.clone(), store)
+}
+
+/// Recovers one image and checks it against the allowed states, the outcome of the interrupted
+/// attempt, a retry of it, a further commit and a reopen.
+fn check_recovery(img: SimIo, allowed: &Allowed) {
+    let mut e = open_image(&img, "after the interruption");
+    let (mut m, applied) = allowed.select(last_position(e.store()));
     count(if applied {
-        "recovered after the step"
+        "recovered with the step"
     } else {
-        "recovered before the step"
+        "recovered without the step"
     });
-    let mut m = if applied {
-        after.clone()
-    } else {
-        before.clone()
-    };
-    m.held.clear();
-    m.log.clear();
-    m.staged.clear();
     main_check(&e, &m.snapshot());
-    let Some(req) = request else {
+    let Some(req) = &allowed.request else {
         return;
     };
-    if !retry && !applied {
+    // The selected state says whether the attempt committed (a later retry may have committed it
+    // even when the interrupted step itself did not); outcomes were compared by the full check.
+    if !m.committed.iter().any(|(c, _)| c.attempt == req.attempt) {
         assert_eq!(
             e.store().outcome(&req.attempt).expect("outcome"),
             AttemptOutcome::Absent,
@@ -1634,28 +1689,28 @@ fn check_recovery(
     let (cs, _staged) = e.change_set(req);
     let basis = e.store().begin().expect("begin");
     let got = e.store().commit(req.attempt.clone(), basis, cs);
-    if retry {
-        // The step in flight was itself a retry of a committed attempt; nothing changes.
-        let expected = match &after.action {
-            Action::Retry { expected, .. } => *expected,
-            other => unreachable!("{other:?}"),
-        };
+    if let Some(expected) = allowed.retry {
+        // The interrupted step was itself a retry of a committed attempt; nothing changes.
         match (&got, expected) {
             (Ok(r), Ok(p)) => assert_eq!(r.position, HistoryPosition(p)),
             (Err(CommitError::AttemptMismatch), Err(ErrKind::Mismatch)) => {}
             (got, expected) => panic!("retry after recovery {got:?}, expected {expected:?}"),
         }
-    } else if applied {
-        count("retry after recovery returned the receipt");
-        check_result(&got, req, &Expected::Committed(after.position));
     } else {
-        count("retry after recovery decided afresh");
-        let (expected, written) = m.predict(req, None);
+        let (expected, written) = branch_expect(&m, req);
+        let known = m.committed.iter().any(|(c, _)| c.attempt == req.attempt);
+        count(if known {
+            "retry after recovery returned the receipt"
+        } else {
+            "retry after recovery decided afresh"
+        });
         check_result(&got, req, &expected);
-        match expected {
-            Expected::Committed(_) => m.apply_commit(req, written),
-            Expected::Failed(_) => {
-                m.uncommitted.insert(req.attempt.clone());
+        if !known {
+            match expected {
+                Expected::Committed(_) => m.apply_commit(req, written),
+                Expected::Failed(_) => {
+                    m.uncommitted.insert(req.attempt.clone());
+                }
             }
         }
     }
@@ -1666,41 +1721,18 @@ fn check_recovery(
     main_check(&e, &snap);
 }
 
-/// The owning process exits at the cut (the operating system keeps its unsynced writes), the store
-/// is recovered, and then the power fails before anything else happens: what the recovery
-/// reported must have been made durable by the recovery itself.
-fn check_exit_then_power_loss(sim: &SimIo, before: &Model, after: &Model) {
+/// The process exits (the operating system keeps its unsynced writes), the store is recovered,
+/// and then the power fails before anything else happens: what the recovery reported must have
+/// been made durable by the recovery itself.
+fn check_exit_then_power_loss(sim: &SimIo, allowed: &Allowed) {
     let img = sim.after_process_exit();
-    let store = NativeStore {
-        inner: Inner::open(Box::new(img.clone()), Default::default())
-            .expect("recovery after a process exit must open the store"),
-    };
-    let reported = last_position(&store);
-    let m = if reported == before.position {
-        before
-    } else if reported == after.position && after.position == before.position + 1 {
-        after
-    } else {
-        panic!(
-            "recovered history ends at {reported}; the model allows {} or {}",
-            before.position, after.position
-        );
-    };
-    let mut m = m.clone();
-    m.held.clear();
-    m.staged.clear();
+    let e = open_image(&img, "after a process exit");
+    let reported = last_position(e.store());
+    let (m, _) = allowed.select(reported);
     let snap = m.snapshot();
-    let e = sim_engine(img.clone(), store);
     main_check(&e, &snap);
     drop(e);
-    let lost = img.after_crash(Persist::None);
-    let e = sim_engine(
-        lost.clone(),
-        NativeStore {
-            inner: Inner::open(Box::new(lost), Default::default())
-                .expect("a power loss after recovery must leave the store recoverable"),
-        },
-    );
+    let e = open_image(&img.after_crash(Persist::None), "power loss after recovery");
     assert_eq!(
         last_position(e.store()),
         reported,
@@ -1710,44 +1742,325 @@ fn check_exit_then_power_loss(sim: &SimIo, before: &Model, after: &Model) {
     count("process exit, recovery, power loss");
 }
 
+/// Recovery itself is interrupted: a crash after each of its mutating operations, and a failure
+/// of each, then a fresh recovery.
+fn check_interrupted_recovery(sim: &SimIo, persist: Persist, allowed: &Allowed) {
+    let probe = sim.after_crash(persist);
+    let base = probe.ops();
+    drop(open_image(&probe, "measuring recovery"));
+    let n = probe.ops() - base;
+    for j in 0..n {
+        let img = sim.after_crash(persist);
+        img.crash_after(j);
+        assert!(
+            Inner::open(Box::new(img.clone()), Default::default()).is_err(),
+            "recovery reported success although it crashed after {j} of {n} operations"
+        );
+        count("crash during recovery");
+        check_recovery(img.after_crash(Persist::None), allowed);
+
+        let img = sim.after_crash(persist);
+        img.fail_nth_op(j + 1);
+        assert!(
+            Inner::open(Box::new(img.clone()), Default::default()).is_err(),
+            "recovery reported success although operation {} of {n} failed",
+            j + 1
+        );
+        img.release();
+        count("failure during recovery, then recovery again");
+        check_recovery(img, allowed);
+    }
+}
+
+fn replay_until(transitions: &[Op], bounds: &[u64], i: usize, e: &mut Option<Engine>) -> Model {
+    let base = 0;
+    let mut m = Model::default();
+    for (j, op) in transitions[..i].iter().enumerate() {
+        m = ModelMachine::apply(m, op);
+        let eng = e.take().expect("engine");
+        let eng = EngineTest::<false>::apply(eng, &m, op.clone());
+        assert_eq!(
+            sim_of(&eng).ops() - base,
+            bounds[j],
+            "replaying step {j} performed different I/O than the first run"
+        );
+        *e = Some(eng);
+    }
+    m
+}
+
+/// A fresh store whose simulator counts operations from zero after creation.
+fn fresh_engine() -> Engine {
+    let sim = SimIo::new();
+    let store = NativeStore {
+        inner: Inner::create(Box::new(sim.clone()), STORE, Default::default()).expect("create"),
+    };
+    let e = sim_engine(sim, store);
+    // Normalize so that replays compare operation counts directly.
+    let ops = sim_of(&e).ops();
+    assert_eq!(
+        ops,
+        CREATE_OPS.with(|c| *c.get_or_init(|| ops)),
+        "store creation I/O changed"
+    );
+    e
+}
+
+thread_local! {
+    static CREATE_OPS: std::cell::OnceCell<u64> = const { std::cell::OnceCell::new() };
+}
+
 /// Replays `transitions` with a crash after `cut` mutating operations and checks every recovery.
 fn crash_at(transitions: &[Op], bounds: &[u64], cut: u64) {
     let Some(i) = bounds.iter().position(|b| *b > cut) else {
         return;
     };
-    let mut e = EngineTest::<false>::init_test(&Model::default());
-    let base = sim_of(&e).ops();
-    sim_of(&e).crash_after(cut);
-    let mut m = Model::default();
-    for (j, op) in transitions[..i].iter().enumerate() {
-        m = ModelMachine::apply(m, op);
-        e = EngineTest::<false>::apply(e, &m, op.clone());
-        assert_eq!(
-            sim_of(&e).ops() - base,
-            bounds[j],
-            "replaying step {j} performed different I/O than the first run"
-        );
-    }
-    let before = m.clone();
-    let after = ModelMachine::apply(m, &transitions[i]);
+    let mut e = Some(fresh_engine());
+    let created = sim_of(e.as_ref().unwrap()).ops();
+    sim_of(e.as_ref().unwrap()).crash_after(cut);
+    let shifted: Vec<u64> = bounds.iter().map(|b| b + created).collect();
+    let before = replay_until(transitions, &shifted, i, &mut e);
+    let mut e = e.unwrap();
+    let after = ModelMachine::apply(before.clone(), &transitions[i]);
     count(&format!("in flight: {}", op_name(&transitions[i])));
-    let request = in_flight(&mut e, &after.action);
-    let retry = matches!(after.action, Action::Retry { .. });
+    let (request, _) = in_flight(&mut e, &after.action);
+    let allowed = Allowed::around(&before, &after, request);
     let sim = sim_of(&e).clone();
     drop(e);
     for p in CRASH_PERSISTS {
         count("recoveries");
-        check_recovery(sim.after_crash(p), &before, &after, request.as_ref(), retry);
+        check_recovery(sim.after_crash(p), &allowed);
     }
-    check_exit_then_power_loss(&sim, &before, &after);
+    check_interrupted_recovery(&sim, Persist::All, &allowed);
+    check_exit_then_power_loss(&sim, &allowed);
+}
+
+/// What a branch of the model expects from `req` now.
+fn branch_expect(m: &Model, req: &Request) -> (Expected, Vec<WriteKey>) {
+    if let Some((prior, p)) = m.committed.iter().find(|(r, _)| r.attempt == req.attempt) {
+        let same = prior.changes == req.changes
+            && prior.evidence == req.evidence
+            && prior.removal == req.removal
+            && prior.refs() == req.refs();
+        return if same {
+            (Expected::Committed(*p), Vec::new())
+        } else {
+            (Expected::Failed([ErrKind::Mismatch].into()), Vec::new())
+        };
+    }
+    let mut free = m.clone();
+    free.held.clear();
+    free.predict(req, None)
+}
+
+/// Feeds one live commit result to the model branches: an acknowledged commit must fit a branch
+/// (the others are dropped); a refused one changes nothing.
+fn live_result(allowed: &mut Allowed, req: &Request, got: &Result<CommitReceipt, CommitError>) {
+    let fits = |m: &Model| -> Option<Model> {
+        let (expected, written) = branch_expect(m, req);
+        let mut m = m.clone();
+        match (got, expected) {
+            (Ok(r), Expected::Committed(p)) if r.position.0 == p => {
+                if !m.committed.iter().any(|(c, _)| c.attempt == req.attempt) {
+                    m.apply_commit(req, written);
+                }
+                Some(m)
+            }
+            (Ok(_), _) => None,
+            (Err(_), _) => {
+                if !m.committed.iter().any(|(c, _)| c.attempt == req.attempt) {
+                    m.uncommitted.insert(req.attempt.clone());
+                }
+                Some(m)
+            }
+        }
+    };
+    let without = allowed.without.as_ref().and_then(fits);
+    let with = allowed
+        .with
+        .as_ref()
+        .and_then(|(m, p)| fits(m).map(|m| (m, *p)));
+    assert!(
+        without.is_some() || with.is_some(),
+        "the store acknowledged {got:?} for {:?}, which fits no model state",
+        req.attempt
+    );
+    count(if got.is_ok() {
+        "acknowledged after the failure"
+    } else {
+        "refused after the failure"
+    });
+    allowed.without = without;
+    allowed.with = with;
+}
+
+/// Replays `transitions` with operation `cut + 1` failing, keeps the process running for a few
+/// commits, and checks what it reported and what recovery finds.
+fn fail_at(transitions: &[Op], bounds: &[u64], cut: u64, lossy: bool, continue_live: bool) {
+    let Some(i) = bounds.iter().position(|b| *b > cut) else {
+        return;
+    };
+    let mut e = Some(fresh_engine());
+    let created = sim_of(e.as_ref().unwrap()).ops();
+    if lossy {
+        sim_of(e.as_ref().unwrap()).lossy_sync_failures();
+    }
+    sim_of(e.as_ref().unwrap()).fail_nth_op(cut + 1);
+    let shifted: Vec<u64> = bounds.iter().map(|b| b + created).collect();
+    let before = replay_until(transitions, &shifted, i, &mut e);
+    let mut e = e.unwrap();
+    let after = ModelMachine::apply(before.clone(), &transitions[i]);
+    count(&format!("failure in: {}", op_name(&transitions[i])));
+    let (request, got) = in_flight(&mut e, &after.action);
+    let mut allowed = Allowed::around(&before, &after, request.clone());
+
+    // What the live store says about the failed attempt narrows the allowed states.
+    if let (Some(req), Some(got), None) = (&request, &got, allowed.retry) {
+        count(match got {
+            Ok(_) => "failed step acknowledged",
+            Err(CommitError::Indeterminate(_)) => "failed step indeterminate",
+            Err(_) => "failed step refused",
+        });
+        match got {
+            Ok(r) => {
+                let (_, p) = allowed.with.as_ref().unwrap_or_else(|| {
+                    panic!("acknowledged {r:?}, but the model expects no commit")
+                });
+                assert_eq!(r.position.0, *p, "receipt position");
+                allowed.without = None;
+            }
+            Err(err) => {
+                if !matches!(err, CommitError::Indeterminate(_)) {
+                    // A definitive refusal: nothing of the attempt may ever appear.
+                    allowed.with = None;
+                }
+            }
+        }
+        match e.store().outcome(&req.attempt).expect("outcome") {
+            AttemptOutcome::Absent => {
+                count("live outcome absent");
+                allowed.with = None;
+            }
+            AttemptOutcome::Committed(r) => {
+                count("live outcome committed");
+                let (_, p) = allowed
+                    .with
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("live outcome {r:?}, but it cannot have committed"));
+                assert_eq!(r.position.0, *p);
+                allowed.without = None;
+            }
+            AttemptOutcome::Unknown => count("live outcome unknown"),
+            AttemptOutcome::Pending => panic!("a resolved attempt is reported pending"),
+        }
+        assert!(
+            allowed.without.is_some() || allowed.with.is_some(),
+            "the live answers for {:?} contradict each other ({got:?})",
+            req.attempt
+        );
+    }
+
+    if continue_live {
+        // Content staged before the failure is committed first: a failed barrier may have lost it.
+        if let (Some(handle), Some(bytes)) = (e.staged.pop(), before.staged.last()) {
+            let probe = Request {
+                attempt: AttemptId::new(*b"after-failure-probe").unwrap(),
+                changes: vec![Change::PutContext {
+                    id: ctx_id(0),
+                    expect: Precondition::Any,
+                    body: b"probe after an I/O failure".to_vec(),
+                    content: Some(0),
+                }],
+                contents: vec![bytes.clone()],
+                evidence: Vec::new(),
+                removal: RemovalMode::PreserveViews,
+            };
+            if let Some(got) = submit_tolerant(&mut e, None, &probe, Some(handle)) {
+                count("probe of content staged before the failure");
+                live_result(&mut allowed, &probe, &got);
+            }
+        }
+        let mut m = after.clone();
+        let mut live = 0;
+        for op in &transitions[i + 1..] {
+            m = ModelMachine::apply(m, op);
+            let req = match &m.action {
+                Action::Commit { request, .. } | Action::Retry { request, .. } => request.clone(),
+                _ => continue,
+            };
+            if let Some(got) = submit_tolerant(&mut e, None, &req, None) {
+                live_result(&mut allowed, &req, &got);
+            }
+            live += 1;
+            if live == LIVE_STEPS {
+                break;
+            }
+        }
+    }
+    let sim = sim_of(&e).clone();
+    e.held.clear();
+    e.staged.clear();
+    drop(e);
+    check_recovery(sim.after_process_exit(), &allowed);
+    for p in [Persist::None, Persist::All, Persist::Seeded(1)] {
+        count("recoveries");
+        check_recovery(sim.after_crash(p), &allowed);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interruption {
+    Crash,
+    Failure,
 }
 
 struct CrashBudget {
     name: &'static str,
+    interruption: Interruption,
     ops: std::ops::RangeInclusive<usize>,
     cases: u32,
-    /// `None`: every cut; otherwise this many seeded cuts per sequence.
+    /// `None`: every cut; otherwise this many seeded cuts per sequence, half of them among the
+    /// last operations of commit steps (where publication happens).
     sampled: Option<u64>,
+}
+
+/// Seeded cuts: half uniform over the sequence, half among the last three operations of a
+/// randomly chosen step that commits.
+fn sampled_cuts(transitions: &[Op], bounds: &[u64], n: u64, seed: u64) -> Vec<u64> {
+    let total = bounds.last().copied().unwrap_or(0);
+    let mut r = seed ^ total.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = || {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        r
+    };
+    let tails: Vec<(u64, u64)> = transitions
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| {
+            matches!(
+                op,
+                Op::Commit(_)
+                    | Op::CommitFromHeld { .. }
+                    | Op::SubmitAndPoll(_)
+                    | Op::Retry { .. }
+                    | Op::Reopen
+            )
+        })
+        .map(|(i, _)| (if i == 0 { 0 } else { bounds[i - 1] }, bounds[i]))
+        .filter(|(a, b)| b > a)
+        .collect();
+    (0..n)
+        .map(|k| {
+            if k % 2 == 1 && !tails.is_empty() {
+                let (a, b) = tails[(next() % tails.len() as u64) as usize];
+                b - 1 - (next() % (b - a).min(3))
+            } else {
+                next() % total.max(1)
+            }
+        })
+        .collect()
 }
 
 fn run_crash_campaign(b: CrashBudget, seed: u64) {
@@ -1764,6 +2077,7 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
     let totals = Arc::new(Mutex::new([0u64; 4]));
     let t = totals.clone();
     let sampled = b.sampled;
+    let interruption = b.interruption;
     let mut runner = TestRunner::new(config);
     let result = runner.run(
         &ModelMachine::sequential_strategy(b.ops.clone()),
@@ -1772,17 +2086,7 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
             let total = bounds.last().copied().unwrap_or(0);
             let cuts: Vec<u64> = match sampled {
                 None => (0..total).collect(),
-                Some(n) => {
-                    let mut r = seed ^ total.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-                    (0..n)
-                        .map(|_| {
-                            r ^= r << 13;
-                            r ^= r >> 7;
-                            r ^= r << 17;
-                            r % total.max(1)
-                        })
-                        .collect()
-                }
+                Some(n) => sampled_cuts(&transitions, &bounds, n, seed),
             };
             {
                 let mut t = t.lock().unwrap();
@@ -1792,26 +2096,44 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
                 t[3] += cuts.len() as u64;
             }
             for cut in cuts {
-                crash_at(&transitions, &bounds, cut);
+                match interruption {
+                    Interruption::Crash => crash_at(&transitions, &bounds, cut),
+                    Interruption::Failure => {
+                        for lossy in [false, true] {
+                            for continue_live in [false, true] {
+                                fail_at(&transitions, &bounds, cut, lossy, continue_live);
+                            }
+                        }
+                    }
+                }
             }
             Ok(())
         },
     );
     let [sequences, ops, cut_points, cuts] = *totals.lock().unwrap();
+    let observed = STATS.with(|s| s.borrow().clone());
     let report = serde_json::json!({
         "campaign": b.name,
         "seed": format!("{seed:#x}"),
         "cases": b.cases,
         "operations_per_sequence": [b.ops.start(), b.ops.end()],
-        "cut_selection": match b.sampled { None => "every cut".to_string(), Some(n) => format!("{n} seeded cuts per sequence") },
-        "persist": ["none", "all", "seeded 1", "seeded 2", "process exit, recovery, then none"],
+        "cut_selection": match b.sampled {
+            None => "every cut".to_string(),
+            Some(n) => format!("{n} seeded cuts per sequence, half at commit tails"),
+        },
+        "interruption": match b.interruption {
+            Interruption::Crash => "crash: persist none, all, seeded 1, seeded 2; crash and failure during recovery; process exit then power loss",
+            Interruption::Failure => "one failed operation, sync failures lossy and not; stop or continue up to 6 commits; then process exit or persist none, all, seeded 1",
+        },
         // Includes shrinking attempts when a case failed.
         "sequences_run": sequences,
         "attempted_operations": ops,
         "cut_points_available": cut_points,
         "cuts_executed": cuts,
+        "recovered_without_step": observed.get("recovered without the step").copied().unwrap_or(0),
+        "recovered_with_step": observed.get("recovered with the step").copied().unwrap_or(0),
         "passed": result.is_ok(),
-        "observed": STATS.with(|s| s.borrow().clone()),
+        "observed": observed,
     });
     println!("crash report: {report}");
     if let Err(e) = result {
@@ -1823,7 +2145,8 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
 fn every_cut_of_short_generated_sequences_recovers_a_model_state() {
     run_crash_campaign(
         CrashBudget {
-            name: "every cut, short sequences",
+            name: "crash at every cut, short sequences",
+            interruption: Interruption::Crash,
             ops: 8..=16,
             cases: env_or("CCE_CRASH_CASES", 4),
             sampled: None,
@@ -1836,10 +2159,39 @@ fn every_cut_of_short_generated_sequences_recovers_a_model_state() {
 fn sampled_cuts_of_long_generated_sequences_recover_a_model_state() {
     run_crash_campaign(
         CrashBudget {
-            name: "sampled cuts, long sequences",
+            name: "crash at sampled cuts, long sequences",
+            interruption: Interruption::Crash,
             ops: MIN_OPS..=MAX_OPS,
             cases: env_or("CCE_CRASH_LONG_CASES", 2),
             sampled: Some(env_or("CCE_CRASH_SAMPLED_CUTS", 12)),
+        },
+        env_or("CCE_CRASH_SEED", CRASH_SEED),
+    );
+}
+
+#[test]
+fn an_io_failure_at_every_cut_of_short_generated_sequences_is_reported_and_recovered() {
+    run_crash_campaign(
+        CrashBudget {
+            name: "I/O failure at every cut, short sequences",
+            interruption: Interruption::Failure,
+            ops: 8..=16,
+            cases: env_or("CCE_FAILURE_CASES", 3),
+            sampled: None,
+        },
+        env_or("CCE_CRASH_SEED", CRASH_SEED),
+    );
+}
+
+#[test]
+fn an_io_failure_at_sampled_cuts_of_long_generated_sequences_is_reported_and_recovered() {
+    run_crash_campaign(
+        CrashBudget {
+            name: "I/O failure at sampled cuts, long sequences",
+            interruption: Interruption::Failure,
+            ops: MIN_OPS..=MAX_OPS,
+            cases: env_or("CCE_FAILURE_LONG_CASES", 2),
+            sampled: Some(env_or("CCE_FAILURE_SAMPLED_CUTS", 12)),
         },
         env_or("CCE_CRASH_SEED", CRASH_SEED),
     );
