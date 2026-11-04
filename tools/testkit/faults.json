@@ -47,7 +47,7 @@
   {
     "id": "data-fence",
     "path": "crates/cce-storage/src/engine.rs",
-    "old": "lock(&self.state).fenced = Some(Fence {\n                why: format!(\"data barrier failed: {e}\"),\n                uncertain: None,\n            });",
+    "old": "self.fence(Fence {\n                why: format!(\"data barrier failed: {e}\"),\n                uncertain: None,\n            });",
     "new": "let _ = &e;",
     "test": "engine_tests::a_failed_data_barrier_fences_writes",
     "witness": "crates/cce-storage/src/engine_tests.rs"
