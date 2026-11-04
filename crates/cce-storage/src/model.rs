@@ -1744,11 +1744,58 @@ impl Engine {
                 budget,
                 snapshot,
             } => {
+                let pages_before = match &e.backend {
+                    Backend::Sim(sim, _) => {
+                        let (desc, reach) = traverse(sim, "before maintenance");
+                        Some((desc.next_page, reach.pages.len() as u64))
+                    }
+                    #[cfg(test)]
+                    Backend::Files(_) => None,
+                };
                 let r = e
                     .store()
                     .maintain(*task, *budget)
                     .unwrap_or_else(|err| panic!("the store failed: maintain {task:?}: {err:?}"));
                 check_maintenance(*task, *budget, &r, snapshot);
+                if let (Some((before, tree_pages)), Backend::Sim(sim, _)) =
+                    (pages_before, &e.backend)
+                {
+                    let after = traverse(sim, "after maintenance").0.next_page;
+                    // A page relocation is complete when it rewrote every page of the tree.
+                    if *task == MaintenanceTask::Relocate
+                        && r.content_bytes_moved == 0
+                        && r.pages_moved > 0
+                        && r.complete
+                    {
+                        assert_eq!(
+                            r.pages_moved, tree_pages,
+                            "page relocation reported complete without moving every page ({r:?})"
+                        );
+                    }
+                    // Moving content rewrites the records that name it; moving pages alone
+                    // only reuses retired pages.
+                    if *task == MaintenanceTask::Relocate && r.content_bytes_moved == 0 {
+                        assert!(
+                            after <= before,
+                            "relocation appended pages: next page {before} -> {after} ({r:?})"
+                        );
+                    }
+                }
+                // A hole reclaim that reports itself complete retired every hole: an identical
+                // step finds none. (A relocation's own moves retire space a later step may use, and
+                // space retired under a pin becomes usable later, so relocation has no such rule.)
+                if r.complete && *task == MaintenanceTask::ReclaimContentHoles {
+                    let again = e.store().maintain(*task, *budget).unwrap_or_else(|err| {
+                        panic!("the store failed: repeated maintain {task:?}: {err:?}")
+                    });
+                    assert_eq!(
+                        (again.content_bytes_moved, again.content_bytes_reclaimed),
+                        (0, 0),
+                        "{task:?} with {budget:?} reported complete ({r:?}), yet the same step did \
+                         more ({again:?})"
+                    );
+                    count("maintenance complete, nothing left");
+                }
                 // Logical equivalence: the store holds exactly what it held before the step.
                 main_check(&e, snapshot);
             }
@@ -2797,8 +2844,30 @@ pub(crate) fn fail_at(
         }
         let mut m = after.clone();
         let mut steps = 0;
+        // A live commit was refused behind the fence: writes stay fenced until reopen.
+        let mut fenced = false;
         for op in &transitions[i + 1..] {
             m = Model::apply(m, op);
+            if let Action::Maintain { task, budget, .. } = &m.action {
+                if fenced && let Some(store) = &e.store {
+                    let ops = sim_of(&e).ops();
+                    let got = store.maintain(*task, *budget);
+                    assert!(
+                        matches!(
+                            &got,
+                            Err(CommitError::Rejected(StorageError::StoreState(_)))
+                        ),
+                        "maintenance in a fenced store: {got:?}"
+                    );
+                    assert_eq!(
+                        sim_of(&e).ops(),
+                        ops,
+                        "a fenced store wrote for maintenance"
+                    );
+                    count("maintenance refused behind the fence");
+                }
+                continue;
+            }
             let req = match &m.action {
                 Action::Commit { request, .. } | Action::Retry { request, .. } => request.clone(),
                 _ => continue,
@@ -2814,6 +2883,7 @@ pub(crate) fn fail_at(
                 if got.is_ok() {
                     audit(&e, "a live commit after the failure");
                 }
+                fenced |= matches!(&got, Err(err) if is_fenced_refusal(err));
             }
             steps += 1;
             if steps == LIVE_STEPS {
