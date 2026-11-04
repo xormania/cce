@@ -263,5 +263,6 @@ length and is reused by later staging or after a restart.
 
 ## Not implemented yet
 
-Space reuse, removal modes, concurrent commit validation beyond preconditions,
-and recovery from an uncertain outcome without reopening.
+Concurrent commit validation beyond preconditions, recovery from an uncertain outcome without
+reopening, and a maintenance pass over the content file that would reclaim the content space reuse
+does not reach (see the storage format document).
