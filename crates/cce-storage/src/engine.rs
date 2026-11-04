@@ -103,6 +103,11 @@ pub(crate) struct Counters {
     pub pages_reused: AtomicU64,
     /// Staged content bytes written into retired content extents.
     pub content_bytes_reused: AtomicU64,
+    pub pages_read: AtomicU64,
+    pub pages_read_at_open: AtomicU64,
+    pub entries_visited: AtomicU64,
+    pub content_buffer_bytes: AtomicU64,
+    pub content_buffer_bytes_peak: AtomicU64,
 }
 
 /// The committed state a view reads.
@@ -487,6 +492,12 @@ impl NodeSink for PageWriter<'_> {
 }
 
 impl NodeSource for Inner {
+    fn entry_visited(&self) {
+        self.counters
+            .entries_visited
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn load(&self, at: PageRef) -> Result<Arc<Node>, StorageError> {
         let cur = lock(&self.state).current;
         let offset = at.page.checked_mul(PAGE_SIZE as u64);
@@ -505,6 +516,7 @@ impl NodeSource for Inner {
             return Ok(n.clone());
         }
         self.counters.cache_misses.fetch_add(1, Ordering::Relaxed);
+        self.counters.pages_read.fetch_add(1, Ordering::Relaxed);
         let mut buf = vec![0; PAGE_SIZE];
         self.io
             .read_at(FileId::Meta, offset.unwrap_or_default(), &mut buf)?;
@@ -592,7 +604,12 @@ impl Inner {
         io.sync(FileId::Content)?;
         io.sync(FileId::Meta)?;
         let inner = Arc::new(Self::new(io, desc, diagnostics, opts));
+        inner
+            .counters
+            .pages_read
+            .fetch_add(PUBLICATION_SLOTS, Ordering::Relaxed);
         inner.load_content_pool()?;
+        inner.opened();
         inner.start_worker(opts.commit_queue)?;
         Ok(inner)
     }
@@ -606,7 +623,37 @@ impl Inner {
         check_guard(&desc, opts.guard)?;
         let mut inner = Self::new(io, desc, diagnostics, opts);
         inner.read_only = true;
+        inner
+            .counters
+            .pages_read
+            .fetch_add(PUBLICATION_SLOTS, Ordering::Relaxed);
+        inner.opened();
         Ok(Arc::new(inner))
+    }
+
+    /// Fixes the count of pages read while opening.
+    fn opened(&self) {
+        let n = self.counters.pages_read.load(Ordering::Relaxed);
+        self.counters.pages_read_at_open.store(n, Ordering::Relaxed);
+    }
+
+    /// Notes `n` more bytes held in content stream buffers, keeping the peak.
+    fn buffer_held(&self, n: u64) {
+        let now = self
+            .counters
+            .content_buffer_bytes
+            .fetch_add(n, Ordering::Relaxed)
+            + n;
+        self.counters
+            .content_buffer_bytes_peak
+            .fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// Notes `n` bytes of content stream buffers released.
+    fn buffer_released(&self, n: u64) {
+        self.counters
+            .content_buffer_bytes
+            .fetch_sub(n, Ordering::Relaxed);
     }
 
     fn refuse_if_read_only(&self, what: &str) -> Result<(), StorageError> {
@@ -942,14 +989,14 @@ impl Inner {
             if let Retired::Page {
                 generation, page, ..
             } = decode_retired(&k, &v)?
-                && page_bound.is_some_and(|b| generation <= b)
+                && may_reuse(generation, page_bound)
             {
                 pages.push(page);
             }
         }
         let extents = lock(&self.pool)
             .free()
-            .filter(|(_, _, retired_at)| content_bound.is_some_and(|b| *retired_at <= b))
+            .filter(|(_, _, retired_at)| may_reuse(*retired_at, content_bound))
             .map(|(offset, len, _)| (offset, len))
             .collect();
         Ok((pages, extents))
@@ -1294,6 +1341,7 @@ impl Inner {
         let mut len = 0u64;
         let mut segments = Vec::new();
         let mut buf = vec![0; CONTENT_CHUNK];
+        let _held = BufferHold::new(self, CONTENT_CHUNK as u64);
         loop {
             // Fill one segment (short reads and interruptions are retried), then write it.
             // With a declared length, never ask for more than one byte past it, and reject as
@@ -2153,6 +2201,7 @@ impl Inner {
     /// current generation is `next - 1`): retired at most two generations before `next`, so
     /// neither publication slot reaches it, and no later than the oldest generation a live view
     /// or content reader pins. `None`: nothing may be reused.
+    /// See [`may_reuse`] for how the bound is applied.
     fn reusable_through(&self, next: u64) -> Option<u64> {
         let oldest_pin = lock(&self.pins).keys().next().copied();
         next.checked_sub(2)
@@ -2412,6 +2461,57 @@ impl Inner {
         (s == self.store.0 && inst == self.instance).then_some(serial)
     }
 
+    /// Space use of the current state (see `SpaceReport`): a walk of a pinned snapshot, holding no
+    /// lock across it. Retirements are split by the reuse rule as of that snapshot.
+    pub(crate) fn space_report(self: &Arc<Self>) -> Result<crate::SpaceReport, StorageError> {
+        let (snap, _pin, ()) = self.pin_current_then(false, |_| ());
+        let d = snap.desc;
+        let through = self.reusable_through(d.generation.saturating_add(1));
+        let mut r = crate::SpaceReport::default();
+        // Every tree page the state reaches.
+        let mut stack = vec![d.root];
+        while let Some(at) = stack.pop() {
+            r.live_pages += 1;
+            if r.live_pages > d.next_page {
+                return Err(corrupt("tree reaches more pages than the store has"));
+            }
+            if let Node::Branch { children, .. } = &*self.load(at)? {
+                stack.extend(children.iter().copied());
+            }
+        }
+        let mut c = Cursor::new(&**self, d.root, &[P_CONTENT], None, d.next_page)?;
+        while let Some((_, v)) = c.next_entry()? {
+            if let ContentEntry::Live { manifest, .. } = ContentEntry::decode(&v)? {
+                let limit = Manifest::encoded_len(u32::MAX as usize);
+                r.live_content_bytes +=
+                    Manifest::decode(&self.read_extent(&manifest, limit, "content manifest")?)?
+                        .content
+                        .len;
+            }
+        }
+        let mut c = Cursor::new(&**self, d.root, &[P_HISTORY], None, d.next_page)?;
+        while let Some((_, v)) = c.next_entry()? {
+            r.history_entries += 1;
+            r.history_bytes += ExtentRef::decode(&v)?.len;
+        }
+        let mut c = Cursor::new(&**self, d.root, &[P_RETIRED], None, d.next_page)?;
+        while let Some((k, v)) = c.next_entry()? {
+            match decode_retired(&k, &v)? {
+                Retired::Page { generation, .. } if may_reuse(generation, through) => {
+                    r.retired_pages_reusable += 1;
+                }
+                Retired::Page { .. } => r.retired_pages_protected += 1,
+                Retired::Extent {
+                    generation, len, ..
+                } if may_reuse(generation, through) => r.retired_content_bytes_reusable += len,
+                Retired::Extent { len, .. } => r.retired_content_bytes_protected += len,
+            }
+        }
+        r.meta_file_bytes = self.io.len(FileId::Meta)?;
+        r.content_file_bytes = self.io.len(FileId::Content)?;
+        Ok(r)
+    }
+
     /// Total length of retired content extents no staging holds.
     pub fn reusable_content_bytes(&self) -> u64 {
         lock(&self.pool).free_bytes()
@@ -2637,6 +2737,7 @@ impl Inner {
             manifest: m,
             next: 0,
             buf: Vec::new(),
+            held: 0,
             pos: 0,
             total: Sha256::new(),
             failed: None,
@@ -2847,16 +2948,14 @@ fn settle_allocation(
                 Retired::Page {
                     generation, page, ..
                 } => {
-                    if reusable_through.is_some_and(|b| generation <= b)
-                        && below.is_none_or(|b| page < b)
-                    {
+                    if may_reuse(generation, reusable_through) && below.is_none_or(|b| page < b) {
                         return Ok(Some((k, v, page)));
                     }
                     generation
                 }
                 Retired::Extent { generation, .. } => generation,
             };
-            if reusable_through.is_none_or(|b| retired_at > b) {
+            if !may_reuse(retired_at, reusable_through) {
                 break;
             }
         }
@@ -2905,6 +3004,17 @@ fn settle_allocation(
     )))
 }
 
+/// The reuse rule, in one place: space retired at generation `retired_at` may be taken when it is
+/// no later than `through` (from `Inner::reusable_through`: two generations before the one being
+/// written, and no later than the oldest generation a live view or content reader pins). `None`:
+/// nothing may be taken. Space this forbids is what the space report calls protected.
+pub(crate) fn may_reuse(retired_at: u64, through: Option<u64>) -> bool {
+    through.is_some_and(|b| retired_at <= b)
+}
+
+/// Publication records, one per slot page at the start of the metadata file.
+const PUBLICATION_SLOTS: u64 = 2;
+
 /// Reads both publication slots and selects the record to recover from, checking its cursors
 /// against the files. Reads only.
 fn read_publication(io: &dyn Io) -> Result<(Descriptor, Vec<String>), StorageError> {
@@ -2915,7 +3025,7 @@ fn read_publication(io: &dyn Io) -> Result<(Descriptor, Vec<String>), StorageErr
         )));
     }
     let mut slots = Vec::new();
-    for s in 0..2u64 {
+    for s in 0..PUBLICATION_SLOTS {
         let mut buf = vec![0; PAGE_SIZE];
         io.read_at(FileId::Meta, s * PAGE_SIZE as u64, &mut buf)?;
         slots.push(decode_slot(&buf));
@@ -3194,6 +3304,8 @@ pub(crate) struct SegmentReader {
     manifest: Manifest,
     next: usize,
     buf: Vec<u8>,
+    /// Bytes of `buf`'s allocation counted as held in the store's content buffer counter.
+    held: u64,
     pos: usize,
     total: Sha256,
     failed: Option<String>,
@@ -3201,7 +3313,44 @@ pub(crate) struct SegmentReader {
     _pin: Option<Pin>,
 }
 
+/// Counts a content stream buffer as held for the guard's life.
+struct BufferHold<'a> {
+    inner: &'a Inner,
+    n: u64,
+}
+
+impl<'a> BufferHold<'a> {
+    fn new(inner: &'a Inner, n: u64) -> Self {
+        inner.buffer_held(n);
+        Self { inner, n }
+    }
+}
+
+impl Drop for BufferHold<'_> {
+    fn drop(&mut self) {
+        self.inner.buffer_released(self.n);
+    }
+}
+
+impl Drop for SegmentReader {
+    fn drop(&mut self) {
+        self.inner.buffer_released(self.held);
+    }
+}
+
 impl SegmentReader {
+    /// Keeps the store's buffer counter equal to the bytes `buf` has allocated. A shorter segment
+    /// reuses the allocation, so its capacity, not its length, is what the reader holds.
+    fn account(&mut self) {
+        let now = self.buf.capacity() as u64;
+        if now > self.held {
+            self.inner.buffer_held(now - self.held);
+        } else {
+            self.inner.buffer_released(self.held - now);
+        }
+        self.held = now;
+    }
+
     /// Holds `pin` (normally a clone of the issuing view's pin) for the reader's life.
     pub(crate) fn pinned(mut self, pin: Pin) -> Self {
         self._pin = Some(pin);
@@ -3258,11 +3407,16 @@ impl Read for SegmentReader {
                 if got != self.manifest.content.digest.0 {
                     let why = "content stream digest mismatch".to_string();
                     self.failed = Some(why.clone());
+                    // A failed reader holds no buffer.
+                    self.buf = Vec::new();
+                    self.account();
+                    self.pos = 0;
                     return Err(io::Error::new(io::ErrorKind::InvalidData, why));
                 }
                 return Ok(0);
             };
             self.buf.resize(x.len as usize, 0);
+            self.account();
             if let Err(e) = self
                 .inner
                 .io
@@ -3271,7 +3425,9 @@ impl Read for SegmentReader {
                 // Nothing of a segment that was not read and verified may stay readable.
                 let why = format!("content segment {} at offset {}: {e}", self.next, x.offset);
                 self.failed = Some(why.clone());
-                self.buf.clear();
+                // Free the allocation: a failed reader holds no buffer.
+                self.buf = Vec::new();
+                self.account();
                 self.pos = 0;
                 return Err(io::Error::other(why));
             }
@@ -3281,7 +3437,9 @@ impl Read for SegmentReader {
                     self.next, x.offset
                 );
                 self.failed = Some(why.clone());
-                self.buf.clear();
+                // Free the allocation: a failed reader holds no buffer.
+                self.buf = Vec::new();
+                self.account();
                 self.pos = 0;
                 return Err(io::Error::new(io::ErrorKind::InvalidData, why));
             }
