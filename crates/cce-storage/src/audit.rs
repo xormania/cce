@@ -223,6 +223,18 @@ pub(crate) fn check_retirement(io: &dyn Io) -> Result<(), String> {
                 cur.generation
             ));
         }
+        // Each record keeps the incarnation at which the preceding state reached its page.
+        for page in &now {
+            let recorded = rc.retired[page].1;
+            let reached = rp.incarnations.get(page).copied();
+            if reached != Some(recorded) {
+                return Err(format!(
+                    "generation {}: page {page} retired with incarnation {recorded}, but the \
+                     preceding state reached it at {reached:?}",
+                    cur.generation
+                ));
+            }
+        }
         let carried: BTreeMap<u64, (u64, u64)> = rc
             .retired
             .iter()
