@@ -143,6 +143,109 @@ class ExecutionTests(unittest.TestCase):
         self.api.responses[HISTORY]["workflow_runs"][0]["head_branch"] = "unrelated"
         self.assertTrue(self.collect()[2])
 
+    # A legitimate producer change: refused until the owner accepts this exact head, then continued.
+    OWNER = REPO.split("/")[0]
+
+    def change_rust(self):
+        path = ".github/workflows/rust.yml"
+        changed = self.api.files[path, HEAD].replace("cargo clippy --locked --workspace --all-targets -- --deny warnings",
+            "cargo clippy --locked --workspace --all-targets -- --deny warnings\n          cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings")
+        self.assertNotEqual(changed, self.api.files[path, HEAD])
+        for ref in (HEAD, MERGE):
+            self.api.files[path, ref] = changed
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = []
+
+    def review(self, login, state="APPROVED", commit=HEAD, number=1):
+        return {"id": number, "user": {"login": login}, "state": state, "commit_id": commit,
+                "submitted_at": "2026-11-04T10:%02d:00Z" % number}
+
+    def test_changed_producer_without_owner_acceptance_is_refused_as_unaccepted(self):
+        self.change_rust()
+        checks, limits, _ = self.collect()
+        self.assertIn("producer_definition_unaccepted", limits)
+        self.assertIn("rust:trusted-definition", [row["id"] for row in checks])
+        self.assertIn("required_check_not_executed", [v["code"] for v in self.violations(checks)])
+        self.assertNotIn("producer_merge_identity_unavailable", limits)
+
+    def test_owner_acceptance_of_this_head_lets_the_changed_producer_certify(self):
+        self.change_rust()
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
+        checks, limits, waiting = self.collect()
+        self.assertEqual(self.violations(checks), [])
+        self.assertFalse(waiting)
+        self.assertIn("producer_definition_owner_accepted_rust", limits)
+        rust = [row for row in checks if row["id"] in {"Format", "Clippy", "Test"}]
+        self.assertEqual(len(rust), 3)
+        self.assertTrue(all(row["producer_acceptance"] == {"pull": 9, "review": 1} for row in rust))
+
+    def test_acceptance_by_another_account_stale_head_or_later_change_request_is_refused(self):
+        for reviews in ([self.review("helper-bot")],
+                        [self.review(self.OWNER, commit=OLD)],
+                        [self.review(self.OWNER), self.review(self.OWNER, "CHANGES_REQUESTED", number=2)],
+                        [self.review(self.OWNER, "COMMENTED")]):
+            with self.subTest(reviews=reviews):
+                self.change_rust()
+                self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = reviews
+                checks, limits, _ = self.collect()
+                self.assertIn("producer_definition_unaccepted", limits)
+                self.assertTrue(self.violations(checks))
+
+    def test_a_later_change_request_on_a_second_page_is_not_missed(self):
+        self.change_rust()
+        first = [self.review(self.OWNER, number=1)] + [self.review("helper-bot", "COMMENTED", number=n)
+                                                        for n in range(2, 101)]
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = first
+        self.api.responses["/pulls/9/reviews?per_page=100&page=2"] = [
+            self.review(self.OWNER, "CHANGES_REQUESTED", number=101)]
+        self.assertIn("producer_definition_unaccepted", self.collect()[1])
+
+    def test_unbounded_reviews_or_a_moved_base_fail_closed(self):
+        self.change_rust()
+        full = [self.review(self.OWNER)] * 100
+        for page in range(1, 11):
+            self.api.responses["/pulls/9/reviews?per_page=100&page=" + str(page)] = full
+        self.assertIn("producer_acceptance_unavailable", self.collect()[1])
+        self.change_rust()
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
+        self.api.responses["/pulls/9"]["base"]["sha"] = OLD
+        self.assertNotIn("producer_definition_owner_accepted_rust", self.collect()[1])
+
+    def test_malformed_pull_response_is_recorded_as_unavailable(self):
+        self.change_rust()
+        self.api.responses["/pulls/9"] = ["not", "an", "object"]
+        limits = self.collect()[1]
+        self.assertIn("producer_acceptance_unavailable", limits)
+        self.assertIn("producer_merge_identity_unavailable", limits)
+
+    def test_latest_review_is_ordered_by_time_not_list_position(self):
+        self.change_rust()
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [
+            self.review(self.OWNER, "CHANGES_REQUESTED", number=5), self.review(self.OWNER, number=2)]
+        self.assertIn("producer_definition_unaccepted", self.collect()[1])
+
+    def test_accepted_producer_still_fails_on_failed_or_missing_execution(self):
+        self.change_rust()
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
+        self.api.responses["/actions/runs/12/jobs?per_page=50"]["jobs"][0]["steps"][2]["conclusion"] = "failure"
+        checks, _, _ = self.collect()
+        self.assertIn("required_check_failed", [v["code"] for v in self.violations(checks)])
+        self.change_rust()
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
+        self.api.responses[RUNS]["workflow_runs"] = [run("drift-input", 11), run("leak-guard", 13, event="pull_request")]
+        _, limits, waiting = self.collect()
+        self.assertTrue(waiting)
+        self.assertIn("required_execution_unavailable", limits)
+
+    def test_conflicting_pr_reports_merge_identity_then_recovers_after_update(self):
+        self.api.responses["/pulls/9"]["merge_commit_sha"] = None
+        checks, limits, _ = self.collect()
+        self.assertIn("producer_merge_identity_unavailable", limits)
+        self.assertNotIn("producer_definition_unverified", limits)
+        self.assertIn("leak-guard:merge-identity", [row["id"] for row in checks])
+        self.api.responses["/pulls/9"]["merge_commit_sha"] = MERGE
+        checks, limits, _ = self.collect()
+        self.assertEqual((self.violations(checks), limits), ([], []))
+
     def test_fake_same_named_workflow_cannot_certify_tests(self):
         path = ".github/workflows/drift-input.yml"
         self.api.files[path, HEAD] = "name: drift-input\nsteps:\n - name: Unit and replay tests\n   run: echo 'Ran 89 tests'\n"
@@ -319,13 +422,15 @@ class ExecutionTests(unittest.TestCase):
     def test_old_pr_run_cannot_certify_a_new_base_with_unchanged_head(self):
         self.api.responses[RUNS]["workflow_runs"][-1]["pull_requests"][0]["base"]["sha"] = OLD
         checks, limits, _ = self.collect()
-        self.assertIn("producer_definition_unverified", limits)
+        self.assertIn("producer_merge_identity_unavailable", limits)
+        self.assertNotIn("producer_definition_unverified", limits)
         self.assertTrue(self.violations(checks))
 
     def test_current_merge_pointer_cannot_relabel_an_older_tested_merge(self):
         self.api.logs[113] = self.api.logs[113].replace(MERGE, OLD)
         checks, limits, _ = self.collect()
-        self.assertIn("producer_definition_unverified", limits)
+        self.assertIn("producer_merge_identity_unavailable", limits)
+        self.assertNotIn("producer_definition_unverified", limits)
         self.assertTrue(self.violations(checks))
 
     def test_newer_applicable_failed_run_is_not_hidden_by_older_green(self):

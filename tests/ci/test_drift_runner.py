@@ -168,7 +168,7 @@ class DataEvidenceTests(unittest.TestCase):
         claims, semantic, limits, failed = runner.data_evidence(source(), self.env(),
                                                                lambda _repo, _token: api)
         self.assertFalse(failed)
-        self.assertEqual(limits, [])
+        self.assertEqual(limits, ['decision_data_not_configured'])
         self.assertTrue(claims[0]['applicable'])
         result = evaluate({'source': source(), 'claims': claims})
         self.assertIn('claim_case_mismatch', [v['code'] for v in result['violations']])
@@ -205,7 +205,7 @@ class DataEvidenceTests(unittest.TestCase):
 
     def test_required_data_absence_is_distinct_from_optional_setup(self):
         result = runner.data_evidence(source(), {})
-        self.assertEqual(result, ([], [], ['data_not_configured'], False))
+        self.assertEqual(result, ([], [], ['data_not_configured', 'decision_data_not_configured'], False))
         result = runner.data_evidence(source(), {'DRIFT_DATA_REQUIRED': 'true'})
         self.assertTrue(result[-1])
         env = self.env(True)

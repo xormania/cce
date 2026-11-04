@@ -483,6 +483,9 @@ def summary(control):
         answers = record.get('diagnosis', {}).get('answers', {})
         if answers:
             lines.append('  Classifications: ' + ', '.join('`'+name+': '+answer['choice']+'`' for name,answer in answers.items()) + '.')
+    if 'decision_data_not_configured' in control['limitations']:
+        lines += ['', 'Private owner-decision consistency was NOT checked: no decision data is configured. '
+                  'This analysis covers public code, tests and execution evidence only.']
     if control['limitations']:
         lines += ['', 'Coverage limitations: ' + ', '.join('`'+x+'`' for x in control['limitations']) + '.']
     lines += ['', 'Private packets and full provider responses are not retained. Public fingerprints identify this analysis.',

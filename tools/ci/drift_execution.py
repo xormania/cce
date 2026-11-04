@@ -19,6 +19,8 @@ MAX_JOBS = 50
 MAX_LOG_BYTES = 1_000_000
 MAX_COMPARE_FILES = 300
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_DEFINITION_REASONS = frozenset({"producer_definition_unaccepted", "unsupported_producer_definition",
+                                 "producer_acceptance_unavailable"})
 _KINDS = {
     "drift-input": {"unittest": r"python3?\s+-m\s+unittest\s+discover\b"},
     "rust": {"format": r"cargo\s+fmt\b", "clippy": r"cargo\s+clippy\b",
@@ -54,12 +56,62 @@ def _steps(text, producer):
     return found
 
 
+REVIEW_PAGES = 10
+
+
+def _owner_acceptance(api, source):
+    """Return the repository owner's approving review of exactly this head, if any.
+
+    Candidate output can never certify a changed producer. Only the repository owner's latest
+    review of the candidate's own head commit, on an open PR whose base is the evaluated base,
+    can accept it; a later push needs a new review. Every review page is read; an unreadable or
+    unbounded review list fails closed.
+    """
+    owner = api.repository.split("/", 1)[0]
+    for number in source.get("pulls", []):
+        pull = api.api("/pulls/" + str(int(number)))
+        if not isinstance(pull, dict):
+            raise ValueError("producer_acceptance_unavailable")
+        if (pull.get("state") != "open" or (pull.get("head") or {}).get("sha") != source["head_sha"]
+                or (pull.get("base") or {}).get("sha") != source["base_sha"]):
+            continue
+        reviews = []
+        for page in range(1, REVIEW_PAGES + 1):
+            rows = api.api("/pulls/" + str(int(number)) + "/reviews?per_page=100&page=" + str(page))
+            if not isinstance(rows, list):
+                raise ValueError("producer_acceptance_unavailable")
+            reviews += rows
+            if len(rows) < 100:
+                break
+        else:
+            raise ValueError("producer_acceptance_unavailable")
+        decisive = [r for r in reviews
+                    if isinstance(r, dict) and (r.get("user") or {}).get("login") == owner
+                    and r.get("commit_id") == source["head_sha"]
+                    and r.get("state") in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}
+                    and type(r.get("id")) is int]
+        if decisive:
+            latest = max(decisive, key=lambda r: (str(r.get("submitted_at") or ""), r["id"]))
+            if latest["state"] == "APPROVED":
+                return {"pull": int(number), "review": latest["id"]}
+    return None
+
+
 def _definition(api, source, producer, root):
+    """Return (path, accepted definition, expected steps, acceptance).
+
+    Distinct failures: ``producer_definition_unaccepted`` (changed, no owner acceptance),
+    ``unsupported_producer_definition`` (steps not recognizable).
+    """
     path = ".github/workflows/" + producer + ".yml"
     trusted = (root / path).read_text()
-    if api.file(path, source["head_sha"]) != trusted:
-        raise ValueError("producer_definition_mismatch")
-    return path, trusted, _steps(trusted, producer)
+    candidate = api.file(path, source["head_sha"])
+    if candidate == trusted:
+        return path, trusted, _steps(trusted, producer), None
+    acceptance = _owner_acceptance(api, source)
+    if acceptance is None:
+        raise ValueError("producer_definition_unaccepted")
+    return path, candidate, _steps(candidate, producer), acceptance
 
 
 def _markdown_filtered(text, event):
@@ -105,6 +157,8 @@ def _workflow_ref(api, source, run, path, trusted, logs):
         raise ValueError("producer_merge_identity_unavailable")
     for number in (row["number"] for row in pulls):
         row = api.api("/pulls/" + str(int(number)))
+        if not isinstance(row, dict):
+            raise ValueError("producer_merge_identity_unavailable")
         merge = row.get("merge_commit_sha")
         if (row.get("state") == "open" and row.get("head", {}).get("sha") == head
                 and row.get("base", {}).get("sha") == source["base_sha"]
@@ -190,11 +244,14 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
         producers.append("leak-guard")
     for producer in producers:
         try:
-            path, trusted, expected = _definition(api, source, producer, root)
-        except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError):
-            checks.append(_row(producer + ":trusted-definition", source_sha=source["head_sha"]))
-            limits.append("producer_definition_unverified")
+            path, trusted, expected, acceptance = _definition(api, source, producer, root)
+        except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError) as error:
+            reason = str(error) if str(error) in _DEFINITION_REASONS else "producer_definition_unavailable"
+            checks.append(_row(producer + ":trusted-definition", source_sha=source["head_sha"], reason=reason))
+            limits += ["producer_definition_unverified", reason]
             continue
+        if acceptance is not None:
+            limits.append("producer_definition_owner_accepted_" + producer.replace("-", "_"))
         candidates = [r for r in runs if _candidate_run(r, source, api, producer)
                       and (r.get("event") == "pull_request"
                            if producer == "leak-guard" or producer == "rust" and rust_pr_required else True)]
@@ -249,9 +306,18 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
         logs = "\n".join(job_logs.values())
         try:
             workflow_ref = _workflow_ref(api, source, run, path, trusted, logs)
-        except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError):
-            checks.append(_row(producer + ":trusted-definition", source_sha=source["head_sha"]))
-            limits.append("producer_definition_unverified")
+        except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError) as error:
+            if str(error) == "producer_merge_identity_unavailable":
+                # The run happened; its merge commit cannot be identified (for example the PR now
+                # conflicts with its base). Remedy: update the branch so a current merge run exists.
+                checks.append(_row(producer + ":merge-identity", source_sha=source["head_sha"],
+                                   reason="producer_merge_identity_unavailable"))
+                limits.append("producer_merge_identity_unavailable")
+            else:
+                reason = ("producer_definition_unaccepted" if str(error) == "producer_definition_mismatch"
+                          else "producer_definition_unavailable")
+                checks.append(_row(producer + ":trusted-definition", source_sha=source["head_sha"], reason=reason))
+                limits += ["producer_definition_unverified", reason]
             continue
         if observations is not None and logs:
             excerpt = _excerpt(logs)
@@ -273,5 +339,6 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
                     ran = ran and not _scan_skipped(witness)
             checks.append(_row(title, "pass" if status == "success" else "fail" if status == "failure" else "skipped",
                 ran, run["head_sha"], equivalent=equivalent, run_id=run["id"], job_id=job_id, attempt=run.get("run_attempt", 1),
-                workflow_ref=workflow_ref, workflow_sha256=hashlib.sha256(trusted.encode("utf-8")).hexdigest()))
+                workflow_ref=workflow_ref, workflow_sha256=hashlib.sha256(trusted.encode("utf-8")).hexdigest(),
+                producer_acceptance=acceptance))
     return checks, sorted(set(limits)), waiting
