@@ -21,7 +21,7 @@ use crate::records::{
     P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, SEGMENT_MAX, decode_history,
     decode_retired, history_key, key, stored_fingerprint,
 };
-use crate::tree::{MAX_ENTRY, MAX_HEIGHT, MAX_KEY, Node, NodeSource};
+use crate::tree::{MAX_HEIGHT, Node, NodeSource};
 use crate::{Finding, Report, VerifyLevel};
 
 pub(crate) fn run(
@@ -224,26 +224,8 @@ impl Verifier<'_> {
         let mut live: Vec<(Vec<u8>, u64)> = Vec::new();
         for (k, val) in &records {
             let at = locate(k);
-            // The limits every writer enforces; a page can hold larger entries.
-            if k.len() > MAX_KEY {
-                self.find(
-                    "key",
-                    at.clone(),
-                    format!(
-                        "key of {} bytes exceeds the {MAX_KEY}-byte key limit",
-                        k.len()
-                    ),
-                );
-            } else if k.len() + val.len() > MAX_ENTRY {
-                self.find(
-                    "value",
-                    at.clone(),
-                    format!(
-                        "key and value of {} bytes exceed the {MAX_ENTRY}-byte entry limit",
-                        k.len() + val.len()
-                    ),
-                );
-            }
+            // Keys and entries over the tree limits never get here: decoding their page refuses
+            // them, which is reported as a page finding naming the limit.
             let Some(&family) = k.first() else {
                 self.find("key", at, "empty key");
                 continue;

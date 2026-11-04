@@ -1532,7 +1532,19 @@ impl Inner {
                     if now == 0 {
                         t.put(ck, ContentEntry::Removed.encode())
                             .map_err(rejected)?;
-                        self.retire_content(t, &manifest, generation, &mut retired)?;
+                        // A committed manifest, named by the stored index: read it like any
+                        // reader does, bounded and verified before it is held whole.
+                        let m = Manifest::decode(
+                            &self
+                                .read_extent(
+                                    &manifest,
+                                    Manifest::encoded_len(u32::MAX as usize),
+                                    "content manifest",
+                                )
+                                .map_err(rejected)?,
+                        )
+                        .map_err(rejected)?;
+                        self.retire_content(t, &manifest, &m, generation, &mut retired)?;
                     } else if now as u64 != n {
                         t.put(
                             ck,
@@ -1572,7 +1584,10 @@ impl Inner {
             }
         }
         for o in orphans {
-            self.retire_content(t, &o, generation, &mut retired)?;
+            // Staged by this instance in this commit, possibly beyond the committed length.
+            let m = Manifest::decode(&self.read_written_extent(&o).map_err(rejected)?)
+                .map_err(rejected)?;
+            self.retire_content(t, &o, &m, generation, &mut retired)?;
         }
         Ok(retired)
     }
@@ -1583,12 +1598,11 @@ impl Inner {
         &self,
         t: &mut TreeTxn,
         manifest: &ExtentRef,
+        m: &Manifest,
         generation: u64,
         retired: &mut Vec<(u64, u64)>,
     ) -> Result<(), CommitError> {
-        let m = Manifest::decode(&self.read_written_extent(manifest).map_err(rejected)?)
-            .map_err(rejected)?;
-        for x in std::iter::once(*manifest).chain(m.segments) {
+        for x in std::iter::once(*manifest).chain(m.segments.iter().copied()) {
             t.put(
                 retired_extent_key(generation, x.offset),
                 x.len.to_le_bytes().to_vec(),

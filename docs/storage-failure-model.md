@@ -187,11 +187,16 @@ digest and length. Commits refuse to continue when the generation or page counte
 **Limitation:** checksums detect accidental damage, not deliberate forgery. A store crafted with
 valid checksums but inconsistent structures is only partly validated today: publication cursors,
 extent bounds and content digests are checked; every node reference must lie inside committed
-metadata with an incarnation no newer than the current generation; and a traversal may load at most
-as many nodes as the store has pages, so a shared or cyclic subtree fails instead of looping. A
+metadata with an incarnation no newer than the current generation; every loaded node holds only
+keys, separators and entries within the limits every write enforces, which splitting relies on; and
+a traversal may load at most as many nodes as the store has pages, so a shared or cyclic subtree
+fails instead of looping. Every committed extent, including a manifest a commit retires, is read
+within its format maximum and committed content and verified in chunks before it is held whole. A
 crafted extent whose length and SHA-256 match real committed bytes is indistinguishable from a
-valid one and is read whole, within committed content and the format maximum. Full structural
-validation of hostile stores is not implemented yet.
+valid one and is read whole. The traversal bound is the page count the store itself records, so a
+crafted store with a large page count and a sparse metadata file can still cost work in proportion
+to that count, one page at a time. Full structural validation of hostile stores is not implemented
+yet.
 
 ## Requests the format cannot hold
 

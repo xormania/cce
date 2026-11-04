@@ -1064,6 +1064,90 @@ fn a_crafted_manifest_extent_is_refused_before_more_than_a_chunk_is_held() {
 }
 
 #[test]
+fn a_commit_retiring_crafted_content_holds_no_more_than_a_chunk_before_the_digest_check() {
+    use crate::records::{P_CONTENT, key};
+    use cce_core::storage::{
+        AttemptId, Change, ChangeSet, CommitError, ContextId, Precondition, StorageEngine,
+    };
+    // B's content entry names a crafted 3 MB manifest extent; removing B retires that content,
+    // which reads the manifest to find its segments.
+    let (s, sizes, _) = forged(|c| key(P_CONTENT, &[&c.content.digest.0]));
+    let r = s.commit(
+        AttemptId::new(*b"remove").unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![Change::RemoveContext {
+                id: ContextId::new(*b"B").unwrap(),
+                expect: Precondition::Any,
+            }],
+            ..ChangeSet::default()
+        },
+    );
+    let r = match r {
+        Err(CommitError::Rejected(e)) => Err(e),
+        other => Ok(other),
+    };
+    assert_digest_refused_within_chunk(r, &sizes, "retired content manifest");
+}
+
+/// A leaf payload with one entry.
+fn leaf_with(key: Vec<u8>, value: Vec<u8>) -> Vec<u8> {
+    let mut entries = crate::tree::Entries::new();
+    entries.insert(key, value);
+    crate::tree::Node::Leaf(entries).encode()
+}
+
+#[test]
+fn a_leaf_entry_over_the_tree_limits_is_refused_when_decoded() {
+    use crate::tree::{MAX_ENTRY, MAX_KEY, Node};
+    let refused = |payload: Vec<u8>, needle: &str, what: &str| match Node::decode(&payload) {
+        Err(StorageError::Integrity(m)) => assert!(m.contains(needle), "{what}: {m}"),
+        other => panic!("{what}: expected an integrity error containing {needle:?}, got {other:?}"),
+    };
+    refused(
+        leaf_with(vec![1; MAX_KEY + 1], vec![]),
+        "key limit",
+        "key over MAX_KEY",
+    );
+    refused(
+        leaf_with(vec![1; 10], vec![0; MAX_ENTRY - 9]),
+        "entry limit",
+        "entry over MAX_ENTRY",
+    );
+    // At the limits, the leaf decodes.
+    assert!(Node::decode(&leaf_with(vec![1; MAX_KEY], vec![])).is_ok());
+    assert!(Node::decode(&leaf_with(vec![1; 10], vec![0; MAX_ENTRY - 10])).is_ok());
+}
+
+#[test]
+fn a_branch_separator_over_the_key_limit_is_refused_when_decoded() {
+    use crate::tree::{MAX_KEY, Node};
+    let branch = |sep_len: usize| {
+        Node::Branch {
+            seps: vec![vec![b's'; sep_len]],
+            children: vec![
+                PageRef {
+                    page: 2,
+                    incarnation: 1,
+                },
+                PageRef {
+                    page: 3,
+                    incarnation: 1,
+                },
+            ],
+        }
+        .encode()
+    };
+    // A two-child branch fits a page with an oversized separator, but splitting it after a child
+    // split has no valid point: the split relies on separators within the key limit.
+    match Node::decode(&branch(MAX_KEY + 1)) {
+        Err(StorageError::Integrity(m)) => assert!(m.contains("key limit"), "{m}"),
+        other => panic!("expected a separator over the key limit to be refused, got {other:?}"),
+    }
+    assert!(Node::decode(&branch(MAX_KEY)).is_ok());
+}
+
+#[test]
 fn verified_extents_read_back_whole_and_small_ones_in_one_read() {
     use std::sync::{Arc, Mutex};
 

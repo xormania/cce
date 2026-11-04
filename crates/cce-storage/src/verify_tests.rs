@@ -566,7 +566,7 @@ fn publish_leaf(sim: &SimIo, entries: Entries) {
 }
 
 #[test]
-fn a_record_larger_than_the_entry_limit_is_a_value_finding() {
+fn a_record_larger_than_the_entry_limit_is_a_page_finding_naming_the_limit() {
     use crate::tree::MAX_ENTRY;
     let sim = empty();
     let k = context_key(&cid("A"));
@@ -580,7 +580,14 @@ fn a_record_larger_than_the_entry_limit_is_a_value_finding() {
     assert!(k.len() + v.len() > MAX_ENTRY && k.len() + v.len() < 2 * MAX_ENTRY);
     publish_leaf(&sim, Entries::from([(k, v)]));
     let r = verify(&sim);
-    assert_only_besides_coverage(&r, "value");
+    assert_only_besides_coverage(&r, "page");
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.check == "page" && f.detail.contains("entry limit")),
+        "the page finding must name the entry limit: {:#?}",
+        r.findings
+    );
     assert!(
         r.findings.iter().any(|f| f.detail.contains("entry limit")),
         "{:#?}",
@@ -589,7 +596,7 @@ fn a_record_larger_than_the_entry_limit_is_a_value_finding() {
 }
 
 #[test]
-fn a_key_longer_than_the_key_limit_is_a_key_finding() {
+fn a_key_longer_than_the_key_limit_is_a_page_finding_naming_the_limit() {
     use crate::records::RelValue;
     use crate::tree::MAX_KEY;
     // A relationship whose identifiers are all zero bytes, which keys escape to two bytes each:
@@ -625,13 +632,22 @@ fn a_key_longer_than_the_key_limit_is_a_key_finding() {
         .unwrap()
     });
     let r = verify(&sim);
-    assert_only_besides_coverage(&r, "key");
+    assert_only_besides_coverage(&r, "page");
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.check == "page" && f.detail.contains("key limit")),
+        "the page finding must name the key limit: {:#?}",
+        r.findings
+    );
+    // The root's separator is the oversized incoming key: decoding stops there, so its leaves are
+    // not reached and the limit is reported once.
     assert_eq!(
         r.findings
             .iter()
             .filter(|f| f.detail.contains("key limit"))
             .count(),
-        2,
+        1,
         "{:#?}",
         r.findings
     );
