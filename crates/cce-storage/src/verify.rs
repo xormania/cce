@@ -136,7 +136,7 @@ impl Verifier<'_> {
                     format!("valid, generation {}", d.generation)
                 }
                 Slot::Invalid(why) => format!("invalid: {why}"),
-                Slot::Unsupported(v) => format!("unsupported format version {v}"),
+                Slot::Unsupported(why) => format!("unsupported: {why}"),
             };
         }
         Ok(out)

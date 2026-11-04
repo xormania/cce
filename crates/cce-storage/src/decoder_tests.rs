@@ -198,9 +198,11 @@ fn descriptor() -> Descriptor {
 /// Publication record layout: magic 0..4, version 4..6, store 6..22, generation 22..30, root page
 /// 30..38, root incarnation 38..46, next page 46..54, content length 54..62, history position
 /// 62..70, checksum 70..74.
+/// Recomputes a publication record's checksum, in the current layout.
 fn reseal_slot(s: &mut [u8]) {
-    let crc = crc32fast::hash(&s[..70]);
-    s[70..74].copy_from_slice(&crc.to_le_bytes());
+    let n = crate::format::DESC_LEN - 4;
+    let crc = crc32fast::hash(&s[..n]);
+    s[n..n + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
 #[test]
@@ -212,15 +214,17 @@ fn publication_records_classify_by_their_bytes() {
         matches!(decode_slot(&good), Slot::Valid(x) if x == d),
         "extreme field values"
     );
+    let len = crate::format::DESC_LEN;
     assert_eq!(&good[0..4], b"CCED");
+    assert_eq!(good[6..10], [0; 4], "no required features");
     assert_eq!(
-        u64::from_le_bytes(good[22..30].try_into().unwrap()),
+        u64::from_le_bytes(good[26..34].try_into().unwrap()),
         d.generation
     );
-    assert!(good[74..].iter().all(|&b| b == 0), "padding");
+    assert!(good[len..].iter().all(|&b| b == 0), "padding");
 
     assert!(matches!(decode_slot(&vec![0; PAGE_SIZE]), Slot::Empty));
-    for len in [0, 1, 73] {
+    for len in [0, 1, len - 1] {
         assert!(
             matches!(decode_slot(&good[..len]), Slot::Invalid(m) if m.contains("short")),
             "{len}-byte slot"
@@ -242,7 +246,10 @@ fn publication_records_classify_by_their_bytes() {
     let mut future = good.clone();
     future[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
     reseal_slot(&mut future);
-    assert!(matches!(decode_slot(&future), Slot::Unsupported(v) if v == FORMAT_VERSION + 1));
+    assert_eq!(
+        decode_slot(&future),
+        Slot::Unsupported(format!("format version {}", FORMAT_VERSION + 1))
+    );
 }
 
 fn err_contains<T: std::fmt::Debug>(r: Result<T, StorageError>, needle: &str, what: &str) {

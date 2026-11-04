@@ -20,7 +20,13 @@ pub(crate) const FIRST_NODE_PAGE: u64 = 2;
 /// magic 4 + version 2 + kind 1 + reserved 1 + store 16 + page 8 + incarnation 8 + len 4 + crc 4.
 pub(crate) const PAGE_HEADER_LEN: usize = 48;
 pub(crate) const PAGE_PAYLOAD_MAX: usize = PAGE_SIZE - PAGE_HEADER_LEN;
-pub(crate) const DESC_LEN: usize = 4 + 2 + 16 + 8 * 6 + 4;
+/// magic 4 + version 2 + required features 4 + store 16 + six counters 8 each + crc 4.
+pub(crate) const DESC_LEN: usize = 4 + 2 + 4 + 16 + 8 * 6 + 4;
+/// Length of the publication record of format versions before 5, which had no required features.
+const EARLIER_DESC_LEN: usize = 4 + 2 + 16 + 8 * 6 + 4;
+/// Required features this build implements: none yet. A publication record that requires any
+/// other is refused as unsupported, like an unknown format version.
+pub(crate) const KNOWN_REQUIRED_FEATURES: u32 = 0;
 
 /// Identity of one store; recorded in every page and publication record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -165,6 +171,8 @@ impl Descriptor {
         let mut e = Enc::default();
         e.raw(&DESC_MAGIC)
             .u16(FORMAT_VERSION)
+            // Required features: this build writes none.
+            .u32(0)
             .raw(&self.store.0)
             .u64(self.generation)
             .u64(self.root.page)
@@ -188,8 +196,9 @@ pub(crate) enum Slot {
     Valid(Descriptor),
     /// Damaged or torn; the reason is kept for diagnostics.
     Invalid(String),
-    /// A well-formed record of a format this build does not support.
-    Unsupported(u16),
+    /// A well-formed record of a format version, or requiring features, this build does not
+    /// support; the reason names which.
+    Unsupported(String),
 }
 
 pub(crate) fn decode_slot(bytes: &[u8]) -> Slot {
@@ -201,16 +210,29 @@ pub(crate) fn decode_slot(bytes: &[u8]) -> Slot {
     }
     let (body, crc) = bytes[..DESC_LEN].split_at(DESC_LEN - 4);
     if crc32fast::hash(body).to_le_bytes() != crc {
+        // Records of earlier versions have no required features, so their checksum ends 4 bytes
+        // earlier: an intact one is a store this build does not support, not a damaged slot.
+        let (old, old_crc) = bytes[..EARLIER_DESC_LEN].split_at(EARLIER_DESC_LEN - 4);
+        if crc32fast::hash(old).to_le_bytes() == old_crc && old[..4] == DESC_MAGIC {
+            let v = u16::from_le_bytes([old[4], old[5]]);
+            if v != FORMAT_VERSION {
+                return Slot::Unsupported(format!("format version {v}"));
+            }
+        }
         return Slot::Invalid("checksum mismatch".into());
     }
     let mut d = Dec::new(body, "descriptor");
-    let parse = |d: &mut Dec| -> Result<Result<Descriptor, u16>, StorageError> {
+    let parse = |d: &mut Dec| -> Result<Result<Descriptor, String>, StorageError> {
         if d.array::<4>()? != DESC_MAGIC {
             return Err(corrupt("bad magic"));
         }
         let v = d.u16()?;
         if v != FORMAT_VERSION {
-            return Ok(Err(v));
+            return Ok(Err(format!("format version {v}")));
+        }
+        let unknown = d.u32()? & !KNOWN_REQUIRED_FEATURES;
+        if unknown != 0 {
+            return Ok(Err(format!("unknown required features {unknown:#x}")));
         }
         Ok(Ok(Descriptor {
             store: StoreId(d.array()?),
@@ -226,7 +248,7 @@ pub(crate) fn decode_slot(bytes: &[u8]) -> Slot {
     };
     match parse(&mut d) {
         Ok(Ok(desc)) => Slot::Valid(desc),
-        Ok(Err(v)) => Slot::Unsupported(v),
+        Ok(Err(why)) => Slot::Unsupported(why),
         Err(e) => Slot::Invalid(e.to_string()),
     }
 }
@@ -290,6 +312,21 @@ mod tests {
         future[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
         let crc = crc32fast::hash(&future[..DESC_LEN - 4]);
         future[DESC_LEN - 4..DESC_LEN].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(decode_slot(&future), Slot::Unsupported(FORMAT_VERSION + 1));
+        assert_eq!(
+            decode_slot(&future),
+            Slot::Unsupported(format!("format version {}", FORMAT_VERSION + 1))
+        );
+        // Required features this build lacks: unsupported, whatever the bit.
+        for bit in [0, 31] {
+            let mut needs = bytes.clone();
+            needs[6..10].copy_from_slice(&(1u32 << bit).to_le_bytes());
+            let crc = crc32fast::hash(&needs[..DESC_LEN - 4]);
+            needs[DESC_LEN - 4..DESC_LEN].copy_from_slice(&crc.to_le_bytes());
+            assert_eq!(
+                decode_slot(&needs),
+                Slot::Unsupported(format!("unknown required features {:#x}", 1u32 << bit))
+            );
+        }
+        assert_eq!(bytes[6..10], [0; 4], "a record requiring nothing");
     }
 }
