@@ -95,6 +95,24 @@ class Attribution(unittest.TestCase):
         })
         self.assertEqual(crates, {"cce_storage": "cce-storage", "cce_core": "cce-core"})
 
+    def test_a_result_after_captured_output_is_attributed_to_its_test(self):
+        text = (
+            "     Running tests/workloads.rs (target/debug/deps/workloads-bbb)\n"
+            "running 2 tests\n"
+            "test large_content_streams_through_one_segment_buffer ... WORKLOAD {\"a\": 1}\n"
+            "ok\n"
+            "test opening_and_point_and_range_reads_do_not_grow_with_the_store ... noise\n"
+            "more noise\n"
+            "FAILED\n"
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
+        )
+        tests, _ = t.parse_test_output(text, *t.executables(NO_RUN))
+        self.assertEqual(tests, {
+            "cce-storage:workloads:large_content_streams_through_one_segment_buffer": "ok",
+            "cce-storage:workloads:opening_and_point_and_range_reads_do_not_grow_with_the_store":
+                "failed",
+        })
+
     def test_every_test_line_is_attributed_to_the_binary_cargo_was_running(self):
         tests, binaries = t.parse_test_output(RUN, *t.executables(NO_RUN))
         self.assertEqual(tests, {
@@ -126,17 +144,24 @@ class Qualification(unittest.TestCase):
         self.assertEqual(t.qualify(101, {"p:lib:a": "ok"}, self.one),
                          ("failed", [{"exit": 101}]))
 
+    one_and_ignored = [{"binary": "p:lib", "passed": 1, "failed": 0, "ignored": 1, "filtered": 0}]
+
     def test_an_undeclared_ignored_test_does_not_pass(self):
-        outcome, problems = t.qualify(0, {"p:lib:a": "ok", "p:lib:b": "ignored"}, self.one,
-                                      declared={})
+        outcome, problems = t.qualify(0, {"p:lib:a": "ok", "p:lib:b": "ignored"},
+                                      self.one_and_ignored, declared={})
         self.assertEqual(outcome, "unexpected-ignored")
         self.assertEqual(problems, [{"unexpected_ignored": ["p:lib:b"]}])
 
     def test_a_declared_ignored_test_is_accepted(self):
         self.assertEqual(
-            t.qualify(0, {"p:lib:a": "ok", "p:lib:b": "ignored"}, self.one,
+            t.qualify(0, {"p:lib:a": "ok", "p:lib:b": "ignored"}, self.one_and_ignored,
                       declared={"p:lib:b": "elsewhere"}),
             ("passed", []))
+
+    def test_tests_counted_but_not_attributed_fail_the_tier(self):
+        outcome, problems = t.qualify(0, {}, self.one)
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(problems, [{"unattributed": "1 tests counted, 0 attributed"}])
 
     def test_zero_executed_tests_is_not_a_pass(self):
         none = [{"binary": "p:lib", "passed": 0, "failed": 0, "ignored": 0, "filtered": 9}]
@@ -176,6 +201,10 @@ class Campaigns(unittest.TestCase):
         _, gaps = self.check(self.model_batch, report("model", **dict(self.model,
                                                                         rejected_cases=3)))
         self.assertEqual(gaps, ["3 generated cases rejected"])
+
+    def test_a_report_printed_after_the_test_name_is_read(self):
+        line = "test model_tests::m ... " + report("model", **self.model)
+        self.assertEqual(self.check(self.model_batch, line)[1], [])
 
     def test_a_missing_or_failed_report_is_a_gap(self):
         self.assertEqual(self.check(self.model_batch, "test result: ok."),

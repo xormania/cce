@@ -144,11 +144,15 @@ TIERS = {
 RUNNING = re.compile(r"^\s+Running (?:unittests )?(\S+) \((.+)\)\s*$")
 DOCTESTS = re.compile(r"^\s+Doc-tests (\S+)\s*$")
 TEST_LINE = re.compile(r"^test (.+?) \.\.\. (ok|FAILED|ignored)\b")
+# With --nocapture a test's own output follows `test NAME ... ` and its result comes on a line of
+# its own once the test ends.
+TEST_START = re.compile(r"^test (.+?) \.\.\. ")
+LONE_RESULT = re.compile(r"^(ok|FAILED|ignored)\b")
 RESULT_LINE = re.compile(
     r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
     r"(\d+) measured; (\d+) filtered out"
 )
-REPORT_LINE = re.compile(r"^(model|crash|decoder) report: (\{.*\})\s*$")
+REPORT_LINE = re.compile(r"\b(model|crash|decoder) report: (\{.*\})\s*$")
 
 
 def now():
@@ -193,7 +197,7 @@ def parse_test_output(text, exes, crates):
     """Attributes every `test … ok|FAILED|ignored` line to the binary Cargo said it was running.
     Returns (tests, binaries): tests maps `package:target:name` to its result; binaries lists
     per-binary counts from its `test result:` line."""
-    tests, binaries, current = {}, [], None
+    tests, binaries, current, pending = {}, [], None, None
     for line in text.splitlines():
         m = RUNNING.match(line)
         if m:
@@ -207,6 +211,16 @@ def parse_test_output(text, exes, crates):
         m = TEST_LINE.match(line)
         if m and current:
             tests[f"{current}:{m.group(1)}"] = m.group(2).lower()
+            pending = None
+            continue
+        m = TEST_START.match(line)
+        if m and current:
+            pending = f"{current}:{m.group(1)}"
+            continue
+        m = LONE_RESULT.match(line)
+        if m and pending:
+            tests[pending] = m.group(1).lower()
+            pending = None
             continue
         m = RESULT_LINE.match(line)
         if m and current:
@@ -229,9 +243,13 @@ def qualify(exit_code, tests, binaries, declared=DECLARED_IGNORED):
         problems.append({"unexpected_ignored": unexpected})
     if executed == 0:
         problems.append({"no_tests": "no test executed"})
+    # Every test Cargo counted must be attributed, or the record misses tests.
+    counted = sum(b["passed"] + b["failed"] + b["ignored"] for b in binaries)
+    if counted != len(tests):
+        problems.append({"unattributed": f"{counted} tests counted, {len(tests)} attributed"})
     if exit_code != 0 and not failed:
         problems.append({"exit": exit_code})
-    if failed or exit_code != 0:
+    if failed or exit_code != 0 or counted != len(tests):
         outcome = "failed"
     elif unexpected:
         outcome = "unexpected-ignored"
@@ -246,7 +264,7 @@ def reports(text):
     """The `<kind> report: {json}` lines of a run, by kind."""
     found = {"model": [], "crash": [], "decoder": []}
     for line in text.splitlines():
-        m = REPORT_LINE.match(line)
+        m = REPORT_LINE.search(line)
         if m:
             try:
                 found[m.group(1)].append(json.loads(m.group(2)))
