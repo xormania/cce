@@ -384,3 +384,91 @@ fn a_damaged_root_page_of_the_newest_record_is_an_error_not_the_previous_generat
         }
     }
 }
+/// The sizes in the markdown table that follows `heading` in `doc`, in the column named `column`
+/// (a size like `8 + 8` is summed).
+fn table_sizes(doc: &str, heading: &str, column: &str) -> Vec<usize> {
+    let rest = &doc[doc
+        .find(heading)
+        .unwrap_or_else(|| panic!("no {heading:?}"))..];
+    let mut rows = rest
+        .lines()
+        .skip_while(|l| !l.starts_with('|'))
+        .take_while(|l| l.starts_with('|'));
+    let cells = |l: &str| -> Vec<String> {
+        l.trim_matches('|')
+            .split('|')
+            .map(|c| c.trim().to_string())
+            .collect()
+    };
+    let header = cells(rows.next().expect("a table"));
+    let at = header
+        .iter()
+        .position(|h| h == column)
+        .expect("the size column");
+    rows.skip(1)
+        .map(|r| {
+            cells(r)[at]
+                .split('+')
+                .map(|n| n.trim().parse::<usize>().expect("a size"))
+                .sum()
+        })
+        .collect()
+}
+
+#[test]
+fn the_format_document_states_the_current_version_and_layout_lengths() {
+    const DOC: &str = include_str!("../../../docs/storage-format.md");
+    // The version is stated once, in the title.
+    assert_eq!(
+        DOC.lines().next(),
+        Some(
+            format!(
+                "# Storage format (version {})",
+                crate::format::FORMAT_VERSION
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        DOC.matches("(version ").count(),
+        1,
+        "the version is stated more than once"
+    );
+    // The node page header.
+    let header = format!("Node page header ({PAGE_HEADER_LEN} bytes)");
+    assert!(
+        DOC.contains(&header),
+        "the document does not state {header:?}"
+    );
+    assert_eq!(
+        table_sizes(DOC, &header, "Size").iter().sum::<usize>(),
+        PAGE_HEADER_LEN,
+        "the node page header table"
+    );
+    // The publication record, as the code encodes it: its fields, then zeros to the page end.
+    let len = crate::format::DESC_LEN;
+    let page = Descriptor {
+        store: STORE,
+        generation: 1,
+        root: crate::format::PageRef {
+            page: 2,
+            incarnation: 1,
+        },
+        next_page: 3,
+        content_len: 0,
+        history_pos: 0,
+        features: 0,
+    }
+    .encode();
+    assert!(page.len() >= len && page[len..].iter().all(|b| *b == 0));
+    let record = format!("Record layout ({len} bytes");
+    assert!(
+        DOC.contains(&record),
+        "the document does not state {record:?}"
+    );
+    assert_eq!(
+        table_sizes(DOC, &record, "Size").iter().sum::<usize>(),
+        len,
+        "the publication record table"
+    );
+}

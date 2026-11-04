@@ -181,6 +181,28 @@ fn leaked(payload: usize, discard: bool) -> (SimIo, NativeStore, u64) {
 /// The published state's audit: reachable structures are disjoint, nothing is retired twice, and no
 /// retired extent overlaps a reachable one.
 fn audit(sim: &SimIo) {
+    assert_eq!(findings(sim), Vec::<String>::new(), "integrity check");
+    audit_physical(sim);
+}
+
+/// Every finding of the public integrity check, reading every content stream, as `check: detail`,
+/// sorted. Runs on a copy, so the store may stay open.
+fn findings(sim: &SimIo) -> Vec<String> {
+    let copy = Inner::open_read_only(Box::new(sim.after_process_exit()), Options::default())
+        .unwrap_or_else(|e| panic!("a read-only copy of the store must open: {e:?}"));
+    let report = crate::verify::run(&copy, crate::VerifyLevel::Scrub)
+        .unwrap_or_else(|e| panic!("the integrity check must run to completion: {e:?}"));
+    let mut found: Vec<String> = report
+        .findings
+        .iter()
+        .map(|f| format!("{}: {}", f.check, f.detail))
+        .collect();
+    found.sort();
+    found
+}
+
+/// The engine's own physical invariants, which the integrity check does not state the same way.
+fn audit_physical(sim: &SimIo) {
     assert_eq!(
         crate::audit::check_retirement(sim),
         Ok(()),
@@ -523,6 +545,14 @@ fn rebuilding_the_relationship_indexes_restores_the_submitted_edges_only_when_as
         (out.clone(), inc.clone())
     );
     damage(&s);
+    // The integrity check reports both: r1 has no incoming entry, and C's entry has no record.
+    assert_eq!(
+        findings(&sim),
+        [
+            "relationship-index: no incoming index entry",
+            "relationship-index: no matching relationship record",
+        ]
+    );
     // The damage shows through the port: r1 is missing from B's incoming listing, and listing C's
     // outgoing relationships fails on the entry without a record.
     let mut v = s.begin().unwrap();
@@ -2343,6 +2373,7 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
     let (mut checked, mut cases) = (0, 0);
     for (name, image, task, budget, partial) in SWEEPS {
         let base = image();
+        let before_findings = findings(&base);
         // The uncut step: what it changes, and how many mutating operations it makes.
         let probe = base.after_process_exit();
         let trace = Arc::new(Mutex::new(Vec::new()));
@@ -2401,11 +2432,22 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
                 let pristine = img.after_process_exit();
                 with_repro(&label, &[("image", &pristine)], &trace, || {
                     let recovered = open(&img);
-                    audit(&img);
+                    audit_physical(&img);
                     let got = logical(&recovered);
                     assert!(
                         got == before || got == after,
                         "{label}: a state between the two"
+                    );
+                    // The integrity check sees what the state holds: the damage the step repairs
+                    // (index rebuild) until it is published, nothing after.
+                    assert_eq!(
+                        findings(&img),
+                        if got == before {
+                            before_findings.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        "{label}: integrity check"
                     );
                     let published = recovered.inner.snapshot().unwrap().desc.generation;
                     assert!(published <= r.generation, "{label}: published {published}");

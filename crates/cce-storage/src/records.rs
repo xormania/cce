@@ -405,11 +405,12 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
         RemovalMode::PreserveViews => 0,
         RemovalMode::RequireQuiescence => 1,
     });
-    debug_assert_eq!(e.buf.len() as u64, encoded_request_len(changes));
+    // The request limit is checked against `encoded_request_len`: it must be exact.
+    assert_eq!(e.buf.len() as u64, encoded_request_len(changes));
     e.buf
 }
 
-/// Exact length of `encode_request(changes)`, computed without encoding (checked in debug builds).
+/// Exact length of `encode_request(changes)`, computed without encoding (checked by every encoding).
 pub(crate) fn encoded_request_len(changes: &ChangeSet) -> u64 {
     let field = |len: usize| 4 + len as u64;
     let expect = |p: &Precondition| match p {
@@ -498,12 +499,29 @@ pub(crate) fn check_request_bounds(
 
 /// Fingerprint binding an attempt identity to its exact logical request.
 pub(crate) fn fingerprint(attempt: &AttemptId, changes: &ChangeSet) -> [u8; 32] {
+    fingerprint_encoded(attempt, &encode_request(changes))
+}
+
+/// The fingerprint of an attempt and its request as encoded.
+fn fingerprint_encoded(attempt: &AttemptId, request: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"cce.attempt.v1\0");
     h.update((attempt.as_bytes().len() as u32).to_le_bytes());
     h.update(attempt.as_bytes());
-    h.update(encode_request(changes));
+    h.update(request);
     h.finalize().into()
+}
+
+/// The attempt of a stored history entry and the fingerprint of its request bytes exactly as
+/// stored, whatever their encoding version: what its commit recorded.
+pub(crate) fn stored_fingerprint(b: &[u8]) -> Result<(AttemptId, [u8; 32]), StorageError> {
+    let mut d = Dec::new(b, "history entry");
+    d.u64()?;
+    let attempt = dec_id(&mut d, AttemptId::new)?;
+    let request = d.bytes()?;
+    d.finish()?;
+    let fp = fingerprint_encoded(&attempt, request);
+    Ok((attempt, fp))
 }
 
 /// Encodes a retained history entry (stored as a content extent).
@@ -530,7 +548,7 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
         return Err(StorageError::Unsupported("history request encoding".into()));
     }
     let n = d.count(2)?;
-    let mut changes = Vec::with_capacity(n);
+    let mut changes = Vec::with_capacity(d.capacity_for(n, 2));
     for _ in 0..n {
         changes.push(match d.u8()? {
             1 => {
@@ -571,7 +589,7 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
         });
     }
     let nc = d.count(40)?;
-    let mut content = Vec::with_capacity(nc);
+    let mut content = Vec::with_capacity(d.capacity_for(nc, 40));
     for _ in 0..nc {
         content.push(ContentRef {
             digest: ContentDigest(d.array()?),
@@ -587,7 +605,7 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
         ));
     }
     let ne = d.count(8)?;
-    let mut evidence = Vec::with_capacity(ne);
+    let mut evidence = Vec::with_capacity(d.capacity_for(ne, 8));
     for _ in 0..ne {
         evidence.push(Evidence {
             label: d.bytes()?.to_vec(),
@@ -699,7 +717,8 @@ impl Manifest {
         for x in &self.segments {
             x.enc(&mut e);
         }
-        debug_assert_eq!(e.buf.len() as u64, Self::encoded_len(self.segments.len()));
+        // Manifest read limits are computed from `encoded_len`: it must be exact.
+        assert_eq!(e.buf.len() as u64, Self::encoded_len(self.segments.len()));
         e.buf
     }
 
@@ -713,7 +732,7 @@ impl Manifest {
             len: d.u64()?,
         };
         let n = d.count(48)?;
-        let mut segments = Vec::with_capacity(n);
+        let mut segments = Vec::with_capacity(d.capacity_for(n, 48));
         let mut total: u64 = 0;
         for _ in 0..n {
             let x = ExtentRef::dec(&mut d)?;

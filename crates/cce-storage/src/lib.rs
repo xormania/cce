@@ -16,6 +16,8 @@ mod content_tests;
 #[cfg(test)]
 mod crash_tests;
 #[cfg(test)]
+mod decoder_tests;
+#[cfg(test)]
 mod descriptor_tests;
 mod engine;
 #[cfg(test)]
@@ -23,6 +25,12 @@ mod engine_tests;
 mod format;
 #[cfg(test)]
 mod fs_seam_tests;
+#[cfg(any(test, feature = "fuzz-api"))]
+mod fuzz_api;
+#[cfg(test)]
+mod fuzz_replay_tests;
+#[cfg(test)]
+mod guard_tests;
 #[cfg(test)]
 mod history_removal_tests;
 mod io;
@@ -37,6 +45,8 @@ mod maintain_tests;
 mod merge_skip_tests;
 #[cfg(test)]
 mod model_tests;
+#[cfg(test)]
+mod oracle_tests;
 #[cfg(test)]
 mod quiescence_tests;
 #[cfg(test)]
@@ -54,7 +64,7 @@ mod resource_tests;
 mod reuse_tests;
 #[cfg(test)]
 mod seal_tests;
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz-api"))]
 mod sim;
 #[cfg(test)]
 mod split_sweep_tests;
@@ -65,10 +75,50 @@ mod tree;
 mod tree_reopen_tests;
 #[cfg(test)]
 mod uncertain_publication_tests;
+mod verify;
+#[cfg(test)]
+mod verify_tests;
 #[cfg(test)]
 mod view_gap_tests;
 #[cfg(test)]
 mod view_tests;
+
+/// Compile-time probes of the public surface, run as doctests. The listed items are reachable from
+/// outside the crate:
+///
+/// ```
+/// use cce_storage::{
+///     CommitTicket, Finding, NativeReadOnly, NativeStore, NativeView, Report, StoreOptions,
+///     StoreStats, VerifyLevel,
+/// };
+/// ```
+///
+/// and no physical module is. Each probe names the module itself, so it compiles exactly when the
+/// module is public (an item probe would also fail on the item's own visibility):
+///
+/// ```compile_fail
+/// use cce_storage::tree as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::format as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::records as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::engine as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::io as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::codec as _;
+/// ```
+/// ```compile_fail
+/// use cce_storage::verify as _;
+/// ```
+#[cfg(doctest)]
+mod surface_probes {}
 
 use std::io::Read;
 use std::path::Path;
@@ -81,6 +131,14 @@ use cce_core::storage::{
 };
 
 use engine::{Inner, Observation, Options, Pin, Snapshot};
+
+/// Fuzzing entry point, with the `fuzz-api` feature only: runs the named target of the fuzz harness
+/// (`page`, `slots`, `node`, `manifest`, `history`, `records` or `image`) on `data`. Not part of the
+/// storage API.
+#[cfg(feature = "fuzz-api")]
+pub fn fuzz_target(name: &str, data: &[u8]) {
+    fuzz_api::run(name, data);
+}
 
 /// A native store owned by this process.
 ///
@@ -192,7 +250,8 @@ impl NativeStore {
         Ok(Self { inner })
     }
 
-    /// Like [`NativeStore::open`], with explicit tuning options.
+    /// Like [`NativeStore::open`], with explicit tuning options; refused with `Busy` in the same
+    /// cases, including the transient one described there.
     pub fn open_with(dir: &Path, options: StoreOptions) -> Result<Self, StorageError> {
         let opts: Options = options.into();
         let inner = Inner::open(Box::new(io::FsIo::new(dir)), opts)?;
@@ -234,16 +293,25 @@ impl NativeStore {
     }
 
     /// Opens an existing store in `dir`. Never initializes a new store in its place.
+    ///
+    /// Fails with [`StorageError::Busy`] while another handle owns the store. Right after a handle
+    /// closes, `Busy` can also be transient: a child process being started at that moment still
+    /// holds a copy of the lock until it starts its program, and a child created without starting
+    /// another program holds it for its whole life (see the failure model's ownership section).
+    /// Retrying is safe.
     pub fn open(dir: &Path) -> Result<Self, StorageError> {
         Self::open_with(dir, StoreOptions::default())
     }
 
-    /// Opens an existing store in `dir` for read-only inspection. See [`NativeReadOnly`].
+    /// Opens an existing store in `dir` for read-only inspection. See [`NativeReadOnly`]. Refused
+    /// with `Busy` while a process owns the store, including transiently right after an owner
+    /// closes, as described for [`NativeStore::open`].
     pub fn open_read_only(dir: &Path) -> Result<NativeReadOnly, StorageError> {
         Self::open_read_only_with(dir, StoreOptions::default())
     }
 
-    /// Like [`NativeStore::open_read_only`], with explicit tuning options.
+    /// Like [`NativeStore::open_read_only`], with explicit tuning options; refused with `Busy` in the
+    /// same cases.
     pub fn open_read_only_with(
         dir: &Path,
         options: StoreOptions,
@@ -267,7 +335,99 @@ pub struct NativeReadOnly {
     inner: Arc<Inner>,
 }
 
+/// How thoroughly [`NativeReadOnly::verify`] inspects a store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VerifyLevel {
+    /// Both publication slots, every metadata page reachable from the current publication record,
+    /// every record in the tree and the relations between records, and the history entries with
+    /// their attempt records. Content bytes are not read.
+    Structure,
+    /// Everything [`VerifyLevel::Structure`] checks, and every committed content stream: each
+    /// manifest is read and matches its record, every segment matches its digest, the stream
+    /// matches the content's digest and length, and each context's binding matches its manifest.
+    Scrub,
+}
+
+/// One inconsistency found by [`NativeReadOnly::verify`].
+///
+/// Findings never contain stored bodies, content, evidence or identifiers: a record is named by its
+/// key family and a hash prefix of its key, a page by its number.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Finding {
+    /// Stable name of the check that failed (for example `relationship-index`).
+    pub check: &'static str,
+    pub location: String,
+    pub detail: String,
+}
+
+/// The result of [`NativeReadOnly::verify`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+    /// The publication record that was inspected.
+    pub generation: u64,
+    pub history_position: u64,
+    /// What each publication slot holds.
+    pub slots: [String; 2],
+    /// Recovery diagnostics from opening the store.
+    pub diagnostics: Vec<String>,
+    /// Metadata pages and tree records visited.
+    pub pages: u64,
+    pub records: u64,
+    /// Content bytes read and verified (zero at the structure level).
+    pub content_bytes: u64,
+    /// Inconsistencies, in a deterministic order.
+    pub findings: Vec<Finding>,
+}
+
+impl Report {
+    /// True if no check failed.
+    pub fn is_consistent(&self) -> bool {
+        self.findings.is_empty()
+    }
+
+    /// The report as JSON objects, one per line, in a deterministic order: a summary, the two
+    /// slots, the diagnostics, the findings, and a result line.
+    pub fn json_lines(&self) -> Vec<String> {
+        let q = |s: &str| verify::json_string(s);
+        let mut out = vec![format!(
+            "{{\"type\":\"summary\",\"generation\":{},\"history_position\":{},\"pages\":{},\"records\":{},\"content_bytes\":{}}}",
+            self.generation, self.history_position, self.pages, self.records, self.content_bytes
+        )];
+        for (i, s) in self.slots.iter().enumerate() {
+            out.push(format!(
+                "{{\"type\":\"slot\",\"slot\":{i},\"state\":{}}}",
+                q(s)
+            ));
+        }
+        for d in &self.diagnostics {
+            out.push(format!("{{\"type\":\"diagnostic\",\"text\":{}}}", q(d)));
+        }
+        for f in &self.findings {
+            out.push(format!(
+                "{{\"type\":\"finding\",\"check\":{},\"location\":{},\"detail\":{}}}",
+                q(f.check),
+                q(&f.location),
+                q(&f.detail)
+            ));
+        }
+        out.push(format!(
+            "{{\"type\":\"result\",\"consistent\":{},\"findings\":{}}}",
+            self.is_consistent(),
+            self.findings.len()
+        ));
+        out
+    }
+}
+
 impl NativeReadOnly {
+    /// Inspects the opened store's structure without changing it. Returns `Err` only when the
+    /// store cannot be inspected; inconsistencies are findings in the report. Because a read-only
+    /// open is refused while another process owns the store, this never runs against a live owner.
+    pub fn verify(&self, level: VerifyLevel) -> Result<Report, StorageError> {
+        verify::run(&self.inner, level)
+    }
+
     /// A consistent view of the selected committed state.
     pub fn begin(&self) -> Result<NativeView, StorageError> {
         NativeView::new(&self.inner)
@@ -318,18 +478,61 @@ impl CommitTicket {
     }
 }
 
-/// Tuning that does not change stored bytes.
+/// Options that never change stored bytes. Construct with `StoreOptions::default()` and set
+/// fields; new fields may be added.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct StoreOptions {
     /// Decoded metadata nodes kept in memory. Larger stores still work with a small cache; they
     /// read more pages.
     pub cache_nodes: usize,
+    /// Largest encoded request this handle writes, 64 MiB by default; a larger request is refused
+    /// whole, never split. Any value up to the format's limit (`u32::MAX` bytes) may be set, and
+    /// lowering it never makes data written under a larger value unreadable: reads are bounded by
+    /// the format, not by this.
+    pub max_request_len: u64,
+    /// Checked when the store is opened, read-write or read-only; `None` opens without it.
+    pub guard: Option<ReceiptGuard>,
+}
+
+/// What a caller retained independently of a store, checked before an open touches its data.
+///
+/// An open with a guard is refused with [`StorageError::GuardRefused`], and leaves the store's
+/// data untouched (a read-write open may have created the store's lock file), when the store has
+/// another identity or its published logical history position is below `min_history_position`.
+/// This is a rollback floor only: a position at or above the minimum does not prove that the
+/// history is the one the receipts came from. Construct it with [`ReceiptGuard::new`]; fields may
+/// be added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReceiptGuard {
+    /// The identity the store was created with.
+    pub store_id: [u8; 16],
+    /// The highest history position of a receipt the caller retained (`HistoryPosition(0)` if
+    /// none): the published position must be at least this.
+    pub min_history_position: cce_core::storage::HistoryPosition,
+}
+
+impl ReceiptGuard {
+    /// A guard for the store created with `store_id`, whose published history position must be
+    /// at least `min_history_position`.
+    pub fn new(
+        store_id: [u8; 16],
+        min_history_position: cce_core::storage::HistoryPosition,
+    ) -> Self {
+        Self {
+            store_id,
+            min_history_position,
+        }
+    }
 }
 
 impl Default for StoreOptions {
     fn default() -> Self {
         Self {
             cache_nodes: engine::DEFAULT_CACHE_NODES,
+            max_request_len: engine::DEFAULT_MAX_REQUEST_LEN,
+            guard: None,
         }
     }
 }
@@ -338,6 +541,8 @@ impl From<StoreOptions> for Options {
     fn from(o: StoreOptions) -> Self {
         Options {
             cache_nodes: o.cache_nodes,
+            max_request_len: o.max_request_len,
+            guard: o.guard,
             ..Options::default()
         }
     }
