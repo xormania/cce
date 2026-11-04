@@ -26,10 +26,13 @@ pub(crate) type Entries = BTreeMap<Vec<u8>, Vec<u8>>;
 /// One key → value entry.
 pub(crate) type KeyValue = (Vec<u8>, Vec<u8>);
 
-/// Largest key accepted into the tree.
-pub(crate) const MAX_KEY: usize = 1024;
 /// Largest key + value accepted into one leaf entry (at least two entries fit per leaf).
 pub(crate) const MAX_ENTRY: usize = 1800;
+/// Largest key accepted into the tree: as long as an entry may be. Keys become branch separators;
+/// a branch of three children with two such separators (5 + 3 * 16 + 2 * (2 + 1800) = 3657 bytes)
+/// still fits a page, so a branch overflows only with four or more children and always splits into
+/// halves of at least two children that fit.
+pub(crate) const MAX_KEY: usize = MAX_ENTRY;
 /// A leaf whose encoded size falls below this is merged with a sibling when the result fits.
 const MERGE_BELOW: usize = PAGE_PAYLOAD_MAX / 4;
 /// Deepest tree accepted when reading; deeper means corruption or a reference cycle.
@@ -1079,6 +1082,41 @@ mod tests {
         assert!(m.contains(&format!("{MAX_ENTRY}-byte entry limit")), "{m}");
         t.put(vec![1; MAX_KEY], vec![]).unwrap();
         t.put(vec![1; 10], vec![0; MAX_ENTRY - 10]).unwrap();
+    }
+
+    #[test]
+    fn keys_at_the_key_limit_split_into_pages_that_fit() {
+        // Keys of the largest accepted length: leaves hold two, branches two or three. The sink
+        // checks that every node written fits a page.
+        let m = Mem::default();
+        let mut model = Entries::new();
+        let key = |i: u32| {
+            let mut k = format!("k{i:05}").into_bytes();
+            k.resize(MAX_KEY, b'L');
+            k
+        };
+        let mut root = empty(&m);
+        for g in 0..6u32 {
+            root = commit(&m, root, u64::from(g) + 1, |t| {
+                for i in g * 40..(g + 1) * 40 {
+                    t.put(key(i), vec![]).unwrap();
+                    model.insert(key(i), vec![]);
+                }
+            });
+        }
+        assert!(
+            height(&m, root).unwrap() >= 4,
+            "branches never split under full-length separators"
+        );
+        assert_eq!(all(&m, root), model.clone().into_iter().collect::<Vec<_>>());
+        // Removing every third key merges and collapses within pages too.
+        root = commit(&m, root, 7, |t| {
+            for i in (0..240).step_by(3) {
+                assert!(t.delete(&key(i)).unwrap());
+                model.remove(&key(i));
+            }
+        });
+        assert_eq!(all(&m, root), model.into_iter().collect::<Vec<_>>());
     }
 
     #[test]

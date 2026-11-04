@@ -132,7 +132,7 @@ fn assert_refused(r: Result<(), CommitError>, total: usize) {
             assert!(m.contains("relationship"), "{m}");
             assert!(m.contains(&format!("{key} bytes")), "{m}");
             assert!(m.contains(&format!("{MAX_KEY}-byte key limit")), "{m}");
-            assert!(!m.contains("1800"), "{m}");
+            assert!(!m.contains("entry limit"), "{m}");
         }
         other => panic!("total {total}: expected a precise refusal, got {other:?}"),
     }
@@ -205,4 +205,25 @@ fn an_oversized_relationship_is_refused_before_any_change_is_applied() {
         content: None,
     };
     assert_refused(commit(&s, "both", vec![stale, rel]), LIMIT + 1);
+}
+
+#[test]
+fn four_full_length_identifiers_without_zero_bytes_fit() {
+    let sim = SimIo::new();
+    let s = sim_create(&sim);
+    let full = identifiers(4 * 255, 5);
+    assert!(full.iter().all(|v| v.len() == 255 && !v.contains(&0)));
+    let rel = relationship(&s, "full-endpoints", &full);
+    commit(&s, "full", vec![rel]).unwrap();
+    assert_eq!(observe(&s, &full).0.len(), 2, "both directions");
+    drop(s);
+    sim.release();
+    let s = NativeStore {
+        inner: Inner::open(Box::new(sim.clone()), Default::default()).unwrap(),
+    };
+    assert_eq!(
+        observe(&s, &full).0.len(),
+        2,
+        "both directions after reopen"
+    );
 }
