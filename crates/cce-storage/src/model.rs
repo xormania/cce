@@ -32,7 +32,7 @@ use crate::sim::{Persist, SimIo};
 use crate::test_support::resources::TestDir;
 #[cfg(test)]
 use crate::test_support::{attempt, cid, create_on, open_on};
-use crate::{NativeStore, NativeView};
+use crate::{MaintenanceBudget, MaintenanceReport, MaintenanceTask, NativeStore, NativeView};
 
 // The shared test support is compiled for unit tests only; the fuzz build defines the same four
 // helpers here.
@@ -222,6 +222,12 @@ pub(crate) enum Op {
     /// Compare the whole logical state, history and outcomes.
     Check,
     Reopen,
+    /// One bounded maintenance step: the task (reclaim, rebuild or relocate) and its budget.
+    Maintain {
+        task: u8,
+        pages: u8,
+        bytes: u8,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -374,6 +380,13 @@ pub(crate) enum Action {
     },
     Check(Box<Snapshot>),
     Reopen,
+    /// A maintenance step: it changes no logical state, so the store must still equal the
+    /// snapshot taken before it.
+    Maintain {
+        task: MaintenanceTask,
+        budget: MaintenanceBudget,
+        snapshot: Box<Snapshot>,
+    },
 }
 
 /// The complete expected state for a [`Op::Check`].
@@ -1004,6 +1017,13 @@ impl Model {
                 m.staged.clear();
                 m.action = Action::Reopen;
             }
+            Op::Maintain { task, pages, bytes } => {
+                m.action = Action::Maintain {
+                    task: maintenance_task(*task),
+                    budget: maintenance_budget(*pages, *bytes),
+                    snapshot: Box::new(m.snapshot()),
+                };
+            }
         }
         m
     }
@@ -1036,6 +1056,7 @@ pub(crate) fn op_name(op: &Op) -> &'static str {
         Op::Discard { .. } => "discard",
         Op::Check => "check",
         Op::Reopen => "reopen",
+        Op::Maintain { .. } => "maintain",
     }
 }
 
@@ -1718,6 +1739,19 @@ impl Engine {
                     .unwrap_or_else(|e| panic!("the store failed: clean close: {e:?}"));
                 e.store = Some(open(&e.backend));
             }
+            Action::Maintain {
+                task,
+                budget,
+                snapshot,
+            } => {
+                let r = e
+                    .store()
+                    .maintain(*task, *budget)
+                    .unwrap_or_else(|err| panic!("the store failed: maintain {task:?}: {err:?}"));
+                check_maintenance(*task, *budget, &r, snapshot);
+                // Logical equivalence: the store holds exactly what it held before the step.
+                main_check(&e, snapshot);
+            }
         }
         audit(&e, &format!("step {}", op_name(&op)));
         ownership_check(&e, &format!("step {}", op_name(&op)));
@@ -2147,6 +2181,12 @@ pub(crate) fn in_flight(
                 let _ = s.close();
             }
             e.store = open_on(e.backend.io(), Default::default()).ok();
+            (None, None)
+        }
+        Action::Maintain { task, budget, .. } => {
+            if let Some(s) = &e.store {
+                let _ = s.maintain(*task, *budget);
+            }
             (None, None)
         }
         // Steps without mutating I/O never contain a cut.
@@ -2580,7 +2620,17 @@ pub(crate) fn fail_at(
     ));
     let prior = unbound_staged_space(&e, &after.action);
     let bound = bound_stagings(&e, &after.action);
-    let (request, got) = in_flight(&mut e, &after.action);
+    let (request, got, maintained) = match &after.action {
+        Action::Maintain { task, budget, .. } => (
+            None,
+            None,
+            e.store.as_ref().map(|s| s.maintain(*task, *budget)),
+        ),
+        action => {
+            let (request, got) = in_flight(&mut e, action);
+            (request, got, None)
+        }
+    };
     // The stagings the step bound are consumed, owned by an uncertain publication or still
     // staged; nothing after the failure may bind them again.
     for k in bound.into_iter().rev() {
@@ -2628,6 +2678,27 @@ pub(crate) fn fail_at(
                 live.fence_allowed = failed == Some("sync");
             }
             _ => {}
+        }
+    }
+    // A maintenance step publishes through the same barrier: the same rule.
+    if let Some(r) = &maintained {
+        count(match r {
+            Ok(_) => "failed maintenance completed",
+            Err(CommitError::Indeterminate(_)) => "failed maintenance indeterminate",
+            Err(_) => "failed maintenance refused",
+        });
+        match r {
+            Err(CommitError::Indeterminate(_)) => live.fence_allowed = true,
+            Err(CommitError::Rejected(StorageError::Io(m))) => {
+                assert!(
+                    failed.is_some(),
+                    "maintenance was refused with an I/O error ({m}), but no injected failure \
+                     was hit"
+                );
+                live.fence_allowed = failed == Some("sync");
+            }
+            Err(e) => panic!("maintenance under an injected failure: unexpected {e:?}"),
+            Ok(_) => {}
         }
     }
 
@@ -2768,9 +2839,11 @@ pub(crate) fn step_spans(transitions: &[Op], bounds: &[u64], reopen: bool) -> Ve
         .iter()
         .enumerate()
         .filter(|(_, op)| match op {
-            Op::Commit(_) | Op::CommitFromHeld { .. } | Op::SubmitAndPoll(_) | Op::Retry { .. } => {
-                true
-            }
+            Op::Commit(_)
+            | Op::CommitFromHeld { .. }
+            | Op::SubmitAndPoll(_)
+            | Op::Retry { .. }
+            | Op::Maintain { .. } => true,
             Op::Reopen => reopen,
             _ => false,
         })
@@ -2822,6 +2895,98 @@ pub(crate) fn sampled_cuts(transitions: &[Op], bounds: &[u64], n: u64, seed: u64
             }
         })
         .collect()
+}
+
+/// The maintenance task a step names.
+pub(crate) fn maintenance_task(task: u8) -> MaintenanceTask {
+    match task % 3 {
+        0 => MaintenanceTask::ReclaimContentHoles,
+        1 => MaintenanceTask::RebuildRelationshipIndexes,
+        _ => MaintenanceTask::Relocate,
+    }
+}
+
+/// A step's budget: from one page to sixteen, and content bytes from less than one small staging
+/// to more than the largest.
+pub(crate) fn maintenance_budget(pages: u8, bytes: u8) -> MaintenanceBudget {
+    MaintenanceBudget {
+        max_pages: 1 + u64::from(pages % 16),
+        max_content_bytes: [64, 4_096, 100_000, 1 << 24][usize::from(bytes % 4)],
+    }
+}
+
+/// What a maintenance report may say: within its budget, nothing a task does not do, and an index
+/// rebuild that rewrote both entries of every relationship the model holds.
+pub(crate) fn check_maintenance(
+    task: MaintenanceTask,
+    budget: MaintenanceBudget,
+    r: &MaintenanceReport,
+    snapshot: &Snapshot,
+) {
+    let name = match task {
+        MaintenanceTask::ReclaimContentHoles => "reclaim",
+        MaintenanceTask::RebuildRelationshipIndexes => "rebuild",
+        MaintenanceTask::Relocate => "relocate",
+    };
+    count(&format!("maintain {name}"));
+    match task {
+        MaintenanceTask::ReclaimContentHoles => {
+            assert!(
+                r.content_bytes_reclaimed <= budget.max_content_bytes,
+                "reclaim over its budget: {r:?} with {budget:?}"
+            );
+            assert_eq!(
+                (
+                    r.pages_moved,
+                    r.content_bytes_moved,
+                    r.index_entries_written
+                ),
+                (0, 0, 0),
+                "reclaim did more than reclaim: {r:?}"
+            );
+            if r.content_bytes_reclaimed > 0 {
+                count("maintenance reclaimed content space");
+            }
+        }
+        MaintenanceTask::RebuildRelationshipIndexes => {
+            assert_eq!(
+                r.index_entries_written,
+                2 * snapshot.logical.rels.len() as u64,
+                "an index rebuild writes both entries of every relationship"
+            );
+            assert!(r.complete, "an index rebuild is one publication: {r:?}");
+            assert_eq!(
+                (
+                    r.pages_moved,
+                    r.content_bytes_moved,
+                    r.content_bytes_reclaimed
+                ),
+                (0, 0, 0),
+                "rebuild did more than rebuild: {r:?}"
+            );
+        }
+        MaintenanceTask::Relocate => {
+            assert!(
+                r.pages_moved <= budget.max_pages
+                    && r.content_bytes_moved <= budget.max_content_bytes,
+                "relocation over its budget: {r:?} with {budget:?}"
+            );
+            assert_eq!(
+                (r.content_bytes_reclaimed, r.index_entries_written),
+                (0, 0),
+                "relocation did more than relocate: {r:?}"
+            );
+            if r.pages_moved > 0 {
+                count("maintenance relocated pages");
+            }
+            if r.content_bytes_moved > 0 {
+                count("maintenance relocated content");
+            }
+        }
+    }
+    if !r.complete {
+        count("maintenance left work");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2990,7 +3155,12 @@ impl ByteReader<'_> {
                 refused: self.byte() % 10 < 3,
             },
             32..=34 => Op::Check,
-            _ => Op::Reopen,
+            35 => Op::Reopen,
+            _ => Op::Maintain {
+                task: self.below(3),
+                pages: self.byte(),
+                bytes: self.byte(),
+            },
         }
     }
 
@@ -3006,7 +3176,7 @@ impl ByteReader<'_> {
 const MAX_CHANGES: usize = 5;
 
 /// The sum of the step weights (the tag ranges in `ByteReader::op`).
-const OP_WEIGHTS: u8 = 36;
+const OP_WEIGHTS: u8 = 38;
 
 /// Decodes an input into how to run it and its steps.
 pub(crate) fn ops_from_bytes(data: &[u8]) -> (ByteRun, Vec<Op>) {
@@ -3201,6 +3371,7 @@ fn put_op(out: &mut Vec<u8>, op: &Op) {
         Op::Discard { pick, refused } => out.extend([30, *pick, if *refused { 0 } else { 9 }]),
         Op::Check => out.push(32),
         Op::Reopen => out.push(35),
+        Op::Maintain { task, pages, bytes } => out.extend([36, *task, *pages, *bytes]),
     }
 }
 

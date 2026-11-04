@@ -136,6 +136,15 @@ fn shape_request_spec(m: &Model) -> BoxedStrategy<RequestSpec> {
         .boxed()
 }
 
+/// A maintenance step: any task, any budget.
+fn maintain_op() -> impl Strategy<Value = Op> {
+    (0u8..3, any::<u8>(), any::<u8>()).prop_map(|(task, pages, bytes)| Op::Maintain {
+        task,
+        pages,
+        bytes,
+    })
+}
+
 fn read_spec() -> impl Strategy<Value = ReadSpec> {
     let n = CONTEXTS.len() as u8;
     let k = KINDS.len() as u8;
@@ -180,6 +189,7 @@ impl ReferenceStateMachine for ModelMachine {
                 1 => any::<u8>().prop_map(Op::Release),
                 1 => Just(Op::Check),
                 1 => Just(Op::Reopen),
+                2 => maintain_op(),
             ]
             .boxed();
         }
@@ -196,6 +206,7 @@ impl ReferenceStateMachine for ModelMachine {
             2 => (any::<u8>(), proptest::bool::weighted(0.3)).prop_map(|(pick, refused)| Op::Discard { pick, refused }),
             3 => Just(Op::Check),
             1 => Just(Op::Reopen),
+            2 => maintain_op(),
         ]
         .boxed()
     }
@@ -288,12 +299,15 @@ fn run_profile<const FILES: bool>(backend: &str, profile: Profile, cases: u32, s
     if !FILES && profile == Profile::Mixed {
         // The staging lifecycle must actually be exercised: a staging a rejected commit bound is
         // committed later, another is discarded, and stagings own space that still carries a
-        // retirement record.
+        // retirement record; and maintenance must reclaim and relocate something.
         let observed = STATS.with(|s| s.borrow().clone());
         for what in [
             "staging committed after a rejected commit bound it",
             "discard after a rejected commit bound the staging",
             "staging owns space with a retirement record",
+            "maintenance reclaimed content space",
+            "maintenance relocated pages",
+            "maintenance relocated content",
         ] {
             assert!(
                 observed.get(what).copied().unwrap_or(0) > 0,
@@ -473,6 +487,7 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
             "failed step acknowledged",
             "live outcome committed",
             "acknowledged after the failure",
+            "failure in: maintain",
         ] {
             assert!(
                 observed.get(what).copied().unwrap_or(0) > 0,
