@@ -1191,6 +1191,8 @@ enum Point {
     Barrier,
     Publish,
     Apply,
+    /// Before any content-file write (a staging writing a segment it just took).
+    ContentWrite,
 }
 
 /// A pause armed at one point: the paused operation signals `reached` and waits for `go`.
@@ -1264,6 +1266,9 @@ impl Io for Watched {
         let publication = file == FileId::Meta && offset < 2 * PAGE_SIZE as u64;
         if publication {
             self.tap.pause_at(Point::Publish);
+        }
+        if file == FileId::Content {
+            self.tap.pause_at(Point::ContentWrite);
         }
         let r = self.note("write", self.sim.write_at(file, offset, data));
         if r.is_ok() && file == FileId::Content {
@@ -3564,8 +3569,56 @@ fn a_failed_publication_with_a_staging_across_it_recovers_on_the_selected_public
         e.store().outcome(&attempt("paused")).expect("outcome"),
         AttemptOutcome::Unknown
     );
+    // The uncertain commit owns the space of the staging it bound until reopen: discarding that
+    // staging is refused, and the staging made across the pause owns none of that space.
+    let y_again = StagedContent {
+        content: y.handle.content,
+        token: y.handle.token.clone(),
+    };
+    assert!(
+        e.store().discard_staged(y_again).is_err(),
+        "a staging bound by an uncertain publication was discarded"
+    );
+    let y_ranges: Vec<(u64, u64)> = y.ranges().collect();
+    e.staged.push(y);
     e.staged.push(z);
     ownership_check(&e, "a failed publication");
+    // Fenced: a new staging takes nothing from the reuse pool (no retired extent, nothing the
+    // uncertain commit owns).
+    let wb = bytes_of(11, 2000);
+    let tap = e.tap().expect("tap").clone();
+    tap.writes.lock().unwrap().clear();
+    // Fencing stops reuse, not staging: the staging is made from fresh space.
+    let staged = e.store().stage_content(&mut &wb[..]);
+    assert!(
+        staged.is_ok(),
+        "staging after the fence: {:?}",
+        staged.as_ref().err()
+    );
+    if let Ok(handle) = staged {
+        let owns = std::mem::take(&mut *tap.writes.lock().unwrap());
+        let w = Staged {
+            handle,
+            owns,
+            rejected: 0,
+        };
+        let (_, r) = traverse(sim_of(&e), "staging after the fence");
+        for a in w.ranges() {
+            assert!(
+                !r.retired_extents
+                    .iter()
+                    .any(|(o, (_, l))| overlaps(a, (*o, *l))),
+                "a staging after the fence took reusable space {a:?}"
+            );
+            assert!(
+                !y_ranges.iter().any(|b| overlaps(a, *b)),
+                "a staging after the fence took the uncertain commit's space {a:?}"
+            );
+        }
+        count("staging after the fence");
+        e.staged.push(w);
+    }
+    ownership_check(&e, "staging after a failed publication");
     let prior: Vec<(u64, u64)> = e.staged.iter().flat_map(Staged::ranges).collect();
     e.staged.clear();
     e.held.clear();
@@ -3584,4 +3637,150 @@ fn a_failed_publication_with_a_staging_across_it_recovers_on_the_selected_public
         .unwrap_or_else(|x| panic!("the retried request after recovery: {x:?}"));
     assert_eq!(record_content(&e, "p"), Some(yb));
     audit(&e, "the retry after recovery");
+}
+
+/// A staging that took space before a commit's publication became uncertain resumes after it:
+/// the staging the uncertain commit binds cannot be discarded, and the resumed staging takes no
+/// reusable space (none of what the uncertain commit owns), so the bytes that commit's record
+/// may reference stay intact; reopen settles which record won.
+#[test]
+fn a_staging_in_progress_across_an_uncertain_publication_takes_none_of_its_space() {
+    use crate::engine::CONTENT_CHUNK;
+    let deadline = std::time::Duration::from_secs(20);
+    let mut e = fresh_engine();
+    // Three retired chunk-sized contents, reusable.
+    let len = CONTENT_CHUNK + 300;
+    for i in 0..3u8 {
+        let s = e.stage(&bytes_of(20 + i, len));
+        put_record(
+            e.store(),
+            &format!("setup-{i}"),
+            &format!("old-{i}"),
+            Some(&s.handle),
+        )
+        .unwrap_or_else(|x| panic!("setup commit: {x:?}"));
+    }
+    let basis = e.store().begin().expect("begin");
+    e.store()
+        .commit(
+            attempt("setup-remove"),
+            basis,
+            ChangeSet {
+                changes: (0..3)
+                    .map(|i| Change::RemoveContext {
+                        id: cid(&format!("old-{i}")),
+                        expect: Precondition::Any,
+                    })
+                    .collect(),
+                ..ChangeSet::default()
+            },
+        )
+        .unwrap_or_else(|x| panic!("setup removal: {x:?}"));
+    for i in 0..3 {
+        put_record(e.store(), &format!("advance-{i}"), "tick", None)
+            .unwrap_or_else(|x| panic!("setup commit: {x:?}"));
+    }
+    let yb = bytes_of(30, len);
+    let y = e.stage(&yb);
+    let (cur, r) = traverse(sim_of(&e), "setup");
+    assert!(
+        y.ranges().any(|a| a.0 < cur.content_len
+            || r.retired_extents
+                .iter()
+                .any(|(o, (_, l))| overlaps(a, (*o, *l)))),
+        "the bound staging did not reuse retired space; the schedule would test nothing"
+    );
+    let wb = bytes_of(31, 2 * CONTENT_CHUNK + 300);
+    let tap = e.tap().expect("tap").clone();
+    let sim = sim_of(&e).clone();
+    let store = e.store();
+    let y_handle = &y.handle;
+    let (got, discard, w, w_owns) = std::thread::scope(|s| {
+        let arm = |point| {
+            let (reached_tx, reached) = std::sync::mpsc::channel();
+            let (go, go_rx) = std::sync::mpsc::channel();
+            *tap.gate.lock().unwrap() = Some(Gate {
+                point,
+                reached: reached_tx,
+                go: go_rx,
+            });
+            (reached, go)
+        };
+        let (p_reached, p_go) = arm(Point::Publish);
+        let p = s.spawn(move || put_record(store, "paused", "p", Some(y_handle)));
+        p_reached
+            .recv_timeout(deadline)
+            .expect("the commit reaches its publication");
+        tap.writes.lock().unwrap().clear();
+        let (w_reached, w_go) = arm(Point::ContentWrite);
+        let w = s.spawn(|| store.stage_content(&mut &wb[..]));
+        w_reached
+            .recv_timeout(deadline)
+            .expect("the staging takes space and reaches its first write");
+        // The next mutating operation is the paused publication record's write.
+        sim.fail_nth_op(1);
+        p_go.send(()).expect("release the commit");
+        let got = p.join().expect("commit thread");
+        let y_again = StagedContent {
+            content: y_handle.content,
+            token: y_handle.token.clone(),
+        };
+        let discard = store.discard_staged(y_again);
+        w_go.send(()).expect("release the staging");
+        let w = w.join().expect("staging thread");
+        let owns = std::mem::take(&mut *tap.writes.lock().unwrap());
+        (got, discard, w, owns)
+    });
+    assert!(
+        matches!(got, Err(CommitError::Indeterminate(_))),
+        "the failed publication: {got:?}"
+    );
+    assert!(
+        discard.is_err(),
+        "a staging bound by an uncertain publication was discarded"
+    );
+    let y_ranges: Vec<(u64, u64)> = y.ranges().collect();
+    let (_, r) = traverse(sim_of(&e), "the uncertain publication");
+    match w {
+        Ok(handle) => {
+            count("staging in progress completed across the fence");
+            let w = Staged {
+                handle,
+                owns: w_owns,
+                rejected: 0,
+            };
+            // Only its first take preceded the fence.
+            for a in w.ranges().skip(1) {
+                assert!(
+                    !r.retired_extents
+                        .iter()
+                        .any(|(o, (_, l))| overlaps(a, (*o, *l))),
+                    "the staging took reusable space {a:?} after the fence"
+                );
+            }
+            for a in w.ranges() {
+                assert!(
+                    !y_ranges.iter().any(|b| overlaps(a, *b)),
+                    "the staging took the uncertain commit's space {a:?}"
+                );
+            }
+            e.staged.push(w);
+        }
+        Err(x) => {
+            count("staging in progress refused at the fence");
+            assert!(
+                matches!(&x, StorageError::StoreState(m) if m.contains("fenced")),
+                "the staging across the fence failed otherwise: {x:?}"
+            );
+        }
+    }
+    e.staged.push(y);
+    ownership_check(&e, "a staging across an uncertain publication");
+    let prior: Vec<(u64, u64)> = e.staged.iter().flat_map(Staged::ranges).collect();
+    e.staged.clear();
+    drop(e.store.take());
+    let e = open_image(&sim.after_process_exit(), "after the uncertain publication");
+    recovered_ownership_check(&e, &prior);
+    audit(&e, "recovery after the uncertain publication");
+    assert_eq!(record_content(&e, "p"), None, "the record write failed");
 }
