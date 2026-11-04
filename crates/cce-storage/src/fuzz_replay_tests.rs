@@ -266,6 +266,21 @@ fn ops_seed_sources() -> Vec<(&'static str, ByteRun, Vec<Op>)> {
             double.clone(),
         ),
         ("staging-lifecycle", ByteRun::Complete, staging_lifecycle()),
+        ("maintenance", ByteRun::Complete, maintenance_sequence()),
+        (
+            "crash-in-maintenance",
+            ByteRun::Crash { cut: 41 },
+            maintenance_sequence(),
+        ),
+        (
+            "failure-in-maintenance",
+            ByteRun::Failure {
+                cut: 33,
+                lossy: false,
+                live: true,
+            },
+            maintenance_sequence(),
+        ),
         // The first commit's data barrier fails and drops its writes; the store keeps running.
         (
             "lossy-barrier-failure",
@@ -310,6 +325,53 @@ fn ops_seeds_decode_to_the_sequences_they_encode() {
         assert_eq!(got_run, run, "{name}");
         assert_eq!(format!("{got:?}"), format!("{ops:?}"), "{name}");
     }
+}
+
+/// Commits content of every size and a relationship, removes records to leave retired space,
+/// holds a view across relocation, reclaim and an index rebuild, reads and commits from it, and
+/// reopens.
+fn maintenance_sequence() -> Vec<Op> {
+    let fresh = |ctx: u8, seed: u8, size: u8| ChangeSpec::PutContext {
+        ctx,
+        expect: ExpectSpec::Any,
+        body: 3,
+        content: Some(ContentPick::Fresh(ContentSpec { seed, size })),
+    };
+    let maintain = |task: u8, pages: u8, bytes: u8| Op::Maintain { task, pages, bytes };
+    vec![
+        Op::Commit(plain(vec![
+            fresh(0, 1, 5),
+            fresh(1, 2, 6),
+            ChangeSpec::PutRelationship {
+                rel: 2,
+                expect: ExpectSpec::Any,
+                kind: 1,
+                source: 0,
+                target: 2,
+            },
+        ])),
+        Op::Commit(plain(vec![fresh(2, 3, 7), crate::model::put(4, 3)])),
+        Op::Commit(plain(vec![
+            crate::model::remove(0),
+            crate::model::remove(1),
+        ])),
+        Op::Hold(vec![ReadSpec::Context(2), ReadSpec::Content(2)]),
+        maintain(2, 15, 3),
+        Op::ReadHeld {
+            slot: 0,
+            reads: vec![ReadSpec::Content(2)],
+        },
+        maintain(0, 0, 3),
+        maintain(1, 0, 0),
+        Op::CommitFromHeld {
+            slot: 0,
+            request: plain(vec![crate::model::put(3, 2)]),
+        },
+        maintain(2, 0, 0),
+        Op::Reopen,
+        maintain(2, 15, 3),
+        Op::Check,
+    ]
 }
 
 /// Stages, binds earlier stagings, holds and reads views, submits, retries, discards and
