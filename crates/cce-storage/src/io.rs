@@ -370,7 +370,6 @@ impl Io for FsIo {
                 .unwrap_or(Path::new("."));
             self.sync_path(parent)?;
         }
-        let had_lock = self.dir.join(LOCK_FILE).exists();
         let lock = self.take_lock()?;
         // Only an absent or empty directory (or one holding just the lock file, left by a creation
         // that stopped early) may receive a new store: never initialize beside existing data.
@@ -388,16 +387,12 @@ impl Io for FsIo {
             } else {
                 "is not empty"
             };
-            let err = StorageError::StoreState(format!(
+            // The lock file stays: removing it after releasing the lock could delete the name of a
+            // file another opener has just locked, letting a later opener take a second lock.
+            return Err(StorageError::StoreState(format!(
                 "{} {why} ({name}); refusing to create a store there",
                 self.dir.display()
-            ));
-            // Leave the directory as it was: remove the lock file if this call created it.
-            drop(lock);
-            if !had_lock {
-                let _ = fs::remove_file(self.dir.join(LOCK_FILE));
-            }
-            return Err(err);
+            )));
         }
         let new = |name: &str| {
             let path = self.dir.join(name);
@@ -575,7 +570,16 @@ mod tests {
                 matches!(&err, StorageError::StoreState(m) if m.contains("not empty")),
                 "{stray}: {err:?}"
             );
-            assert_eq!(names(&store), before, "{stray}: nothing created beside it");
+            // Only the lock file may appear: a refused create never deletes the lock file, since
+            // another opener may already hold a lock on it.
+            let mut expected = before.clone();
+            expected.push(LOCK_FILE.to_string());
+            expected.sort();
+            assert_eq!(
+                names(&store),
+                expected,
+                "{stray}: nothing but the lock file created"
+            );
         }
         // Positive neighbours: an existing empty directory, and one left with only the lock file
         // by a creation that stopped before writing any store file.
