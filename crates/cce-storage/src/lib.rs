@@ -514,9 +514,8 @@ pub struct StoreOptions {
     /// that would exceed it fails with [`StorageError::ResourceExhausted`] and registers nothing,
     /// though segments it wrote before the refusal stay in the content file (unreferenced, never
     /// shrunk, and written over by the next staging); committing or discarding outstanding
-    /// stagings releases their share. It bounds only new
-    /// staging: lowering it never affects reading, committing or discarding what is already
-    /// staged or committed.
+    /// stagings releases their share. It bounds only new staging: lowering it never affects
+    /// reading, committing or discarding what is already staged or committed.
     pub max_staged_bytes: u64,
     /// Checked when the store is opened, read-write or read-only; `None` opens without it.
     pub guard: Option<ReceiptGuard>,
