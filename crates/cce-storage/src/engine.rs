@@ -32,9 +32,9 @@ use crate::io::{FileId, Io};
 use crate::ledger::{ContentPool, Reuse, overlap};
 use crate::records::{
     AttemptValue, ContentEntry, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT,
-    P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, decode_history, decode_retired,
-    encode_history, fingerprint, history_key, key, removed_history_key, retired_extent_key,
-    retired_page_key,
+    P_HISTORY, P_HISTORY_REMOVED, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, decode_history,
+    decode_retired, encode_history, fingerprint, history_key, key, removed_history_key,
+    retired_extent_key, retired_page_key,
 };
 use crate::tree::{self, Cursor, MAX_KEY, Node, NodeSink, NodeSource, TreeTxn};
 
@@ -2493,6 +2493,16 @@ impl Inner {
         while let Some((_, v)) = c.next_entry()? {
             r.history_entries += 1;
             r.history_bytes += ExtentRef::decode(&v)?.len;
+        }
+        let mut c = Cursor::new(&**self, d.root, &[P_HISTORY_REMOVED], None, d.next_page)?;
+        while let Some((k, v)) = c.next_entry()? {
+            r.history_entries_removed += 1;
+            r.history_marker_bytes += (k.len() + v.len()) as u64;
+        }
+        let mut c = Cursor::new(&**self, d.root, &[P_ATTEMPT], None, d.next_page)?;
+        while let Some((k, v)) = c.next_entry()? {
+            r.attempt_receipts += 1;
+            r.attempt_receipt_bytes += (k.len() + v.len()) as u64;
         }
         let mut c = Cursor::new(&**self, d.root, &[P_RETIRED], None, d.next_page)?;
         while let Some((k, v)) = c.next_entry()? {

@@ -260,8 +260,10 @@ impl Driver {
                 }
                 .map_err(|e| e.to_string())?;
                 self.say(&format!(
-                    "space live_pages={} live_content={} history_entries={} history_bytes={} retired_pages_protected={} retired_pages_reusable={} retired_content_protected={} retired_content_reusable={} meta_file={} content_file={}",
+                    "space live_pages={} live_content={} history_entries={} history_bytes={} history_entries_removed={} history_marker_bytes={} attempt_receipts={} attempt_receipt_bytes={} retired_pages_protected={} retired_pages_reusable={} retired_content_protected={} retired_content_reusable={} meta_file={} content_file={}",
                     r.live_pages, r.live_content_bytes, r.history_entries, r.history_bytes,
+                    r.history_entries_removed, r.history_marker_bytes, r.attempt_receipts,
+                    r.attempt_receipt_bytes,
                     r.retired_pages_protected, r.retired_pages_reusable,
                     r.retired_content_bytes_protected, r.retired_content_bytes_reusable,
                     r.meta_file_bytes, r.content_file_bytes

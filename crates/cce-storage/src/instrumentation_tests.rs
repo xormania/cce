@@ -289,6 +289,10 @@ fn expected_report(sim: &SimIo, oldest_pin: Option<u64>) -> crate::SpaceReport {
         live_content_bytes: r.content_segments.iter().map(|(_, l)| l).sum(),
         history_entries: r.history_extents.len() as u64,
         history_bytes: r.history_extents.iter().map(|(_, l)| l).sum(),
+        history_entries_removed: r.removed_history.len() as u64,
+        history_marker_bytes: r.marker_bytes,
+        attempt_receipts: r.attempts.len() as u64,
+        attempt_receipt_bytes: r.attempt_bytes,
         meta_file_bytes: sim.len(FileId::Meta).unwrap(),
         content_file_bytes: sim.len(FileId::Content).unwrap(),
         ..Default::default()
@@ -349,6 +353,17 @@ fn the_space_report_matches_an_independent_walk_and_the_reuse_rule() {
             Vec::new(),
         );
     }
+    // The host removes two of those commits' history: their receipts stay.
+    let removed = ["a0", "a1"].map(|a| {
+        let r = s.outcome(&AttemptId::new(a.as_bytes().to_vec()).unwrap());
+        match r {
+            Ok(cce_core::storage::AttemptOutcome::Committed(r)) => Change::RemoveHistory {
+                position: r.position,
+            },
+            other => panic!("{a} must be committed: {other:?}"),
+        }
+    });
+    commit(&s, "forget", removed.into(), Vec::new());
     // Removing many records retires many pages while writing few: some stay reusable.
     commit(
         &s,
@@ -386,6 +401,13 @@ fn the_space_report_matches_an_independent_walk_and_the_reuse_rule() {
     assert!(want.retired_pages_protected > 0 && want.retired_pages_reusable > 0);
     assert!(want.retired_content_bytes_reusable > 0 && want.live_content_bytes > 0);
     assert!(want.history_entries > 0 && want.history_bytes > 0);
+    assert_eq!(want.history_entries_removed, 2);
+    assert!(want.history_marker_bytes > 0);
+    assert_eq!(
+        want.attempt_receipts,
+        want.history_entries + want.history_entries_removed,
+        "one receipt per committed attempt"
+    );
 
     drop(held);
     let got = s.space_report().unwrap();

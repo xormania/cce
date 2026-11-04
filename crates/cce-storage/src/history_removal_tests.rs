@@ -254,6 +254,66 @@ fn every_cut_of_a_removal_commit_recovers_the_state_before_or_after_it() {
 }
 
 #[test]
+fn the_space_report_moves_removed_history_into_retired_space_and_keeps_receipts_apart() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    three_commits(&s);
+    let entry_len = |p: u64| {
+        let r = reach(&sim, &newest(&sim)).unwrap();
+        r.history_at
+            .get(&p)
+            .unwrap_or_else(|| panic!("position {p} must be retained"))
+            .1
+    };
+    let removed = entry_len(2);
+    let before = s.space_report().unwrap();
+    committed(&s, "forget", remove_history(&[2]));
+    let after = s.space_report().unwrap();
+    let removal = history(&s).last().map(|h| h.position.0).unwrap();
+    let removal_len = entry_len(removal);
+    assert_eq!(
+        after.history_bytes,
+        before.history_bytes - removed + removal_len,
+        "retained history: the removed entry left, the removal's own entry arrived"
+    );
+    assert_eq!(after.history_entries, before.history_entries);
+    assert_eq!(
+        after.history_entries_removed,
+        before.history_entries_removed + 1
+    );
+    assert_eq!(
+        after.attempt_receipts,
+        before.attempt_receipts + 1,
+        "every receipt stays; the removal adds its own"
+    );
+    let retired = |r: &crate::SpaceReport| {
+        r.retired_content_bytes_protected + r.retired_content_bytes_reusable
+    };
+    assert_eq!(
+        retired(&after),
+        retired(&before) + removed,
+        "the removed entry's bytes are retired content space"
+    );
+    // Two more generations without readers: the removed entry's bytes become reusable.
+    committed(
+        &s,
+        "later-1",
+        changes(vec![put_context("d", Precondition::Absent, b"d", None)]),
+    );
+    committed(
+        &s,
+        "later-2",
+        changes(vec![put_context("e", Precondition::Absent, b"e", None)]),
+    );
+    let settled = s.space_report().unwrap();
+    assert!(
+        settled.retired_content_bytes_reusable >= removed,
+        "the removed entry's bytes never became reusable: {settled:?}"
+    );
+    assert_eq!(settled.history_entries_removed, 1);
+}
+
+#[test]
 fn a_retry_after_removal_restores_no_content_relationship_or_history() {
     let sim = SimIo::new();
     let s = create(&sim);

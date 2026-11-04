@@ -59,8 +59,14 @@ pub(crate) struct Reach {
     pub attempts: BTreeMap<Vec<u8>, u64>,
     /// Retained history entries: position -> attempt index key of the attempt the entry records.
     pub history_attempts: BTreeMap<u64, Vec<u8>>,
+    /// Retained history entries: position -> extent `(offset, len)`.
+    pub history_at: BTreeMap<u64, (u64, u64)>,
     /// Markers of removed history entries: position -> attempt index key the marker names.
     pub removed_history: BTreeMap<u64, Vec<u8>>,
+    /// Key plus value bytes of the history markers.
+    pub marker_bytes: u64,
+    /// Key plus value bytes of the attempt records.
+    pub attempt_bytes: u64,
 }
 
 impl Reach {
@@ -180,6 +186,7 @@ pub(crate) fn reach(io: &dyn Io, d: &Descriptor) -> Result<Reach, StorageError> 
                             let h = decode_history(&read_extent(io, d, &x)?)?;
                             r.history_attempts
                                 .insert(h.position.0, key(P_ATTEMPT, &[h.attempt.as_bytes()]));
+                            r.history_at.insert(h.position.0, (x.offset, x.len));
                         }
                         Some(&P_HISTORY_REMOVED) => {
                             let pos = u64::from_be_bytes(
@@ -188,10 +195,12 @@ pub(crate) fn reach(io: &dyn Io, d: &Descriptor) -> Result<Reach, StorageError> 
                                     .map_err(|_| corrupt("history marker key"))?,
                             );
                             r.removed_history.insert(pos, key(P_ATTEMPT, &[&v]));
+                            r.marker_bytes += (k.len() + v.len()) as u64;
                         }
                         Some(&P_ATTEMPT) => {
                             r.attempts
                                 .insert(k.clone(), AttemptValue::decode(&v)?.position);
+                            r.attempt_bytes += (k.len() + v.len()) as u64;
                         }
                         Some(&P_RETIRED) => match decode_retired(&k, &v)? {
                             Retired::Page {
