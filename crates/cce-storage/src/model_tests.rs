@@ -22,7 +22,9 @@ use cce_core::storage::{
     Precondition, ReadView, StagedContent, StorageEngine, StorageError,
 };
 use proptest::prelude::*;
-use proptest::test_runner::{Config, FileFailurePersistence, RngSeed, TestRunner};
+use proptest::test_runner::{
+    Config, FailurePersistence, FileFailurePersistence, RngSeed, TestError, TestRunner,
+};
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest};
 
 use crate::test_support::{attempt, cid, open_on};
@@ -233,10 +235,53 @@ impl<const FILES: bool> StateMachineTest for EngineTest<FILES> {
     }
 }
 
-/// The runner's own counts after a run: generated cases that passed, and cases it rejected
-/// (local and global rejects; the generator has no rejection path, so these are expected to be 0).
-/// `None` when the runner's summary cannot be read.
-fn case_counts(runner: &TestRunner) -> (Option<u64>, Option<u64>) {
+/// Cases the harness ran before the first failing one (shrinking runs after it are not cases).
+#[derive(Clone, Default)]
+struct CaseRuns(Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicBool)>);
+
+/// Marks the case failed if it unwinds.
+struct CaseRun(Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicBool)>);
+
+impl CaseRuns {
+    fn start(&self) -> CaseRun {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !self.0.1.load(SeqCst) {
+            self.0.0.fetch_add(1, SeqCst);
+        }
+        CaseRun(self.0.clone())
+    }
+
+    /// Cases run up to and including the first failure.
+    fn before_failure(&self) -> u64 {
+        self.0.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for CaseRun {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.1.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// What a run's report says about its cases. `accepted` and `rejected` come from the property
+/// runner's summary (new cases that passed; local and global rejects). `attempted` counts newly
+/// generated cases from the harness side: every case the harness ran before the first failure,
+/// minus the persisted failures the runner replayed first (loaded with the runner's own loader),
+/// plus the rejected ones, which never reach the harness. `failed` is 1 when a newly generated case
+/// failed. Shrinking steps are not cases. So `attempted == accepted + rejected + failed` on any
+/// run; a field is `None` when the runner's summary cannot be read.
+#[derive(Debug, PartialEq, Eq)]
+struct CaseCounts {
+    attempted: Option<u64>,
+    accepted: Option<u64>,
+    rejected: Option<u64>,
+    failed: u64,
+    persisted_replayed: u64,
+}
+
+fn case_counts(runner: &TestRunner, config: &Config, runs: &CaseRuns, failed: bool) -> CaseCounts {
     let text = runner.to_string();
     let field = |name: &str| {
         text.lines()
@@ -246,7 +291,19 @@ fn case_counts(runner: &TestRunner) -> (Option<u64>, Option<u64>) {
         (Some(l), Some(g)) => Some(l + g),
         _ => None,
     };
-    (field("successes:"), rejected)
+    let persisted = config.failure_persistence.as_ref().map_or(0, |p| {
+        p.load_persisted_failures2(config.source_file).len() as u64
+    });
+    let ran = runs.before_failure();
+    let replayed = ran.min(persisted);
+    let generated_failed = failed && ran > persisted;
+    CaseCounts {
+        attempted: rejected.map(|r| ran - replayed + r),
+        accepted: field("successes:"),
+        rejected,
+        failed: u64::from(generated_failed),
+        persisted_replayed: replayed,
+    }
 }
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -279,20 +336,25 @@ fn run_profile<const FILES: bool>(backend: &str, profile: Profile, cases: u32, s
     let mut runner = TestRunner::new(config.clone());
     let attempted = Arc::new(Mutex::new((0u64, 0u64)));
     let counter = attempted.clone();
+    let ran = CaseRuns::default();
+    let runs = ran.clone();
+    let case_config = config.clone();
     let result = runner.run(
         &ModelMachine::sequential_strategy(MIN_OPS..=MAX_OPS),
         move |(initial, transitions, seen)| {
+            let _case = runs.start();
             {
                 let mut c = counter.lock().unwrap();
                 c.0 += 1;
                 c.1 += transitions.len() as u64;
             }
-            EngineTest::<FILES>::test_sequential(config.clone(), initial, transitions, seen);
+            EngineTest::<FILES>::test_sequential(case_config.clone(), initial, transitions, seen);
             Ok(())
         },
     );
     let (sequences, ops) = *attempted.lock().unwrap();
-    let (accepted, rejected) = case_counts(&runner);
+    let failed = matches!(result, Err(TestError::Fail(..)));
+    let counts = case_counts(&runner, &config, &ran, failed);
     let report = serde_json::json!({
         "backend": backend,
         "profile": match profile {
@@ -305,8 +367,11 @@ fn run_profile<const FILES: bool>(backend: &str, profile: Profile, cases: u32, s
         // Includes shrinking attempts when a case failed.
         "sequences_run": sequences,
         "attempted_operations": ops,
-        "accepted_cases": accepted,
-        "rejected_cases": rejected,
+        "attempted_cases": counts.attempted,
+        "accepted_cases": counts.accepted,
+        "rejected_cases": counts.rejected,
+        "failed_cases": counts.failed,
+        "persisted_cases_replayed": counts.persisted_replayed,
         "passed": result.is_ok(),
         "observed": STATS.with(|s| s.borrow().clone()),
     });
@@ -428,10 +493,13 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
     let t = totals.clone();
     let sampled = b.sampled;
     let interruption = b.interruption;
-    let mut runner = TestRunner::new(config);
+    let mut runner = TestRunner::new(config.clone());
+    let ran = CaseRuns::default();
+    let runs = ran.clone();
     let result = runner.run(
         &ModelMachine::sequential_strategy(b.ops.clone()),
         move |(_, transitions, _)| {
+            let _case = runs.start();
             let bounds = boundaries(&transitions);
             let total = bounds.last().copied().unwrap_or(0);
             let cuts: Vec<u64> = match sampled {
@@ -470,7 +538,8 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
         },
     );
     let [sequences, ops, cut_points, cuts, post_cuts] = *totals.lock().unwrap();
-    let (accepted, rejected) = case_counts(&runner);
+    let failed = matches!(result, Err(TestError::Fail(..)));
+    let counts = case_counts(&runner, &config, &ran, failed);
     let observed = STATS.with(|s| s.borrow().clone());
     let report = serde_json::json!({
         "campaign": b.name,
@@ -490,8 +559,11 @@ fn run_crash_campaign(b: CrashBudget, seed: u64) {
         "attempted_operations": ops,
         "cut_points_available": cut_points,
         "cuts_executed": cuts,
-        "accepted_cases": accepted,
-        "rejected_cases": rejected,
+        "attempted_cases": counts.attempted,
+        "accepted_cases": counts.accepted,
+        "rejected_cases": counts.rejected,
+        "failed_cases": counts.failed,
+        "persisted_cases_replayed": counts.persisted_replayed,
         "recovered_without_step": observed.get("recovered without the step").copied().unwrap_or(0),
         "recovered_with_step": observed.get("recovered with the step").copied().unwrap_or(0),
         "failures_after_publication": post_cuts,
@@ -1330,4 +1402,65 @@ fn a_submitted_commit_whose_caller_drops_the_ticket_and_exits_completes_and_repo
     }
     let observed = STATS.with(|s| s.borrow().clone());
     println!("schedule report: {}", serde_json::json!(observed));
+}
+
+/// The case counts the reports carry add up on any run: on a strategy that rejects, on a run
+/// whose generated case fails (and is then shrunk), and on one that first replays a persisted
+/// failure.
+#[test]
+fn reported_case_counts_add_up_on_rejecting_failing_and_replaying_runs() {
+    let even = || (0u8..=255).prop_filter("even", |x| x % 2 == 0);
+    // Returns the counts, whether the run failed, and the failures it persisted.
+    let run = |config: Config, fail_at: Option<u8>| {
+        let mut runner = TestRunner::new(config.clone());
+        let ran = CaseRuns::default();
+        let runs = ran.clone();
+        let result = runner.run(&even(), move |x| {
+            let _case = runs.start();
+            assert!(fail_at.is_none_or(|f| x < f), "planted failure at {x}");
+            Ok(())
+        });
+        let failed = matches!(result, Err(TestError::Fail(..)));
+        let persisted = runner.config().failure_persistence.clone();
+        (
+            case_counts(&runner, &config, &ran, failed),
+            failed,
+            persisted,
+        )
+    };
+    let sums = |c: &CaseCounts| {
+        c.attempted.expect("attempted")
+            == c.accepted.expect("accepted") + c.rejected.expect("rejected") + c.failed
+    };
+    let config = |persist: Option<Box<dyn FailurePersistence>>| Config {
+        cases: 40,
+        rng_seed: RngSeed::Fixed(7),
+        failure_persistence: persist,
+        // The in-memory store keys saved failures by source file.
+        source_file: Some("case counts"),
+        ..Config::default()
+    };
+    // Passing, with rejections.
+    let (c, failed, _) = run(config(None), None);
+    assert!(!failed && c.rejected > Some(0), "{c:?}");
+    assert_eq!(
+        (c.accepted, c.failed, c.persisted_replayed),
+        (Some(40), 0, 0),
+        "{c:?}"
+    );
+    assert!(sums(&c), "passing run: {c:?}");
+    // A generated case fails and is shrunk (the shrinking steps are not cases); its seed is saved.
+    let store = || -> Option<Box<dyn FailurePersistence>> {
+        Some(Box::new(
+            proptest::test_runner::MapFailurePersistence::default(),
+        ))
+    };
+    let (c, failed, saved) = run(config(store()), Some(100));
+    assert!(failed && c.failed == 1, "{c:?}");
+    assert!(sums(&c), "failing run: {c:?}");
+    // The saved failure is replayed first (and passes now), then new cases pass.
+    let (c, failed, _) = run(config(saved), None);
+    assert!(!failed && c.persisted_replayed == 1, "{c:?}");
+    assert_eq!(c.accepted, Some(40), "{c:?}");
+    assert!(sums(&c), "replaying run: {c:?}");
 }
