@@ -21,6 +21,8 @@ mod engine_tests;
 mod format;
 mod io;
 #[cfg(test)]
+mod maintain_tests;
+#[cfg(test)]
 mod quiescence_tests;
 #[cfg(test)]
 mod reader_race_tests;
@@ -63,7 +65,65 @@ pub struct NativeStore {
     inner: Arc<Inner>,
 }
 
+/// A physical maintenance task for [`NativeStore::maintain`]. Maintenance changes only where and
+/// how committed information is stored, never what it is: it writes no logical record, adds no
+/// history, and causes no conflict with logical commits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MaintenanceTask {
+    /// Retire content-file space below the committed content length that no published structure
+    /// reaches and no retirement record covers (left by stagings that were covered by a later
+    /// commit and then abandoned or discarded across a restart), so later staging can reuse it.
+    ReclaimContentHoles,
+    /// Rebuild both relationship indexes from the relationship records.
+    RebuildRelationshipIndexes,
+    /// Move committed content and metadata pages from the end of their files into retired space
+    /// nearer the start.
+    Relocate,
+}
+
+/// How much one [`NativeStore::maintain`] call may do before it publishes and returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaintenanceBudget {
+    pub max_pages: u64,
+    pub max_content_bytes: u64,
+}
+
+impl Default for MaintenanceBudget {
+    fn default() -> Self {
+        Self {
+            max_pages: 1024,
+            max_content_bytes: 64 << 20,
+        }
+    }
+}
+
+/// What one [`NativeStore::maintain`] call did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MaintenanceReport {
+    /// The generation current after the call (unchanged if there was nothing to do).
+    pub generation: u64,
+    pub pages_moved: u64,
+    pub content_bytes_moved: u64,
+    pub content_bytes_reclaimed: u64,
+    pub index_entries_written: u64,
+    /// False if the budget ran out before the task was done; call again to continue.
+    pub complete: bool,
+}
+
 impl NativeStore {
+    /// Runs one bounded step of physical maintenance and publishes its result as a new physical
+    /// generation, ordered with commits. Returns at once with nothing done if there is nothing to do.
+    /// Never run implicitly: opening a store does no maintenance.
+    pub fn maintain(
+        &self,
+        task: MaintenanceTask,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceReport, CommitError> {
+        self.inner.maintain(task, budget)
+    }
+
     /// Creates a new store in `dir`. `store_id` is the caller-supplied identity recorded in every
     /// page; it lets the engine reject pages and handles from other stores. Refuses to create over
     /// an existing store.

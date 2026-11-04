@@ -197,6 +197,8 @@ pub(crate) struct Inner {
 
 /// Engine locks. `Recorded` keeps its mutex private to this module, so engine code can reach a
 /// recorded lock only through `lock()` (a bypass would not compile).
+mod maintain;
+
 mod locks {
     use std::sync::{Mutex, MutexGuard};
 
@@ -1247,6 +1249,51 @@ impl Inner {
         };
         let retired_content = self.settle_content(&mut txn, &extents, content_refs, generation)?;
         let remainders = self.consume_reuse(&mut txn, &bound)?;
+        let (desc, discarded) = self.publish(&cur, txn, generation, pos, Some(&attempt))?;
+        lock(&self.conflicts).record(pos, written);
+        let mut st = lock(&self.state);
+        st.current = desc;
+        for (serial, _) in &bound {
+            st.staged.remove(serial);
+        }
+        drop(st);
+        // The published state's retired content, as this commit changed it: what it retired is
+        // reusable from the next generation on; what bound stagings held is consumed, apart from
+        // unused remainders.
+        let mut pool = lock(&self.pool);
+        for (serial, _) in &bound {
+            pool.held.remove(serial);
+        }
+        for (offset, len) in retired_content {
+            pool.free.insert(offset, (len, generation));
+        }
+        for (offset, len, retired_at) in remainders {
+            pool.free.insert(offset, (len, retired_at));
+        }
+        for (offset, len) in &discarded {
+            pool.free.insert(*offset, (*len, generation));
+        }
+        pool.discarded.retain(|x| !discarded.contains(x));
+        drop(pool);
+        Ok(CommitReceipt {
+            attempt,
+            position: HistoryPosition(pos),
+        })
+    }
+
+    /// Publishes `txn` as generation `generation` at history position `pos`: retires the space of
+    /// discarded stagings, settles page retirement and reuse, writes the tree, and runs the data
+    /// and publication barriers. Returns the published record and the discarded extents it
+    /// retired; the caller makes the record current. `uncertain` names the attempt whose outcome a
+    /// failed publication barrier leaves unknown (none for maintenance).
+    fn publish(
+        &self,
+        cur: &Descriptor,
+        mut txn: TreeTxn<'_>,
+        generation: u64,
+        pos: u64,
+        uncertain: Option<&AttemptId>,
+    ) -> Result<(Descriptor, Vec<(u64, u64)>), CommitError> {
         // Discarded stagings' own space becomes retired with this commit.
         let discarded: Vec<(u64, u64)> = lock(&self.pool).discarded.clone();
         for (offset, len) in &discarded {
@@ -1268,7 +1315,7 @@ impl Inner {
                 hook();
             }
         }
-        let reuse = settle_allocation(&mut txn, self, &cur, generation, reusable_through)
+        let reuse = settle_allocation(&mut txn, self, cur, generation, reusable_through)
             .map_err(rejected)?;
         let mut sink = PageWriter {
             inner: self,
@@ -1324,40 +1371,12 @@ impl Inner {
             let why = format!("publication of generation {generation} uncertain: {e}");
             lock(&self.state).fenced = Some(Fence {
                 why: why.clone(),
-                uncertain: Some(attempt.clone()),
+                uncertain: uncertain.cloned(),
             });
             return Err(CommitError::Indeterminate(why));
         }
 
-        lock(&self.conflicts).record(pos, written);
-        let mut st = lock(&self.state);
-        st.current = desc;
-        for (serial, _) in &bound {
-            st.staged.remove(serial);
-        }
-        drop(st);
-        // The published state's retired content, as this commit changed it: what it retired is
-        // reusable from the next generation on; what bound stagings held is consumed, apart from
-        // unused remainders.
-        let mut pool = lock(&self.pool);
-        for (serial, _) in &bound {
-            pool.held.remove(serial);
-        }
-        for (offset, len) in retired_content {
-            pool.free.insert(offset, (len, generation));
-        }
-        for (offset, len, retired_at) in remainders {
-            pool.free.insert(offset, (len, retired_at));
-        }
-        for (offset, len) in &discarded {
-            pool.free.insert(*offset, (*len, generation));
-        }
-        pool.discarded.retain(|x| !discarded.contains(x));
-        drop(pool);
-        Ok(CommitReceipt {
-            attempt,
-            position: HistoryPosition(pos),
-        })
+        Ok((desc, discarded))
     }
 
     fn resolve_content(&self, cs: &ChangeSet) -> Result<Vec<(u64, BoundContent)>, CommitError> {
