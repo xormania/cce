@@ -298,9 +298,10 @@ pub enum StorageError {
     /// The content was committed once, but no record uses it any more and storage no longer keeps
     /// its bytes. Retained history may still name it by digest and length.
     ContentNotRetained,
-    /// The request is valid, but a configured resource limit leaves no room for it now. Nothing
-    /// was changed; it can succeed once the resource is released (the message says what releases
-    /// it).
+    /// The request is valid, but a configured resource limit leaves no room for it now. No logical
+    /// or accounted state changed (a refused staging may still have written unreferenced bytes,
+    /// which later stagings reuse); it can succeed once the resource is released (the message says
+    /// what releases it).
     ResourceExhausted(String),
     /// An open guarded by retained receipt information was refused: the store has another
     /// identity, or its published history position is below the retained minimum. The store's

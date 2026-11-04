@@ -254,9 +254,12 @@ sync) keeps `close` waiting with it.
 
 The total content length of a handle's outstanding stagings, those staged and neither committed nor
 discarded, is bounded by `StoreOptions::max_staged_bytes` (64 GiB by default; manifests are not
-counted). A staging that would take the total past it fails with `ResourceExhausted` and changes
-nothing: it is not registered, any retired space it took is returned, and bytes it already wrote
-are not kept (the next staging writes over them). A staging with a declared length is refused before
+counted). A staging that would take the total past it fails with `ResourceExhausted` and changes no
+logical or accounted state: it is not registered, any retired space it took is returned, and nothing
+refers to the bytes it already wrote. Those bytes are not reclaimed either: a stream refused part-way
+may already have written segments past the end of committed content, so the content file can grow by
+up to the budget that remained (64 GiB by default) and is never shrunk; the next staging writes over
+that space and reuses it. A staging with a declared length is refused before
 its source is read; otherwise the check runs before each segment is written, against the
 outstanding total at that moment, so a commit or discard that finishes meanwhile counts. Reads,
 commits and discards are never refused by the budget, and lowering it never affects what is already

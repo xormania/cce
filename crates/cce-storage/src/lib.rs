@@ -511,8 +511,10 @@ pub struct StoreOptions {
     pub max_request_len: u64,
     /// Largest total content length of the stagings outstanding at once, 64 GiB by default:
     /// content staged and neither committed nor discarded. Manifests are not counted. A staging
-    /// that would exceed it fails with [`StorageError::ResourceExhausted`] and changes nothing;
-    /// committing or discarding outstanding stagings releases their share. It bounds only new
+    /// that would exceed it fails with [`StorageError::ResourceExhausted`] and registers nothing,
+    /// though segments it wrote before the refusal stay in the content file (unreferenced, never
+    /// shrunk, and written over by the next staging); committing or discarding outstanding
+    /// stagings releases their share. It bounds only new
     /// staging: lowering it never affects reading, committing or discarding what is already
     /// staged or committed.
     pub max_staged_bytes: u64,
