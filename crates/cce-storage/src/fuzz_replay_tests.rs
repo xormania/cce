@@ -79,6 +79,7 @@ fn rich_store() -> (SimIo, ChangeSet) {
     let payload: Vec<u8> = (0..70_000u32).map(|i| (i * 7 + i / 300) as u8).collect();
     let staged = s.stage_content(&mut &payload[..]).unwrap();
     let cs = ChangeSet {
+        removal: Default::default(),
         changes: vec![
             put("A", "first", Some(0)),
             put("B", "second", None),

@@ -339,6 +339,9 @@ pub(crate) struct TreeTxn<'a> {
     root: Child,
     /// Every key put or deleted, in order (the transaction's write set).
     touched: Vec<Vec<u8>>,
+    /// Committed pages this transaction copied in order to change them, in the order copied. The
+    /// result never refers to them.
+    replaced: Vec<PageRef>,
 }
 
 enum Outcome {
@@ -356,6 +359,7 @@ impl<'a> TreeTxn<'a> {
             arena: Vec::new(),
             root: Child::Clean(root),
             touched: Vec::new(),
+            replaced: Vec::new(),
         }
     }
 
@@ -363,6 +367,7 @@ impl<'a> TreeTxn<'a> {
         match c {
             Child::Dirty(i) => Ok(i),
             Child::Clean(at) => {
+                self.replaced.push(at);
                 let w = match &*self.src.load(at)? {
                     Node::Leaf(e) => Work::Leaf(e.clone()),
                     Node::Branch { seps, children } => Work::Branch {
@@ -631,6 +636,29 @@ impl<'a> TreeTxn<'a> {
     }
 
     /// Keys put or deleted by this transaction.
+    /// Pages `finish` will write: the changed nodes reachable from the root.
+    pub fn dirty_pages(&self) -> usize {
+        fn count(arena: &[Work], c: Child) -> usize {
+            match c {
+                Child::Clean(_) => 0,
+                Child::Dirty(i) => {
+                    1 + match &arena[i] {
+                        Work::Leaf(_) => 0,
+                        Work::Branch { children, .. } => {
+                            children.iter().map(|&ch| count(arena, ch)).sum()
+                        }
+                    }
+                }
+            }
+        }
+        count(&self.arena, self.root)
+    }
+
+    /// Committed pages replaced so far (see `replaced`).
+    pub fn replaced(&self) -> &[PageRef] {
+        &self.replaced
+    }
+
     pub fn touched(&self) -> &[Vec<u8>] {
         &self.touched
     }

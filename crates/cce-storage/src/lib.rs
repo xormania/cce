@@ -6,6 +6,8 @@
 
 #[cfg(test)]
 mod attempt_tests;
+#[cfg(test)]
+mod audit;
 mod codec;
 #[cfg(test)]
 mod content_tests;
@@ -29,12 +31,18 @@ mod io;
 #[cfg(test)]
 mod oracle_tests;
 #[cfg(test)]
+mod quiescence_tests;
+#[cfg(test)]
 mod reader_race_tests;
 #[cfg(test)]
 mod readonly_tests;
 mod records;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod repro_tests;
+#[cfg(test)]
+mod reuse_tests;
 #[cfg(any(test, feature = "fuzz-api"))]
 mod sim;
 mod tree;
@@ -95,7 +103,7 @@ use cce_core::storage::{
     RelationshipQuery, StagedContent, StorageEngine, StorageError,
 };
 
-use engine::{Inner, Observation, Options, Snapshot};
+use engine::{Inner, Observation, Options, Pin, Snapshot};
 
 /// Fuzzing entry point, with the `fuzz-api` feature only: runs the named target of the fuzz harness
 /// (`page`, `slots`, `node`, `manifest`, `history`, `records` or `image`) on `data`. Not part of the
@@ -158,10 +166,17 @@ impl NativeStore {
         if !Arc::ptr_eq(&basis.inner, &self.inner) {
             return Err(CommitError::Rejected(StorageError::ForeignHandle));
         }
+        // The basis view is consumed here: release its pin before the commit can run, so a commit
+        // requiring quiescence never counts its own basis as a live reader.
+        let NativeView {
+            snap,
+            observed,
+            pin,
+            ..
+        } = basis;
+        drop(pin);
         Ok(CommitTicket {
-            rx: self
-                .inner
-                .submit(attempt, basis.snap, basis.observed, changes)?,
+            rx: self.inner.submit(attempt, snap, observed, changes)?,
         })
     }
 
@@ -299,11 +314,7 @@ impl NativeReadOnly {
 
     /// A consistent view of the selected committed state.
     pub fn begin(&self) -> Result<NativeView, StorageError> {
-        Ok(NativeView {
-            inner: self.inner.clone(),
-            snap: self.inner.snapshot()?,
-            observed: Vec::new(),
-        })
+        NativeView::new(&self.inner)
     }
 
     /// Recovery diagnostics from opening, such as an ignored damaged publication slot.
@@ -317,7 +328,7 @@ impl NativeReadOnly {
     }
 }
 
-fn stats_of(inner: &Inner) -> Result<StoreStats, StorageError> {
+fn stats_of(inner: &Arc<Inner>) -> Result<StoreStats, StorageError> {
     let c = &inner.counters;
     let get = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
     Ok(StoreStats {
@@ -328,6 +339,9 @@ fn stats_of(inner: &Inner) -> Result<StoreStats, StorageError> {
         node_cache_evictions: get(&c.cache_evictions),
         node_cache_capacity: inner.cache_capacity(),
         tree_height: inner.height()?,
+        pages_reused: get(&c.pages_reused),
+        content_bytes_reused: get(&c.content_bytes_reused),
+        reusable_content_bytes: inner.reusable_content_bytes(),
     })
 }
 
@@ -412,6 +426,12 @@ pub struct StoreStats {
     pub node_cache_capacity: usize,
     /// Height of the current metadata tree (1 = a single leaf).
     pub tree_height: usize,
+    /// Tree pages written over retired pages instead of at new pages.
+    pub pages_reused: u64,
+    /// Staged content bytes written into retired content extents instead of at the end.
+    pub content_bytes_reused: u64,
+    /// Retired content bytes currently available for reuse (not held by a staging).
+    pub reusable_content_bytes: u64,
 }
 
 /// A consistent view of one committed state of a [`NativeStore`].
@@ -420,6 +440,20 @@ pub struct NativeView {
     snap: Snapshot,
     /// Logical reads made through this view; a commit from it is validated against them.
     observed: Vec<Observation>,
+    /// Keeps the generation this view reads from being reused while the view lives.
+    pin: Pin,
+}
+
+impl NativeView {
+    fn new(inner: &Arc<Inner>) -> Result<Self, StorageError> {
+        let (snap, pin) = inner.pin_current()?;
+        Ok(Self {
+            inner: inner.clone(),
+            snap,
+            observed: Vec::new(),
+            pin,
+        })
+    }
 }
 
 impl ReadView for NativeView {
@@ -449,7 +483,11 @@ impl ReadView for NativeView {
     }
 
     fn content(&mut self, content: &ContentRef) -> Result<Box<dyn ContentReader>, StorageError> {
-        Ok(Box::new(self.inner.content(&self.snap, content)?))
+        Ok(Box::new(
+            self.inner
+                .content(&self.snap, content)?
+                .pinned(self.pin.clone()),
+        ))
     }
 }
 
@@ -457,15 +495,15 @@ impl StorageEngine for NativeStore {
     type View = NativeView;
 
     fn begin(&self) -> Result<NativeView, StorageError> {
-        Ok(NativeView {
-            inner: self.inner.clone(),
-            snap: self.inner.snapshot()?,
-            observed: Vec::new(),
-        })
+        NativeView::new(&self.inner)
     }
 
     fn stage_content(&self, bytes: &mut dyn Read) -> Result<StagedContent, StorageError> {
         self.inner.stage(bytes)
+    }
+
+    fn discard_staged(&self, staged: StagedContent) -> Result<(), StorageError> {
+        self.inner.discard_staged(staged)
     }
 
     fn stage_content_expecting(

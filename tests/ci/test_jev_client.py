@@ -1,0 +1,261 @@
+"""Offline provider-boundary regressions using typed choices and bounded replies."""
+import copy
+import importlib.util
+import io
+import json
+from pathlib import Path
+import socket
+import unittest
+import urllib.error
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SPEC = importlib.util.spec_from_file_location("jev_client", ROOT / "tools/ci/jev_client.py")
+client = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(client)
+
+
+def packet():
+    return {
+        "subject": "a" * 16,
+        "source": {"repository": "xormania/cce", "head_sha": "b" * 40, "base_sha": "c" * 40},
+        "excerpts": [{"id": "e1", "text": "The claim is partial and its incomplete test is acknowledged."},
+                     {"id": "e2", "text": "A held reader is checked against the expected original bytes."}],
+        "questions": ["proof", "witness"],
+    }
+
+
+def response(value=None, choices=None):
+    payload = client.payload_for(value or packet())
+    choices = choices or {"proof": "supported", "witness": "semantic_behavior",
+                          "support_1": "e1", "support_2": "e2"}
+    return {"model": client.MODEL,
+            "answers": {name: {"type": "choice", "choice": choices.get(name, "insufficient_context")}
+                        for name in payload["questions"]},
+            "usage": {"input_tokens": 500, "output_tokens": 80, "total_tokens": 580}}
+
+
+class Handle(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+
+class Opener:
+    def __init__(self, body=None, error=None):
+        self.body = body if isinstance(body, bytes) else json.dumps(body or response()).encode()
+        self.error = error
+        self.calls = []
+
+    def open(self, request, timeout):
+        self.calls.append((request, timeout))
+        if self.error:
+            raise self.error
+        return Handle(self.body)
+
+
+class PayloadTests(unittest.TestCase):
+    def test_only_requested_atomic_questions_and_evidence_supports(self):
+        value = packet()
+        payload = client.payload_for(value)
+        self.assertEqual(payload["model"], "jev-1.14.0")
+        self.assertEqual(set(payload["questions"]), {"proof", "witness", "support_1", "support_2"})
+        self.assertEqual(set(payload["questions"]["support_1"]["criteria"]), {"e1", "e2", "none"})
+        self.assertEqual(payload["state"]["excerpts"], value["excerpts"])
+        self.assertIn("untrusted data", payload["questions"]["proof"]["instructions"])
+
+    def test_opaque_subject_and_public_source_are_validated(self):
+        for location, bad in (("subject", "private-label"), ("source", {"repository": "hidden-data"})):
+            value = packet()
+            value[location] = bad
+            with self.subTest(location=location), self.assertRaises(ValueError):
+                client.payload_for(value)
+
+    def test_excerpts_have_local_safe_ids(self):
+        for eid in ("none", "private-record", "e0", "e10000"):
+            value = packet()
+            value["excerpts"][0]["id"] = eid
+            with self.subTest(eid=eid), self.assertRaises(ValueError):
+                client.payload_for(value)
+
+    def test_duplicate_excerpt_or_question_is_refused(self):
+        for change in (lambda value: value["excerpts"].append(value["excerpts"][0]),
+                       lambda value: value["questions"].append("proof")):
+            value = packet()
+            change(value)
+            with self.assertRaises(ValueError):
+                client.payload_for(value)
+
+    def test_byte_budget_includes_questions(self):
+        value = packet()
+        value["excerpts"] = [{"id": f"e{n}", "text": "x" * 9_000} for n in range(1, 7)]
+        with self.assertRaises(ValueError):
+            client.payload_for(value)
+
+    def test_utf8_byte_bound_is_not_character_count(self):
+        value = packet()
+        value["excerpts"][0]["text"] = "é" * 6_000
+        with self.assertRaises(ValueError):
+            client.payload_for(value)
+
+
+class ResponseTests(unittest.TestCase):
+    def setUp(self):
+        self.payload = client.payload_for(packet())
+
+    def test_valid_typed_answers_with_optional_metadata(self):
+        value = response()
+        value["answers"]["proof"].update(confidence=.9, probabilities={
+            "supported": .9, "overstated": .05, "contradicted": .03, "insufficient_context": .02})
+        clean = client.validate_response(value, self.payload)
+        self.assertFalse(clean["abstained"])
+        self.assertEqual(clean["supporting_excerpt_ids"], ["e1", "e2"])
+        self.assertEqual(clean["answers"]["proof"]["confidence"], .9)
+
+    def test_one_support_is_sufficient(self):
+        value = response()
+        value["answers"]["support_2"]["choice"] = "none"
+        self.assertEqual(client.validate_response(value, self.payload)["supporting_excerpt_ids"], ["e1"])
+
+    def test_duplicate_support_is_rejected_instead_of_repaired(self):
+        value = response()
+        value["answers"]["support_2"]["choice"] = "e1"
+        with self.assertRaises(ValueError):
+            client.validate_response(value, self.payload)
+
+    def test_unsupported_nonabstention_is_rejected(self):
+        value = response()
+        for name in ("support_1", "support_2"):
+            value["answers"][name]["choice"] = "none"
+        with self.assertRaises(ValueError):
+            client.validate_response(value, self.payload)
+
+    def test_full_abstention_allows_no_support(self):
+        value = response(choices={"proof": "insufficient_context", "witness": "insufficient_context",
+                                  "support_1": "none", "support_2": "none"})
+        self.assertTrue(client.validate_response(value, self.payload)["abstained"])
+
+    def test_wrong_model_inventory_choice_and_invented_reference_are_rejected(self):
+        changes = [lambda value: value.update(model="other-model"),
+                   lambda value: value["answers"].pop("proof"),
+                   lambda value: value["answers"].update(extra={"type": "choice", "choice": "hidden"}),
+                   lambda value: value["answers"]["proof"].update(choice="arbitrary provider prose"),
+                   lambda value: value["answers"]["support_1"].update(choice="e9")]
+        for change in changes:
+            value = response()
+            change(value)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                client.validate_response(value, self.payload)
+
+    def test_numeric_metadata_is_finite_bounded_and_not_boolean(self):
+        values = [-.1, 1.1, float("inf"), float("nan"), True, "0.5", 10**1000]
+        for confidence in values:
+            value = response()
+            value["answers"]["proof"]["confidence"] = confidence
+            with self.subTest(confidence=confidence), self.assertRaises(ValueError):
+                client.validate_response(value, self.payload)
+        for probabilities in ({"supported": 1}, {key: 1 for key in client.CRITERIA["proof"]}):
+            value = response()
+            value["answers"]["proof"]["probabilities"] = probabilities
+            with self.assertRaises(ValueError):
+                client.validate_response(value, self.payload)
+
+
+class TransportTests(unittest.TestCase):
+    def test_missing_credentials_do_not_make_a_request(self):
+        opener = Opener()
+        result = client.diagnose(packet(), opener=opener)
+        self.assertEqual(result["status"], "missing_credentials")
+        self.assertFalse(result["provider_request_attempted"])
+        self.assertEqual(result["provider_request_attempts"], 0)
+        self.assertEqual(opener.calls, [])
+
+    def test_exact_endpoint_timeout_and_single_attempt_are_recorded(self):
+        opener = Opener()
+        result = client.diagnose(packet(), key="test-key", opener=opener)
+        self.assertEqual(result["status"], "diagnosed")
+        self.assertEqual(result["observed_model"], client.MODEL)
+        self.assertEqual(result["usage"]["total_tokens"], 580)
+        self.assertEqual(result["provider_request_attempts"], 1)
+        request, timeout = opener.calls[0]
+        self.assertEqual(request.full_url, client.ENDPOINT)
+        self.assertEqual(timeout, 15)
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+        self.assertEqual(len(result["request_sha256"]), 64)
+        self.assertEqual(len(result["response_sha256"]), 64)
+        self.assertFalse(result["full_response_retained"])
+
+    def test_abstention_is_distinct_from_diagnosed(self):
+        body = response(choices={"proof": "insufficient_context", "witness": "insufficient_context",
+                                 "support_1": "none", "support_2": "none"})
+        result = client.diagnose(packet(), key="key", opener=Opener(body))
+        self.assertEqual(result["status"], "abstained")
+
+    def test_active_credential_is_redacted_from_evidence_before_request(self):
+        value = packet()
+        value["excerpts"][0]["text"] = "accidentally captured secret-provider-token"
+        opener = Opener()
+        client.diagnose(value, key="secret-provider-token", opener=opener)
+        request, _timeout = opener.calls[0]
+        self.assertNotIn(b"secret-provider-token", request.data)
+        self.assertIn(b"[REDACTED]", request.data)
+        self.assertIn("secret-provider-token", value["excerpts"][0]["text"])
+
+    def test_timeout_or_os_failure_does_not_retry_or_echo_error(self):
+        errors = [(TimeoutError("sensitive detail"), "timeout"),
+                  (urllib.error.URLError(socket.timeout("sensitive detail")), "timeout"),
+                  (OSError("sensitive detail"), "provider_failure")]
+        for error, status in errors:
+            opener = Opener(error=error)
+            result = client.diagnose(packet(), key="key", opener=opener)
+            with self.subTest(status=status):
+                self.assertEqual(result["status"], status)
+                self.assertEqual(len(opener.calls), 1)
+                self.assertNotIn("sensitive detail", json.dumps(result))
+
+    def test_http_error_body_is_not_returned(self):
+        error = urllib.error.HTTPError(client.ENDPOINT, 429, "sensitive message", {}, io.BytesIO(b"sensitive body"))
+        result = client.diagnose(packet(), key="key", opener=Opener(error=error))
+        self.assertEqual(result["status"], "provider_failure")
+        self.assertNotIn("sensitive", json.dumps(result))
+        self.assertIsNotNone(result["response_sha256"])
+
+    def test_oversized_or_non_json_response_is_rejected(self):
+        for raw in (b"x" * (client.MAX_RESPONSE + 1), b"not-json", b'[{"too":"nested"}]'):
+            result = client.diagnose(packet(), key="key", opener=Opener(raw))
+            with self.subTest(size=len(raw)):
+                self.assertEqual(result["status"], "malformed_response")
+
+    def test_duplicate_json_keys_and_nonfinite_values_are_rejected(self):
+        raws = [b'{"model":"jev-1.14.0","model":"jev-1.14.0"}',
+                b'{"model":"jev-1.14.0","value":NaN}',
+                b'{"model":"jev-1.14.0","value":1e10000}']
+        for raw in raws:
+            with self.subTest(raw=raw):
+                result = client.diagnose(packet(), key="key", opener=Opener(raw))
+                self.assertEqual(result["status"], "malformed_response")
+
+    def test_private_evidence_provider_echo_and_errors_never_escape(self):
+        marker = "DO_NOT_PUBLISH_9f582b"
+        value = packet()
+        value["excerpts"][0]["text"] = marker
+        body = response(value)
+        body["private_echo"] = marker
+        body["answers"]["proof"]["explanation"] = marker
+        body["usage"][marker] = 1
+        result = client.diagnose(value, key=marker, opener=Opener(body))
+        self.assertNotIn(marker, json.dumps(result))
+        self.assertEqual(result["status"], "diagnosed")
+        body["answers"]["proof"]["choice"] = marker
+        result = client.diagnose(value, key="key", opener=Opener(body))
+        self.assertNotIn(marker, json.dumps(result))
+        self.assertEqual(result["status"], "malformed_response")
+
+    def test_redirect_handler_refuses_redirect(self):
+        self.assertIsNone(client._NoRedirect().redirect_request(None, None, 302, "", {}, "https://example.invalid"))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -24,8 +24,13 @@ use crate::records::{
 use crate::tree::{MAX_HEIGHT, Node, NodeSource};
 use crate::{Finding, Report, VerifyLevel};
 
-pub(crate) fn run(inner: &Inner, level: VerifyLevel) -> Result<Report, StorageError> {
-    let d = inner.snapshot()?.desc;
+pub(crate) fn run(
+    inner: &std::sync::Arc<Inner>,
+    level: VerifyLevel,
+) -> Result<Report, StorageError> {
+    // A pinned state: nothing the walk reads can be reused under it.
+    let (snap, _pin) = inner.pin_current()?;
+    let d = snap.desc;
     let mut v = Verifier {
         inner,
         desc: d,
@@ -403,6 +408,7 @@ impl Verifier<'_> {
             }
             // The fingerprint covers the canonical request; staging tokens are not part of it.
             let request = ChangeSet {
+                removal: Default::default(),
                 changes: entry.changes,
                 content: entry
                     .content

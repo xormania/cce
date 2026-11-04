@@ -685,6 +685,7 @@ fn data_written_under_larger_limits_reads_back_under_smaller_ones() {
     let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
     let staged = s.stage_content(&mut &payload[..]).unwrap();
     let cs = ChangeSet {
+        removal: Default::default(),
         changes: vec![Change::PutContext {
             id: ContextId::new(*b"A").unwrap(),
             expect: Precondition::Absent,

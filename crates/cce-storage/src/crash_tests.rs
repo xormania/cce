@@ -15,6 +15,7 @@ use crate::io::{FsIo, Io, Op, Traced};
 use crate::oracle_tests::{
     IDS, State, cid, commit_step, payload, reference_states, request, state,
 };
+use crate::repro_tests::{survival, with_repro};
 use crate::sim::{Persist, SimIo};
 
 const STORE: StoreId = StoreId(*b"crash-test-store");
@@ -64,8 +65,10 @@ fn every_cut_of_a_commit_recovers_a_whole_old_or_new_state() {
     let mut checked = 0;
     for cut in 0..=total {
         let sim = SimIo::new();
-        let s = create(Box::new(sim.clone()));
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let s = create(traced(sim.clone(), &trace));
         assert!(commit_step(&s, 1));
+        trace.lock().unwrap().clear();
         sim.crash_after(cut);
         let acknowledged = commit_step(&s, 2);
         assert_eq!(
@@ -74,35 +77,44 @@ fn every_cut_of_a_commit_recovers_a_whole_old_or_new_state() {
             "cut {cut}: acknowledgment only after every barrier"
         );
         drop(s);
+        let trace = trace.lock().unwrap().clone();
         let persists = [Persist::None, Persist::All]
             .into_iter()
             .chain((1..=12).map(Persist::Seeded));
         for p in persists {
             let img = sim.after_crash(p);
-            let recovered = open(Box::new(img.clone()));
-            let got = state(&recovered);
-            assert!(
-                &got == old || &got == new,
-                "cut {cut} {p:?}: recovered a partial state:\n{got:#?}"
-            );
-            if acknowledged {
-                assert_eq!(&got, new, "cut {cut} {p:?}: acknowledged commit lost");
-            }
-            if cut <= publication {
-                assert_eq!(
-                    &got, old,
-                    "cut {cut} {p:?}: change visible before its publication record was written"
+            let pristine = img.after_process_exit();
+            let label = format!("commit cut {cut}, {}", survival(p));
+            with_repro(&label, &[("image", &pristine)], &trace, || {
+                let recovered = open(Box::new(img.clone()));
+                crate::audit::check_retirement(&img)
+                    .unwrap_or_else(|e| panic!("cut {cut} {p:?}: after recovery: {e}"));
+                let got = state(&recovered);
+                assert!(
+                    &got == old || &got == new,
+                    "cut {cut} {p:?}: recovered a partial state:\n{got:#?}"
                 );
-            }
-            // The recovered store keeps working: commit again and reopen.
-            assert!(
-                commit_step(&recovered, 3),
-                "cut {cut} {p:?}: store unusable after recovery"
-            );
-            let after = state(&recovered);
-            drop(recovered);
-            img.release();
-            assert_eq!(state(&open(Box::new(img))), after);
+                if acknowledged {
+                    assert_eq!(&got, new, "cut {cut} {p:?}: acknowledged commit lost");
+                }
+                if cut <= publication {
+                    assert_eq!(
+                        &got, old,
+                        "cut {cut} {p:?}: change visible before its publication record was written"
+                    );
+                }
+                // The recovered store keeps working: commit again and reopen.
+                assert!(
+                    commit_step(&recovered, 3),
+                    "cut {cut} {p:?}: store unusable after recovery"
+                );
+                crate::audit::check_retirement(&img)
+                    .unwrap_or_else(|e| panic!("cut {cut} {p:?}: after the next commit: {e}"));
+                let after = state(&recovered);
+                drop(recovered);
+                img.release();
+                assert_eq!(state(&open(Box::new(img))), after);
+            });
             checked += 1;
         }
     }

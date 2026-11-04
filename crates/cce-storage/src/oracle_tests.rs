@@ -43,6 +43,7 @@ pub(crate) fn request_with(staged: &StagedContent, step: u32) -> (AttemptId, Cha
 fn request_for(binding: ContentBinding, step: u32) -> (AttemptId, ChangeSet) {
     let (a, b) = (IDS[step as usize % 4], IDS[(step as usize + 1) % 4]);
     let cs = ChangeSet {
+        removal: Default::default(),
         changes: vec![
             Change::PutContext {
                 id: cid(a),

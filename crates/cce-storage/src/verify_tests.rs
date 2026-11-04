@@ -68,6 +68,7 @@ fn rich() -> SimIo {
         &s,
         "one",
         ChangeSet {
+            removal: Default::default(),
             changes: vec![
                 put("A", Some(0)),
                 put("B", None),
@@ -504,6 +505,7 @@ fn inspection_reports_no_stored_bytes_and_changes_nothing() {
         &s,
         &format!("{MARK}-attempt"),
         ChangeSet {
+            removal: Default::default(),
             changes: vec![
                 Change::PutContext {
                     id: cid(&format!("{MARK}-ctx")),
@@ -701,6 +703,7 @@ fn a_history_binding_that_differs_from_its_manifest_is_found_by_a_scrub() {
         let entry =
             decode_history(&inner.read_extent(&old, u64::MAX, "history entry").unwrap()).unwrap();
         let request = ChangeSet {
+            removal: Default::default(),
             changes: entry.changes,
             content: entry
                 .content

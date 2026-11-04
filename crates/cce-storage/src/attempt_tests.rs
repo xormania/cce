@@ -15,7 +15,8 @@ use cce_core::storage::{
 use crate::NativeStore;
 use crate::engine::Inner;
 use crate::format::{Descriptor, StoreId};
-use crate::io::{FileId, Io};
+use crate::io::{FileId, Io, Traced};
+use crate::repro_tests::{survival, with_repro};
 use crate::sim::{Persist, SimIo};
 
 const STORE: StoreId = StoreId(*b"attempt-id-store");
@@ -81,6 +82,7 @@ fn request(s: &NativeStore, v: Variant) -> ChangeSet {
                 _ => b"evidence".to_vec(),
             },
         }],
+        ..ChangeSet::default()
     }
 }
 
@@ -284,6 +286,7 @@ fn step_request(s: &NativeStore, step: u32) -> Option<ChangeSet> {
             label: b"decision".to_vec(),
             bytes: format!("evidence {step}").into_bytes(),
         }],
+        ..ChangeSet::default()
     })
 }
 
@@ -334,28 +337,45 @@ fn outcome_after_any_cut_matches_the_recovered_state() {
     let (mut saw_old, mut saw_new) = (false, false);
     for cut in 0..=total {
         let sim = SimIo::new();
-        let s = sim_store(&sim);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let s = NativeStore {
+            inner: Inner::create(
+                Box::new(Traced {
+                    inner: sim.clone(),
+                    trace: trace.clone(),
+                }),
+                STORE,
+                Default::default(),
+            )
+            .unwrap(),
+        };
         commit_step(&s, 1).unwrap();
+        trace.lock().unwrap().clear();
         sim.crash_after(cut);
         let acknowledged = commit_step(&s, 2).is_ok();
         assert_eq!(acknowledged, cut == total, "cut {cut}");
         drop(s);
+        let trace = trace.lock().unwrap().clone();
         let persists = [Persist::None, Persist::All]
             .into_iter()
             .chain((1..=12).map(Persist::Seeded));
         for p in persists {
-            let s = reopen(&sim.after_crash(p));
-            let got = logical_state(&s);
-            assert_eq!(s.outcome(&step_attempt(1)).unwrap(), committed(1));
-            let second = s.outcome(&step_attempt(2)).unwrap();
-            if got == new {
-                saw_new = true;
-                assert_eq!(second, committed(2), "cut {cut} {p:?}: new state");
-            } else {
-                saw_old = true;
-                assert_eq!(got, old, "cut {cut} {p:?}: partial state");
-                assert_eq!(second, AttemptOutcome::Absent, "cut {cut} {p:?}: old state");
-            }
+            let img = sim.after_crash(p);
+            let label = format!("attempt cut {cut}, {}", survival(p));
+            with_repro(&label, &[("image", &img)], &trace, || {
+                let s = reopen(&img.after_process_exit());
+                let got = logical_state(&s);
+                assert_eq!(s.outcome(&step_attempt(1)).unwrap(), committed(1));
+                let second = s.outcome(&step_attempt(2)).unwrap();
+                if got == new {
+                    saw_new = true;
+                    assert_eq!(second, committed(2), "cut {cut} {p:?}: new state");
+                } else {
+                    saw_old = true;
+                    assert_eq!(got, old, "cut {cut} {p:?}: partial state");
+                    assert_eq!(second, AttemptOutcome::Absent, "cut {cut} {p:?}: old state");
+                }
+            });
         }
     }
     assert!(saw_old && saw_new, "cuts covered only one outcome");

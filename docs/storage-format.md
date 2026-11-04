@@ -24,7 +24,7 @@ Node page header (48 bytes), followed by the payload and zero padding:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `CCEP` |
-| 4 | 2 | format version (4) |
+| 4 | 2 | format version (5) |
 | 6 | 1 | page kind (1 = leaf) |
 | 7 | 1 | reserved (0) |
 | 8 | 16 | store identity |
@@ -87,7 +87,11 @@ tuple order of the raw components.
 | `04` | target, kind, source, relationship id | empty — incoming index |
 | `05` | history position (`u64` big-endian) | extent of the history entry |
 | `06` | attempt id | history position `u64`, request fingerprint (32 bytes) |
-| `07` | content SHA-256 | extent of the content's manifest |
+| `07` | content SHA-256 | `01`, extent of the content's manifest, number of records using it (`u64`); or `00`: committed once, no longer retained |
+| `08` | retiring generation (`u64` big-endian), kind `00`, page (`u64` big-endian) | incarnation `u64` of the retired page |
+| `08` | retiring generation (`u64` big-endian), kind `01`, offset (`u64` big-endian) | length `u64` of the retired content extent |
+
+Retirement keys are fixed-width, not escaped components, so they sort by retiring generation.
 
 An extent is `offset: u64, length: u64, sha256: [u8; 32]` into `content.cce`.
 
@@ -142,6 +146,53 @@ original receipt; any difference is rejected as a mismatch.
 
 ## Allocation
 
-Tree pages and content extents are allocated by advancing cursors (`next unallocated page`, the
-content length). Nothing is reused or freed yet. Content staged but not committed lies beyond the
-committed content length and is ignored, and later overwritten, after a restart.
+Staging places each segment and its manifest in the smallest retired content extent that fits,
+else at the content length. It may reuse an extent retired at generation `r` only if `r` is at most
+one generation before the current one (so neither publication slot reaches it while it is
+written) and no live view or content reader pins a generation older than `r`. A staging holds the
+extents it took until a commit binding it publishes, which deletes their retirement records; the
+unused rest of a longer extent stays retired under its original generation. Extents held by a
+staging that is not committed (pending, or not yet given up) are not handed out again in that
+process; a failed staging returns them at once.
+
+`discard_staged` gives up staged content that will not be committed. Retired extents the staging
+took return to the pool at once, since their retirement records were never consumed; the extents
+it appended are retired by the next commit, at that commit's generation. Content bound by an
+admitted commit cannot be discarded until that commit resolves (`InvalidRequest`), and committed,
+already discarded or foreign handles are refused (`ForeignHandle`) without effect.
+
+A content entry counts the records that use the content. When a commit leaves it with none (the
+last such record is removed or replaced), the entry becomes a removed entry and the commit retires
+the content's manifest and segments (prefix `08`, kind `01`). A commit that binds a second staging
+of content that is already committed, or binds content no change uses, retires that staging too:
+no published state reaches it. Committing the same bytes again later indexes them afresh.
+
+Content staged but neither committed nor discarded keeps its space for the life of the process.
+After a restart nothing refers to it: staged bytes beyond the committed content length are
+overwritten later, and retired extents a staging was using are still recorded as retired and
+reused. Staged bytes that a later commit's content length came to cover, and the appended space of
+a discarded staging whose retirement no commit published before a crash, are not reclaimed; that
+needs a maintenance pass over the content file, which is not implemented.
+
+Tree pages are allocated from retired pages first, then by advancing the next unallocated page. A
+commit producing generation `n` may reuse a page retired at generation `r` only if `r <= n - 2` and
+no live view or content reader pins a generation older than `r`. The first condition keeps the page
+unreachable from both publication slots while the commit is unpublished, so recovery, including a
+fall back to the previous record, never follows a reference into a reused page. The second keeps it
+unreachable from every live reader. A reused page is written with the new generation as its
+incarnation; pages and cached nodes are identified by page and incarnation, so a stale reference
+fails its check instead of reading the new contents. Reusing a page deletes its retirement record
+in the same commit.
+
+Each commit records, in the tree it publishes, every tree page it stopped referencing: the pages it
+copied in order to change them, under prefix `08` with the new generation as the retiring
+generation. Recording, consuming and returning those records change the tree in turn, which can
+replace further pages and change how many pages the commit writes, so the commit repeats until a
+round changes nothing (at most sixteen rounds, otherwise the commit is rejected). The
+records therefore cover their own pages, and every page below the next unallocated page is either
+reachable from the published root or recorded as retired. The records are part of the published
+state, so recovery always finds the retirement records that match the state it selects.
+
+Live views and content readers pin the generation they read. A content reader keeps its view's
+pin after the view is dropped. Pins exist only in the owning process, and no other process can hold
+the store while it is owned.

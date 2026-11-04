@@ -18,6 +18,8 @@
 //! put-rel <rel-id> <expect> <kind> <source> <target>
 //! remove-rel <rel-id> <expect>
 //! evidence <label> <bytes>
+//! removal preserve|quiescent              removal mode of the next commit (default preserve)
+//! discard <name>                          gives up a staged content without committing it
 //! commit <attempt>                        submits the changes accumulated since the last commit
 //! outcome <attempt>
 //! dump <id>[,<id>...]                     prints the committed state reachable from those ids
@@ -40,8 +42,8 @@ use std::process::ExitCode;
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, ContentBinding, ContentDigest, ContentRef,
     ContextId, Direction, Evidence, HistoryPosition, Precondition, ReadView, RelationshipId,
-    RelationshipKind, RelationshipPosition, RelationshipQuery, Revision, StagedContent,
-    StorageEngine,
+    RelationshipKind, RelationshipPosition, RelationshipQuery, RemovalMode, Revision,
+    StagedContent, StorageEngine,
 };
 use cce_storage::{NativeReadOnly, NativeStore, StoreOptions};
 
@@ -232,9 +234,10 @@ impl Driver {
             ["stats"] => {
                 let s = self.store()?.stats().map_err(|e| e.to_string())?;
                 self.say(&format!(
-                    "stats height={} pages_written={} page_bytes={} content_bytes={} misses={} evictions={} cache={}",
+                    "stats height={} pages_written={} page_bytes={} content_bytes={} misses={} evictions={} cache={} pages_reused={} content_reused={} reusable={}",
                     s.tree_height, s.pages_written, s.page_bytes_written, s.content_bytes_written,
-                    s.node_cache_misses, s.node_cache_evictions, s.node_cache_capacity
+                    s.node_cache_misses, s.node_cache_evictions, s.node_cache_capacity,
+                    s.pages_reused, s.content_bytes_reused, s.reusable_content_bytes
                 ));
             }
             ["stage", name, "hex", bytes] => {
@@ -297,6 +300,21 @@ impl Driver {
                     expect: expect(exp)?,
                 });
                 self.say("ok");
+            }
+            ["removal", mode] => {
+                self.pending.removal = match *mode {
+                    "preserve" => RemovalMode::PreserveViews,
+                    "quiescent" => RemovalMode::RequireQuiescence,
+                    _ => return Err(format!("bad removal mode: {mode}")),
+                };
+                self.say("ok");
+            }
+            ["discard", name] => {
+                let staged = self.staged.remove(*name).ok_or("unknown staged content")?;
+                self.store()?
+                    .discard_staged(staged)
+                    .map_err(|e| e.to_string())?;
+                self.say("ok discarded");
             }
             ["evidence", label, bytes] => {
                 self.pending.evidence.push(Evidence {
