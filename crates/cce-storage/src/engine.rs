@@ -177,6 +177,10 @@ pub(crate) struct Inner {
     /// commit in between).
     #[cfg(test)]
     relocate_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// The next relocation step applies its moves without checking that each source manifest is
+    /// still the one indexed (tests of what the space check alone refuses).
+    #[cfg(test)]
+    skip_relocation_revalidation: std::sync::atomic::AtomicBool,
     /// Runs once inside a commit on its space journal and tree just before the journal is sealed
     /// (tests planting a faulty change of ownership).
     #[cfg(test)]
@@ -631,6 +635,8 @@ impl Inner {
             reuse_hook: Mutex::new(None),
             #[cfg(test)]
             relocate_hook: Mutex::new(None),
+            #[cfg(test)]
+            skip_relocation_revalidation: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             journal_hook: Mutex::new(None),
             #[cfg(test)]

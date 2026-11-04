@@ -1488,6 +1488,15 @@ fn relocation_takes_lower_space_when_a_tighter_fit_lies_above() {
 /// Runs `maintain(Relocate)` on another thread and `between` on this one once the copy is done
 /// and before the step publishes.
 fn relocate_around(s: &NativeStore, between: impl FnOnce()) -> crate::MaintenanceReport {
+    relocate_around_result(s, between)
+        .unwrap_or_else(|e| panic!("the relocation must publish: {e:?}"))
+}
+
+/// [`relocate_around`], returning the step's result.
+fn relocate_around_result(
+    s: &NativeStore,
+    between: impl FnOnce(),
+) -> Result<crate::MaintenanceReport, CommitError> {
     let (copied_tx, copied_rx) = std::sync::mpsc::channel();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     s.inner.set_relocate_hook_for_test(Some(Box::new(move || {
@@ -1508,10 +1517,7 @@ fn relocate_around(s: &NativeStore, between: impl FnOnce()) -> crate::Maintenanc
         }
         between();
         go_tx.send(()).unwrap();
-        worker
-            .join()
-            .unwrap()
-            .unwrap_or_else(|e| panic!("the relocation must publish: {e:?}"))
+        worker.join().unwrap()
     })
 }
 
@@ -1633,6 +1639,76 @@ fn a_move_whose_content_was_committed_again_during_relocation_is_dropped() {
         logical(&s).contexts.get("D").and_then(|c| c.2.as_deref()),
         Some(&bytes_of(2, 100_000)[..])
     );
+}
+
+/// A relocation that applied a move of a superseded manifest (here: revalidation switched off
+/// for one step) is refused by the space check before it writes anything: no page, no record,
+/// the generation unchanged, no fence, its reservations returned, and the store keeps working.
+#[test]
+fn a_move_of_a_superseded_manifest_is_refused_before_anything_is_written() {
+    let sim = fragmented();
+    let s = open(&sim);
+    s.inner.skip_relocation_revalidation_for_test();
+    let image = |sim: &SimIo| {
+        [crate::io::FileId::Meta, crate::io::FileId::Content].map(|f| {
+            let mut b = vec![0; crate::io::Io::len(sim, f).unwrap() as usize];
+            crate::io::Io::read_at(sim, f, 0, &mut b).unwrap();
+            b
+        })
+    };
+    let at_publication = std::sync::Mutex::new(None);
+    let r = relocate_around_result(&s, || {
+        // B gives up its content, then D binds the same bytes again under another manifest.
+        commit(
+            &s,
+            "release",
+            ChangeSet {
+                changes: vec![put("B", "B", None)],
+                ..ChangeSet::default()
+            },
+        );
+        let staged = s.stage_content(&mut &bytes_of(2, 100_000)[..]).unwrap();
+        commit(
+            &s,
+            "again",
+            ChangeSet {
+                changes: vec![put("D", "d", Some(0))],
+                content: vec![ContentBinding::from(&staged)],
+                ..ChangeSet::default()
+            },
+        );
+        *at_publication.lock().unwrap() =
+            Some((s.inner.snapshot().unwrap().desc.generation, image(&sim)));
+    });
+    let (generation, files) = at_publication.lock().unwrap().take().unwrap();
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::StoreState(m))) if m.starts_with("space check failed")),
+        "the move itself must be refused before publication (not a later step behind a fence): {r:?}"
+    );
+    assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
+    assert!(
+        image(&sim) == files,
+        "a refused relocation wrote to the store"
+    );
+    assert_eq!(
+        s.inner.fence_reason(),
+        None,
+        "a refused relocation fenced writes"
+    );
+    assert_eq!(s.inner.reserved_bytes_for_test(), (0, 0));
+    commit(
+        &s,
+        "afterwards",
+        ChangeSet {
+            changes: vec![put("E", "e", None)],
+            ..ChangeSet::default()
+        },
+    );
+    assert_eq!(
+        logical(&s).contexts.get("D").and_then(|c| c.2.as_deref()),
+        Some(&bytes_of(2, 100_000)[..])
+    );
+    audit(&sim);
 }
 
 #[test]

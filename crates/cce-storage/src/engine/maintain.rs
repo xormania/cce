@@ -389,10 +389,18 @@ impl Inner {
         let mut txn = TreeTxn::new(&**self, cur.root);
         let mut applied = Vec::new();
         let mut dropped = Vec::new();
+        #[cfg(test)]
+        let skip = self
+            .skip_relocation_revalidation
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let skip = false;
         for mv in moves {
             let still = match txn.get(&mv.key).map_err(rejected)? {
                 Some(v) => match ContentEntry::decode(&v).map_err(rejected)? {
-                    ContentEntry::Live { manifest, refs } if manifest == mv.old => Some(refs),
+                    ContentEntry::Live { manifest, refs } if manifest == mv.old || skip => {
+                        Some(refs)
+                    }
                     _ => None,
                 },
                 None => None,
@@ -633,6 +641,13 @@ impl Inner {
     #[cfg(test)]
     pub(crate) fn set_relocate_hook_for_test(&self, hook: Option<Box<dyn FnOnce() + Send>>) {
         *lock(&self.relocate_hook) = hook;
+    }
+
+    /// Makes the next relocation step skip revalidating its moves.
+    #[cfg(test)]
+    pub(crate) fn skip_relocation_revalidation_for_test(&self) {
+        self.skip_relocation_revalidation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Publishes the current tree with `edit` applied, as a physical generation (tests that craft
