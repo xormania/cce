@@ -32,6 +32,7 @@ use crate::io::{FileId, Io};
 use crate::records::{
     AttemptValue, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT, P_HISTORY,
     P_IN, P_OUT, P_REL, RelValue, decode_history, encode_history, fingerprint, history_key, key,
+    retired_page_key,
 };
 use crate::tree::{self, Cursor, Node, NodeSink, NodeSource, TreeTxn};
 
@@ -831,6 +832,7 @@ impl Inner {
                 "generation counter exhausted".into(),
             )));
         };
+        retire_replaced_pages(&mut txn, generation).map_err(rejected)?;
         let mut sink = PageWriter {
             inner: self,
             next_page: cur.next_page,
@@ -1197,6 +1199,33 @@ impl ConflictLog {
             }
         }
     }
+}
+
+/// Upper bound on rounds of recording retirements: each round's records can only touch pages
+/// already being rewritten or split from them, so the set of replaced pages stops growing quickly.
+const RETIREMENT_ROUNDS: usize = 8;
+
+/// Records, in the transaction itself, every committed page it replaces as retired at
+/// `generation`. Recording a retirement edits the tree and can replace further committed pages, so
+/// this repeats until no new page is replaced; the records then account for their own pages.
+fn retire_replaced_pages(txn: &mut TreeTxn, generation: u64) -> Result<(), StorageError> {
+    let mut recorded = 0;
+    for _ in 0..RETIREMENT_ROUNDS {
+        let fresh: Vec<PageRef> = txn.replaced()[recorded..].to_vec();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        recorded += fresh.len();
+        for p in fresh {
+            txn.put(
+                retired_page_key(generation, p.page),
+                p.incarnation.to_le_bytes().to_vec(),
+            )?;
+        }
+    }
+    Err(StorageError::InvalidRequest(format!(
+        "retirement records did not settle within {RETIREMENT_ROUNDS} rounds"
+    )))
 }
 
 /// Reads both publication slots and selects the record to recover from, checking its cursors

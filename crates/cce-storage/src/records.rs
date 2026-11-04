@@ -29,6 +29,11 @@ pub(crate) const P_IN: u8 = 0x04;
 pub(crate) const P_HISTORY: u8 = 0x05;
 pub(crate) const P_ATTEMPT: u8 = 0x06;
 pub(crate) const P_CONTENT: u8 = 0x07;
+/// Retirement records: space a published generation no longer reaches.
+pub(crate) const P_RETIRED: u8 = 0x08;
+
+/// Kind byte of a retired metadata page in a retirement key.
+pub(crate) const RETIRED_PAGE: u8 = 0;
 
 /// Version tag of the canonical request encoding used for attempt fingerprints.
 const REQUEST_ENCODING_V1: u8 = 1;
@@ -39,6 +44,40 @@ pub(crate) fn key(prefix: u8, parts: &[&[u8]]) -> Vec<u8> {
         key_component(&mut k, p);
     }
     k
+}
+
+/// Key recording that metadata page `page` is unreachable from generation `generation` on. Keys
+/// sort by retiring generation. The value is the retired page's incarnation.
+pub(crate) fn retired_page_key(generation: u64, page: u64) -> Vec<u8> {
+    let mut k = vec![P_RETIRED];
+    k.extend_from_slice(&generation.to_be_bytes());
+    k.push(RETIRED_PAGE);
+    k.extend_from_slice(&page.to_be_bytes());
+    k
+}
+
+/// Parses a retired-page record: `(retiring generation, page, incarnation)`. Only the audit reads
+/// retirement records so far.
+#[cfg(test)]
+pub(crate) fn decode_retired_page(
+    key: &[u8],
+    value: &[u8],
+) -> Result<(u64, u64, u64), StorageError> {
+    let bad = || corrupt("retirement record");
+    let [P_RETIRED, rest @ ..] = key else {
+        return Err(bad());
+    };
+    let (generation, rest) = rest.split_first_chunk::<8>().ok_or_else(bad)?;
+    let [RETIRED_PAGE, page @ ..] = rest else {
+        return Err(bad());
+    };
+    let page: [u8; 8] = page.try_into().map_err(|_| bad())?;
+    let incarnation: [u8; 8] = value.try_into().map_err(|_| bad())?;
+    Ok((
+        u64::from_be_bytes(*generation),
+        u64::from_be_bytes(page),
+        u64::from_le_bytes(incarnation),
+    ))
 }
 
 pub(crate) fn history_key(pos: u64) -> Vec<u8> {

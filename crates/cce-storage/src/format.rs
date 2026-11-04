@@ -12,7 +12,7 @@ pub(crate) const PAGE_SIZE: usize = 4096;
 /// as verified segments with manifests and context records holding logical content references
 /// (version 2 had single-extent content; version 1 single-leaf trees). Older versions are refused,
 /// never reinterpreted.
-pub(crate) const FORMAT_VERSION: u16 = 4;
+pub(crate) const FORMAT_VERSION: u16 = 5;
 pub(crate) const PAGE_MAGIC: [u8; 4] = *b"CCEP";
 pub(crate) const DESC_MAGIC: [u8; 4] = *b"CCED";
 /// Pages 0 and 1 are publication slots.

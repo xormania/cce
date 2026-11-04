@@ -2,7 +2,7 @@
 //! reading the publication slots and walking each root page by page, without the engine's cache or
 //! its in-memory state.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cce_core::storage::StorageError;
 use sha2::{Digest, Sha256};
@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::codec::corrupt;
 use crate::format::{Descriptor, PAGE_SIZE, PageKind, PageRef, Slot, decode_page, decode_slot};
 use crate::io::{FileId, Io};
-use crate::records::{ExtentRef, Manifest, P_CONTENT, P_HISTORY};
+use crate::records::{ExtentRef, Manifest, P_CONTENT, P_HISTORY, P_RETIRED, decode_retired_page};
 use crate::tree::Node;
 
 /// The valid publication records, in their proper slots, oldest generation first.
@@ -40,6 +40,8 @@ pub(crate) struct Reach {
     pub content_segments: BTreeSet<(u64, u64)>,
     /// Retained history entries `(offset, len)`.
     pub history_extents: BTreeSet<(u64, u64)>,
+    /// Retired metadata pages recorded in this state: page -> (retiring generation, incarnation).
+    pub retired: BTreeMap<u64, (u64, u64)>,
 }
 
 impl Reach {
@@ -116,6 +118,12 @@ pub(crate) fn reach(io: &dyn Io, d: &Descriptor) -> Result<Reach, StorageError> 
                             let x = ExtentRef::decode(&v)?;
                             r.history_extents.insert((x.offset, x.len));
                         }
+                        Some(&P_RETIRED) => {
+                            let (generation, page, incarnation) = decode_retired_page(&k, &v)?;
+                            if r.retired.insert(page, (generation, incarnation)).is_some() {
+                                return Err(corrupt(format!("page {page} retired twice")));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -123,4 +131,67 @@ pub(crate) fn reach(io: &dyn Io, d: &Descriptor) -> Result<Reach, StorageError> 
         }
     }
     Ok(r)
+}
+
+/// Checks the retirement records of the newest published state against what the states reach:
+/// no retired page is reachable, every retirement lies inside the state, and when the other slot
+/// holds the directly preceding generation, the pages retired by the newest commit are exactly the
+/// pages the preceding state reached and the newest no longer does, while older records carry over
+/// unchanged.
+pub(crate) fn check_retirement(io: &dyn Io) -> Result<(), String> {
+    let e = |x: StorageError| x.to_string();
+    let slots = published(io).map_err(e)?;
+    let cur = slots.last().ok_or("no valid publication record")?;
+    let rc = reach(io, cur).map_err(e)?;
+    if !rc.disjoint() {
+        return Err(format!(
+            "generation {}: overlapping extents",
+            cur.generation
+        ));
+    }
+    for (page, (generation, _)) in &rc.retired {
+        if rc.pages.contains(page) {
+            return Err(format!(
+                "generation {}: retired page {page} is reachable",
+                cur.generation
+            ));
+        }
+        if *generation > cur.generation || *page >= cur.next_page {
+            return Err(format!(
+                "generation {}: retirement of page {page} at {generation} lies outside the state",
+                cur.generation
+            ));
+        }
+    }
+    if let [prev, _] = slots.as_slice()
+        && prev.generation + 1 == cur.generation
+    {
+        let rp = reach(io, prev).map_err(e)?;
+        let dropped: BTreeSet<u64> = rp.pages.difference(&rc.pages).copied().collect();
+        let now: BTreeSet<u64> = rc
+            .retired
+            .iter()
+            .filter(|(_, (g, _))| *g == cur.generation)
+            .map(|(p, _)| *p)
+            .collect();
+        if now != dropped {
+            return Err(format!(
+                "generation {}: retired {now:?}, but the commit stopped reaching {dropped:?}",
+                cur.generation
+            ));
+        }
+        let carried: BTreeMap<u64, (u64, u64)> = rc
+            .retired
+            .iter()
+            .filter(|(_, (g, _))| *g != cur.generation)
+            .map(|(p, v)| (*p, *v))
+            .collect();
+        if carried != rp.retired {
+            return Err(format!(
+                "generation {}: earlier retirements changed",
+                cur.generation
+            ));
+        }
+    }
+    Ok(())
 }

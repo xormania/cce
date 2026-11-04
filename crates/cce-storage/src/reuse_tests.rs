@@ -174,3 +174,21 @@ fn sim_meta_len(sim: &SimIo) -> u64 {
     use crate::io::{FileId, Io};
     sim.len(FileId::Meta).unwrap()
 }
+
+#[test]
+fn every_commit_retires_exactly_the_pages_it_stopped_reaching() {
+    let sim = SimIo::new();
+    let s = sim_create(&sim);
+    for i in 0..40u8 {
+        put(&s, &format!("a{i}"), &format!("K{i:03}"), &[i; 50]);
+        crate::audit::check_retirement(&sim).unwrap_or_else(|e| panic!("after commit {i}: {e}"));
+    }
+    let cur = *published(&sim).unwrap().last().unwrap();
+    let r = reach(&sim, &cur).unwrap();
+    assert!(r.pages.len() > 2, "the tree never outgrew a single path");
+    // Nothing leaks: every metadata page ever written is either reachable or retired.
+    let written: std::collections::BTreeSet<u64> = (2..cur.next_page).collect();
+    let accounted: std::collections::BTreeSet<u64> =
+        r.pages.iter().chain(r.retired.keys()).copied().collect();
+    assert_eq!(accounted, written);
+}
