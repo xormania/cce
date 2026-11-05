@@ -959,5 +959,44 @@ print(os.getcwd() in [os.path.realpath(entry) for entry in sys.path if entry])
                         self.assertEqual(done.stdout, "")
 
 
+class ScopeIdentityTests(unittest.TestCase):
+    """An unset scope (broad view of all open work) and an empty one (no scoped work) are different scopes."""
+
+    NONEMPTY = {"objective": "a", "work": ["W-cache"], "origin": "lead"}
+
+    def test_unset_and_empty_scopes_have_different_fingerprints(self):
+        self.assertNotEqual(context.scope_fingerprint(None), context.scope_fingerprint({}))
+
+    def test_equal_scopes_keep_one_fingerprint_and_different_ones_do_not_share_it(self):
+        self.assertEqual(context.scope_fingerprint(None), context.scope_fingerprint(None))
+        self.assertEqual(context.scope_fingerprint({}), context.scope_fingerprint(dict()))
+        reordered = dict(reversed(list(self.NONEMPTY.items())))
+        self.assertEqual(context.scope_fingerprint(self.NONEMPTY), context.scope_fingerprint(reordered))
+        self.assertEqual(context.scope_fingerprint(self.NONEMPTY),
+                         context.scope_fingerprint(json.loads(json.dumps(self.NONEMPTY))))
+        self.assertNotEqual(context.scope_fingerprint(self.NONEMPTY), context.scope_fingerprint({}))
+        self.assertNotEqual(context.scope_fingerprint(self.NONEMPTY), context.scope_fingerprint(None))
+        self.assertNotEqual(context.scope_fingerprint(self.NONEMPTY),
+                            context.scope_fingerprint(dict(self.NONEMPTY, objective="b")))
+
+    def test_checkpoint_for_the_unset_scope_reports_a_scope_change_when_read_for_the_empty_one(self):
+        s = snap()
+        result = context.changes(s, context.checkpoint(s, None), {})
+        self.assertTrue(result["scope_changed"])
+        self.assertEqual(result["changed"], [])
+
+    def test_checkpoint_for_the_empty_scope_reports_a_scope_change_when_read_for_the_unset_one(self):
+        s = snap()
+        result = context.changes(s, context.checkpoint(s, {}), None)
+        self.assertTrue(result["scope_changed"])
+        self.assertEqual(result["changed"], [])
+
+    def test_checkpoint_read_for_the_same_scope_reports_no_scope_change(self):
+        s = snap()
+        for name, scope in {"unset": None, "empty": {}, "non-empty": self.NONEMPTY}.items():
+            with self.subTest(name):
+                self.assertIs(context.changes(s, context.checkpoint(s, scope), scope)["scope_changed"], False)
+
+
 if __name__ == "__main__":
     unittest.main()

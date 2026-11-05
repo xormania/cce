@@ -553,6 +553,73 @@ quote = "words"
         self.assertEqual(meta["unlisted"], len(self.OTHERS))
 
 
+class ScopeIdentityTests(unittest.TestCase):
+    """An unset scope (broad view of all open work) and an empty one (no scoped work) are different scopes."""
+
+    NOT_APPLIED = "the relevance selection is for another ledger or scope, or stale"
+    NO_OPEN_WORK = "version = 2\n" + EXTRA  # Both scopes govern and offer the same records here.
+    NONEMPTY = SCOPE
+
+    def assert_not_applied(self, text):
+        self.assertIn(self.NOT_APPLIED, text)
+        self.assertNotIn("Judged not relevant", text)
+        self.assertNotIn("Judged relevant", text)
+        self.assertNotIn("; judged)", text)
+        self.assertNotIn("selection: relevance", text)
+
+    def test_selection_for_the_unset_scope_is_not_applied_to_the_empty_scope(self):
+        s = snap()
+        for name, scores in {"all rejected": {}, "one relevant": {"B10": 0.9}}.items():
+            with self.subTest(name):
+                result = select.select(s, None, Fake(scores))
+                text, _ = context.brief(s, {}, selection=result)
+                self.assert_not_applied(text)
+                self.assertNotIn("Decision about topic 10", text)
+
+    def test_selection_for_the_empty_scope_is_not_applied_to_the_unset_scope(self):
+        s = snap()
+        for name, scores in {"all rejected": {}, "one relevant": {"B10": 0.9}}.items():
+            with self.subTest(name):
+                result = select.select(s, {}, Fake(scores))
+                text, _ = context.brief(s, None, selection=result)
+                self.assert_not_applied(text)
+                self.assertNotIn("Decision about topic 10", text)
+
+    def test_selection_is_applied_to_a_brief_for_the_same_scope(self):
+        s = snap()
+        for name, scope in {"unset": None, "empty": {}, "non-empty": self.NONEMPTY}.items():
+            with self.subTest(name):
+                result = select.select(s, scope, Fake({"B10": 0.9}))
+                text, _ = context.brief(s, scope, selection=result)
+                self.assertNotIn(self.NOT_APPLIED, text)
+                self.assertIn("selection: relevance jev: 1 relevant", text)
+                self.assertIn("## Judged relevant to this scope (1 of 1)", text)
+                self.assertIn("Decision about topic 10", text)
+                self.assertIn("Judged not relevant", text)
+
+    def test_cached_selection_is_not_served_between_the_unset_and_empty_scopes(self):
+        s = snap(self.NO_OPEN_WORK)
+        for name, first, second in (("unset then empty", None, {}), ("empty then unset", {}, None)):
+            with self.subTest(name), tempfile.TemporaryDirectory() as cache:
+                select.select(s, first, Fake({"B10": 0.9}), cache_dir=cache)
+                fake = Fake({"B11": 0.9})
+                result = select.select(s, second, fake, cache_dir=cache)
+                self.assertGreater(fake.calls, 0, "served from the other scope's cached result")
+                self.assertFalse(result["cache_hit"])
+                self.assertEqual(result["relevant"], ["B11"])
+
+    def test_cached_selection_is_reused_for_the_same_unset_or_empty_scope(self):
+        s = snap(self.NO_OPEN_WORK)
+        for name, scope in {"unset": None, "empty": {}}.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as cache:
+                select.select(s, scope, Fake({"B10": 0.9}), cache_dir=cache)
+                fake = Fake()
+                result = select.select(s, scope, fake, cache_dir=cache)
+                self.assertEqual((fake.calls, result["cache_hit"], result["relevant"]), (0, True, ["B10"]))
+                text, _ = context.brief(s, scope, selection=result)
+                self.assertIn("Decision about topic 10", text)
+
+
 class Response(io.BytesIO):
     def __enter__(self):
         return self
