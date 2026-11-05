@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import stat
 import tomllib
 
 from .domain import TelemetryError
@@ -50,29 +51,37 @@ def _section(data: dict, name: str, allowed: set[str]) -> dict:
     return section
 
 
+def _no_symlinks(path: Path, label: str) -> None:
+    for component in (path, *path.parents):
+        try:
+            mode = component.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError:
+            _fail(f"{label} cannot be inspected")
+        if stat.S_ISLNK(mode):
+            _fail(f"{label} cannot contain symbolic links")
+
+
 def _child(root: Path, value: object, label: str) -> Path:
     relative = Path(_text(value, label))
     if relative.is_absolute() or ".." in relative.parts:
         _fail(f"{label} must be a relative path inside runtime_root")
     candidate = root / relative
+    _no_symlinks(candidate, label)
     try:
         resolved = candidate.resolve()
     except (OSError, RuntimeError):
         _fail(f"{label} cannot be resolved")
     if not resolved.is_relative_to(root) or resolved == root:
         _fail(f"{label} must be inside runtime_root")
-    current = candidate
-    while current != root:
-        if current.is_symlink():
-            _fail(f"{label} cannot contain symbolic links")
-        current = current.parent
     return resolved
 
 
 def load_config(path: str | Path) -> Config:
     """Validate the complete profile and freeze its effective storage locations."""
     try:
-        profile = Path(path).resolve()
+        profile = Path(path).absolute()
         with profile.open("rb") as stream:
             data = tomllib.load(stream)
     except (OSError, ValueError, RuntimeError):
@@ -101,8 +110,10 @@ def load_config(path: str | Path) -> Config:
     enabled = artifacts.get("enabled", True)
     if type(enabled) is not bool:
         _fail("artifacts.enabled must be boolean")
+    root_input = profile.parent / _text(storage.get("runtime_root"), "runtime_root")
+    _no_symlinks(root_input, "runtime_root")
     try:
-        root = (profile.parent / _text(storage.get("runtime_root"), "runtime_root")).resolve()
+        root = root_input.resolve()
     except (OSError, RuntimeError):
         _fail("runtime_root cannot be resolved")
     database = _child(root, storage.get("database", "live.sqlite3"), "database")
