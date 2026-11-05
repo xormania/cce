@@ -9,8 +9,9 @@ it names it in ``supersedes``.
 
 Every entry carries a revision ``rev`` that advances by one on each change, so a
 writer who read an older revision cannot overwrite a newer one even when the
-visible value looks the same. Answers are never edited: a change of direction is a
-new answer that names the old one in ``supersedes``. An owner answer recorded by
+visible value looks the same. Answers are not edited: a change of direction is a
+new answer that names the old one in ``supersedes``. The one exception is a correction
+the owner asked for, which the writer names explicitly (``owner_edits``). An owner answer recorded by
 someone else carries the owner's words (``quote``) or says why only a
 transcription survives (``quote_unavailable``).
 
@@ -591,7 +592,7 @@ def _mismatch():
                    "remedy": "nothing was written; report this ledger content as a writer defect"}]
 
 
-def update(base_text, current_text, proposed_text):
+def update(base_text, current_text, proposed_text, owner_edits=()):
     """Apply a writer's changes onto the current ledger.
 
     ``base`` is the ledger the writer read, ``proposed`` the writer's edited copy of it and
@@ -601,6 +602,8 @@ def update(base_text, current_text, proposed_text):
     changed and changed back (A -> B -> A) still counts as changed. Every value the reader accepts
     is written back unchanged, as are top-level data outside the entries and full-line comments.
     The written text is read back and must match exactly; otherwise nothing is returned.
+    ``owner_edits`` names answers the owner asked to have corrected in place. They follow the same
+    revision rules as any other entry. Every other changed answer is refused.
     """
     base, current, proposed = (_entries(load(t)) for t in (base_text, current_text, proposed_text))
     conflicts = []
@@ -625,7 +628,7 @@ def update(base_text, current_text, proposed_text):
             continue
         if b[0] != p[0]:
             conflicts.append({"code": "kind_changed", "id": eid, "remedy": "record a new entry"})
-        elif b[0] == "answer":
+        elif b[0] == "answer" and eid not in owner_edits:
             conflicts.append({"code": "answer_modified", "id": eid,
                               "remedy": "record a new answer that names this one in supersedes"})
         elif p[1]["rev"] != b[1]["rev"] + 1:
@@ -702,6 +705,8 @@ def main(argv=None):
     view_cmd.add_argument("--scan", action="append", default=[])
     view_cmd.add_argument("--provenance", default="")
     update_cmd = sub.add_parser("update")
+    update_cmd.add_argument("--owner-edit", action="append", default=[],
+                            help="an answer the owner asked to have corrected in place (repeatable)")
     for name in ("--base", "--current", "--proposed", "--out"):
         update_cmd.add_argument(name, required=True)
     args = parser.parse_args(argv)
@@ -732,7 +737,7 @@ def _update_command(args):
     """Exit 0: merged ledger written ("updated", or "unchanged" when already published); 3: conflicts; 2: invalid input."""
     try:
         texts = [open(path, encoding="utf-8").read() for path in (args.base, args.current, args.proposed)]
-        merged, conflicts = update(*texts)
+        merged, conflicts = update(*texts, owner_edits=args.owner_edit)
     except (OSError, LedgerError) as error:
         print("invalid ledger input: " + str(error))
         return 2
