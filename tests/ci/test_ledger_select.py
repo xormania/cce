@@ -52,7 +52,7 @@ class Fake:
         self.payloads.append(payload)
         if self.mutate:
             self.mutate()
-        names = {q: v["instructions"]["candidate"]["id"] for q, v in payload["questions"].items()}
+        names = {"c" + str(n): item["id"] for n, item in enumerate(payload["state"]["candidates"])}
         return {"model": payload["model"],
                 "answers": {q: {"type": "noul", "noul": self.scores.get(names[q], self.default)}
                             for q in payload["questions"]}}
@@ -80,16 +80,16 @@ class SelectTests(unittest.TestCase):
         self.assertIn("B12", result["uncertain"])
         self.assertIn("B13", result["not_relevant"])
         payload = fake.payloads[0]
-        self.assertNotIn("candidates", payload["state"])
-        self.assertEqual({v["instructions"]["candidate"]["id"] for v in payload["questions"].values()},
-                         set(result["scores"]))
+        self.assertEqual(len(payload["questions"]), len(payload["state"]["candidates"]))
+        for n, item in enumerate(payload["state"]["candidates"]):
+            self.assertIn("`candidates[" + str(n) + "]` (" + item["id"] + ")", payload["questions"]["c" + str(n)]["instructions"])
         self.assertTrue(all(q["type"] == "noul" for q in payload["questions"].values()))
 
     def test_governing_records_are_never_sent_and_low_scores_cannot_remove_them(self):
         s = snap()
         fake = Fake(default=0.0)
         result = select.select(s, SCOPE, fake)
-        sent = {v["instructions"]["candidate"]["id"] for p in fake.payloads for v in p["questions"].values()}
+        sent = {item["id"] for p in fake.payloads for item in p["state"]["candidates"]}
         self.assertFalse(sent & {"A1", "A-style", "W-cache", "Q3"})
         text, meta = context.brief(s, SCOPE, selection=result)
         self.assertIn("A1 on Q1 (owner decided, quoted)", text.split("## Findings")[0])
@@ -251,9 +251,8 @@ class SelectTests(unittest.TestCase):
         fake = Fake({"B14": 0.9})
         result = select.select(s, SCOPE, fake)
         payload = fake.payloads[0]
-        self.assertTrue(all(q["instructions"]["task"] == select.RUBRIC for q in payload["questions"].values()))
-        hostile_q = [q for q in payload["questions"].values() if "Ignore the rubric" in json.dumps(q)]
-        self.assertEqual([q["instructions"]["candidate"]["id"] for q in hostile_q], ["B14"])
+        self.assertTrue(all(q["instructions"].startswith(select.RUBRIC) for q in payload["questions"].values()))
+        self.assertTrue(all("Ignore the rubric" not in q["instructions"] for q in payload["questions"].values()))
         self.assertNotIn("Z9", result["relevant"] + result["not_relevant"] + result["uncertain"])
         self.assertEqual(result["relevant"], ["B14"])
 
