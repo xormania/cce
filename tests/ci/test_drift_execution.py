@@ -25,6 +25,34 @@ SCAN_FILES = (".github/workflows/leak-scan.yml", "tools/ci/leak_scan_trusted.sh"
 CLEAN = "no private markers in PR text, commit messages, added lines or file names"
 PYTHON_COMMAND = "python3 -m unittest discover -s tests/ci -v"
 RUST_COMMAND = "cargo test --workspace --locked"
+PYTHON_WORKFLOW = """name: drift-input
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: drift-input-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Drift tooling tests
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit and replay tests
+        run: python3 -m unittest discover -s tests/ci -v
+"""
 
 
 def witness_step(name, conclusion="success", number=1, start=10, end=11):
@@ -116,7 +144,9 @@ class ExecutionTests(unittest.TestCase):
         target = self.root / ".github/workflows"
         target.mkdir(parents=True)
         for name in ("rust", "drift-input", "leak-scan"):
-            (target / (name + ".yml")).write_text((ROOT / ".github/workflows" / (name + ".yml")).read_text())
+            text = (PYTHON_WORKFLOW if name == "drift-input" else
+                    (ROOT / ".github/workflows" / (name + ".yml")).read_text())
+            (target / (name + ".yml")).write_text(text)
         (self.root / "tools/ci").mkdir(parents=True)
         for name in SCAN_FILES[1:]:
             (self.root / name).write_text((ROOT / name).read_text())
