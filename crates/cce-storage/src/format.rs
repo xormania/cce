@@ -290,6 +290,34 @@ mod tests {
     }
 
     #[test]
+    fn a_record_in_this_layout_naming_an_older_version_is_unsupported() {
+        // No engine writes this: the current layout, intact under its own checksum, but carrying
+        // an older version number. It must not be read as a current record.
+        let d = Descriptor {
+            store: S,
+            generation: 9,
+            root: PageRef {
+                page: 4,
+                incarnation: 9,
+            },
+            next_page: 5,
+            content_len: 100,
+            history_pos: 2,
+        };
+        for version in [FORMAT_VERSION - 1, 1, 0] {
+            let mut older = d.encode();
+            older[4..6].copy_from_slice(&version.to_le_bytes());
+            let crc = crc32fast::hash(&older[..DESC_LEN - 4]);
+            older[DESC_LEN - 4..DESC_LEN].copy_from_slice(&crc.to_le_bytes());
+            assert_eq!(
+                decode_slot(&older),
+                Slot::Unsupported(format!("format version {version}")),
+                "a current-layout record naming version {version}"
+            );
+        }
+    }
+
+    #[test]
     fn descriptor_slots_classify_empty_valid_torn_and_unsupported() {
         let d = Descriptor {
             store: S,

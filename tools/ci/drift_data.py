@@ -8,13 +8,15 @@ import re
 import tomllib
 import urllib.error
 
+from drift_contracts import MAX_CASE_STATUSES, mutation_run_aborted
+
 SHA = re.compile(r"[a-f0-9]{40}\Z")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 STATUSES = frozenset({"green", "qualified", "complete", "implemented", "partial", "deferred", "planned", "red"})
 DISPOSITIONS = frozenset({"caught", "equivalent", "defence-in-depth", "superseded", "planned", "missed", "unviable", "error"})
 MAX_RECORDS = 8
 MAX_LINKS = 8
-MAX_CASES = 1000
+MAX_CASES = MAX_CASE_STATUSES
 MAX_STATUS_GROUPS = 40
 MAX_MUTATIONS = 12
 MAX_MUTATION_LOGS = 8
@@ -226,9 +228,12 @@ def _runs(raw):
             if field in row and type(row[field]) is not bool:
                 raise ValueError("invalid_mutation_flags")
         exit_code = row["exit"]
-        runs.append({"exit": exit_code, "executed": row.get("executed", False),
-                     "failed_by_assertion": row.get("failed_by_assertion", False),
-                     "aborted": row.get("aborted", False) or exit_code in {-6, 134}})
+        run = {"exit": exit_code, "executed": row.get("executed", False),
+               "failed_by_assertion": row.get("failed_by_assertion", False),
+               "aborted": mutation_run_aborted(row)}
+        if "exit_convention" in row:
+            run["exit_convention"] = row["exit_convention"]
+        runs.append(run)
     return runs
 
 
