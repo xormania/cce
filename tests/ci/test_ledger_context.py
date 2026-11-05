@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -283,6 +284,103 @@ quote = "standing {n}"
                     context.brief(snap(), None, **arguments)
                 self.assertEqual(caught.exception.code, "frame_exceeds_budget")
 
+    def test_more_budget_never_loads_fewer_governing_records(self):
+        s = snap()
+        scope = {"objective": "x", "work": ["W-cache"], "origin": "lead"}
+        total = len(context._governing(s, scope)[0])
+        loaded, reached = 0, 0
+        for budget in range(200, 2000):
+            try:
+                _, meta = context.brief(s, scope, max_chars=budget)
+            except context.ContextError:
+                now = 0
+            else:
+                now = total - len(meta["pending"])
+            self.assertGreaterEqual(now, loaded, "budget " + str(budget))
+            loaded, reached = now, max(reached, now)
+        self.assertEqual(reached, total)
+
+    def test_brief_is_within_budget_or_refused_for_every_header_length(self):
+        for length in range(0, 601):
+            try:
+                text, meta = context.brief(snap(), None, head="h" * length, foot="f", max_chars=600)
+            except context.ContextError as error:
+                self.assertEqual(error.code, "frame_exceeds_budget")
+                continue
+            self.assertLessEqual(len(text), 600, "header of " + str(length))
+            self.assertTrue(meta["fits"], "header of " + str(length))
+
+    def test_missing_decisions_and_conflicts_load_before_work_when_the_budget_runs_out(self):
+        rival = """
+[[answer]]
+id = "A2-rival"
+rev = 1
+questions = ["Q2"]
+authority = "owner"
+outcome = "decided"
+given = "day 3"
+source = "session"
+summary = "Export format is a rival answer"
+recorded_by = "lead"
+quote = "use the other format"
+"""
+        work = "".join(f'\n[[work]]\nid = "W{n}"\nrev = 1\nanswer = "A1"\nsummary = "{"y" * 1500}"\n'
+                       f'owner = "agent"\nstate = "open"\n' for n in range(6))
+        text, meta = context.brief(snap(LEDGER + rival + work), None, max_chars=6000)
+        governing = text.split("## Governing")[1].split("## Findings")[0]
+        self.assertTrue(meta["pending"], "the fixture must overflow the budget")
+        for rid in ("Q3", "A2", "A2-rival"):
+            self.assertNotIn(rid, meta["pending"])
+        self.assertLess(governing.index("Retry budget"), governing.index("- W-cache"))
+        self.assertLess(governing.index("rival answer"), governing.index("- W-cache"))
+        self.assertTrue(set(meta["pending"]) <= {"W-cache"} | {"W" + str(n) for n in range(6)})
+
+    def test_open_proposal_on_a_missing_decision_governs(self):
+        proposals = """
+[[proposal]]
+id = "P-retry"
+rev = 1
+by = "agent"
+summary = "Retry three times"
+state = "open"
+questions = ["Q3"]
+
+[[proposal]]
+id = "P-export"
+rev = 1
+by = "agent"
+summary = "Export as CSV"
+state = "open"
+questions = ["Q2"]
+"""
+        text, _ = context.brief(snap(LEDGER + proposals), {"objective": "x", "work": ["W-cache"], "origin": "lead"})
+        governing = text.split("## Governing")[1].split("## Findings")[0]
+        self.assertIn("P-retry by agent on Q3 (agent proposal, not a decision): Retry three times", governing)
+        # A proposal on a decided question outside the scope stays a candidate.
+        self.assertNotIn("Export as CSV", text)
+
+    def test_superseded_scoped_work_brings_its_successor_and_names_it(self):
+        replaced = LEDGER.replace('summary = "Implement size-based eviction"\nowner = "agent-a"\nstate = "open"',
+                                  'summary = "Implement size-based eviction"\nowner = "agent-a"\n'
+                                  'state = "superseded"\nsuperseded_by = "W-new"')
+        successor = '\n[[work]]\nid = "W-new"\nrev = 1\nanswer = "A2"\nsummary = "Successor work"\n' \
+                    'owner = "agent-c"\nstate = "open"\n'
+        text, _ = context.brief(snap(replaced + successor), {"objective": "x", "work": ["W-cache"], "origin": "lead"})
+        governing = text.split("## Governing")[1].split("## Findings")[0]
+        self.assertIn("- W-cache (superseded by W-new, owner agent-a", governing)
+        self.assertIn("- W-new (open, owner agent-c, under A2): Successor work", governing)
+        # The successor's own answer governs too.
+        self.assertIn("Export format waits for the schema review", governing)
+
+    def test_work_superseding_each_other_in_a_cycle_is_each_brought_once(self):
+        items = "".join(f'\n[[work]]\nid = "{a}"\nrev = 1\nanswer = "A1"\nsummary = "s"\nowner = "agent"\n'
+                        f'state = "superseded"\nsuperseded_by = "{b}"\n'
+                        for a, b in (("W-a", "W-b"), ("W-b", "W-a")))
+        text, _ = context.brief(snap(LEDGER + items), {"objective": "x", "work": ["W-a"], "origin": "lead"})
+        governing = text.split("## Governing")[1].split("## Findings")[0]
+        self.assertEqual(governing.count("- W-a ("), 1)
+        self.assertEqual(governing.count("- W-b ("), 1)
+
     def test_quote_and_summary_stay_distinct(self):
         s = snap()
         text, _ = context.brief(s, {"objective": "x", "work": ["W-cache"], "origin": "lead"})
@@ -354,6 +452,15 @@ class ReadTests(unittest.TestCase):
         with self.assertRaises(context.ContextError) as caught:
             context.read(s, ["Q2"], first["next"], max_chars=300)
         self.assertEqual(caught.exception.code, "cursor_for_another_request")
+
+    def test_cursor_offset_must_be_ascii_digits(self):
+        s = snap()
+        bound = context.read(s, ["Q1"], max_chars=300)["next"].rsplit(":", 1)[0]
+        for name, offset in (("superscript", "\u00b2"), ("arabic-indic", "\u0663")):
+            with self.subTest(name):
+                with self.assertRaises(context.ContextError) as caught:
+                    context.read(s, ["Q1"], bound + ":" + offset, max_chars=300)
+                self.assertEqual(caught.exception.code, "invalid_cursor")
 
     def test_question_read_includes_all_its_answers(self):
         page = context.read(snap(), ["Q1"])["text"]
@@ -442,6 +549,58 @@ class CommandLineTests(unittest.TestCase):
             self.assertIn("A1", json.loads(changes.stdout)["unknown"])
             outside = self.run_tool("brief", "--root", tmp + "/sub", "--ledger", tmp + "/ledger.toml", cwd=tmp)
             self.assertNotEqual(outside.returncode, 0)
+
+    def test_unusable_checkpoint_reads_as_every_record_unknown(self):
+        records = sorted(snap()["records"])
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "ledger.toml").write_text(LEDGER)
+            Path(tmp, "text.json").write_text("not json")
+            Path(tmp, "bytes.json").write_bytes(b"\xff\xfe")
+            for name in ("text.json", "bytes.json", "absent.json"):
+                with self.subTest(name):
+                    done = self.run_tool("changes", "--root", tmp, "--ledger", tmp + "/ledger.toml",
+                                         "--checkpoint", tmp + "/" + name, cwd=tmp)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    result = json.loads(done.stdout)
+                    self.assertEqual(result["state"], "ok")
+                    self.assertEqual(result["unknown"], records)
+                    self.assertEqual(result["unchanged"], [])
+
+    def test_unusable_checkpoint_with_an_unreadable_ledger_is_still_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "text.json").write_text("not json")
+            done = self.run_tool("changes", "--root", tmp, "--ledger", tmp + "/missing.toml",
+                                 "--checkpoint", tmp + "/text.json", cwd=tmp)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            result = json.loads(done.stdout)
+            self.assertEqual(result["state"], "unavailable")
+            self.assertEqual(result["unavailable"], [])
+
+    def test_budget_too_small_for_the_overflow_text_exits_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "ledger.toml").write_text(LEDGER)
+            done = self.run_tool("brief", "--root", tmp, "--ledger", tmp + "/ledger.toml", "--max-chars", "50", cwd=tmp)
+            self.assertEqual(done.returncode, 2, done.stderr)
+            self.assertIn("frame_exceeds_budget", done.stderr)
+            self.assertEqual(done.stdout, "")
+
+    def test_in_memory_loading_does_not_add_the_working_directory_to_the_import_path(self):
+        # The way a caller loads the modules from stored text, without files beside them.
+        loader = """
+import os, sys, types
+for name in ("drift_ledger", "ledger_context"):
+    module = types.ModuleType(name)
+    module.__file__ = name + ".py"
+    sys.modules[name] = module
+    exec(compile(open(os.path.join(sys.argv[1], name + ".py"), encoding="utf-8").read(), name + ".py", "exec"),
+         module.__dict__)
+print(os.getcwd() in [os.path.realpath(entry) for entry in sys.path if entry])
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            done = subprocess.run([sys.executable, "-I", "-c", loader, str(ROOT / "tools/ci")],
+                                  capture_output=True, text=True, cwd=os.path.realpath(tmp))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), "False")
 
     def unreadable_ledgers(self, tmp):
         """A missing file, a directory and undecodable bytes: each cannot be read as a ledger."""
