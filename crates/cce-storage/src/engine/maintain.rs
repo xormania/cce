@@ -230,24 +230,12 @@ impl Inner {
             }
         }
         // Stagings of this process are not published; their manifests may lie beyond committed
-        // content, so they are read directly and checked against their digest.
+        // content, so they are read straight from the file, bounded and checked against their
+        // digest like every other manifest read.
         let staged: Vec<ExtentRef> = lock(&self.state).staged.values().map(|(m, _)| *m).collect();
         for m in staged {
             used.push((m.offset, m.len));
-            let mut buf = vec![
-                0;
-                usize::try_from(m.len).map_err(|_| StorageError::Integrity(
-                    "manifest too large".into()
-                ))?
-            ];
-            self.io.read_at(FileId::Content, m.offset, &mut buf)?;
-            if sha256(&buf) != m.digest {
-                return Err(StorageError::Integrity(format!(
-                    "staged manifest at {}: digest mismatch",
-                    m.offset
-                )));
-            }
-            for s in Manifest::decode(&buf)?.segments {
+            for s in Manifest::decode(&self.read_raw(&m)?)?.segments {
                 used.push((s.offset, s.len));
             }
         }

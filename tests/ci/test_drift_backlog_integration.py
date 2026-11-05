@@ -69,6 +69,60 @@ class CollectionApi:
 
 
 class BacklogIntegrationTests(unittest.TestCase):
+    def test_mapped_case_requires_explicit_resolution_to_retire_prior_evidence(self):
+        old = packet(identity='mapped-relationship:case-one')
+        corrected = packet(source('c' * 40), identity='mapped-relationship:case-one', text='Corrected proof')
+        old_recipe = backlog.descriptor(old, runner.fingerprint(old), 'data',
+                                        data_ref='e' * 40, data_key='f' * 64)
+        current_recipe = backlog.descriptor(corrected, runner.fingerprint(corrected), 'data',
+                                            data_ref='1' * 40, data_key='f' * 64)
+        for resolved in (False, True):
+            with self.subTest(resolved=resolved):
+                result = entry(corrected, 'supported')
+                if resolved:
+                    result['record']['diagnosis']['answers']['resolution'] = {'choice': 'addressed'}
+                control = {'version': runner.VERSION, 'source': corrected['source'], 'trusted_sha': 'd' * 40,
+                           'engine_hash': runner.engine_hash(), 'violations': [], 'data_failed': False,
+                           'waiting': False, 'selected': 1, 'pending': [], 'limitations': [],
+                           'previous_entries': [entry(old)], 'backlog': [old_recipe, current_recipe],
+                           'current_fingerprints': [result['fingerprint']], 'results': [result]}
+                with tempfile.TemporaryDirectory() as directory, \
+                        patch.object(runner, 'current_candidate', return_value=True), \
+                        patch.object(runner, 'begin_check', return_value=123), \
+                        patch.object(runner, 'complete_check', return_value=True), \
+                        patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
+                    runner.save(Path(directory) / 'control.json', control)
+                    runner.publish(None, directory)
+                    state = runner.load(Path(directory) / 'public' / 'state.json')
+                self.assertEqual(state['backlog'], [] if resolved else [old_recipe])
+
+    def test_engine_change_keeps_valid_legacy_work_but_not_cached_diagnosis(self):
+        value = packet()
+        malformed = {**recipe(value), 'private_text': 'must not survive'}
+        api = ArtifactApi({11: {'engine_hash': '0' * 64, 'entries': [entry(value)],
+                               'backlog': [recipe(value, 'reserved'), malformed],
+                               'backlog_overflow': 1000}})
+        with patch.dict(os.environ, {'GITHUB_RUN_ID': '99'}):
+            state = runner.GitHub.baseline(api, 'd' * 40)
+        self.assertEqual(state['entries'], [])
+        self.assertEqual(state['backlog'], [recipe(value)])
+        self.assertEqual(state['backlog_overflow'], 1)
+        self.assertNotIn('must not survive', json.dumps(state))
+
+    def test_newest_queue_still_wins_across_engine_changes(self):
+        value = packet()
+        for older_hash, newer_hash in [('0' * 64, runner.engine_hash()),
+                                       (runner.engine_hash(), '0' * 64)]:
+            with self.subTest(older_hash=older_hash):
+                api = ArtifactApi({
+                    11: {'engine_hash': older_hash, 'entries': [entry(value)],
+                         'backlog': [recipe(value, 'tracked')]},
+                    12: {'engine_hash': newer_hash, 'entries': [], 'backlog': []},
+                })
+                with patch.dict(os.environ, {'GITHUB_RUN_ID': '99'}):
+                    state = runner.GitHub.baseline(api, 'd' * 40)
+                self.assertEqual(state['backlog'], [])
+
     def test_newer_healthy_correction_does_not_resurrect_older_tracked_recipe(self):
         old = packet()
         corrected = packet(source('c' * 40), text='Corrected complete assertion')

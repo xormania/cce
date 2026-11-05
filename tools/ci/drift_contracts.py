@@ -12,12 +12,14 @@ import re
 
 
 MAX_ROWS = 256
+MAX_CASE_STATUSES = 1000
 MAX_EXCERPTS = 8
 MAX_EXCERPT_BYTES = 1600
 MAX_ID_BYTES = 4096
 QUESTION_KINDS = frozenset({"proof", "guarantee", "witness", "deferral", "resolution"})
 VIOLATION_CODES = frozenset({
     "required_check_not_executed", "required_check_failed", "evidence_candidate_mismatch",
+    "workflow_definition_awaiting_acceptance",
     "claim_case_mismatch", "semantic_disposition_conflict", "semantic_catch_not_demonstrated",
 })
 LIMITATION_CODES = frozenset({"no_evidence", "unscoped_claim", "unscoped_mutation", "missing_evidence_identity", "incomplete_case_inventory"})
@@ -49,6 +51,26 @@ def _boolean(row: dict, key: str, default=False) -> bool:
     if type(value) is not bool:
         _invalid()
     return value
+
+
+def mutation_run_aborted(run: dict) -> bool:
+    """Keep signal termination distinct from an assertion failure on Linux.
+
+    Receipts retain their raw exit code. Signed subprocess returns use negative
+    signal numbers; shell returns use 128 + signal (1..64). Without an explicit
+    convention, signal-looking codes cannot certify a catch. A producer that
+    records ``exit_convention = "subprocess"`` can distinguish positive
+    application exits from shell-encoded signals. Existing receipts need no new
+    field, and an explicit abort always takes precedence.
+    """
+    exit_code = run.get("exit")
+    if type(exit_code) is not int:
+        _invalid()
+    convention = run.get("exit_convention")
+    if "exit_convention" in run and (not isinstance(convention, str) or convention not in {"subprocess", "shell"}):
+        _invalid()
+    return (_boolean(run, "aborted") or exit_code < 0
+            or convention != "subprocess" and 129 <= exit_code <= 192)
 
 
 def _rows(value) -> list:
@@ -124,11 +146,20 @@ def evaluate(bundle: dict) -> dict:
         status = row.get("status")
         if not isinstance(status, str) or status not in _CHECK_STATES:
             _invalid()
-        executed = _boolean(row, "executed")
+        definition_status = row.get("definition_status")
+        if "definition_status" in row:
+            if (definition_status != "awaiting_acceptance" or row.get("executed", False) is not None
+                    or status != "unknown"):
+                _invalid()
+            executed = None
+        else:
+            executed = _boolean(row, "executed")
         matches = _identity_matches(row, "source_sha", head, limitations)
         if not _boolean(row, "required"):
             continue
-        if not executed or status in {"skipped", "blocked", "cancelled", "not_exercised", "unknown"}:
+        if definition_status == "awaiting_acceptance":
+            fail("workflow_definition_awaiting_acceptance", subject)
+        elif not executed or status in {"skipped", "blocked", "cancelled", "not_exercised", "unknown"}:
             fail("required_check_not_executed", subject)
         elif status == "fail":
             fail("required_check_failed", subject)
@@ -141,7 +172,7 @@ def evaluate(bundle: dict) -> dict:
         if not isinstance(status, str) or status not in _CLAIM_STATES:
             _invalid()
         states = row.get("case_statuses", [])
-        if not isinstance(states, list) or len(states) > MAX_ROWS or any(not isinstance(s, str) or s not in _CLAIM_STATES for s in states):
+        if not isinstance(states, list) or len(states) > MAX_CASE_STATUSES or any(not isinstance(s, str) or s not in _CLAIM_STATES for s in states):
             _invalid()
         matches = _identity_matches(row, "evidence_sha", head, limitations)
         applicable = _boolean(row, "applicable")
@@ -166,11 +197,8 @@ def evaluate(bundle: dict) -> dict:
         for run in runs:
             executed = _boolean(run, "executed")
             assertion = _boolean(run, "failed_by_assertion")
-            aborted = _boolean(run, "aborted")
-            exit_code = run.get("exit")
-            if type(exit_code) is not int:
-                _invalid()
-            valid_catch |= executed and assertion and not aborted and exit_code not in {0, -6, 134}
+            aborted = mutation_run_aborted(run)
+            valid_catch |= executed and assertion and not aborted and run["exit"] != 0
         applicable = _boolean(row, "applicable")
         claimed_semantic = _boolean(row, "claimed_semantic")
         if not applicable:

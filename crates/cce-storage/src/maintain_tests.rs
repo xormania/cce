@@ -329,6 +329,46 @@ fn reclaiming_on_a_store_without_holes_does_nothing() {
 }
 
 #[test]
+fn a_damaged_manifest_of_a_pending_staging_stops_hole_reclaim() {
+    use crate::io::{FileId, Io};
+    let sim = SimIo::new();
+    let s = create(&sim);
+    let pending: Vec<u8> = (0..90_000u32).map(|i| (i % 227) as u8).collect();
+    let staged = s.stage_content(&mut &pending[..]).unwrap();
+    commit(
+        &s,
+        "cover",
+        ChangeSet {
+            changes: vec![put("B", "b", None)],
+            ..ChangeSet::default()
+        },
+    );
+    // The staging's manifest comes first in its extents. Its last byte belongs to the last
+    // segment's digest, so the damaged manifest still decodes; only its own digest exposes it.
+    let (offset, len) = s.inner.staged_extents_for_test(&staged).unwrap()[0];
+    let mut last = [0u8; 1];
+    sim.read_at(FileId::Content, offset + len - 1, &mut last)
+        .unwrap();
+    sim.write_at(FileId::Content, offset + len - 1, &[last[0] ^ 0x5a])
+        .unwrap();
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let r = s.maintain(
+        MaintenanceTask::ReclaimContentHoles,
+        MaintenanceBudget::default(),
+    );
+    assert!(
+        matches!(&r, Err(cce_core::storage::CommitError::Rejected(StorageError::Integrity(m)))
+            if m.contains(&format!("{offset}"))),
+        "a damaged staged manifest must stop the step as damage naming it: {r:?}"
+    );
+    assert_eq!(
+        s.inner.snapshot().unwrap().desc.generation,
+        generation,
+        "the refused step published"
+    );
+}
+
+#[test]
 fn a_pending_staging_of_this_process_is_not_reclaimed() {
     let sim = SimIo::new();
     let s = create(&sim);
