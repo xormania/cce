@@ -211,7 +211,7 @@ quote = "standing {n}"
         text, meta = context.brief(s, None, head="CCE STATE: LOADED test", max_chars=6000)
         self.assertLessEqual(meta["chars"], 6000)
         self.assertTrue(meta["pending"])
-        self.assertIn("NOT LOADED: " + str(len(meta["pending"])) + " governing records did not fit", text)
+        self.assertIn("NOT LOADED: " + str(len(meta["pending"])) + " required records did not fit", text)
         for rid in meta["pending"]:
             self.assertIn(rid, text.split("NOT LOADED")[1])
         # Loaded summaries are whole; none is cut.

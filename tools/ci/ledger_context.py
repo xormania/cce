@@ -237,17 +237,35 @@ def _card(snap, rid, titled=True):
     return ", ".join(names)
 
 
-def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_bytes=None, reader="read"):
+def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_bytes=None, reader="read",
+          selection=None):
     """Render the scoped brief. Returns (text, meta); ``text`` includes ``head`` and ``foot``.
 
     ``meta``: chars, bytes, tokens_estimate (bytes / 4, an estimate only), selection, scope fingerprint,
     governing identities not delivered (``pending``) and candidates delivered only as cards.
-    ``reader`` is the command a session runs to read records (shown in locators).
+    ``reader`` is the command a session runs to read records (shown in locators). ``selection`` is a
+    relevance selection (``ledger_select.select``) for this snapshot and scope: its relevant candidates
+    load in full after the governing records, uncertain and unjudged ones are named as such. A
+    selection for another snapshot or scope, or a stale one, is ignored and the brief says so.
     """
     max_bytes = max_bytes or max_chars
     governing, work, notes = _governing(snap, scope)
     candidates = _candidates(snap, governing)
     view = snap["view"]
+    method = "deterministic (scope links and standing directions)"
+    relevant, doubtful, rejected = [], [], []
+    if selection is not None:
+        if (selection.get("state") == "current" and selection.get("snapshot") == snap["id"]
+                and selection.get("scope") == scope_fingerprint(scope)):
+            relevant = [r for r in candidates if r in selection["relevant"]]
+            doubtful = [r for r in candidates if r in selection["uncertain"] or r in selection["unexamined"]]
+            rejected = [r for r in candidates if r in selection["not_relevant"]]
+            method = ("relevance " + selection["mode"] + ": " + str(len(relevant)) + " relevant, "
+                      + str(len(doubtful)) + " uncertain or not judged, " + str(len(rejected)) + " not relevant")
+        else:
+            method = "deterministic (the relevance selection is for another ledger or scope, or stale)"
+    required = governing + relevant
+    candidates = [r for r in candidates if r not in relevant]
     if scope is None:
         scope_line = "Scope: none set; broad coordination view of all open work (" + str(len(work)) + " items)."
     else:
@@ -255,7 +273,7 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
                       + " | set by: " + scope.get("origin", "not stated"))
     top = ["# Applicable owner decisions and work (generated)", "",
            "Snapshot " + snap["id"][:12] + "; scope " + scope_fingerprint(scope)[:12]
-           + "; selection: deterministic (scope links and standing directions).",
+           + "; selection: " + method + ".",
            scope_line,
            "Direct instructions from the owner in the current session take precedence over this view "
            "immediately, even before they are recorded. Each line is the recorder's summary: 'quoted' means "
@@ -279,16 +297,28 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
         lines.append("## Governing this scope (" + str(len([r for r in governing if r in full_ids])) + " of "
                      + str(len(governing)) + ")")
         lines += [_full(snap, rid) for rid in governing if rid in full_ids] or ["- none"]
+        if relevant:
+            lines += ["", "## Judged relevant to this scope (" + str(len([r for r in relevant if r in full_ids]))
+                      + " of " + str(len(relevant)) + ")"]
+            lines += [_full(snap, rid) for rid in relevant if rid in full_ids]
         if pending:
-            lines.append("NOT LOADED: " + str(len(pending)) + " governing records did not fit; read them before "
+            lines.append("NOT LOADED: " + str(len(pending)) + " required records did not fit; read them before "
                          "acting on what they govern: " + reader + " " + " ".join(pending))
         lines += ["", "## Findings (" + str(len(findings)) + ")"] + (findings or ["- none"])
         shown = [rid for rid in candidates if rid in full_ids]
-        lines += ["", "## Other current records (" + str(len(candidates)) + "; not judged for this scope)"]
+        judged = bool(relevant or doubtful or rejected)
+        lines += ["", "## Other current records (" + str(len(candidates))
+                  + ("; judged" if judged else "; not judged for this scope") + ")"]
         lines += [_full(snap, rid) for rid in shown]
-        if card_ids:
-            lines.append("- Named only; " + reader + " ID before acting on what it covers: "
-                         + "; ".join(_card(snap, rid, titled[0]) for rid in card_ids))
+        unsure = [r for r in card_ids if r in doubtful]
+        rest = [r for r in card_ids if r not in doubtful]
+        if unsure:
+            lines.append("- Uncertain or not judged; " + reader + " ID before relying on it: "
+                         + "; ".join(_card(snap, rid, titled[0]) for rid in unsure))
+        if rest:
+            lines.append("- " + ("Judged not relevant" if judged else "Named only") + "; " + reader
+                         + " ID before acting on what it covers: "
+                         + "; ".join(_card(snap, rid, titled[0]) for rid in rest))
         if more_cards:
             lines.append("- " + str(more_cards) + " more not listed: " + reader + " inventory")
         if not candidates:
@@ -303,8 +333,8 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
         return chars <= max_chars and nbytes <= max_bytes
 
     # The longest prefix of the governing records that fits with the rest named as NOT LOADED.
-    for k in range(len(governing), -1, -1):
-        full, pending = governing[:k], governing[k:]
+    for k in range(len(required), -1, -1):
+        full, pending = required[:k], required[k:]
         if fits(assemble(full, [], pending, len(candidates) if pending else 0)):
             break
     cards = []
@@ -328,9 +358,9 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
         # Even the frame does not fit: name what is missing instead of cutting text.
         lines = [head.rstrip("\n")] if head else []
         lines += ["Context too large for this channel: nothing loaded. Governing records: "
-                  + ", ".join(governing) + ". Read them: " + reader + " inventory"]
+                  + ", ".join(required) + ". Read them: " + reader + " inventory"]
         text = "\n".join(lines) + "\n"
-        pending, more, cards = list(governing), len(candidates), []
+        pending, more, cards = list(required), len(candidates), []
     chars, nbytes = size(text)
     meta = {"chars": chars, "bytes": nbytes, "tokens_estimate": (nbytes + 3) // 4, "selection": "deterministic",
             "snapshot": snap["id"], "scope": scope_fingerprint(scope), "pending": pending,
