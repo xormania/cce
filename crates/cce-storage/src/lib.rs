@@ -137,8 +137,8 @@ use cce_core::storage::{
 use engine::{Inner, Observation, Options, Pin, Snapshot};
 
 /// Fuzzing entry point, with the `fuzz-api` feature only: runs the named target of the fuzz harness
-/// (`page`, `slots`, `node`, `manifest`, `history`, `records`, `image` or `ops`) on `data`. Not
-/// part of the storage API.
+/// (`page`, `page_repaired`, `slots`, `node`, `manifest`, `history`, `records`, `image`,
+/// `image_repaired` or `ops`) on `data`. Not part of the storage API.
 #[cfg(feature = "fuzz-api")]
 pub fn fuzz_target(name: &str, data: &[u8]) {
     fuzz_api::run(name, data);

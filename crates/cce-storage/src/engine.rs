@@ -1180,16 +1180,15 @@ impl Inner {
         finish_pending(&self.pending, attempt);
     }
 
-    /// Both publication slots as stored now (inspection). Reads only.
-    pub(crate) fn publication_slots(&self) -> Result<Vec<Slot>, StorageError> {
-        (0..2u64)
-            .map(|s| {
-                let mut buf = vec![0; PAGE_SIZE];
-                self.io
-                    .read_at(FileId::Meta, s * PAGE_SIZE as u64, &mut buf)?;
-                Ok(decode_slot(&buf))
-            })
-            .collect()
+    /// The bytes of one metadata page as stored now, undecoded (inspection: the integrity check
+    /// also reads the padding the decoders ignore). Reads only, outside the node cache.
+    pub(crate) fn meta_page(&self, page: u64) -> Result<Vec<u8>, StorageError> {
+        let offset = page
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| corrupt(format!("page {page} lies beyond any metadata file")))?;
+        let mut buf = vec![0; PAGE_SIZE];
+        self.io.read_at(FileId::Meta, offset, &mut buf)?;
+        Ok(buf)
     }
 
     /// The current committed state without a pin (tests only: production reads go through

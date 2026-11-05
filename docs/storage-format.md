@@ -41,6 +41,11 @@ generation therefore cannot be mistaken for its predecessor. The checksum is ver
 version and reserved byte are interpreted: a page that fails it is reported as damaged, and only an
 intact page with another version, or with its reserved byte set, is reported as unsupported.
 
+Writers zero-fill the page after the payload. The padding is outside the checksum and carries no
+information, so readers ignore it: a page whose header and payload are intact reads even if a byte
+after the payload is not zero. The integrity check reports such a byte as a `padding` finding
+naming the page and the offset, because writers never leave one there.
+
 Node payload (page kind 1), first byte is the node tag:
 
 - **Leaf (tag 1):** `count: u32`, then `count` entries of `key_len: u16, key, value_len: u16, value`,
@@ -91,6 +96,10 @@ version, the required features and the other fields at the same offsets, and the
 over bytes 0 to 74. Anything a later version adds follows byte 78, with its own check. The bytes after
 the record are not required to be zero, so this build reads such a record's intact first 78 bytes,
 finds a version it does not support, and refuses the store as unsupported rather than as damaged.
+Readers of this version ignore the bytes after a record of this version too, so a damaged byte there
+never makes recovery fall back to the older record. This build always writes zeros after its record,
+and a slot never written is all zeros, so the integrity check reports a non-zero byte after a valid record
+of this version, or anywhere in an empty slot, as a `padding` finding naming the slot.
 
 ## Logical key space
 
