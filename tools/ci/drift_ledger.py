@@ -46,6 +46,9 @@ WORK_STATES = frozenset({"open", "done", "withdrawn", "superseded"})
 PROPOSAL_STATES = frozenset({"open", "withdrawn", "adopted"})
 MAX_ITEMS = 500
 MAX_TEXT = 2000
+# An owner quotation is kept whole however long the message was; readers page it instead of cutting it.
+MAX_QUOTE = 200_000
+APPLIES = frozenset({"", "always"})
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 # A line that treats a question as still waiting for the owner.
 OPEN_WORDS = re.compile(
@@ -68,9 +71,9 @@ class LedgerError(ValueError):
     pass
 
 
-def _text(row, key, required=True):
+def _text(row, key, required=True, limit=MAX_TEXT):
     value = row.get(key, "")
-    if not isinstance(value, str) or len(value) > MAX_TEXT or (required and not value.strip()):
+    if not isinstance(value, str) or len(value) > limit or (required and not value.strip()):
         raise LedgerError("invalid_field:" + key)
     return value
 
@@ -116,6 +119,9 @@ def load(text):
         _text(q, "asked")
         _text(q, "affects", required=False)
         _text(q, "withdrawn", required=False)
+        # "always": a standing direction that applies to every scope (included in every scoped brief).
+        if _text(q, "applies", required=False) not in APPLIES:
+            raise LedgerError("invalid_field:applies")
     for a in model["answers"].values():
         if a.get("authority") not in AUTHORITIES or a.get("outcome") not in OUTCOMES:
             raise LedgerError("invalid_answer:" + a["id"])
@@ -123,7 +129,8 @@ def load(text):
             raise LedgerError("invalid_answer:" + a["id"])
         for key in ("given", "source", "summary", "recorded_by"):
             _text(a, key)
-        quote, unavailable = _text(a, "quote", required=False), _text(a, "quote_unavailable", required=False)
+        quote = _text(a, "quote", required=False, limit=MAX_QUOTE)
+        unavailable = _text(a, "quote_unavailable", required=False)
         if a["authority"] == "owner" and bool(quote.strip()) == bool(unavailable.strip()):
             # The owner's own words, or an explicit statement that only a transcription survives.
             raise LedgerError("owner_words_missing:" + a["id"])

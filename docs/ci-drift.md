@@ -234,6 +234,32 @@ keeps other writers' unrelated changes. It refuses:
 Re-applying changes that are already published reports `unchanged`, so a retry
 after a lost response has no duplicate effect.
 
+### Scoped context for agent sessions
+
+`tools/ci/ledger_context.py` reads the same ledger for one session's current work
+instead of printing every record:
+
+- `brief` renders the records that govern a scope (a JSON descriptor with an
+  objective, the work items in hand and who set it): current answers to questions
+  marked `applies = "always"`, each work item with the current answer to its
+  question and that answer's `forbids`, and every missing decision, conflict and
+  finding. Without a scope it covers all open work and says so. Other current
+  records are listed as candidates, by identity first and in full while they fit.
+  The whole output, including the caller's header, stays within a character and
+  byte budget. Text is never cut: governing records that do not fit are named with
+  the read that returns them.
+- `read ID...` (or `read inventory`) returns the exact stored fields, written as
+  TOML, in pages. A cursor is bound to the ledger snapshot and the request, so a
+  page from a changed ledger is refused instead of mixed.
+- `changes` compares a held checkpoint with the ledger and reports added, changed,
+  superseded, unchanged, missing and unknown records separately. A record whose
+  status changed (for example an answer that was superseded) counts as changed.
+
+The summary in each line is the recorder's wording. The brief marks whether the
+owner's own words are stored with it (`quoted`) or only a paraphrase survives;
+`read` shows the quotation as stored. An owner quotation may be longer than other
+text fields, so a long message is kept whole.
+
 The writer keeps everything the reader accepts:
 - every TOML value, including booleans, floats (also `inf` and `nan`), dates and
   times, inline tables, arrays and quoted keys;
