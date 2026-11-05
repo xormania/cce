@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import sqlite3
 import stat
+from .artifacts import directory
 from .domain import (CaptureResult, Receipt, TelemetryError, canonical,
                      observation_digest, validate)
 
@@ -50,7 +51,8 @@ def version_check(db):
     if db.execute("PRAGMA user_version").fetchone()[0] != 1:
         raise TelemetryError("schema_version", "unsupported database schema")
     metadata = dict(db.execute("SELECT key,value FROM metadata"))
-    if metadata.get("format") != "agent-telemetry-v1":
+    if (metadata.get("format") != "agent-telemetry-v1" or
+            not metadata.get("dataset_id") or not metadata.get("collector_id")):
         raise TelemetryError("schema_version", "unsupported database format")
     return metadata
 
@@ -124,6 +126,8 @@ class SQLiteRepository:
         require_sqlite()
         if not all(isinstance(value, str) and value for value in (dataset_id, collector_id)):
             raise TelemetryError("invalid_config", "missing dataset identity")
+        if type(timeout_ms) is not int or not 0 <= timeout_ms <= 60000:
+            raise TelemetryError("invalid_config", "invalid lock timeout")
         path = Path(os.path.abspath(path))
         check_path(path)
         if path.exists():
@@ -132,7 +136,8 @@ class SQLiteRepository:
                 existing.close()
                 raise TelemetryError("identity_mismatch", "different collector already initialized")
             return existing
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent_fd = directory(path.parent, create=True)
+        os.close(parent_fd)
         check_path(path)
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
@@ -244,8 +249,9 @@ class SQLiteRepository:
         return result
 
     def status(self):
-        row = self.db.execute("SELECT count(*),max(sequence),max(captured_at) FROM events").fetchone()
-        return {"event_count": row[0], "max_sequence": row[1], "last_capture": row[2],
+        row = self.db.execute("SELECT count(*),max(sequence) FROM events").fetchone()
+        latest = self.db.execute("SELECT captured_at FROM events ORDER BY sequence DESC LIMIT 1").fetchone()
+        return {"event_count": row[0], "max_sequence": row[1], "last_capture": latest[0] if latest else None,
                 "coverage": "observed" if row[0] else "unknown", "publication": "unknown",
                 "schema_version": 1, "dataset_id": self.metadata["dataset_id"],
                 "collector_id": self.metadata["collector_id"],
