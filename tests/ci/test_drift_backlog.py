@@ -36,6 +36,27 @@ def recipe(value, **kwargs):
 
 
 class BacklogTests(unittest.TestCase):
+    def test_repeated_omission_does_not_invent_new_lost_relationships(self):
+        rows = [recipe(packet(i)) for i in range(3)]
+        previous = {'items': [], 'overflow': 0}
+        counts = []
+        for _ in range(3):
+            previous = backlog.merge(previous['items'], rows, maximum=2,
+                                     previous_overflow=previous['overflow'])
+            counts.append(previous['overflow'])
+        self.assertEqual(counts, [1, 1, 1])
+        self.assertIn('backlog_inventory_truncated', previous['limitations'])
+
+    def test_correction_metadata_is_bounded_and_contains_only_hashes(self):
+        original = packet()
+        valid = {'anchor': 'a' * 64, 'before': ['b' * 64], 'after': ['c' * 64]}
+        row = recipe(dict(original, correction=valid))
+        self.assertEqual(backlog.safe_descriptor(row), row)
+        for changed in [dict(valid, anchor='private-marker'), dict(valid, extra='private-marker'),
+                        dict(valid, before=['b' * 64, 'b' * 64]),
+                        dict(valid, after=[format(i, '064x') for i in range(17)])]:
+            self.assertIsNone(backlog.safe_descriptor(dict(row, correction=changed)))
+
     def test_budget_overflow_reconstructs_after_unrelated_followup(self):
         original = [packet(i) for i in range(6)]
         pending = backlog.merge([], [recipe(value) for value in original[4:]])

@@ -78,6 +78,11 @@ impl Driver {
         Self { child, stdin, rx }
     }
 
+    /// The driver's process id (the shell, if any, exec'd into the driver).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Sends one command and waits for its answer, an exit, or the deadline.
     pub fn step(&mut self, command: &str) -> Step {
         self.step_with_deadline(command, STEP_DEADLINE)
@@ -178,6 +183,38 @@ pub fn answered(step: Step, what: &str) -> Vec<String> {
         }
         other => panic!("{what}: expected an answer, got {other:?}"),
     }
+}
+
+/// A live process's peak and current resident memory (KiB) and open file descriptors, read by the
+/// parent from Linux `/proc` (the declared platform).
+pub fn proc_usage(pid: u32) -> (u64, u64, usize) {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("process status");
+    let kib = |name: &str| -> u64 {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap_or_else(|| panic!("no {name} in /proc/{pid}/status"))
+    };
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("process fds")
+        .count();
+    (kib("VmHWM:"), kib("VmRSS:"), fds)
+}
+
+/// A live process's soft resource limit as Linux `/proc/<pid>/limits` reports it, read by the
+/// parent; `None` when it is unlimited.
+pub fn proc_limit(pid: u32, name: &str) -> Option<u64> {
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).expect("process limits");
+    let soft = limits
+        .lines()
+        .find_map(|l| l.strip_prefix(name))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no {name} in /proc/{pid}/limits"));
+    (soft != "unlimited").then(|| {
+        soft.parse()
+            .unwrap_or_else(|_| panic!("{name} soft limit {soft}"))
+    })
 }
 
 pub fn hex(bytes: &[u8]) -> String {

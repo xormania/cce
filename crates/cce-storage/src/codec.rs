@@ -101,6 +101,12 @@ impl<'a> Dec<'a> {
         }
         Ok(n)
     }
+    /// How many of `n` elements of at least `min_elem` bytes to reserve room for: never more than
+    /// the remaining input can hold, so a reservation stays bounded by the input even if a count
+    /// was not checked.
+    pub fn capacity_for(&self, n: usize, min_elem: usize) -> usize {
+        n.min(self.remaining() / min_elem.max(1))
+    }
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
