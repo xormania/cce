@@ -44,6 +44,11 @@ telemetry --config profile.toml status
 telemetry --config profile.toml query --event-type usage.sample --limit 20 --after 0
 ```
 
+Initialization installs a complete database without replacing existing storage.
+An interrupted attempt can be retried; an unrelated database is still rejected.
+Termination before installation can leave a private temporary file, but it does
+not occupy the configured database path.
+
 The same interface is available as `python -m agent_telemetry`. Commands emit JSON
 and failures use standard error with exit status 2. `status` and `query` open an
 existing database for reading; they do not create one. The query cursor is the
