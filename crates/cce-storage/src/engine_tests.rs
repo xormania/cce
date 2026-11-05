@@ -454,7 +454,8 @@ fn a_store_in_an_older_format_version_is_refused_without_modification() {
         .unwrap();
         drop(s);
         // Both publication records rewritten as the older version, as an older engine left them.
-        // Record layout: magic 4 + version 2 + store 16 + six u64 fields = 70 bytes, then CRC-32.
+        // They use the earlier 74-byte layout (before required features): magic 4 + version 2 +
+        // store 16 + six u64 fields = 70 bytes, then CRC-32.
         for slot in [0, PAGE_SIZE as u64] {
             let mut rec = vec![0; 74];
             sim.read_at(FileId::Meta, slot, &mut rec).unwrap();

@@ -44,6 +44,10 @@ pub(crate) fn put_context(
     }
 }
 
+/// Most rounds a commit may take to settle its page allocation in the tests that check it. The
+/// suites observe at most 4; the engine itself rejects a commit only past a larger limit.
+pub(crate) const SETTLE_ROUNDS_BOUND: usize = 6;
+
 pub(crate) fn changes(changes: Vec<Change>) -> ChangeSet {
     ChangeSet {
         changes,

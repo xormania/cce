@@ -3,7 +3,7 @@
 //! the root back to a leaf. Each starts from a compact deterministic store just before the event;
 //! the probe proves on the real engine that the commit causes it.
 
-use crate::test_support::{create_on, open_on};
+use crate::test_support::{SETTLE_ROUNDS_BOUND, create_on, open_on};
 
 use std::sync::{Arc, Mutex};
 
@@ -149,6 +149,13 @@ fn sweep(case: &Case, event: impl Fn(&[usize], &[usize]) -> bool) {
     let start = probe.ops();
     let receipt = (case.commit)(&s).unwrap();
     let total = probe.ops() - start;
+    let rounds = s.inner.allocation_rounds_max();
+    assert!(
+        (1..=SETTLE_ROUNDS_BOUND).contains(&rounds),
+        "{}: a commit took {rounds} rounds to settle its page allocation \
+         (expected 1 to {SETTLE_ROUNDS_BOUND})",
+        case.name
+    );
     let (after, new) = (shape(&s), logical_state(&s, case.records));
     assert!(
         event(&before, &after),
@@ -189,7 +196,8 @@ fn sweep(case: &Case, event: impl Fn(&[usize], &[usize]) -> bool) {
             let label = format!("{} cut {cut}, {survived}", case.name);
             let pristine = img.after_process_exit();
             with_repro(&label, &[("image", &pristine)], &trace, || {
-                let rec = open_on(Box::new(img.clone()), Default::default()).unwrap();
+                let rec = open_on(Box::new(img.clone()), Default::default())
+                    .unwrap_or_else(|e| panic!("{label}: recovery must open the store: {e:?}"));
                 let got = logical_state(&rec, case.records);
                 assert!(
                     got == old || got == new,
@@ -226,6 +234,12 @@ fn sweep(case: &Case, event: impl Fn(&[usize], &[usize]) -> bool) {
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: next commit: {e:?}"));
+                let rounds = rec.inner.allocation_rounds_max();
+                assert!(
+                    (1..=SETTLE_ROUNDS_BOUND).contains(&rounds),
+                    "{label}: a commit took {rounds} rounds to settle its page allocation \
+                     (expected 1 to {SETTLE_ROUNDS_BOUND})"
+                );
                 let later = logical_state(&rec, case.records);
                 drop(rec);
                 img.release();

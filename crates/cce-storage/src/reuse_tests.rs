@@ -13,6 +13,7 @@ use crate::audit::{published, reach};
 use crate::engine::{CONTENT_CHUNK, Inner};
 use crate::format::{PAGE_SIZE, StoreId};
 use crate::sim::SimIo;
+use crate::test_support::SETTLE_ROUNDS_BOUND;
 use crate::{NativeReadOnly, NativeStore};
 
 const STORE: StoreId = StoreId(*b"reuse-test-store");
@@ -29,7 +30,12 @@ fn sim_create(sim: &SimIo) -> NativeStore {
 
 /// Puts record `id` with `payload` as its content.
 fn put(s: &NativeStore, attempt: &str, id: &str, payload: &[u8]) -> u64 {
-    let staged = s.stage_content(&mut &payload[..]).unwrap();
+    let staged = s.stage_content(&mut &payload[..]);
+    assert!(
+        staged.is_ok(),
+        "staging for {attempt} was refused: {staged:?}"
+    );
+    let staged = staged.unwrap();
     let cs = ChangeSet {
         changes: vec![Change::PutContext {
             id: cid(id),
@@ -40,14 +46,13 @@ fn put(s: &NativeStore, attempt: &str, id: &str, payload: &[u8]) -> u64 {
         content: vec![ContentBinding::from(&staged)],
         ..ChangeSet::default()
     };
-    s.commit(
+    let r = s.commit(
         AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
         s.begin().unwrap(),
         cs,
-    )
-    .unwrap()
-    .position
-    .0
+    );
+    assert!(r.is_ok(), "commit {attempt} was refused: {r:?}");
+    r.unwrap().position.0
 }
 
 fn pins(inner: &Inner) -> BTreeMap<u64, u32> {
@@ -220,6 +225,7 @@ fn put_body(s: &NativeStore, attempt: &str, id: &str, body: &str) {
 /// Commits `range` of the churn: commit `i` sets record `K{i % LIVE}` to `v{i}`. Every commit is
 /// audited when `sim` is given.
 fn churn(s: &NativeStore, sim: Option<&SimIo>, range: std::ops::Range<usize>) {
+    let what = format!("churn {range:?}");
     for i in range {
         put_body(
             s,
@@ -231,6 +237,12 @@ fn churn(s: &NativeStore, sim: Option<&SimIo>, range: std::ops::Range<usize>) {
             crate::audit::check_retirement(sim).unwrap_or_else(|e| panic!("after churn {i}: {e}"));
         }
     }
+    let rounds = s.inner.allocation_rounds_max();
+    assert!(
+        (1..=SETTLE_ROUNDS_BOUND).contains(&rounds),
+        "{what}: a commit took {rounds} rounds to settle its page allocation \
+         (expected 1 to {SETTLE_ROUNDS_BOUND})"
+    );
 }
 
 /// The live set's bodies after the first `commits` churn commits (an independent model).
@@ -528,7 +540,7 @@ fn a_fixed_live_set_keeps_idle_metadata_space_constant() {
 // ----- logical content removal -----------------------------------------------------------------
 
 fn remove(s: &NativeStore, attempt: &str, id: &str) {
-    s.commit(
+    let r = s.commit(
         AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
         s.begin().unwrap(),
         ChangeSet {
@@ -538,8 +550,8 @@ fn remove(s: &NativeStore, attempt: &str, id: &str) {
             }],
             ..ChangeSet::default()
         },
-    )
-    .unwrap();
+    );
+    assert!(r.is_ok(), "removal {attempt} was refused: {r:?}");
 }
 
 fn read_all(
@@ -702,12 +714,12 @@ fn commit_staged(
         content: vec![ContentBinding::from(staged)],
         ..ChangeSet::default()
     };
-    s.commit(
+    let r = s.commit(
         AttemptId::new(attempt.as_bytes().to_vec()).unwrap(),
         s.begin().unwrap(),
         cs,
-    )
-    .unwrap();
+    );
+    assert!(r.is_ok(), "commit {attempt} was refused: {r:?}");
 }
 
 fn content_of(s: &NativeStore, id: &str) -> cce_core::storage::ContentRef {
