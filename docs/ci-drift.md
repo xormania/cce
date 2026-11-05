@@ -93,6 +93,14 @@ outcomes or convert a deterministic failure to success. The summary shows the
 classification and the relevant public file where one is available. Private
 subjects use opaque references.
 
+A standalone `support` question identifies the requested relationships and selects
+the most relevant supplied excerpt, or `none`. The `supporting_excerpt_ids` list
+therefore contains zero or one supplied ID. This reference is a starting point for
+inspection, not proof that a classification is correct. Questions are evaluated
+independently; the reference question does not rely on another question's answer.
+A fully abstaining response may select `none`; any non-abstaining diagnosis still
+requires a supplied reference.
+
 Packets join affected before/after functions or document sections with linked
 contracts and named proof. Hunk locations select the context; assertions near the
 end of long tests are retained. Excerpts identify immutable revisions, line ranges,
@@ -109,7 +117,8 @@ blocking claims; it does not infer equivalence from a model answer or a new SHA.
 Add repository secret `TYPESAFE_API_KEY`. The provider step uses the pinned
 `jev-1.14.0` model with a 15-second timeout, one request per packet and at most four
 packets per run. There are no automatic provider retries. Responses are bounded
-and validated; duplicate/invented supporting references are rejected.
+and validated; invented references, mismatched answer inventories and invalid
+confidence or probability values are rejected.
 
 The trusted `workflow_run` consumer becomes active after this workflow and its
 scripts are on the default branch. Before that, PR checks prove the candidate
@@ -208,6 +217,10 @@ until explicit replay or history expiration. The collector inspects a bounded
 history window and reports when no reusable baseline exists. It does not promise
 permanent suppression. Changed evidence or model/tooling configuration reopens
 analysis; unrelated candidate identity alone does not change packet fingerprints.
+Question version 2 records the single-reference request format. The tooling's
+`engine_hash` invalidates prior cached answers and request reservations. Packet
+fingerprints and the runner state version stay unchanged, so retained backlog
+recipes can still reconstruct their original packets.
 
 `drift-state` also retains an `observations` list for this run's completed provider
 attempts, including rejected responses. It holds at most four records, separately
@@ -221,11 +234,13 @@ unknown field names, error bodies or private evidence. Oversized responses have 
 bounded byte count and no complete-response hash.
 
 The summary distinguishes HTTP/transport failures, invalid JSON, response-schema
-violations and local acceptance rules, such as `policy/duplicate_support`.
+violations and local acceptance rules, such as `policy/unsupported_diagnosis`.
 `malformed_response` alone does not establish that the provider returned invalid
-JSON. Two independently evaluated support questions can select the same excerpt;
-the current client rejects that combination. These observations expose the reason
-without changing the questions, acceptance rules, retries or check verdicts.
+JSON. Historical `policy/duplicate_support` observations and the old `support_1`
+and `support_2` diagnostic names remain readable; new requests use only `support`.
+Responses using the old two-support answer inventory fail inventory validation
+against the new request. These observations retain rejection reasons without
+changing retries or check verdicts.
 
 Top-level `provider_status` distinguishes completed, partial and unexecuted phases;
 an unrecognized status is reported as `unavailable`. Completed observations survive
