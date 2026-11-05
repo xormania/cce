@@ -45,7 +45,9 @@ import os
 import re
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if "drift_ledger" not in sys.modules:
+    # Only when the ledger module is not already provided (an in-memory loader registers it first).
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import drift_ledger as ledger  # noqa: E402
 
 # Hook channels commonly cap injected text near 10,000 characters; the default leaves room for framing.
@@ -152,20 +154,31 @@ def _governing(snap, scope):
         if q.get("applies") == ALWAYS:
             for aid in governing_answers(q["id"]):
                 take(aid)
-    for wid in work:
-        answer = records[records[wid]["links"]["answer"]]
-        for qid in answer["links"]["questions"]:
-            for aid in governing_answers(qid):
-                take(aid)
-        take(wid)
+    # Decisions the owner still has to make, and conflicts, come before agent work records.
     for row in snap["view"]["missing"]:
         take(row["question"])
     for row in snap["view"]["conflicts"]:
         for aid in row["answers"]:
             take(aid)
+    seen_work = set()
+    queue = list(work)
+    while queue:
+        wid = queue.pop(0)
+        if wid in seen_work or records.get(wid, {}).get("kind") != "work":
+            continue
+        seen_work.add(wid)
+        answer = records[records[wid]["links"]["answer"]]
+        for qid in answer["links"]["questions"]:
+            for aid in governing_answers(qid):
+                take(aid)
+        take(wid)
+        # A superseded work item brings the work that replaced it.
+        if records[wid]["status"] == "superseded" and records[wid]["links"]["superseded_by"]:
+            queue.append(records[wid]["links"]["superseded_by"])
+    missing = {row["question"] for row in snap["view"]["missing"]}
     for row in snap["view"]["proposals"]:
-        if row["conflicts_with"] or set(row["questions"]) & {
-                q for rid in order if records[rid]["kind"] == "answer" for q in records[rid]["links"]["questions"]}:
+        if row["conflicts_with"] or set(row["questions"]) & (missing | {
+                q for rid in order if records[rid]["kind"] == "answer" for q in records[rid]["links"]["questions"]}):
             take(row["proposal"])
     return order, work, notes
 
@@ -209,8 +222,9 @@ def _full(snap, rid):
             id=rid, qs=", ".join(rec["links"]["questions"]), label=_label(rec), summary=row["summary"],
             forbids=forbids)
     if rec["kind"] == "work":
+        state = row["state"] + (" by " + row["superseded_by"] if row.get("superseded_by") else "")
         return "- {id} ({state}, owner {owner}, under {answer}): {summary}".format(
-            id=rid, state=row["state"], owner=row["owner"], answer=row["answer"], summary=row["summary"])
+            id=rid, state=state, owner=row["owner"], answer=row["answer"], summary=row["summary"])
     if rec["kind"] == "proposal":
         view = next((p for p in snap["view"]["proposals"] if p["proposal"] == rid), None)
         conflict = (" CONFLICTS with deferred " + ", ".join(view["conflicts_with"]) + ": needs an owner decision"
@@ -308,7 +322,7 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
     # The longest prefix of the governing records that fits with the rest named as NOT LOADED.
     for k in range(len(governing), -1, -1):
         full, pending = governing[:k], governing[k:]
-        if fits(assemble(full, [], pending, len(candidates) if pending else 0)):
+        if fits(assemble(full, [], pending, len(candidates))):
             break
     cards = []
     if not pending:
@@ -342,6 +356,8 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
         text = overflow(governing)
         if not fits(text):
             text = overflow([])
+        if not fits(text):
+            raise ContextError("frame_exceeds_budget", "shorten the header and footer or raise the budget")
         pending, more, cards = list(governing), len(candidates), []
     chars, nbytes = size(text)
     meta = {"chars": chars, "bytes": nbytes, "tokens_estimate": (nbytes + 3) // 4, "selection": "deterministic",
@@ -421,7 +437,7 @@ def read(snap, refs, cursor=None, max_chars=DEFAULT_PAGE_CHARS, scope=None):
     offset = 0
     if cursor is not None:
         parts = cursor.split(":")
-        if len(parts) != 3 or not parts[2].isdigit():
+        if len(parts) != 3 or not re.fullmatch(r"[0-9]+", parts[2]):
             raise ContextError("invalid_cursor", "read again without a cursor")
         if parts[0] != snap["id"][:16]:
             raise ContextError("snapshot_changed", "the ledger changed since that page; read again without a cursor")
@@ -482,6 +498,16 @@ def _read_inside(root, path):
         return stream.read()
 
 
+def _checkpoint_file(root, path):
+    """A held checkpoint, or None (every record then reads as unknown) when it is absent or unreadable."""
+    if not path:
+        return None
+    try:
+        return json.loads(_read_inside(root, path))
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -505,7 +531,7 @@ def main(argv=None):
         snap = snapshot(_read_inside(root, args.ledger))
     except (ledger.LedgerError, OSError, UnicodeError) as error:
         if args.command == "changes":
-            held = json.loads(_read_inside(root, args.checkpoint)) if args.checkpoint else None
+            held = _checkpoint_file(root, args.checkpoint)
             print(json.dumps(changes(None, held, scope), indent=1))
             return 0
         print("ledger did not load: " + str(error), file=sys.stderr)
@@ -522,7 +548,7 @@ def main(argv=None):
                 o=page["offset"], e=page["offset"] + len(page["text"]), t=page["total"], s=page["snapshot"][:12],
                 n=("next: --cursor " + page["next"]) if page["next"] else "complete"))
         else:
-            held = json.loads(_read_inside(root, args.checkpoint)) if args.checkpoint else None
+            held = _checkpoint_file(root, args.checkpoint)
             print(json.dumps(changes(snap, held, scope), indent=1))
     except ContextError as error:
         print(error.code + ": " + error.remedy, file=sys.stderr)
