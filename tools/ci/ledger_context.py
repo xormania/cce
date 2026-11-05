@@ -492,9 +492,12 @@ def changes(snap, held=None, scope=None):
 
 
 def _read_inside(root, path):
-    if not ledger._inside(root, path):
+    """Read ``path`` (relative paths are relative to ``root``) through the canonical path that passed
+    the root check, so a same-named file elsewhere (for example in the current directory) is never read."""
+    full = ledger._inside(root, path)
+    if not full:
         raise SystemExit("path outside --root: " + path)
-    with open(path, encoding="utf-8") as stream:
+    with open(full, encoding="utf-8") as stream:
         return stream.read()
 
 
