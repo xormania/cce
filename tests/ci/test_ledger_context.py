@@ -153,7 +153,7 @@ class BriefTests(unittest.TestCase):
         s = snap()
         text, meta = context.brief(s, {"objective": "eviction", "work": ["W-cache"], "origin": "lead"})
         other = text.split("## Other current records")[1]
-        self.assertIn("A2 (Q2: Export format)", other)
+        self.assertIn("Q2 Export format", other)
         # Named, not loaded: room left in the budget is not filled with unjudged records.
         self.assertNotIn("Export format waits", text)
         self.assertIn("not judged for this scope", text)
@@ -183,7 +183,7 @@ quote = "words {n}"
         self.assertLessEqual(meta["chars"], 3000)
         self.assertEqual(meta["unlisted"], 0)
         for n in range(10, 40):
-            self.assertIn("B" + str(n), text)
+            self.assertIn("Q" + str(n), text.split("## Other current")[1])
 
     def test_governing_records_over_budget_are_named_not_cut(self):
         long = "x" * 1500
@@ -263,6 +263,14 @@ quote = "standing {n}"
         page = context.read(s, ["A2"])["text"]
         self.assertIn("no owner quotation survives", page)
         self.assertNotIn("quote = ", page)
+
+    def test_label_names_a_question_in_short(self):
+        s = snap(LEDGER.replace('title = "Export format"', 'title = "Export format"\nlabel = "export fmt"'))
+        text, _ = context.brief(s, {"objective": "x", "work": ["W-cache"], "origin": "lead"})
+        self.assertIn("Q2 export fmt", text)
+        self.assertNotIn("Export format", text)
+        with self.assertRaises(ledger.LedgerError):
+            snap(LEDGER.replace('title = "Export format"', 'title = "Export format"\nlabel = "' + "x" * 41 + '"'))
 
     def test_text_inside_a_record_does_not_change_selection(self):
         text = LEDGER.replace('summary = "Export format waits for the schema review"',

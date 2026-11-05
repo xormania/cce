@@ -119,6 +119,8 @@ def load(text):
         _text(q, "asked")
         _text(q, "affects", required=False)
         _text(q, "withdrawn", required=False)
+        # A short name for lists that only name the question (the title stays the full wording).
+        _text(q, "label", required=False, limit=40)
         # "always": a standing direction that applies to every scope (included in every scoped brief).
         if _text(q, "applies", required=False) not in APPLIES:
             raise LedgerError("invalid_field:applies")

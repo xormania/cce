@@ -42,6 +42,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -180,7 +181,14 @@ def _candidates(snap, governing):
                 or (rec["kind"] == "work" and rec["status"] == "open")):
             out.append(rid)
     rank = {"answer": 0, "proposal": 1, "work": 2}
-    return sorted(out, key=lambda rid: (rank[snap["records"][rid]["kind"]], rid))
+
+    def key(rid):
+        rec = snap["records"][rid]
+        name = rec["links"]["questions"][0] if rec["kind"] == "answer" else rid
+        # Natural order: Q2 before Q10.
+        return rank[rec["kind"]], [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+    return sorted(out, key=key)
 
 
 def _label(rec):
@@ -215,13 +223,18 @@ def _full(snap, rid):
 
 
 def _card(snap, rid, titled=True):
+    """A name for a record that is not loaded. An answer is named by its question (``read`` of a
+    question returns its answers), with the question's short ``label``, else its title when there is
+    room. Question identities that read as words (``T-review-cadence``) need neither."""
     rec, records = snap["records"][rid], snap["records"]
-    if rec["kind"] == "answer" and not titled:
-        return rid + " (" + ", ".join(rec["links"]["questions"]) + ")"
-    if rec["kind"] == "answer":
-        return rid + " (" + ", ".join(rec["links"]["questions"]) + ": " + "; ".join(
-            records[q]["row"]["title"] for q in rec["links"]["questions"]) + ")"
-    return rid
+    if rec["kind"] != "answer":
+        return rid
+    names = []
+    for qid in rec["links"]["questions"]:
+        row = records[qid]["row"]
+        word = row.get("label", "").strip() or (row["title"] if titled and not qid.startswith("T-") else "")
+        names.append(qid + (" " + word if word else ""))
+    return ", ".join(names)
 
 
 def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_bytes=None, reader="read"):
@@ -274,7 +287,7 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
         lines += ["", "## Other current records (" + str(len(candidates)) + "; not judged for this scope)"]
         lines += [_full(snap, rid) for rid in shown]
         if card_ids:
-            lines.append("- By identity only; read one before acting on what it covers: "
+            lines.append("- Named only; " + reader + " ID before acting on what it covers: "
                          + "; ".join(_card(snap, rid, titled[0]) for rid in card_ids))
         if more_cards:
             lines.append("- " + str(more_cards) + " more not listed: " + reader + " inventory")
