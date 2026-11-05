@@ -172,6 +172,21 @@ class RuntimeWorkflowTests(unittest.TestCase):
             with self.subTest(changed=changed):
                 self.assert_not_automatic(changed)
 
+    def test_ascii_setup_action_comment_keeps_runtime_change_automatic(self):
+        candidate = self.workflow().replace(
+            f"setup-uv@{PIN}\n", f"setup-uv@{PIN} # provision the runtime\n")
+        self.configure(candidate)
+        self.assert_auto_success(candidate)
+
+    def test_unicode_comment_separators_cannot_hide_additional_workflow_content(self):
+        for separator in ("\u0085", "\u2028", "\u2029"):
+            with self.subTest(separator=f"U+{ord(separator):04X}"):
+                candidate = self.workflow().replace(
+                    f"setup-uv@{PIN}\n",
+                    f"setup-uv@{PIN} # provision the runtime{separator}"
+                    "        env: {EXAMPLE_MODE: enabled}\n")
+                self.assert_not_automatic(candidate)
+
     def test_runtime_versions_must_be_exact_numeric_pins(self):
         for uv, python in (("latest", "3.12.16"), ("0.13", "3.12.16"),
                            ("0.13.7", "latest"), ("0.13.7", "3.12")):
