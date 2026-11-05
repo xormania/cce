@@ -18,7 +18,8 @@ use crate::format::{
 use crate::io::{FileId, Io};
 use crate::records::{
     AttemptValue, ContentEntry, ContextValue, P_ATTEMPT, P_CONTENT, P_IN, P_OUT, P_RETIRED,
-    Retired, decode_retired, history_key, key, retired_extent_key, retired_page_key,
+    Retired, decode_retired, history_key, key, removed_history_key, retired_extent_key,
+    retired_page_key,
 };
 use crate::sim::SimIo;
 use crate::tree::{Entries, Node, NodeSink, TreeTxn};
@@ -407,6 +408,120 @@ fn assert_consistent(sim: &SimIo) {
     }
 }
 
+/// [`rich`] with the history entries of its first two commits removed, and later commits that
+/// reuse the space. Released.
+fn with_removed_history() -> SimIo {
+    let sim = rich();
+    let s = NativeStore {
+        inner: Inner::open(Box::new(sim.clone()), Options::default()).unwrap(),
+    };
+    commit(
+        &s,
+        "forget",
+        ChangeSet {
+            changes: [1, 2]
+                .map(|p| Change::RemoveHistory {
+                    position: cce_core::storage::HistoryPosition(p),
+                })
+                .into(),
+            ..ChangeSet::default()
+        },
+    );
+    for i in 0..3 {
+        commit(
+            &s,
+            &format!("after-{i}"),
+            ChangeSet {
+                changes: vec![put(&format!("after-{i}"), None)],
+                ..ChangeSet::default()
+            },
+        );
+    }
+    drop(s);
+    sim.release();
+    sim
+}
+
+#[test]
+fn a_store_with_removed_history_is_consistent() {
+    assert_consistent(&with_removed_history());
+}
+
+#[test]
+fn a_history_marker_naming_another_attempt_is_an_attempt_finding() {
+    let sim = with_removed_history();
+    edit_tree(&sim, |t| {
+        t.put(removed_history_key(1), b"forged".to_vec()).unwrap();
+    });
+    assert_only(&verify(&sim), "attempt");
+}
+
+#[test]
+fn a_history_marker_naming_an_attempt_recorded_at_another_position_is_an_attempt_finding() {
+    // Position 1's marker names "three" (retained at position 3), and no attempt record points at
+    // position 1 any more: only the marker's own pairing check can see it.
+    let sim = with_removed_history();
+    edit_tree(&sim, |t| {
+        t.put(removed_history_key(1), b"three".to_vec()).unwrap();
+        t.delete(&key(P_ATTEMPT, &[b"one"])).unwrap();
+    });
+    assert_only(&verify(&sim), "attempt");
+}
+
+#[test]
+fn removing_history_whose_entry_records_another_position_is_refused_as_damage() {
+    // Uses this module's crafted publication: position 2's key names position 1's entry.
+    let sim = rich();
+    edit_tree(&sim, |t| {
+        let first = t.get(&history_key(1)).unwrap().unwrap();
+        t.put(history_key(2), first).unwrap();
+    });
+    let s = NativeStore {
+        inner: Inner::open(Box::new(sim.clone()), Options::default()).unwrap(),
+    };
+    let r = s.commit(
+        AttemptId::new(*b"forget").unwrap(),
+        s.begin().unwrap(),
+        ChangeSet {
+            changes: vec![Change::RemoveHistory {
+                position: cce_core::storage::HistoryPosition(2),
+            }],
+            ..ChangeSet::default()
+        },
+    );
+    assert!(
+        matches!(&r, Err(cce_core::storage::CommitError::Rejected(StorageError::Integrity(m)))
+            if m.contains("records position 1")),
+        "a removal must not trust a history key naming another position's entry: {r:?}"
+    );
+}
+
+#[test]
+fn a_position_both_retained_and_removed_is_a_history_finding() {
+    let sim = rich();
+    edit_tree(&sim, |t| {
+        t.put(removed_history_key(1), b"one".to_vec()).unwrap();
+    });
+    // The state does not require the marker feature either; both are history findings.
+    assert_only(&verify(&sim), "history");
+}
+
+#[test]
+fn a_history_marker_in_a_state_without_the_marker_feature_is_a_history_finding() {
+    let sim = with_removed_history();
+    let mut d = *crate::audit::published(&sim).unwrap().last().unwrap();
+    d.features = 0;
+    sim.write_at(
+        FileId::Meta,
+        Descriptor::slot(d.generation) * PAGE_SIZE as u64,
+        &d.encode(),
+    )
+    .unwrap();
+    sim.sync(FileId::Meta).unwrap();
+    sim.release();
+    assert_only(&verify(&sim), "history");
+}
+
 #[test]
 fn a_store_with_reused_space_removed_content_and_both_removal_modes_is_consistent() {
     assert_consistent(&reused());
@@ -752,6 +867,7 @@ fn bytes_after_an_intact_record_of_a_later_version_are_not_padding() {
         next_page: 3,
         content_len: 0,
         history_pos: 0,
+        features: 0,
     };
     let mut page = d.encode();
     page[4..6].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());

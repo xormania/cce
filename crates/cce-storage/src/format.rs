@@ -24,9 +24,12 @@ pub(crate) const PAGE_PAYLOAD_MAX: usize = PAGE_SIZE - PAGE_HEADER_LEN;
 pub(crate) const DESC_LEN: usize = 4 + 2 + 4 + 16 + 8 * 6 + 4;
 /// Length of the publication record of format versions before 5, which had no required features.
 const EARLIER_DESC_LEN: usize = 4 + 2 + 16 + 8 * 6 + 4;
-/// Required features this build implements: none yet. A publication record that requires any
-/// other is refused as unsupported, like an unknown format version.
-pub(crate) const KNOWN_REQUIRED_FEATURES: u32 = 0;
+/// Required feature: a history marker may be present (some retained history entry was removed).
+/// Set by the first publication that removes history and carried by every later one.
+pub(crate) const FEATURE_HISTORY_MARKERS: u32 = 1 << 0;
+/// Required features this build implements. A publication record that requires any other is
+/// refused as unsupported, like an unknown format version.
+pub(crate) const KNOWN_REQUIRED_FEATURES: u32 = FEATURE_HISTORY_MARKERS;
 
 /// Identity of one store; recorded in every page and publication record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -180,6 +183,8 @@ pub(crate) struct Descriptor {
     pub content_len: u64,
     /// Last committed logical history position (0 = none).
     pub history_pos: u64,
+    /// Required features a reader must implement to read this state.
+    pub features: u32,
 }
 
 impl Descriptor {
@@ -192,8 +197,7 @@ impl Descriptor {
         let mut e = Enc::default();
         e.raw(&DESC_MAGIC)
             .u16(FORMAT_VERSION)
-            // Required features: this build writes none.
-            .u32(0)
+            .u32(self.features)
             .raw(&self.store.0)
             .u64(self.generation)
             .u64(self.root.page)
@@ -251,7 +255,8 @@ pub(crate) fn decode_slot(bytes: &[u8]) -> Slot {
         if v != FORMAT_VERSION {
             return Ok(Err(format!("format version {v}")));
         }
-        let unknown = d.u32()? & !KNOWN_REQUIRED_FEATURES;
+        let features = d.u32()?;
+        let unknown = features & !KNOWN_REQUIRED_FEATURES;
         if unknown != 0 {
             return Ok(Err(format!("unknown required features {unknown:#x}")));
         }
@@ -265,6 +270,7 @@ pub(crate) fn decode_slot(bytes: &[u8]) -> Slot {
             next_page: d.u64()?,
             content_len: d.u64()?,
             history_pos: d.u64()?,
+            features,
         }))
     };
     match parse(&mut d) {
@@ -304,6 +310,7 @@ mod tests {
             next_page: 6,
             content_len: 0,
             history_pos: 0,
+            features: 0,
         };
         let mut r = d.encode();
         assert_ne!(r[DESC_LEN - 1], 0, "the record's last byte");
@@ -356,6 +363,7 @@ mod tests {
             next_page: 5,
             content_len: 100,
             history_pos: 2,
+            features: 0,
         };
         for version in [FORMAT_VERSION - 1, 1, 0] {
             let mut older = d.encode();
@@ -382,6 +390,7 @@ mod tests {
             next_page: 5,
             content_len: 100,
             history_pos: 2,
+            features: 0,
         };
         let bytes = d.encode();
         assert_eq!(decode_slot(&bytes), Slot::Valid(d));
@@ -398,7 +407,7 @@ mod tests {
             Slot::Unsupported(format!("format version {}", FORMAT_VERSION + 1))
         );
         // Required features this build lacks: unsupported, whatever the bit.
-        for bit in [0, 31] {
+        for bit in [1, 31] {
             let mut needs = bytes.clone();
             needs[6..10].copy_from_slice(&(1u32 << bit).to_le_bytes());
             let crc = crc32fast::hash(&needs[..DESC_LEN - 4]);

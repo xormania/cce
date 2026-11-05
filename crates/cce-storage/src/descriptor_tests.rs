@@ -244,7 +244,8 @@ fn file_images(sim: &SimIo) -> Vec<Option<(Vec<u8>, Vec<u8>)>> {
 #[test]
 fn a_record_requiring_unknown_features_is_refused_without_falling_back_or_writing() {
     let t = two_commits();
-    for bit in [0, 7, 31] {
+    // Bit 0 (history markers) is known to this build.
+    for bit in [1, 7, 31] {
         let img = t.sim.after_process_exit();
         write_durably(&img, PAGE_SIZE as u64, &requiring(&t, 1 << bit));
         let before = file_images(&img);
@@ -456,6 +457,7 @@ fn the_format_document_states_the_current_version_and_layout_lengths() {
         next_page: 3,
         content_len: 0,
         history_pos: 0,
+        features: 0,
     }
     .encode();
     assert!(page.len() >= len && page[len..].iter().all(|b| *b == 0));

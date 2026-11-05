@@ -185,6 +185,7 @@ fn seeds() -> BTreeMap<(&'static str, String), Vec<u8>> {
         next_page: 3,
         content_len: 0,
         history_pos: 0,
+        features: 0,
     };
     let mut two = desc(2).encode();
     two.extend(desc(1).encode());

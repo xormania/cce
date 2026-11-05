@@ -228,6 +228,7 @@ pub(crate) fn expected(steps: u32) -> State {
                     s.outgoing.retain(|(_, k), _| k != id.as_bytes());
                     s.incoming.retain(|(_, k), _| k != id.as_bytes());
                 }
+                _ => unreachable!("the oracle's submissions only put and remove records"),
             }
         }
         s.history.push(HistoryEntry {

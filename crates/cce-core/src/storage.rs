@@ -124,8 +124,10 @@ pub struct StagedContent {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StagingToken(pub Vec<u8>);
 
-/// One logical mutation. Names logical identities only; never pages or index entries.
+/// One logical mutation. Names logical identities only; never pages or index entries. New kinds
+/// of change may be added.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Change {
     /// Create or replace a context record.
     PutContext {
@@ -150,6 +152,12 @@ pub enum Change {
         id: RelationshipId,
         expect: Precondition,
     },
+    /// Remove the retained history entry at `position`, as the host designates. Its changes,
+    /// evidence and content references are no longer kept; the position is not reused and the
+    /// attempt it recorded still returns its original receipt. Records and relationships are not
+    /// changed by it. The entry must be retained in the current state: removing a position that is
+    /// already removed, or that does not exist, rejects the whole change set.
+    RemoveHistory { position: HistoryPosition },
 }
 
 /// One complete logical change submitted atomically.

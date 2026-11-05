@@ -83,8 +83,11 @@ overwritten by the next commit. Record layout (78 bytes; this build writes zeros
 
 A record is checked in this order: its checksum (a mismatch makes the slot damaged), its magic, its
 format version, and its required features, a bit set of features a reader must implement to read
-the store. No feature is defined yet and writers set none; a record that requires any feature this
-build does not implement is unsupported, exactly like an unknown format version. Records of earlier
+the store. Bit 0 means a history marker (prefix `09`) may be present: it is set by the first
+publication that removes a history entry and carried by every later publication, maintenance
+included, so a reader that does not know markers refuses the store instead of misreading its
+history. No other bit is defined; a record that requires any feature this build does not
+implement is unsupported, exactly like an unknown format version. Records of earlier
 versions had no required features, so their checksum ends 4 bytes earlier; such an intact record is
 reported as its unsupported version rather than as a damaged slot.
 
@@ -115,8 +118,13 @@ tuple order of the raw components.
 | `07` | content SHA-256 | `01`, extent of the content's manifest, number of records using it (`u64`); or `00`: committed once, no longer retained |
 | `08` | retiring generation (`u64` big-endian), kind `00`, page (`u64` big-endian) | incarnation `u64` of the retired page |
 | `08` | retiring generation (`u64` big-endian), kind `01`, offset (`u64` big-endian) | length `u64` of the retired content extent |
+| `09` | history position (`u64` big-endian) | attempt id the removed entry recorded — marker of a removed history entry |
 
 Retirement keys are fixed-width, not escaped components, so they sort by retiring generation.
+History keys (`05`) and history markers (`09`) are fixed-width too; a position is held by at most
+one of them. Markers have a family of their own rather than a second value form under `05`: a `05`
+value is an extent of fixed length, and a marker holding an attempt id of the same encoded length
+could not be told apart from it.
 
 An extent is `offset: u64, length: u64, sha256: [u8; 32]` into `content.cce`.
 
@@ -164,12 +172,26 @@ again. A record's key plus value is limited to 1800 bytes; larger data belongs i
 
 ## History entries and attempt fingerprints
 
-A history entry is `position: u64`, attempt id, and the canonical request encoding: a version byte
-(1), the changes in submitted order (tagged; identities, preconditions, bodies, content indexes as `u64`), the
-bound content as `(sha256, length)` pairs, and the supplied evidence as `(label, bytes)` pairs.
+A history entry is `position: u64`, attempt id, and the canonical request encoding: a version byte,
+the changes in submitted order (tagged; identities, preconditions, bodies, content indexes as `u64`,
+removed history positions as `u64`), the bound content as `(sha256, length)` pairs, the supplied
+evidence as `(label, bytes)` pairs, and the removal mode byte. Version 2 is written for every
+request that removes no history and version 3 for one that does (only it may hold the history
+removal tag); version 1, which had no removal mode byte, is still read.
 Staging tokens and physical locations are not part of it. Every content index must refer to a
 binding of the same request; a request with an out-of-range index is rejected before it is
 fingerprinted. History entries return the bound content references with the changes.
+
+### Removed history
+
+A commit can remove the retained history entry at a position the host names. In the state it
+publishes, that position's `05` key is gone and a `09` marker holds only the attempt id the entry
+recorded; the entry's extent is retired at the commit's generation and is reused under the same
+rules as any retired extent. Positions are not renumbered. The attempt's `06` record is kept
+unchanged, so its position and fingerprint still answer a retry with the original receipt; neither
+holds any of the entry's changes, evidence or content references. History entries never keep
+content in use (a content entry counts current records only), so removing history retires no
+content.
 
 A store's limits (the encoded request limit and the segment quota) bound what an open writes, not
 what it reads: data written under larger limits reads back under smaller ones. The encoded request

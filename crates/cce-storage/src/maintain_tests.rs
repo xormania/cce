@@ -2040,6 +2040,105 @@ fn relocation_moves_tree_pages_into_lower_retired_pages_and_changes_no_record() 
 }
 
 #[test]
+fn maintenance_carries_history_markers_and_never_reaches_a_removed_entry_again() {
+    use crate::format::FEATURE_HISTORY_MARKERS;
+    use cce_core::storage::{AttemptOutcome, CommitReceipt};
+    let sim = scattered();
+    let s = open(&sim);
+    // The scattered fixture's commits are at positions 1 ("many") to 4 ("four"); remove two.
+    commit(
+        &s,
+        "forget",
+        ChangeSet {
+            changes: [2, 3]
+                .map(|p| Change::RemoveHistory {
+                    position: HistoryPosition(p),
+                })
+                .into(),
+            ..ChangeSet::default()
+        },
+    );
+    let state = |sim: &SimIo| {
+        let d = crate::audit::published(sim).unwrap().pop().unwrap();
+        let r = crate::audit::reach(sim, &d)
+            .unwrap_or_else(|e| panic!("the published state must decode: {e:?}"));
+        (d.features, r.removed_history, r.history_extents)
+    };
+    let outcomes = |s: &NativeStore| {
+        ["many", "rewrite", "three", "four", "forget"].map(|a| {
+            s.outcome(&crate::test_support::attempt(a))
+                .unwrap_or_else(|e| panic!("outcome of {a} must be known: {e:?}"))
+        })
+    };
+    let before = logical(&s);
+    assert_eq!(
+        before
+            .history
+            .iter()
+            .map(|h| h.position.0)
+            .collect::<Vec<_>>(),
+        vec![1, 4, 5],
+        "the fixture's removal"
+    );
+    let (features, markers, _) = state(&sim);
+    assert_eq!(features & FEATURE_HISTORY_MARKERS, FEATURE_HISTORY_MARKERS);
+    assert_eq!(markers.keys().copied().collect::<Vec<_>>(), vec![2, 3]);
+    let receipts = outcomes(&s);
+    assert_eq!(
+        receipts[1],
+        AttemptOutcome::Committed(CommitReceipt {
+            attempt: crate::test_support::attempt("rewrite"),
+            position: HistoryPosition(2)
+        })
+    );
+    let mut moved = 0;
+    for task in [
+        MaintenanceTask::Relocate,
+        MaintenanceTask::RebuildRelationshipIndexes,
+        MaintenanceTask::ReclaimContentHoles,
+    ] {
+        let r = s
+            .maintain(task, MaintenanceBudget::default())
+            .unwrap_or_else(|e| panic!("{task:?} must succeed: {e:?}"));
+        moved += r.pages_moved;
+        let (f, m, extents) = state(&sim);
+        assert_eq!(
+            f & FEATURE_HISTORY_MARKERS,
+            FEATURE_HISTORY_MARKERS,
+            "{task:?} dropped the history marker feature"
+        );
+        assert_eq!(m, markers, "{task:?} changed the history markers");
+        // Relocation may move retained entries; it never brings a removed one back.
+        assert_eq!(
+            extents.len(),
+            before.history.len(),
+            "{task:?}: the state reaches one extent per retained entry"
+        );
+        assert_eq!(
+            logical(&s),
+            before,
+            "{task:?} changed logical state or history"
+        );
+        assert_eq!(
+            outcomes(&s),
+            receipts,
+            "{task:?} changed an attempt's outcome"
+        );
+        audit(&sim);
+    }
+    assert!(
+        moved > 0,
+        "relocation moved nothing: the test exercised no move"
+    );
+    let s = open(&{
+        drop(s);
+        sim
+    });
+    assert_eq!(logical(&s), before, "after reopening");
+    assert_eq!(outcomes(&s), receipts, "after reopening");
+}
+
+#[test]
 fn page_relocation_moves_no_more_pages_than_the_budget() {
     let sim = scattered();
     let s = open(&sim);

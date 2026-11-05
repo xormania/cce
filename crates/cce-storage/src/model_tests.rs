@@ -65,6 +65,7 @@ fn change_spec() -> impl Strategy<Value = ChangeSpec> {
         4 => (0..r, expect_spec(), 0..k, 0..n, 0..n)
             .prop_map(|(rel, expect, kind, source, target)| ChangeSpec::PutRelationship { rel, expect, kind, source, target }),
         2 => (0..r, expect_spec()).prop_map(|(rel, expect)| ChangeSpec::RemoveRelationship { rel, expect }),
+        1 => any::<u8>().prop_map(|pick| ChangeSpec::RemoveHistory { pick }),
     ]
 }
 
@@ -426,6 +427,8 @@ fn run_profile<const FILES: bool>(backend: &str, profile: Profile, cases: u32, s
             "staging committed after a rejected commit bound it",
             "discard after a rejected commit bound the staging",
             "staging owns space with a retirement record",
+            "history removed",
+            "retry of an attempt whose history was removed",
             "maintenance reclaimed content space",
             "maintenance relocated pages",
             "maintenance relocated content",

@@ -62,7 +62,7 @@ fn attempt(s: &str) -> AttemptId {
 
 /// Seed of the routine run. Changing it changes the generated sequences.
 pub(crate) const ROUTINE_SEED: u64 = 0x5eed_0001_cce0_0001;
-pub(crate) const ROUTINE_CASES: u32 = 32;
+pub(crate) const ROUTINE_CASES: u32 = 64;
 pub(crate) const ROUTINE_FS_CASES: u32 = 4;
 pub(crate) const MIN_OPS: usize = 64;
 pub(crate) const MAX_OPS: usize = 80;
@@ -162,6 +162,11 @@ pub(crate) enum ChangeSpec {
     RemoveRelationship {
         rel: u8,
         expect: ExpectSpec,
+    },
+    /// Remove the history entry at a position chosen by `pick`: mostly a committed one (retained
+    /// or already removed), sometimes position 0 or one not yet written.
+    RemoveHistory {
+        pick: u8,
     },
 }
 
@@ -649,6 +654,17 @@ impl Model {
                         id,
                     }
                 }
+                ChangeSpec::RemoveHistory { pick } => {
+                    let last = self.position;
+                    let position = match pick % 8 {
+                        0 => 0,
+                        1 => last + 2,
+                        _ => 1 + u64::from(*pick) % last.max(1),
+                    };
+                    Change::RemoveHistory {
+                        position: HistoryPosition(position),
+                    }
+                }
             })
             .collect();
         for (j, k) in pending {
@@ -701,6 +717,9 @@ impl Model {
         }
         let mut seen_ctx = BTreeSet::new();
         let mut seen_rel = BTreeSet::new();
+        let mut seen_history = BTreeSet::new();
+        // Without a held view, the request's basis is the latest state.
+        let basis = held.map_or(self.position, |h| h.basis);
         let mut written = Vec::new();
         let check = |expect: &Precondition, cur: Option<u64>| match (expect, cur) {
             (Precondition::Any, _) | (Precondition::Absent, None) => true,
@@ -757,6 +776,16 @@ impl Model {
                         written.push(WriteKey::Index(false, p.target.clone(), p.kind.clone()));
                     }
                 }
+                Change::RemoveHistory { position } => {
+                    // Only an entry the basis includes and is still retained can be removed, once
+                    // per request; removal writes no key a read basis can observe.
+                    let retained =
+                        position.0 <= basis && self.history.iter().any(|h| h.position == *position);
+                    if !seen_history.insert(*position) || !retained {
+                        errs.insert(ErrKind::Rejected);
+                    }
+                }
+                _ => unreachable!("the model generates no other change"),
             }
         }
         if errs.is_empty() {
@@ -813,6 +842,10 @@ impl Model {
                 Change::RemoveRelationship { id, .. } => {
                     self.state.rels.remove(id);
                 }
+                Change::RemoveHistory { position } => {
+                    self.history.retain(|h| h.position != *position);
+                }
+                _ => unreachable!("the model generates no other change"),
             }
         }
         self.history.push(HistoryEntry {
@@ -1616,6 +1649,13 @@ impl Engine {
                     .collect();
                 if got.is_ok() {
                     count("commit ok");
+                    if request
+                        .changes
+                        .iter()
+                        .any(|c| matches!(c, Change::RemoveHistory { .. }))
+                    {
+                        count("history removed");
+                    }
                     if !picks.is_empty() {
                         count("commit of earlier stagings");
                     }
@@ -1655,6 +1695,19 @@ impl Engine {
                         count("retry returned original receipt");
                         assert_eq!(r.position, HistoryPosition(*p));
                         assert_eq!(r.attempt, request.attempt);
+                        // The first entry the current history holds from that position on.
+                        let mut v = e
+                            .store()
+                            .begin()
+                            .unwrap_or_else(|e| panic!("the store failed: begin: {e:?}"));
+                        let first = v
+                            .history(HistoryPosition(*p))
+                            .unwrap_or_else(|e| panic!("the store failed: history: {e:?}"))
+                            .next()
+                            .map(|h| h.map(|h| h.position));
+                        if !matches!(first, Some(Ok(at)) if at == HistoryPosition(*p)) {
+                            count("retry of an attempt whose history was removed");
+                        }
                     }
                     (Err(CommitError::AttemptMismatch), Err(ErrKind::Mismatch)) => {
                         count("retry mismatch")
@@ -3182,10 +3235,11 @@ impl ByteReader<'_> {
                 source: self.below(n),
                 target: self.below(n),
             },
-            _ => ChangeSpec::RemoveRelationship {
+            11 => ChangeSpec::RemoveRelationship {
                 rel: self.below(RELATIONSHIPS),
                 expect: self.expect(),
             },
+            _ => ChangeSpec::RemoveHistory { pick: self.byte() },
         }
     }
 
@@ -3384,6 +3438,7 @@ fn put_change(out: &mut Vec<u8>, c: &ChangeSpec) {
             out.extend([11, *rel]);
             put_expect(out, *expect);
         }
+        ChangeSpec::RemoveHistory { pick } => out.extend([12, *pick]),
     }
 }
 

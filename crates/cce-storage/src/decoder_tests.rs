@@ -192,6 +192,7 @@ fn descriptor() -> Descriptor {
         next_page: u64::MAX,
         content_len: u64::MAX,
         history_pos: u64::MAX,
+        features: 0,
     }
 }
 
@@ -555,12 +556,40 @@ fn history_entries_reject_malformed_requests() {
     trailing.push(0);
     err_contains(decode_history(&trailing), "trailing", "trailing byte");
     err_contains(decode_history(&entry(&[])), "truncated", "empty request");
+    // A history removal (tag 5, then a u64 position) exists only in version 3, and version 3 is
+    // written only for a request that removes history.
+    let with = |version: u8, changes: &[u8], n: u32| {
+        let mut r = request(changes, n, 0);
+        r[0] = version;
+        r.push(0);
+        r
+    };
+    let mut removal = vec![5];
+    removal.extend(7u64.to_le_bytes());
+    let v3 = decode_history(&entry(&with(3, &removal, 1)))
+        .unwrap_or_else(|e| panic!("a version 3 history removal must decode: {e:?}"));
+    assert_eq!(
+        v3.changes,
+        vec![cce_core::storage::Change::RemoveHistory {
+            position: cce_core::storage::HistoryPosition(7)
+        }]
+    );
+    err_contains(
+        decode_history(&entry(&with(2, &removal, 1))),
+        "change tag 5",
+        "a history removal in version 2",
+    );
+    err_contains(
+        decode_history(&entry(&with(3, &[], 0))),
+        "removes no history",
+        "version 3 without a history removal",
+    );
     assert!(
         matches!(
-            decode_history(&entry(&[3])),
+            decode_history(&entry(&[4])),
             Err(StorageError::Unsupported(_))
         ),
-        "a request encoding of another version is unsupported"
+        "a request encoding of another version (1 to 3 are known) is unsupported"
     );
 }
 

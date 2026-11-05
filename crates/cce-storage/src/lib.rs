@@ -32,6 +32,8 @@ mod fuzz_replay_tests;
 #[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
+mod history_removal_tests;
+#[cfg(test)]
 mod instrumentation_tests;
 mod io;
 #[cfg(test)]
@@ -636,6 +638,15 @@ pub struct SpaceReport {
     /// Retained history entries (one per committed transaction) and their encoded bytes.
     pub history_entries: u64,
     pub history_bytes: u64,
+    /// History entries the host removed: each leaves a marker holding only the attempt id it
+    /// recorded. Their count, and the metadata bytes (key and value) of the markers. The removed
+    /// entries' own bytes are retired space, counted below like any other.
+    pub history_entries_removed: u64,
+    pub history_marker_bytes: u64,
+    /// Attempt receipts: one per committed attempt, kept for retries even after its history entry
+    /// is removed. Their count, and their metadata bytes (key and value).
+    pub attempt_receipts: u64,
+    pub attempt_receipt_bytes: u64,
     /// Retired tree pages, by whether the reuse rule allows taking them now.
     pub retired_pages_protected: u64,
     pub retired_pages_reusable: u64,
