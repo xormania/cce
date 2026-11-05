@@ -80,9 +80,17 @@ fn interrupted_and_short_transfers_still_write_and_read_every_byte() {
             Fault::Short(7)
         })
     }));
-    io.write_at(FileId::Content, 4096, &data).unwrap();
+    let wrote = io.write_at(FileId::Content, 4096, &data);
+    assert!(
+        wrote.is_ok(),
+        "interrupted and short writes must be retried to completion: {wrote:?}"
+    );
     let mut got = vec![0; data.len()];
-    io.read_at(FileId::Content, 4096, &mut got).unwrap();
+    let read = io.read_at(FileId::Content, 4096, &mut got);
+    assert!(
+        read.is_ok(),
+        "interrupted and short reads must be retried to completion: {read:?}"
+    );
     faults.clear();
     // The faults happened, on both kinds of call.
     for call in [Call::Read, Call::Write] {
@@ -223,7 +231,12 @@ fn read(s: &NativeStore, id: &str) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
         .unwrap()?;
     let content = r.content.map(|c| {
         let mut out = Vec::new();
-        v.content(&c).unwrap().read_to_end(&mut out).unwrap();
+        v.content(&c)
+            .and_then(|mut r| {
+                r.read_to_end(&mut out)
+                    .map_err(|e| StorageError::Io(e.to_string()))
+            })
+            .unwrap_or_else(|e| panic!("content on the real adapter must read back: {e:?}"));
         out
     });
     Some((r.body, content))
@@ -243,7 +256,9 @@ fn a_store_on_the_real_adapter_commits_and_reads_through_interruptions_and_short
     };
     let blob = pattern(200_000, 9);
     faults.set(interrupt_and_shorten());
-    let staged = s.stage_content(&mut &blob[..]).unwrap();
+    let staged = s
+        .stage_content(&mut &blob[..])
+        .unwrap_or_else(|e| panic!("staging on the real adapter must complete: {e:?}"));
     s.commit(
         AttemptId::new(*b"a").unwrap(),
         s.begin().unwrap(),
@@ -253,7 +268,7 @@ fn a_store_on_the_real_adapter_commits_and_reads_through_interruptions_and_short
             ..ChangeSet::default()
         },
     )
-    .unwrap();
+    .unwrap_or_else(|e| panic!("a commit on the real adapter must complete: {e:?}"));
     let a = read(&s, "A");
     faults.clear();
     for call in [Call::Read, Call::Write] {

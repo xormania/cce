@@ -2,9 +2,12 @@
 
 Each target feeds arbitrary bytes to one harness through `cce_storage::fuzz_target` (enabled by the
 `fuzz-api` feature): `page`, `slots`, `node`, `manifest`, `history`, `records` (record values and key
-components, selected by the first byte) and `image` (a whole store image, opened read-only and read
-through). Every entry point must return for any input: a panic, a hang or an allocation beyond its
-limit is a finding. Decoders that accept an input must re-encode it to an equal value.
+components, selected by the first byte), `image` (a whole store image, opened read-only and read
+through) and `ops` (an operation sequence decoded from the input, run on the storage simulator
+against the logical model of the model tests, completely or interrupted once by a crash or an I/O
+failure, with the same checks after every step and every recovery). Every entry point must return
+for any input: a panic, a hang or an allocation beyond its limit is a finding. Decoders that accept
+an input must re-encode it to an equal value.
 
 This package is outside the repository workspace and needs a nightly toolchain and
 [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz). From `crates/cce-storage`:
@@ -26,4 +29,6 @@ normal test fails when the committed seeds differ from what the generator produc
 A finding becomes a permanent test: minimize it with `cargo +nightly fuzz tmin <target> <artifact>`,
 fix the cause, and save the minimized input as `regressions/<target>/<short-description>`. The
 ordinary test suite replays every seed and every saved finding through the same entry points, so
-no nightly toolchain is needed to keep them covered.
+no nightly toolchain is needed to keep them covered. It also runs a deterministic sweep of seeded
+mutations of the seeds through every decoder target (`CCE_DECODER_CASES` per target, default 10000)
+and of seeded random inputs through `ops` (`CCE_OPS_SWEEP_CASES`), without a fuzzing toolchain.

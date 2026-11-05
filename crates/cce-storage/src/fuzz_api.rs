@@ -1,5 +1,6 @@
-//! Fuzzing harness: one entry point per decoder of stored bytes, and one that opens a whole store
-//! image read-only and reads everything it can reach. For any input each entry point must return —
+//! Fuzzing harness: one entry point per decoder of stored bytes, one that opens a whole store
+//! image read-only and reads everything it can reach, and one that runs operation sequences
+//! against the logical model. For any input each entry point must return —
 //! with or without an error — and never panic, hang or allocate beyond what its input bounds.
 //! Decoders that accept an input must also re-encode it to an equal value.
 //!
@@ -13,7 +14,7 @@ use cce_core::storage::{ContextId, Direction, HistoryPosition, ReadView, Relatio
 
 use crate::codec::key_components;
 use crate::engine::{Inner, Options};
-use crate::format::{PageKind, PageRef, StoreId, decode_page, decode_slot};
+use crate::format::{PageKind, PageRef, Slot, StoreId, decode_page, decode_slot};
 use crate::records::{
     AttemptValue, ContextValue, ExtentRef, Manifest, P_CONTEXT, RelValue, decode_history,
 };
@@ -26,15 +27,16 @@ const MAX_KEYS: usize = 10_000;
 const MAX_LISTED: usize = 1_000;
 const MAX_CONTENT_BYTES: usize = 4 << 20;
 
-/// A fuzz target's entry point: takes arbitrary bytes.
-pub type Harness = fn(&[u8]);
+/// A fuzz target's entry point: takes arbitrary bytes and returns whether the input was accepted
+/// (it decoded, the image opened, or the sequence had steps), so a sweep can count both kinds.
+pub type Harness = fn(&[u8]) -> bool;
 
-/// Runs the named target's harness on `data`.
-pub fn run(target: &str, data: &[u8]) {
+/// Runs the named target's harness on `data`; true if the input was accepted.
+pub fn run(target: &str, data: &[u8]) -> bool {
     let Some((_, harness)) = TARGETS.iter().find(|(name, _)| *name == target) else {
         panic!("unknown fuzz target {target}");
     };
-    harness(data);
+    harness(data)
 }
 
 /// The fuzz targets, by name.
@@ -46,6 +48,7 @@ pub const TARGETS: &[(&str, Harness)] = &[
     ("history", history),
     ("records", records),
     ("image", image),
+    ("ops", ops),
 ];
 
 fn le_u64(data: &[u8], at: usize) -> u64 {
@@ -55,7 +58,7 @@ fn le_u64(data: &[u8], at: usize) -> u64 {
 
 /// A metadata page, checked against the store, address and incarnation its own header claims, so
 /// inputs can reach the checks after the address.
-pub fn page(data: &[u8]) {
+pub fn page(data: &[u8]) -> bool {
     let store = StoreId(
         data.get(8..24)
             .map_or([0; 16], |b| b.try_into().unwrap_or([0; 16])),
@@ -64,68 +67,64 @@ pub fn page(data: &[u8]) {
         page: le_u64(data, 24),
         incarnation: le_u64(data, 32),
     };
-    let _ = decode_page(store, PageKind::Node, at, data);
+    decode_page(store, PageKind::Node, at, data).is_ok()
 }
 
 /// Two publication slots: the first and second half of the input.
-pub fn slots(data: &[u8]) {
+pub fn slots(data: &[u8]) -> bool {
     let (a, b) = data.split_at(data.len() / 2);
-    let _ = (decode_slot(a), decode_slot(b));
+    [decode_slot(a), decode_slot(b)]
+        .iter()
+        .any(|s| matches!(s, Slot::Valid(_)))
 }
 
-pub fn node(data: &[u8]) {
-    if let Ok(n) = Node::decode(data) {
-        assert_eq!(
-            Node::decode(&n.encode()).ok(),
-            Some(n),
-            "node does not round-trip"
-        );
-    }
+pub fn node(data: &[u8]) -> bool {
+    let Ok(n) = Node::decode(data) else {
+        return false;
+    };
+    assert_eq!(
+        Node::decode(&n.encode()).ok(),
+        Some(n),
+        "node does not round-trip"
+    );
+    true
 }
 
-pub fn manifest(data: &[u8]) {
-    if let Ok(m) = Manifest::decode(data) {
-        assert_eq!(
-            Manifest::decode(&m.encode()).ok(),
-            Some(m),
-            "manifest does not round-trip"
-        );
-    }
+pub fn manifest(data: &[u8]) -> bool {
+    let Ok(m) = Manifest::decode(data) else {
+        return false;
+    };
+    assert_eq!(
+        Manifest::decode(&m.encode()).ok(),
+        Some(m),
+        "manifest does not round-trip"
+    );
+    true
 }
 
-pub fn history(data: &[u8]) {
-    let _ = decode_history(data);
+pub fn history(data: &[u8]) -> bool {
+    decode_history(data).is_ok()
 }
 
 /// The first byte selects a record value decoder or the key-component parser.
-pub fn records(data: &[u8]) {
+pub fn records(data: &[u8]) -> bool {
     let Some((&which, rest)) = data.split_first() else {
-        return;
+        return false;
     };
     match which % 5 {
-        0 => {
-            if let Ok(v) = ContextValue::decode(rest) {
-                assert_eq!(ContextValue::decode(&v.encode()).ok(), Some(v));
-            }
-        }
-        1 => {
-            if let Ok(v) = RelValue::decode(rest) {
-                assert_eq!(RelValue::decode(&v.encode()).ok(), Some(v));
-            }
-        }
-        2 => {
-            if let Ok(v) = AttemptValue::decode(rest) {
-                assert_eq!(AttemptValue::decode(&v.encode()).ok(), Some(v));
-            }
-        }
-        3 => {
-            if let Ok(v) = ExtentRef::decode(rest) {
-                assert_eq!(ExtentRef::decode(&v.encode()).ok(), Some(v));
-            }
-        }
-        _ => {
-            let _ = key_components(rest);
-        }
+        0 => ContextValue::decode(rest)
+            .map(|v| assert_eq!(ContextValue::decode(&v.encode()).ok(), Some(v)))
+            .is_ok(),
+        1 => RelValue::decode(rest)
+            .map(|v| assert_eq!(RelValue::decode(&v.encode()).ok(), Some(v)))
+            .is_ok(),
+        2 => AttemptValue::decode(rest)
+            .map(|v| assert_eq!(AttemptValue::decode(&v.encode()).ok(), Some(v)))
+            .is_ok(),
+        3 => ExtentRef::decode(rest)
+            .map(|v| assert_eq!(ExtentRef::decode(&v.encode()).ok(), Some(v)))
+            .is_ok(),
+        _ => key_components(rest).is_ok(),
     }
 }
 
@@ -152,18 +151,18 @@ pub fn join_image(meta: &[u8], content: &[u8]) -> Vec<u8> {
 
 /// A whole store image: opened read-only, then every context the tree holds is read with its
 /// content and relationships in both directions, and the history is listed.
-pub fn image(data: &[u8]) {
+pub fn image(data: &[u8]) -> bool {
     let (meta, content) = split_image(data);
     let opts = Options {
         cache_nodes: 16,
         ..Options::default()
     };
     let Ok(inner) = Inner::open_read_only(Box::new(SimIo::from_images(meta, content)), opts) else {
-        return;
+        return false;
     };
     let store = NativeReadOnly { inner };
     let Ok(mut v) = store.begin() else {
-        return;
+        return false;
     };
     let ids = context_ids(&store);
     let mut budget = MAX_CONTENT_BYTES;
@@ -173,6 +172,7 @@ pub fn image(data: &[u8]) {
     if let Ok(entries) = v.history(HistoryPosition(0)) {
         for _ in entries.take(MAX_LISTED) {}
     }
+    true
 }
 
 /// Context identities stored in the tree of the store's current state.
@@ -223,4 +223,11 @@ fn read_context(v: &mut NativeView, id: &ContextId, budget: &mut usize) {
             for _ in rels.take(MAX_LISTED) {}
         }
     }
+}
+
+/// An operation sequence decoded from the input and run on the simulator against the logical
+/// model, completely or interrupted once by a crash or an I/O failure, with the model's checks
+/// after every step and every recovery.
+pub fn ops(data: &[u8]) -> bool {
+    crate::model::run_bytes(data)
 }
