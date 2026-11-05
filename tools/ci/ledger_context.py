@@ -129,7 +129,8 @@ def _records(model, view):
 
 
 def scope_fingerprint(scope):
-    return _digest(scope or {})
+    # An unset scope (all open work) and an empty one (no work) are different scopes.
+    return _digest(scope)
 
 
 def _governing(snap, scope):
@@ -261,7 +262,7 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
     """Render the scoped brief. Returns (text, meta); ``text`` includes ``head`` and ``foot``.
 
     ``meta``: chars, bytes, tokens_estimate (bytes / 4, an estimate only), selection, scope fingerprint,
-    governing identities not delivered (``pending``) and candidates delivered only as cards.
+    required identities not delivered (``pending``) and candidates delivered only as cards.
     ``reader`` is the command a session runs to read records (shown in locators). ``selection`` is a
     relevance selection (``ledger_select.select``) for this snapshot and scope: its relevant candidates
     load in full after the governing records, uncertain and unjudged ones are named as such. A
@@ -354,7 +355,7 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
         chars, nbytes = size(text)
         return chars <= max_chars and nbytes <= max_bytes
 
-    # The longest prefix of the governing records that fits with the rest named as NOT LOADED.
+    # The longest prefix of the required records that fits with the rest named as NOT LOADED.
     for k in range(len(required), -1, -1):
         full, pending = required[:k], required[k:]
         if fits(assemble(full, [], pending, len(candidates))):

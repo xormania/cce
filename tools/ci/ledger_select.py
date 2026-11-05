@@ -266,7 +266,7 @@ def validate(response, payload):
 def fingerprint(snap, scope, cards, governing, model, max_questions, max_bytes, layout="shared"):
     # The thresholds are not part of the evaluation: cached scores are classified with the current rule.
     return context._digest({"version": VERSION, "rubric": [RUBRIC_VERSION, RUBRIC, CRITERIA], "layout": layout,
-                            "model": model, "budget": [max_questions, max_bytes], "scope": scope or {},
+                            "model": model, "budget": [max_questions, max_bytes], "scope": scope,
                             "governing": {rid: snap["records"][rid]["digest"] for rid in governing},
                             "cards": cards})
 
