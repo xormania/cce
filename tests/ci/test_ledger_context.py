@@ -529,6 +529,64 @@ supersedes = ["A2"]
         self.assertEqual(sorted(result["unavailable"]), sorted(held["records"]))
 
 
+class RelativeInputTests(unittest.TestCase):
+    """Relative input paths resolve against --root; a same-named file in the working directory is never read."""
+
+    SCOPE = {"objective": "objective from the root", "work": ["W-cache"], "origin": "lead"}
+    DECOY_SCOPE = {"objective": "objective from the decoy", "work": [], "origin": "decoy"}
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root, self.elsewhere = Path(temporary.name, "root"), Path(temporary.name, "elsewhere")
+        self.root.mkdir()
+        self.elsewhere.mkdir()
+        (self.root / "ledger.toml").write_text(LEDGER)
+        (self.elsewhere / "ledger.toml").write_text(LEDGER.replace("Evict by size, largest first", "DECOY LEDGER"))
+
+    def run_tool(self, command, *args, ledger="ledger.toml"):
+        return subprocess.run([sys.executable, "-I", str(ROOT / "tools/ci/ledger_context.py"), command,
+                               "--root", str(self.root), "--ledger", ledger, *args],
+                              capture_output=True, text=True, cwd=self.elsewhere)
+
+    def test_brief_reads_the_ledger_under_the_root(self):
+        done = self.run_tool("brief")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Evict by size, largest first", done.stdout)
+        self.assertNotIn("DECOY LEDGER", done.stdout)
+
+    def test_read_returns_the_record_under_the_root(self):
+        done = self.run_tool("read", "A1")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Evict by size, largest first", done.stdout)
+        self.assertNotIn("DECOY LEDGER", done.stdout)
+
+    def test_scope_is_read_under_the_root(self):
+        (self.root / "scope.json").write_text(json.dumps(self.SCOPE))
+        (self.elsewhere / "scope.json").write_text(json.dumps(self.DECOY_SCOPE))
+        done = self.run_tool("brief", "--scope", "scope.json")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("objective from the root", done.stdout)
+        self.assertNotIn("objective from the decoy", done.stdout)
+
+    def test_checkpoint_is_read_under_the_root(self):
+        held = context.checkpoint(snap())
+        (self.root / "held.json").write_text(json.dumps(held))
+        (self.elsewhere / "held.json").write_text(json.dumps({"records": {}}))
+        done = self.run_tool("changes", "--checkpoint", "held.json")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = json.loads(done.stdout)
+        self.assertEqual(result["unchanged"], sorted(held["records"]))
+        self.assertEqual(result["added"], [])
+
+    def test_a_ledger_only_in_the_working_directory_is_not_found(self):
+        (self.root / "ledger.toml").unlink()
+        done = self.run_tool("brief")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("ledger did not load", done.stderr)
+        self.assertEqual(done.stdout, "")
+
+
 class CommandLineTests(unittest.TestCase):
     def run_tool(self, *args, cwd):
         return subprocess.run([sys.executable, "-I", str(ROOT / "tools/ci/ledger_context.py"), *args],
