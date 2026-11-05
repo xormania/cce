@@ -309,6 +309,7 @@ mod tests {
             next_page: 5,
             content_len: 100,
             history_pos: 2,
+            features: 0,
         };
         for version in [FORMAT_VERSION - 1, 1, 0] {
             let mut older = d.encode();
