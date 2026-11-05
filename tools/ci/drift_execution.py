@@ -212,6 +212,10 @@ def _python_runtime_basis(text):
     controls. Comparing the whole resulting document keeps everything outside
     the provisioning step and interpreter wrapper unchanged.
     """
+    # YAML readers can treat these as line breaks rather than comment text.
+    # Unsupported line boundaries must survive comparison, never be erased.
+    if any(char in text for char in "\x85\u2028\u2029"):
+        return text, False
     setup_pin = "94527f2e458b27549849d47d273a16bec83a01e9"
     version = r"[0-9]+\.[0-9]+\.[0-9]+"
     managed = re.compile(
