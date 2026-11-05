@@ -426,6 +426,108 @@ fn only_retained_positions_can_be_designated_and_a_refusal_changes_nothing() {
     }
 }
 
+/// Commits position 4 past whatever views are already open on the first three commits.
+fn commit_past_open_views(s: &NativeStore) {
+    let d = changes(vec![put_context(
+        "d",
+        Precondition::Absent,
+        b"body of d",
+        None,
+    )]);
+    assert_eq!(committed(s, "d", d), 4);
+}
+
+fn assert_refused(r: &Result<CommitReceipt, CommitError>, what: &str) {
+    assert!(
+        matches!(
+            r,
+            Err(CommitError::Rejected(StorageError::InvalidRequest(_)))
+        ),
+        "{what}: {r:?}"
+    );
+}
+
+#[test]
+fn a_position_newer_than_the_basis_is_refused_and_changes_nothing() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    three_commits(&s);
+    let older = s.begin().unwrap();
+    commit_past_open_views(&s);
+    let before = history(&s);
+    let generation = newest(&sim).generation;
+
+    let r = s.commit(attempt("remove-d"), older, remove_history(&[4]));
+    assert_refused(&r, "position 4 against a basis at position 3");
+
+    assert_eq!(positions(&before), vec![1, 2, 3, 4]);
+    assert_eq!(history(&s), before, "a refused removal changed history");
+    assert_eq!(
+        newest(&sim).generation,
+        generation,
+        "a refused removal published"
+    );
+    assert_eq!(
+        s.outcome(&attempt("remove-d")).unwrap(),
+        AttemptOutcome::Absent,
+        "a refused removal was recorded"
+    );
+}
+
+#[test]
+fn a_position_refused_against_an_older_basis_is_removed_from_a_basis_that_includes_it() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    three_commits(&s);
+    let older = s.begin().unwrap();
+    commit_past_open_views(&s);
+
+    let r = s.commit(attempt("remove-d"), older, remove_history(&[4]));
+    assert_refused(&r, "position 4 against a basis at position 3");
+
+    // The same attempt and request, now from a basis at position 4.
+    let r = commit(&s, "remove-d", remove_history(&[4]));
+    assert_eq!(
+        r,
+        Ok(CommitReceipt {
+            attempt: attempt("remove-d"),
+            position: HistoryPosition(5)
+        }),
+        "position 4 against a basis at position 4"
+    );
+    assert_eq!(positions(&history(&s)), vec![1, 2, 3, 5]);
+}
+
+#[test]
+fn the_basis_latest_position_is_the_newest_a_commit_can_remove() {
+    let sim = SimIo::new();
+    let s = create(&sim);
+    three_commits(&s);
+    let refused = s.begin().unwrap();
+    let accepted = s.begin().unwrap();
+    commit_past_open_views(&s);
+    let before = history(&s);
+
+    let r = s.commit(attempt("remove-c-d"), refused, remove_history(&[3, 4]));
+    assert_refused(&r, "the basis's latest position and the next");
+    assert_eq!(
+        history(&s),
+        before,
+        "a refusal must not remove the position the basis includes"
+    );
+
+    let r = s.commit(attempt("remove-c"), accepted, remove_history(&[3]));
+    assert_eq!(
+        r,
+        Ok(CommitReceipt {
+            attempt: attempt("remove-c"),
+            position: HistoryPosition(5)
+        }),
+        "the basis's latest position, with a newer commit after the basis"
+    );
+    assert_eq!(positions(&history(&s)), vec![1, 2, 4, 5]);
+}
+
 #[test]
 fn a_removed_entry_keeps_no_payload_and_its_space_is_retired() {
     let sim = SimIo::new();

@@ -680,6 +680,8 @@ impl Model {
         let mut seen_ctx = BTreeSet::new();
         let mut seen_rel = BTreeSet::new();
         let mut seen_history = BTreeSet::new();
+        // Without a held view, the request's basis is the latest state.
+        let basis = held.map_or(self.position, |h| h.basis);
         let mut written = Vec::new();
         let check = |expect: &Precondition, cur: Option<u64>| match (expect, cur) {
             (Precondition::Any, _) | (Precondition::Absent, None) => true,
@@ -737,9 +739,10 @@ impl Model {
                     }
                 }
                 Change::RemoveHistory { position } => {
-                    // Only a retained entry can be removed, once per request; removal writes no
-                    // key a read basis can observe.
-                    let retained = self.history.iter().any(|h| h.position == *position);
+                    // Only an entry the basis includes and is still retained can be removed, once
+                    // per request; removal writes no key a read basis can observe.
+                    let retained =
+                        position.0 <= basis && self.history.iter().any(|h| h.position == *position);
                     if !seen_history.insert(*position) || !retained {
                         errs.insert(ErrKind::Rejected);
                     }

@@ -1626,7 +1626,8 @@ impl Inner {
                 "generation counter exhausted".into(),
             )));
         };
-        let removed_history = self.remove_history(&mut txn, &cs, pos, generation)?;
+        let removed_history =
+            self.remove_history(&mut txn, &cs, basis.desc.history_pos, generation)?;
         let (mut retired_content, live_manifests) =
             self.settle_content(&mut txn, &stagings, content_refs, generation)?;
         let removed_features = if removed_history.is_empty() {
@@ -2093,14 +2094,14 @@ impl Inner {
 
     /// Removes the history entries `cs` designates: each entry's key is replaced by a marker that
     /// keeps only the attempt it recorded, and its extent is retired at `generation`. Returns the
-    /// retired extents. An entry that is not retained (never written, already removed, or the
-    /// commit's own at `pos`) rejects the commit; a position named twice was already refused by
-    /// `apply`.
+    /// retired extents. An entry the basis at `basis_pos` does not retain (never written, already
+    /// removed, the commit's own, or newer than the basis) rejects the commit; a position named twice
+    /// was already refused by `apply`.
     fn remove_history(
         &self,
         t: &mut TreeTxn,
         cs: &ChangeSet,
-        pos: u64,
+        basis_pos: u64,
         generation: u64,
     ) -> Result<ExtentList, CommitError> {
         let invalid = |m: String| CommitError::Rejected(StorageError::InvalidRequest(m));
@@ -2110,7 +2111,7 @@ impl Inner {
                 continue;
             };
             let k = history_key(position.0);
-            let retained = if position.0 < pos {
+            let retained = if position.0 <= basis_pos {
                 t.get(&k).map_err(rejected)?
             } else {
                 None
