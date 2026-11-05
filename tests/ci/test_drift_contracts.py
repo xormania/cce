@@ -95,6 +95,66 @@ class ContractTests(unittest.TestCase):
         result = contracts.evaluate(bundle(checks=[{"id": "compile", "status": "fail", "required": True, "executed": True, "source_sha": HEAD}]))
         self.assertEqual(result["violations"][0]["code"], "required_check_failed")
 
+    def test_unaccepted_workflow_is_a_policy_violation_without_execution_claim(self):
+        row = {"id": "producer:trusted-definition", "status": "unknown", "required": True,
+               "executed": None, "source_sha": HEAD, "definition_status": "awaiting_acceptance"}
+        result = contracts.evaluate(bundle(checks=[row]))
+        self.assertEqual([v["code"] for v in result["violations"]],
+                         ["workflow_definition_awaiting_acceptance"])
+        self.assertIn("workflow_definition_awaiting_acceptance", contracts.VIOLATION_CODES)
+
+    def test_policy_marker_does_not_hide_a_separate_executed_failure(self):
+        rows = [
+            {"id": "definition", "status": "unknown", "required": True, "executed": None,
+             "source_sha": HEAD, "definition_status": "awaiting_acceptance"},
+            {"id": "tests", "status": "fail", "required": True, "executed": True, "source_sha": HEAD},
+        ]
+        result = contracts.evaluate(bundle(checks=rows))
+        self.assertEqual(sorted(v["code"] for v in result["violations"]),
+                         ["required_check_failed", "workflow_definition_awaiting_acceptance"])
+
+    def test_policy_marker_does_not_hide_wrong_candidate_identity(self):
+        row = {"id": "definition", "status": "unknown", "required": True, "executed": None,
+               "source_sha": OLD, "definition_status": "awaiting_acceptance"}
+        result = contracts.evaluate(bundle(checks=[row]))
+        codes = [v["code"] for v in result["violations"]]
+        self.assertIn("workflow_definition_awaiting_acceptance", codes)
+        self.assertIn("evidence_candidate_mismatch", codes)
+        self.assertNotIn("required_check_not_executed", codes)
+
+    def test_legacy_execution_rows_retain_their_actual_failure_meaning(self):
+        for status, executed, expected in (("fail", True, ["required_check_failed"]),
+                                           ("unknown", False, ["required_check_not_executed"]),
+                                           ("pass", True, [])):
+            with self.subTest(status=status, executed=executed):
+                row = {"id": "tests", "status": status, "required": True,
+                       "executed": executed, "source_sha": HEAD}
+                self.assertEqual([v["code"] for v in contracts.evaluate(bundle(checks=[row]))["violations"]], expected)
+
+    def test_malformed_policy_marker_is_rejected_without_echoing_values(self):
+        row = {"id": "definition", "status": "unknown", "required": True, "executed": None,
+               "source_sha": HEAD, "definition_status": "awaiting_acceptance"}
+        changes = [{"definition_status": value} for value in
+                   ("untrusted-private-policy-marker", "accepted", None, True, ["awaiting_acceptance"])]
+        changes += [{"executed": True}, {"executed": False}, {"status": "fail"}, {"status": "pass"}]
+        changes.append({"definition_status": None, "executed": False})
+        for changed in changes:
+            with self.subTest(changed=changed):
+                with self.assertRaises(ValueError) as caught:
+                    contracts.evaluate(bundle(checks=[dict(row, **changed)]))
+                self.assertEqual(str(caught.exception), "Invalid normalized evidence")
+
+    def test_policy_violation_subject_and_reason_remain_private(self):
+        marker = "untrusted-private-definition-marker"
+        row = {"id": marker, "status": "unknown", "required": True, "executed": None,
+               "source_sha": HEAD, "definition_status": "awaiting_acceptance", "reason": marker}
+        result = contracts.evaluate(bundle(checks=[row]))
+        public = {"violations": result["violations"], "limitations": result["limitations"]}
+        self.assertEqual([v["code"] for v in result["violations"]],
+                         ["workflow_definition_awaiting_acceptance"])
+        self.assertNotIn(marker, json.dumps(public))
+        self.assertRegex(result["violations"][0]["subject"], r"^[0-9a-f]{24}$")
+
     def test_no_evidence_is_not_a_success_claim(self):
         self.assertEqual(contracts.evaluate(bundle())["limitations"], ["no_evidence"])
 

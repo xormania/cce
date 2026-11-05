@@ -436,6 +436,36 @@ class PublishingTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(posts[-1][2]['conclusion'], 'failure')
 
+    def test_unaccepted_workflow_publishes_a_clear_policy_failure(self):
+        value = control(violations=[{'code': 'workflow_definition_awaiting_acceptance', 'subject': 'f' * 24}])
+        result, posts, root = self.publish_control(value)
+        self.assertEqual(result, 1)
+        self.assertEqual(posts[-1][2]['conclusion'], 'failure')
+        summary = (root / 'public' / 'summary.md').read_text()
+        self.assertIn('Workflow definition awaiting acceptance. Test execution is unverified by this analysis.', summary)
+        self.assertNotIn('required_check_not_executed', summary)
+        self.assertNotIn('required_check_failed', summary)
+
+    def test_execution_failure_does_not_claim_workflow_acceptance_is_pending(self):
+        value = control(violations=[{'code': 'required_check_failed', 'subject': 'f' * 24}])
+        result, posts, root = self.publish_control(value)
+        self.assertEqual(result, 1)
+        self.assertEqual(posts[-1][2]['conclusion'], 'failure')
+        self.assertNotIn('Workflow definition awaiting acceptance.',
+                         (root / 'public' / 'summary.md').read_text())
+
+    def test_policy_summary_does_not_publish_raw_producer_identity_or_reason(self):
+        marker = 'untrusted-private-definition-marker'
+        normalized = {'source': source(), 'checks': [
+            {'id': marker, 'status': 'unknown', 'required': True, 'executed': None,
+             'source_sha': HEAD, 'definition_status': 'awaiting_acceptance', 'reason': marker}]}
+        violations = evaluate(normalized)['violations']
+        _, posts, root = self.publish_control(control(violations=violations))
+        public = json.dumps(posts) + (root / 'public' / 'summary.md').read_text()
+        public += (root / 'public' / 'state.json').read_text()
+        self.assertIn('Workflow definition awaiting acceptance.', public)
+        self.assertNotIn(marker, public)
+
     def test_older_result_cannot_clear_newer_candidate(self):
         result, posts, root = self.publish_control(control(), current=OTHER)
         self.assertEqual(result, 0)
