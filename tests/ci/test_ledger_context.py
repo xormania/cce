@@ -245,6 +245,44 @@ quote = "standing {n}"
         self.assertIn("nothing loaded", text)
         self.assertEqual(set(meta["pending"]), {"A-style", "A1", "W-cache", "Q3"})
 
+    def test_overflow_too_long_to_name_identities_gives_their_count_within_budget(self):
+        ids = ["Q" + str(n).zfill(63) for n in range(200)]
+        rows = "".join(f'\n[[question]]\nid = "{qid}"\nrev = 1\ntitle = "t"\nasked = "a"\n' for qid in ids)
+        text, meta = context.brief(snap("version = 2\n" + rows), None, head="CCE STATE: LOADED test",
+                                   foot="footer", reader="tool read")
+        self.assertEqual(context.DEFAULT_MAX_CHARS, 9000)
+        self.assertLessEqual(len(text), 9000)
+        self.assertLessEqual(len(text.encode()), 9000)
+        self.assertEqual((meta["chars"], meta["bytes"]), (len(text), len(text.encode())))
+        self.assertTrue(meta["fits"])
+        self.assertTrue(text.startswith("CCE STATE: LOADED test\n"))
+        self.assertTrue(text.endswith("footer\n"))
+        self.assertIn("nothing loaded", text)
+        self.assertRegex(text, r"\b200 governing records\b")
+        self.assertIn("tool read inventory", text)
+        # The count stands in for the names; every one stays pending and none is partly shown.
+        self.assertEqual(sorted(meta["pending"]), ids)
+        self.assertNotIn(ids[0], text)
+
+    def test_overflow_that_can_name_identities_keeps_the_footer(self):
+        text, meta = context.brief(snap(), None, head="h" * 500, foot="footer", max_chars=700)
+        self.assertLessEqual(meta["chars"], 700)
+        self.assertIn("nothing loaded", text)
+        for rid in ("A-style", "A1", "W-cache", "Q3"):
+            self.assertIn(rid, text)
+        self.assertTrue(text.endswith("footer\n"))
+
+    def test_header_and_footer_over_budget_are_refused(self):
+        cases = {"header": {"head": "h" * 601, "max_chars": 600},
+                 "footer": {"foot": "f" * 601, "max_chars": 600},
+                 "header and footer together": {"head": "h" * 300, "foot": "f" * 300, "max_chars": 600},
+                 "bytes": {"head": "é" * 400, "max_chars": 1000, "max_bytes": 600}}
+        for name, arguments in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(context.ContextError) as caught:
+                    context.brief(snap(), None, **arguments)
+                self.assertEqual(caught.exception.code, "frame_exceeds_budget")
+
     def test_quote_and_summary_stay_distinct(self):
         s = snap()
         text, _ = context.brief(s, {"objective": "x", "work": ["W-cache"], "origin": "lead"})
@@ -404,6 +442,39 @@ class CommandLineTests(unittest.TestCase):
             self.assertIn("A1", json.loads(changes.stdout)["unknown"])
             outside = self.run_tool("brief", "--root", tmp + "/sub", "--ledger", tmp + "/ledger.toml", cwd=tmp)
             self.assertNotEqual(outside.returncode, 0)
+
+    def unreadable_ledgers(self, tmp):
+        """A missing file, a directory and undecodable bytes: each cannot be read as a ledger."""
+        Path(tmp, "directory.toml").mkdir()
+        Path(tmp, "bytes.toml").write_bytes(b"version = 2\n\xff\xfe\n")
+        return {"missing": tmp + "/missing.toml", "directory": tmp + "/directory.toml", "bytes": tmp + "/bytes.toml"}
+
+    def test_changes_reports_an_unreadable_ledger_as_unavailable(self):
+        held = context.checkpoint(snap())
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "held.json").write_text(json.dumps(held))
+            for name, path in self.unreadable_ledgers(tmp).items():
+                with self.subTest(name):
+                    done = self.run_tool("changes", "--root", tmp, "--ledger", path,
+                                         "--checkpoint", tmp + "/held.json", cwd=tmp)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertNotIn("Traceback", done.stderr)
+                    result = json.loads(done.stdout)
+                    self.assertEqual(result["state"], "unavailable")
+                    self.assertEqual(result["unavailable"], sorted(held["records"]))
+                    self.assertEqual(result["unchanged"], [])
+
+    def test_brief_and_read_of_an_unreadable_ledger_exit_2_with_a_message(self):
+        commands = {"brief": ("brief",), "read": ("read", "A1")}
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, path in self.unreadable_ledgers(tmp).items():
+                for command, words in commands.items():
+                    with self.subTest(ledger=name, command=command):
+                        done = self.run_tool(words[0], "--root", tmp, "--ledger", path, *words[1:], cwd=tmp)
+                        self.assertEqual(done.returncode, 2, done.stderr)
+                        self.assertNotIn("Traceback", done.stderr)
+                        self.assertIn("ledger did not load", done.stderr)
+                        self.assertEqual(done.stdout, "")
 
 
 if __name__ == "__main__":
