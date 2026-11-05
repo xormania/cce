@@ -46,7 +46,9 @@ import re
 import sys
 import tomllib
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if "drift_ledger" not in sys.modules:
+    # Only when the ledger module is not already provided (an in-memory loader registers it first).
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import drift_ledger as ledger  # noqa: E402
 
 # Hook channels commonly cap injected text near 10,000 characters; the default leaves room for framing.
@@ -157,20 +159,31 @@ def _governing(snap, scope):
         if q.get("applies") == ALWAYS:
             for aid in governing_answers(q["id"]):
                 take(aid)
-    for wid in work:
-        answer = records[records[wid]["links"]["answer"]]
-        for qid in answer["links"]["questions"]:
-            for aid in governing_answers(qid):
-                take(aid)
-        take(wid)
+    # Decisions the owner still has to make, and conflicts, come before agent work records.
     for row in snap["view"]["missing"]:
         take(row["question"])
     for row in snap["view"]["conflicts"]:
         for aid in row["answers"]:
             take(aid)
+    seen_work = set()
+    queue = list(work)
+    while queue:
+        wid = queue.pop(0)
+        if wid in seen_work or records.get(wid, {}).get("kind") != "work":
+            continue
+        seen_work.add(wid)
+        answer = records[records[wid]["links"]["answer"]]
+        for qid in answer["links"]["questions"]:
+            for aid in governing_answers(qid):
+                take(aid)
+        take(wid)
+        # A superseded work item brings the work that replaced it.
+        if records[wid]["status"] == "superseded" and records[wid]["links"]["superseded_by"]:
+            queue.append(records[wid]["links"]["superseded_by"])
+    missing = {row["question"] for row in snap["view"]["missing"]}
     for row in snap["view"]["proposals"]:
-        if row["conflicts_with"] or set(row["questions"]) & {
-                q for rid in order if records[rid]["kind"] == "answer" for q in records[rid]["links"]["questions"]}:
+        if row["conflicts_with"] or set(row["questions"]) & (missing | {
+                q for rid in order if records[rid]["kind"] == "answer" for q in records[rid]["links"]["questions"]}):
             take(row["proposal"])
     return order, work, notes
 
@@ -214,8 +227,9 @@ def _full(snap, rid):
             id=rid, qs=", ".join(rec["links"]["questions"]), label=_label(rec), summary=row["summary"],
             forbids=forbids)
     if rec["kind"] == "work":
+        state = row["state"] + (" by " + row["superseded_by"] if row.get("superseded_by") else "")
         return "- {id} ({state}, owner {owner}, under {answer}): {summary}".format(
-            id=rid, state=row["state"], owner=row["owner"], answer=row["answer"], summary=row["summary"])
+            id=rid, state=state, owner=row["owner"], answer=row["answer"], summary=row["summary"])
     if rec["kind"] == "proposal":
         view = next((p for p in snap["view"]["proposals"] if p["proposal"] == rid), None)
         conflict = (" CONFLICTS with deferred " + ", ".join(view["conflicts_with"]) + ": needs an owner decision"
@@ -254,6 +268,9 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
     selection for another snapshot or scope, or a stale one, is ignored and the brief says so.
     """
     max_bytes = max_bytes or max_chars
+    frame = (head.rstrip("\n") + "\n" if head else "") + (foot.rstrip("\n") + "\n" if foot else "")
+    if len(frame) > max_chars or len(frame.encode("utf-8")) > max_bytes:
+        raise ContextError("frame_exceeds_budget", "shorten the header and footer or raise the budget")
     governing, work, notes = _governing(snap, scope)
     candidates = _candidates(snap, governing)
     view = snap["view"]
@@ -340,7 +357,7 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
     # The longest prefix of the governing records that fits with the rest named as NOT LOADED.
     for k in range(len(required), -1, -1):
         full, pending = required[:k], required[k:]
-        if fits(assemble(full, [], pending, len(candidates) if pending else 0)):
+        if fits(assemble(full, [], pending, len(candidates))):
             break
     cards = []
     if not pending:
@@ -360,11 +377,22 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
         more = len(candidates)
     text = assemble(full, cards, pending, more)
     if not fits(text):
-        # Even the frame does not fit: name what is missing instead of cutting text.
-        lines = [head.rstrip("\n")] if head else []
-        lines += ["Context too large for this channel: nothing loaded. Governing records: "
-                  + ", ".join(required) + ". Read them: " + reader + " inventory"]
-        text = "\n".join(lines) + "\n"
+        # Even the frame does not fit: name what is missing instead of cutting text, with the
+        # identities when they fit and only their count and the inventory read when they do not.
+        def overflow(names):
+            lines = [head.rstrip("\n")] if head else []
+            lines.append("Context too large for this channel: nothing loaded. " + str(len(required))
+                         + (" required records" if relevant else " governing records") + (": " + ", ".join(names) if names else "")
+                         + ". Read them: " + reader + " inventory")
+            if foot:
+                lines.append(foot.rstrip("\n"))
+            return "\n".join(lines) + "\n"
+
+        text = overflow(required)
+        if not fits(text):
+            text = overflow([])
+        if not fits(text):
+            raise ContextError("frame_exceeds_budget", "shorten the header and footer or raise the budget")
         pending, more, cards = list(required), len(candidates), []
     chars, nbytes = size(text)
     meta = {"chars": chars, "bytes": nbytes, "tokens_estimate": (nbytes + 3) // 4, "selection": "deterministic",
@@ -444,7 +472,7 @@ def read(snap, refs, cursor=None, max_chars=DEFAULT_PAGE_CHARS, scope=None):
     offset = 0
     if cursor is not None:
         parts = cursor.split(":")
-        if len(parts) != 3 or not parts[2].isdigit():
+        if len(parts) != 3 or not re.fullmatch(r"[0-9]+", parts[2]):
             raise ContextError("invalid_cursor", "read again without a cursor")
         if parts[0] != snap["id"][:16]:
             raise ContextError("snapshot_changed", "the ledger changed since that page; read again without a cursor")
@@ -499,10 +527,23 @@ def changes(snap, held=None, scope=None):
 
 
 def _read_inside(root, path):
-    if not ledger._inside(root, path):
+    """Read ``path`` (relative paths are relative to ``root``) through the canonical path that passed
+    the root check, so a same-named file elsewhere (for example in the current directory) is never read."""
+    full = ledger._inside(root, path)
+    if not full:
         raise SystemExit("path outside --root: " + path)
-    with open(path, encoding="utf-8") as stream:
+    with open(full, encoding="utf-8") as stream:
         return stream.read()
+
+
+def _checkpoint_file(root, path):
+    """A held checkpoint, or None (every record then reads as unknown) when it is absent or unreadable."""
+    if not path:
+        return None
+    try:
+        return json.loads(_read_inside(root, path))
+    except (OSError, UnicodeError, ValueError):
+        return None
 
 
 def main(argv=None):
@@ -526,9 +567,9 @@ def main(argv=None):
     scope = json.loads(_read_inside(root, args.scope)) if args.scope else None
     try:
         snap = snapshot(_read_inside(root, args.ledger))
-    except ledger.LedgerError as error:
+    except (ledger.LedgerError, OSError, UnicodeError) as error:
         if args.command == "changes":
-            held = json.loads(_read_inside(root, args.checkpoint)) if args.checkpoint else None
+            held = _checkpoint_file(root, args.checkpoint)
             print(json.dumps(changes(None, held, scope), indent=1))
             return 0
         print("ledger did not load: " + str(error), file=sys.stderr)
@@ -545,7 +586,7 @@ def main(argv=None):
                 o=page["offset"], e=page["offset"] + len(page["text"]), t=page["total"], s=page["snapshot"][:12],
                 n=("next: --cursor " + page["next"]) if page["next"] else "complete"))
         else:
-            held = json.loads(_read_inside(root, args.checkpoint)) if args.checkpoint else None
+            held = _checkpoint_file(root, args.checkpoint)
             print(json.dumps(changes(snap, held, scope), indent=1))
     except ContextError as error:
         print(error.code + ": " + error.remedy, file=sys.stderr)
