@@ -249,12 +249,12 @@ impl Driver {
             ["stats"] => {
                 let s = self.store()?.stats().map_err(|e| e.to_string())?;
                 self.say(&format!(
-                    "stats height={} pages_written={} page_bytes={} content_bytes={} misses={} evictions={} cache={} pages_reused={} content_reused={} reusable={} pages_read={} pages_read_at_open={} entries_visited={} buffer_bytes={} buffer_peak={}",
+                    "stats height={} pages_written={} page_bytes={} content_bytes={} misses={} evictions={} cache={} pages_reused={} content_reused={} reusable={} pages_read={} pages_read_at_open={} entries_visited={} buffer_bytes={} buffer_peak={} staged_bytes={}",
                     s.tree_height, s.pages_written, s.page_bytes_written, s.content_bytes_written,
                     s.node_cache_misses, s.node_cache_evictions, s.node_cache_capacity,
                     s.pages_reused, s.content_bytes_reused, s.reusable_content_bytes,
                     s.pages_read, s.pages_read_at_open, s.entries_visited,
-                    s.content_buffer_bytes, s.content_buffer_bytes_peak
+                    s.content_buffer_bytes, s.content_buffer_bytes_peak, s.staged_bytes
                 ));
             }
             ["space"] => {
