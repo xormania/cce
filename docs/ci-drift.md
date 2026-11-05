@@ -59,7 +59,7 @@ Execution and acceptance findings are reported separately, each with its remedy:
 | `required_check_failed` | The producer ran and the step failed. | Fix the failure. |
 | `required_execution_unavailable` | No applicable run exists yet. | Wait for or start the run. |
 | `producer_merge_identity_unavailable` | The run happened, but its merge commit cannot be identified (for example the PR conflicts with its base). | Update the branch from its base. |
-| `workflow_definition_awaiting_acceptance` | A workflow definition has not satisfied the acceptance policy; test execution remains unverified by this analysis. | Owner review of this head, or drop the workflow change. |
+| `workflow_definition_awaiting_acceptance` | A workflow definition has not satisfied the acceptance policy; test execution remains unverified by this analysis. | Obtain owner review of this head, or drop the workflow change; align the actual run’s workflow with the accepted definition if the merge commit differs. |
 | `producer_definition_unaccepted` | Collection reason retained for the workflow acceptance finding. | Inspect the workflow acceptance finding. |
 | `unsupported_producer_definition` | The steps cannot be recognized. | Keep the named direct-command steps. |
 
