@@ -313,6 +313,9 @@ store, inspection cannot run against a live owner.
 The structure level checks, for the current publication record:
 
 - both publication slots, reporting what each holds; a valid record in the wrong slot is a finding;
+- the zero padding after every reachable page's payload, after a valid publication record and in an
+  empty slot: writers zero-fill it, and it is outside the checksum, so readers ignore it, but a
+  non-zero byte there is a finding naming the page or slot and the offset;
 - every metadata page reachable from the root decodes and belongs to this store, lies within
   committed metadata, has the incarnation its parent recorded (no newer than the generation), and
   is reached only once; all leaves are at the same depth; every key and separator lies within the

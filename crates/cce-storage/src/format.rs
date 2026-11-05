@@ -77,6 +77,27 @@ pub(crate) fn encode_page(
     Ok(e.buf)
 }
 
+/// Where the zero padding of a stored page begins: after the payload of a node page whose header
+/// claims a payload that fits, or after the record of a publication slot.
+pub(crate) fn padding_start(page: &[u8], slot: bool) -> Option<usize> {
+    if slot {
+        return Some(DESC_LEN);
+    }
+    let len = u32::from_le_bytes(page.get(40..44)?.try_into().ok()?) as usize;
+    (len <= PAGE_PAYLOAD_MAX).then_some(PAGE_HEADER_LEN + len)
+}
+
+/// Offset in `page` of the first non-zero byte of its padding, if any. This build zero-fills the rest
+/// of every page it writes; the padding is outside the checksum, so readers ignore it and only the
+/// integrity check reports a non-zero byte there (as damage or foreign bytes near the page).
+pub(crate) fn first_padding_byte(page: &[u8], slot: bool) -> Option<usize> {
+    let from = padding_start(page, slot)?;
+    page.get(from..)?
+        .iter()
+        .position(|&b| b != 0)
+        .map(|i| from + i)
+}
+
 /// Decodes and validates a node page read from `at`.
 pub(crate) fn decode_page(
     store: StoreId,
@@ -258,6 +279,38 @@ mod tests {
     use super::*;
 
     const S: StoreId = StoreId([7; 16]);
+
+    #[test]
+    fn padding_starts_right_after_the_payload_and_after_the_record() {
+        let at = PageRef {
+            page: 5,
+            incarnation: 3,
+        };
+        // A payload and a record whose last byte is not zero, so the boundary is exact.
+        let mut p = encode_page(S, PageKind::Node, at, b"payload").unwrap();
+        assert_eq!(first_padding_byte(&p, false), None);
+        p[PAGE_HEADER_LEN + 7] = 1;
+        assert_eq!(first_padding_byte(&p, false), Some(PAGE_HEADER_LEN + 7));
+        let full = encode_page(S, PageKind::Node, at, &[9; PAGE_PAYLOAD_MAX]).unwrap();
+        assert_eq!(
+            first_padding_byte(&full, false),
+            None,
+            "a full page has no padding"
+        );
+        let d = Descriptor {
+            store: S,
+            generation: 1,
+            root: at,
+            next_page: 6,
+            content_len: 0,
+            history_pos: 0,
+        };
+        let mut r = d.encode();
+        assert_ne!(r[DESC_LEN - 1], 0, "the record's last byte");
+        assert_eq!(first_padding_byte(&r, true), None);
+        r[DESC_LEN] = 1;
+        assert_eq!(first_padding_byte(&r, true), Some(DESC_LEN));
+    }
 
     #[test]
     fn page_roundtrip_and_rejections() {

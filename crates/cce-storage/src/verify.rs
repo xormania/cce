@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::codec::key_components;
 use crate::engine::{HISTORY_ENTRY_MAX, Inner};
-use crate::format::{Descriptor, FIRST_NODE_PAGE, PageRef, Slot};
+use crate::format::{Descriptor, FIRST_NODE_PAGE, PageRef, Slot, decode_slot, first_padding_byte};
 use crate::records::{
     AttemptValue, ContentEntry, ContextValue, ExtentRef, Manifest, P_ATTEMPT, P_CONTENT, P_CONTEXT,
     P_HISTORY, P_IN, P_OUT, P_REL, P_RETIRED, RelValue, Retired, SEGMENT_MAX, decode_history,
@@ -83,6 +83,17 @@ struct Verifier<'a> {
     extents: Vec<(u64, u64, String)>,
 }
 
+/// Offset of the first non-zero padding byte of a publication slot whose page is `page`, where this
+/// build knows what follows the record: after a valid record of this version, or anywhere in an
+/// empty slot. A later format version may extend its record after this one's, and a damaged record
+/// says nothing about what follows it, so the bytes after either are not checked.
+pub(crate) fn slot_padding(page: &[u8], slot: &Slot) -> Option<usize> {
+    match slot {
+        Slot::Valid(_) | Slot::Empty => first_padding_byte(page, true),
+        Slot::Invalid(_) | Slot::Unsupported(_) => None,
+    }
+}
+
 /// A record's location: its key family and the first 8 bytes of the SHA-256 of its key.
 fn locate(k: &[u8]) -> String {
     let family = match k.first() {
@@ -115,14 +126,32 @@ impl Verifier<'_> {
         });
     }
 
-    /// What each publication slot holds; a valid record in the wrong slot is a finding.
+    /// A finding for a non-zero byte at offset `at` of a page's zero padding.
+    fn padding_finding(&mut self, at: usize, slot: bool, location: String) {
+        let after = if slot { "record" } else { "payload" };
+        self.find(
+            "padding",
+            location,
+            format!("non-zero byte at offset {at} of the zero padding after the {after}"),
+        );
+    }
+
+    /// What each publication slot holds; a valid record in the wrong slot is a finding, and so is a
+    /// non-zero byte after a valid record or in an empty slot. A later format version may extend
+    /// its record after this one's, so the bytes after a record this build cannot read are not
+    /// checked.
     fn slots(&mut self) -> Result<[String; 2], StorageError> {
-        let mut out = [String::new(), String::new()];
-        for (i, s) in self.inner.publication_slots()?.into_iter().enumerate() {
-            out[i] = match s {
+        let mut out = Vec::with_capacity(2);
+        for i in 0..2u64 {
+            let page = self.inner.meta_page(i)?;
+            let slot = decode_slot(&page);
+            if let Some(at) = slot_padding(&page, &slot) {
+                self.padding_finding(at, true, format!("slot {i}"));
+            }
+            out.push(match slot {
                 Slot::Empty => "empty".into(),
                 Slot::Valid(d) => {
-                    if Descriptor::slot(d.generation) != i as u64 {
+                    if Descriptor::slot(d.generation) != i {
                         self.find(
                             "slot",
                             format!("slot {i}"),
@@ -137,9 +166,9 @@ impl Verifier<'_> {
                 }
                 Slot::Invalid(why) => format!("invalid: {why}"),
                 Slot::Unsupported(why) => format!("unsupported: {why}"),
-            };
+            });
         }
-        Ok(out)
+        Ok([out.remove(0), out.remove(0)])
     }
 
     /// Walks the subtree at `at`, whose keys must lie in `[lo, hi)`.
@@ -162,6 +191,14 @@ impl Verifier<'_> {
                 return;
             }
         };
+        match self.inner.meta_page(at.page) {
+            Ok(page) => {
+                if let Some(off) = first_padding_byte(&page, false) {
+                    self.padding_finding(off, false, here.clone());
+                }
+            }
+            Err(e) => self.find("page", here.clone(), e.to_string()),
+        }
         let outside = |k: &[u8]| {
             lo.as_deref().is_some_and(|l| k < l) || hi.as_deref().is_some_and(|h| k >= h)
         };
