@@ -3,7 +3,8 @@
 This describes the bytes the `cce-storage` engine writes today, in the format version of the title,
 which pages and publication records carry as their "format version". It changes with the code; a
 change that alters how existing bytes are read must change the version and either migrate or refuse
-older stores without modifying them.
+older stores without modifying them. A test checks the version and layout lengths stated here
+against the code.
 
 ## Store directory
 
@@ -36,7 +37,14 @@ Node page header (48 bytes), followed by the payload and zero padding:
 
 A page is accepted only if magic, version, checksum, store identity, page number, incarnation and
 kind all match what the referring structure expects. A page written to a reused location by a later
-generation therefore cannot be mistaken for its predecessor.
+generation therefore cannot be mistaken for its predecessor. The checksum is verified before the
+version and reserved byte are interpreted: a page that fails it is reported as damaged, and only an
+intact page with another version, or with its reserved byte set, is reported as unsupported.
+
+Writers zero-fill the page after the payload. The padding is outside the checksum and carries no
+information, so readers ignore it: a page whose header and payload are intact reads even if a byte
+after the payload is not zero. The integrity check reports such a byte as a `padding` finding
+naming the page and the offset, because writers never leave one there.
 
 Node payload (page kind 1), first byte is the node tag:
 
@@ -58,7 +66,7 @@ as it reaches them; trees deeper than 32 levels are rejected as damaged.
 ## Publication records (slots 0 and 1)
 
 Generation `g` is written to slot `g mod 2`, so the previous generation's record is never
-overwritten by the next commit. Record layout (78 bytes, rest of the page zero):
+overwritten by the next commit. Record layout (78 bytes; this build writes zeros after it):
 
 | Field | Size |
 |---|---|
@@ -75,8 +83,11 @@ overwritten by the next commit. Record layout (78 bytes, rest of the page zero):
 
 A record is checked in this order: its checksum (a mismatch makes the slot damaged), its magic, its
 format version, and its required features, a bit set of features a reader must implement to read
-the store. No feature is defined yet and writers set none; a record that requires any feature this
-build does not implement is unsupported, exactly like an unknown format version. Records of earlier
+the store. Bit 0 means a history marker (prefix `09`) may be present: it is set by the first
+publication that removes a history entry and carried by every later publication, maintenance
+included, so a reader that does not know markers refuses the store instead of misreading its
+history. No other bit is defined; a record that requires any feature this build does not
+implement is unsupported, exactly like an unknown format version. Records of earlier
 versions had no required features, so their checksum ends 4 bytes earlier; such an intact record is
 reported as its unsupported version rather than as a damaged slot.
 
@@ -85,6 +96,10 @@ version, the required features and the other fields at the same offsets, and the
 over bytes 0 to 74. Anything a later version adds follows byte 78, with its own check. The bytes after
 the record are not required to be zero, so this build reads such a record's intact first 78 bytes,
 finds a version it does not support, and refuses the store as unsupported rather than as damaged.
+Readers of this version ignore the bytes after a record of this version too, so a damaged byte there
+never makes recovery fall back to the older record. This build always writes zeros after its record,
+and a slot never written is all zeros, so the integrity check reports a non-zero byte after a valid record
+of this version, or anywhere in an empty slot, as a `padding` finding naming the slot.
 
 ## Logical key space
 
@@ -103,8 +118,13 @@ tuple order of the raw components.
 | `07` | content SHA-256 | `01`, extent of the content's manifest, number of records using it (`u64`); or `00`: committed once, no longer retained |
 | `08` | retiring generation (`u64` big-endian), kind `00`, page (`u64` big-endian) | incarnation `u64` of the retired page |
 | `08` | retiring generation (`u64` big-endian), kind `01`, offset (`u64` big-endian) | length `u64` of the retired content extent |
+| `09` | history position (`u64` big-endian) | attempt id the removed entry recorded — marker of a removed history entry |
 
 Retirement keys are fixed-width, not escaped components, so they sort by retiring generation.
+History keys (`05`) and history markers (`09`) are fixed-width too; a position is held by at most
+one of them. Markers have a family of their own rather than a second value form under `05`: a `05`
+value is an extent of fixed length, and a marker holding an attempt id of the same encoded length
+could not be told apart from it.
 
 An extent is `offset: u64, length: u64, sha256: [u8; 32]` into `content.cce`.
 
@@ -129,7 +149,10 @@ refused, and so are key plus value longer than 1800 bytes.
 ## Content
 
 Content is stored as segments of at most 65536 bytes, each written to its own allocation in
-`content.cce`, followed by a manifest:
+`content.cce`, followed by a manifest. A stream has at most 2^20 segments, 64 GiB, by default; a
+staging that would need more is refused. This quota bounds what is written: a manifest is read up
+to the format's own maximum, a `u32` segment count, so content written under a larger quota reads
+back. The manifest:
 
 | Field | Size |
 |---|---|
@@ -149,12 +172,44 @@ again. A record's key plus value is limited to 1800 bytes; larger data belongs i
 
 ## History entries and attempt fingerprints
 
-A history entry is `position: u64`, attempt id, and the canonical request encoding: a version byte
-(1), the changes in submitted order (tagged; identities, preconditions, bodies, content indexes as `u64`), the
-bound content as `(sha256, length)` pairs, and the supplied evidence as `(label, bytes)` pairs.
+A history entry is `position: u64`, attempt id, and the canonical request encoding: a version byte,
+the changes in submitted order (tagged; identities, preconditions, bodies, content indexes as `u64`,
+removed history positions as `u64`), the bound content as `(sha256, length)` pairs, the supplied
+evidence as `(label, bytes)` pairs, and the removal mode byte. Version 2 is written for every
+request that removes no history and version 3 for one that does (only it may hold the history
+removal tag); version 1, which had no removal mode byte, is still read.
 Staging tokens and physical locations are not part of it. Every content index must refer to a
 binding of the same request; a request with an out-of-range index is rejected before it is
 fingerprinted. History entries return the bound content references with the changes.
+
+### Removed history
+
+A commit can remove the retained history entry at a position the host names. In the state it
+publishes, that position's `05` key is gone and a `09` marker holds only the attempt id the entry
+recorded; the entry's extent is retired at the commit's generation and is reused under the same
+rules as any retired extent. Positions are not renumbered. The attempt's `06` record is kept
+unchanged, so its position and fingerprint still answer a retry with the original receipt; neither
+holds any of the entry's changes, evidence or content references. History entries never keep
+content in use (a content entry counts current records only), so removing history retires no
+content.
+
+A store's limits (the encoded request limit and the segment quota) bound what an open writes, not
+what it reads: data written under larger limits reads back under smaller ones. The encoded request
+limit is 64 MiB by default and callers set it through `StoreOptions::max_request_len`; a request over
+it is refused whole and never split across history entries. The staging budget
+(`StoreOptions::max_staged_bytes`) bounds the content outstanding in stagings at once, likewise only
+for new writes (see the failure model). Reads are bounded by the format itself.
+The format's hard limits are separate from these write limits and change only with the format
+version. When a history entry or content manifest is read, its recorded length is checked against
+the largest the format can hold (a `u32`-prefixed request; a `u32` segment count) and against the
+committed content before anything is allocated or read, and decoders never reserve more elements
+than the remaining input can hold.
+
+Before an extent's digest is verified, at most one 65536-byte chunk of it is held: an extent longer
+than that is first read through one reused chunk buffer and hashed, and nothing from that pass is
+kept or interpreted. A verified history entry or manifest is then held whole, so its size is bounded
+by what was actually written: within committed content and the format maximum. The verification
+chunk and the 65536-byte segment limit are separate bounds that happen to be equal today.
 
 The attempt fingerprint is SHA-256 over `"cce.attempt.v1\0"`, the attempt id (length-prefixed),
 and that canonical encoding. Retrying an attempt with an identical logical request returns the

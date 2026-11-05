@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes the fuzzing harness (`fuzz_api`) and the storage simulator it uses. For the fuzz targets
+# in `fuzz/`; not part of the storage API.
+fuzz-api = []
+
 [dependencies]
 cce-core = { path = "../cce-core" }
 crc32fast = "1"
@@ -15,9 +20,18 @@ sha2 = "0.11"
 name = "storage-driver"
 path = "src/bin/storage-driver.rs"
 
+# Structure check of a store: see the binary's documentation for its output and exit status.
+[[bin]]
+name = "cce-verify"
+path = "src/bin/cce-verify.rs"
+
 [lints]
 workspace = true
 
 [dev-dependencies]
+proptest = "1"
+proptest-state-machine = "0.9"
 serde_json = "1"
 sha2 = "0.11"
+# Parses sources in the architecture checks.
+syn = { version = "2", default-features = false, features = ["full", "parsing", "visit", "printing"] }

@@ -14,7 +14,7 @@ use crate::engine::{Inner, Options};
 use crate::format::StoreId;
 use crate::records::Manifest;
 use crate::sim::SimIo;
-use crate::test_support::{changes, cid, create_on, open_on, put_context};
+use crate::test_support::{SETTLE_ROUNDS_BOUND, changes, cid, create_on, open_on, put_context};
 use crate::{MaintenanceBudget, MaintenanceTask, NativeStore};
 
 const STORE: StoreId = StoreId(*b"maintenance-test");
@@ -181,6 +181,28 @@ fn leaked(payload: usize, discard: bool) -> (SimIo, NativeStore, u64) {
 /// The published state's audit: reachable structures are disjoint, nothing is retired twice, and no
 /// retired extent overlaps a reachable one.
 fn audit(sim: &SimIo) {
+    assert_eq!(findings(sim), Vec::<String>::new(), "integrity check");
+    audit_physical(sim);
+}
+
+/// Every finding of the public integrity check, reading every content stream, as `check: detail`,
+/// sorted. Runs on a copy, so the store may stay open.
+fn findings(sim: &SimIo) -> Vec<String> {
+    let copy = Inner::open_read_only(Box::new(sim.after_process_exit()), Options::default())
+        .unwrap_or_else(|e| panic!("a read-only copy of the store must open: {e:?}"));
+    let report = crate::verify::run(&copy, crate::VerifyLevel::Scrub)
+        .unwrap_or_else(|e| panic!("the integrity check must run to completion: {e:?}"));
+    let mut found: Vec<String> = report
+        .findings
+        .iter()
+        .map(|f| format!("{}: {}", f.check, f.detail))
+        .collect();
+    found.sort();
+    found
+}
+
+/// The engine's own physical invariants, which the integrity check does not state the same way.
+fn audit_physical(sim: &SimIo) {
     assert_eq!(
         crate::audit::check_retirement(sim),
         Ok(()),
@@ -304,6 +326,46 @@ fn reclaiming_on_a_store_without_holes_does_nothing() {
     assert_eq!(r.content_bytes_reclaimed, 0);
     assert!(r.complete);
     assert_eq!(r.generation, generation, "nothing to do publishes nothing");
+}
+
+#[test]
+fn a_damaged_manifest_of_a_pending_staging_stops_hole_reclaim() {
+    use crate::io::{FileId, Io};
+    let sim = SimIo::new();
+    let s = create(&sim);
+    let pending: Vec<u8> = (0..90_000u32).map(|i| (i % 227) as u8).collect();
+    let staged = s.stage_content(&mut &pending[..]).unwrap();
+    commit(
+        &s,
+        "cover",
+        ChangeSet {
+            changes: vec![put("B", "b", None)],
+            ..ChangeSet::default()
+        },
+    );
+    // The staging's manifest comes first in its extents. Its last byte belongs to the last
+    // segment's digest, so the damaged manifest still decodes; only its own digest exposes it.
+    let (offset, len) = s.inner.staged_extents_for_test(&staged).unwrap()[0];
+    let mut last = [0u8; 1];
+    sim.read_at(FileId::Content, offset + len - 1, &mut last)
+        .unwrap();
+    sim.write_at(FileId::Content, offset + len - 1, &[last[0] ^ 0x5a])
+        .unwrap();
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let r = s.maintain(
+        MaintenanceTask::ReclaimContentHoles,
+        MaintenanceBudget::default(),
+    );
+    assert!(
+        matches!(&r, Err(cce_core::storage::CommitError::Rejected(StorageError::Integrity(m)))
+            if m.contains(&format!("{offset}"))),
+        "a damaged staged manifest must stop the step as damage naming it: {r:?}"
+    );
+    assert_eq!(
+        s.inner.snapshot().unwrap().desc.generation,
+        generation,
+        "the refused step published"
+    );
 }
 
 #[test]
@@ -523,6 +585,14 @@ fn rebuilding_the_relationship_indexes_restores_the_submitted_edges_only_when_as
         (out.clone(), inc.clone())
     );
     damage(&s);
+    // The integrity check reports both: r1 has no incoming entry, and C's entry has no record.
+    assert_eq!(
+        findings(&sim),
+        [
+            "relationship-index: no incoming index entry",
+            "relationship-index: no matching relationship record",
+        ]
+    );
     // The damage shows through the port: r1 is missing from B's incoming listing, and listing C's
     // outgoing relationships fails on the entry without a record.
     let mut v = s.begin().unwrap();
@@ -1944,6 +2014,13 @@ fn relocation_moves_tree_pages_into_lower_retired_pages_and_changes_no_record() 
         .unwrap();
     let (after, e) = tree_pages(&sim);
     assert!(r.pages_moved > 0, "no page moved");
+    // This instance published only the relocation, so its settle rounds are the step's.
+    let rounds = s.inner.allocation_rounds_max();
+    assert!(
+        (1..=SETTLE_ROUNDS_BOUND).contains(&rounds),
+        "relocation took {rounds} rounds to settle its page allocation \
+         (expected 1 to {SETTLE_ROUNDS_BOUND})"
+    );
     assert!(
         after.last() < pages.last(),
         "the highest tree page did not move down: {:?} -> {:?}",
@@ -1960,6 +2037,105 @@ fn relocation_moves_tree_pages_into_lower_retired_pages_and_changes_no_record() 
     drop(s);
     let s = open(&sim);
     assert_eq!(logical(&s), before, "the move did not survive reopening");
+}
+
+#[test]
+fn maintenance_carries_history_markers_and_never_reaches_a_removed_entry_again() {
+    use crate::format::FEATURE_HISTORY_MARKERS;
+    use cce_core::storage::{AttemptOutcome, CommitReceipt};
+    let sim = scattered();
+    let s = open(&sim);
+    // The scattered fixture's commits are at positions 1 ("many") to 4 ("four"); remove two.
+    commit(
+        &s,
+        "forget",
+        ChangeSet {
+            changes: [2, 3]
+                .map(|p| Change::RemoveHistory {
+                    position: HistoryPosition(p),
+                })
+                .into(),
+            ..ChangeSet::default()
+        },
+    );
+    let state = |sim: &SimIo| {
+        let d = crate::audit::published(sim).unwrap().pop().unwrap();
+        let r = crate::audit::reach(sim, &d)
+            .unwrap_or_else(|e| panic!("the published state must decode: {e:?}"));
+        (d.features, r.removed_history, r.history_extents)
+    };
+    let outcomes = |s: &NativeStore| {
+        ["many", "rewrite", "three", "four", "forget"].map(|a| {
+            s.outcome(&crate::test_support::attempt(a))
+                .unwrap_or_else(|e| panic!("outcome of {a} must be known: {e:?}"))
+        })
+    };
+    let before = logical(&s);
+    assert_eq!(
+        before
+            .history
+            .iter()
+            .map(|h| h.position.0)
+            .collect::<Vec<_>>(),
+        vec![1, 4, 5],
+        "the fixture's removal"
+    );
+    let (features, markers, _) = state(&sim);
+    assert_eq!(features & FEATURE_HISTORY_MARKERS, FEATURE_HISTORY_MARKERS);
+    assert_eq!(markers.keys().copied().collect::<Vec<_>>(), vec![2, 3]);
+    let receipts = outcomes(&s);
+    assert_eq!(
+        receipts[1],
+        AttemptOutcome::Committed(CommitReceipt {
+            attempt: crate::test_support::attempt("rewrite"),
+            position: HistoryPosition(2)
+        })
+    );
+    let mut moved = 0;
+    for task in [
+        MaintenanceTask::Relocate,
+        MaintenanceTask::RebuildRelationshipIndexes,
+        MaintenanceTask::ReclaimContentHoles,
+    ] {
+        let r = s
+            .maintain(task, MaintenanceBudget::default())
+            .unwrap_or_else(|e| panic!("{task:?} must succeed: {e:?}"));
+        moved += r.pages_moved;
+        let (f, m, extents) = state(&sim);
+        assert_eq!(
+            f & FEATURE_HISTORY_MARKERS,
+            FEATURE_HISTORY_MARKERS,
+            "{task:?} dropped the history marker feature"
+        );
+        assert_eq!(m, markers, "{task:?} changed the history markers");
+        // Relocation may move retained entries; it never brings a removed one back.
+        assert_eq!(
+            extents.len(),
+            before.history.len(),
+            "{task:?}: the state reaches one extent per retained entry"
+        );
+        assert_eq!(
+            logical(&s),
+            before,
+            "{task:?} changed logical state or history"
+        );
+        assert_eq!(
+            outcomes(&s),
+            receipts,
+            "{task:?} changed an attempt's outcome"
+        );
+        audit(&sim);
+    }
+    assert!(
+        moved > 0,
+        "relocation moved nothing: the test exercised no move"
+    );
+    let s = open(&{
+        drop(s);
+        sim
+    });
+    assert_eq!(logical(&s), before, "after reopening");
+    assert_eq!(outcomes(&s), receipts, "after reopening");
 }
 
 #[test]
@@ -2244,6 +2420,7 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
     let (mut checked, mut cases) = (0, 0);
     for (name, image, task, budget, partial) in SWEEPS {
         let base = image();
+        let before_findings = findings(&base);
         // The uncut step: what it changes, and how many mutating operations it makes.
         let probe = base.after_process_exit();
         let trace = Arc::new(Mutex::new(Vec::new()));
@@ -2302,11 +2479,22 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
                 let pristine = img.after_process_exit();
                 with_repro(&label, &[("image", &pristine)], &trace, || {
                     let recovered = open(&img);
-                    audit(&img);
+                    audit_physical(&img);
                     let got = logical(&recovered);
                     assert!(
                         got == before || got == after,
                         "{label}: a state between the two"
+                    );
+                    // The integrity check sees what the state holds: the damage the step repairs
+                    // (index rebuild) until it is published, nothing after.
+                    assert_eq!(
+                        findings(&img),
+                        if got == before {
+                            before_findings.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        "{label}: integrity check"
                     );
                     let published = recovered.inner.snapshot().unwrap().desc.generation;
                     assert!(published <= r.generation, "{label}: published {published}");
@@ -2538,4 +2726,63 @@ fn a_fenced_store_refuses_maintenance_and_writes_nothing() {
         assert_eq!(sim.ops(), ops, "{name}: maintenance wrote while fenced");
         assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
     }
+}
+
+/// A store over `sim` whose reads are tallied per file.
+fn tallied(sim: &SimIo) -> (NativeStore, std::sync::Arc<std::sync::Mutex<FileReads>>) {
+    let reads = std::sync::Arc::new(std::sync::Mutex::new(FileReads::default()));
+    let s = NativeStore {
+        inner: Inner::open(
+            Box::new(Sizes {
+                sim: sim.clone(),
+                largest: Default::default(),
+                reads: reads.clone(),
+            }),
+            Options::default(),
+        )
+        .unwrap(),
+    };
+    (s, reads)
+}
+
+#[test]
+fn reclaiming_holes_counts_every_metadata_page_it_reads() {
+    let (sim, s, _) = leaked(100_000, false);
+    drop(s);
+    sim.release();
+    let (s, reads) = tallied(&sim);
+    let pages_before = s.stats().unwrap().pages_read;
+    let meta_before = reads.lock().unwrap()[0].1;
+    let r = s
+        .maintain(
+            MaintenanceTask::ReclaimContentHoles,
+            MaintenanceBudget::default(),
+        )
+        .unwrap();
+    assert!(r.content_bytes_reclaimed > 0, "nothing was reclaimed");
+    let pages = s.stats().unwrap().pages_read - pages_before;
+    let meta = reads.lock().unwrap()[0].1 - meta_before;
+    assert_eq!(
+        pages * crate::format::PAGE_SIZE as u64,
+        meta,
+        "pages_read must count every metadata page read from the file"
+    );
+}
+
+#[test]
+fn relocation_counts_its_copy_buffer_as_held_content_buffer() {
+    let sim = fragmented();
+    let (s, _) = tallied(&sim);
+    assert_eq!(s.stats().unwrap().content_buffer_bytes_peak, 0);
+    let r = s
+        .maintain(MaintenanceTask::Relocate, MaintenanceBudget::default())
+        .unwrap();
+    assert!(r.content_bytes_moved > 0, "nothing moved");
+    let st = s.stats().unwrap();
+    assert_eq!(
+        st.content_buffer_bytes_peak,
+        crate::engine::CONTENT_CHUNK as u64,
+        "the copy holds one segment at a time"
+    );
+    assert_eq!(st.content_buffer_bytes, 0, "the copy released its buffer");
 }

@@ -284,7 +284,7 @@ fn a_history_extent_outside_committed_content_is_rejected_before_reading() {
         len: 1 << 20,
         digest: [0; 32],
     };
-    let err = s.inner.read_extent(&bogus).unwrap_err();
+    let err = s.inner.read_extent(&bogus, u64::MAX, "extent").unwrap_err();
     assert!(
         format!("{err:?}").contains("outside committed content"),
         "{err:?}"
@@ -295,8 +295,13 @@ fn a_history_extent_outside_committed_content_is_rejected_before_reading() {
         digest: [0; 32],
     };
     assert!(
-        format!("{:?}", s.inner.read_extent(&overflow).unwrap_err())
-            .contains("outside committed content")
+        format!(
+            "{:?}",
+            s.inner
+                .read_extent(&overflow, u64::MAX, "extent")
+                .unwrap_err()
+        )
+        .contains("outside committed content")
     );
 }
 
@@ -449,7 +454,8 @@ fn a_store_in_an_older_format_version_is_refused_without_modification() {
         .unwrap();
         drop(s);
         // Both publication records rewritten as the older version, as an older engine left them.
-        // Record layout: magic 4 + version 2 + store 16 + six u64 fields = 70 bytes, then CRC-32.
+        // They use the earlier 74-byte layout (before required features): magic 4 + version 2 +
+        // store 16 + six u64 fields = 70 bytes, then CRC-32.
         for slot in [0, PAGE_SIZE as u64] {
             let mut rec = vec![0; 74];
             sim.read_at(FileId::Meta, slot, &mut rec).unwrap();
@@ -578,8 +584,8 @@ fn history_position_exhaustion_is_rejected_without_wrapping() {
 
 #[test]
 fn an_oversized_manifest_reference_is_refused_before_allocation() {
-    // A small segment quota keeps the largest valid manifest small, so a crafted reference only a
-    // little beyond it (backed by real bytes, within committed content) shows the size bound.
+    // A crafted, checksum-valid content record points at a manifest one byte longer than the
+    // largest the format can hold. The open's own segment quota bounds staging only.
     let opts = crate::engine::Options {
         max_content_segments: 4,
         ..Default::default()
@@ -594,14 +600,14 @@ fn an_oversized_manifest_reference_is_refused_before_allocation() {
     };
     commit(&s, "x", cs).unwrap();
     let cur = s.inner.snapshot().unwrap().desc;
-    // Crafted metadata: the content record points at a manifest far larger than any valid one.
+    // Crafted metadata: the content record points at a manifest larger than any valid one.
     let filler = vec![7u8; 1 << 20];
     sim.write_at(FileId::Content, cur.content_len, &filler)
         .unwrap();
     sim.sync(FileId::Content).unwrap();
     let huge = ExtentRef {
         offset: 0,
-        len: filler.len() as u64,
+        len: crate::records::Manifest::encoded_len(u32::MAX as usize) + 1,
         digest: [0; 32],
     };
     let mut t = TreeTxn::new(&*s.inner, cur.root);
@@ -632,7 +638,8 @@ fn an_oversized_manifest_reference_is_refused_before_allocation() {
     }
     let mut sink = Sink(&sim, cur.next_page, cur.generation + 1);
     let root = t.finish(&mut sink).unwrap();
-    // Enough committed content that the bounds check alone would not stop the read.
+    // The size check runs before the committed-content bounds and before any allocation, so the
+    // refusal names the limit.
     let d = Descriptor {
         generation: cur.generation + 1,
         root,
@@ -1016,6 +1023,90 @@ fn a_request_whose_fields_fit_but_whose_whole_encoding_does_not_is_refused() {
     assert_eq!(commit(&s, "one", with_evidence(1)).unwrap(), 1);
 }
 
+/// A request whose encoding is a little over 64 MiB: one evidence item of 64 MiB.
+fn over_64_mib() -> ChangeSet {
+    ChangeSet {
+        changes: vec![put("E", Precondition::Any, b"e", None)],
+        evidence: vec![cce_core::storage::Evidence {
+            label: b"large".to_vec(),
+            bytes: vec![5; 64 << 20],
+        }],
+        ..ChangeSet::default()
+    }
+}
+
+#[test]
+fn the_default_write_limit_refuses_an_encoded_request_over_64_mib_whole() {
+    assert_eq!(crate::StoreOptions::default().max_request_len, 64 << 20);
+    let s = store();
+    let r = commit(&s, "large", over_64_mib());
+    assert!(
+        matches!(&r, Err(CommitError::Rejected(StorageError::InvalidRequest(m))) if m.starts_with("encoded request")),
+        "{r:?}"
+    );
+    // Nothing of it was committed: a request is never split.
+    assert!(revision(&s, "E").is_none());
+    assert_eq!(
+        s.begin()
+            .unwrap()
+            .history(cce_core::storage::HistoryPosition(0))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn a_request_written_under_a_raised_limit_reads_back_under_the_default() {
+    use crate::engine::Options;
+    let sim = SimIo::new();
+    let raised = crate::StoreOptions {
+        max_request_len: 80 << 20,
+        ..crate::StoreOptions::default()
+    };
+    let s = NativeStore {
+        inner: Inner::create(
+            Box::new(sim.clone()),
+            StoreId([4; 16]),
+            Options::from(raised),
+        )
+        .unwrap(),
+    };
+    assert_eq!(commit(&s, "large", over_64_mib()).unwrap(), 1);
+    drop(s);
+    sim.release();
+    // Lowering the limit bounds what the store writes, never what it reads.
+    let s = NativeStore {
+        inner: Inner::open(
+            Box::new(sim.clone()),
+            Options::from(crate::StoreOptions::default()),
+        )
+        .unwrap_or_else(|e| {
+            panic!("a store with a larger request must open under the default: {e:?}")
+        }),
+    };
+    let mut v = s.begin().unwrap();
+    let entry = v
+        .history(cce_core::storage::HistoryPosition(0))
+        .unwrap_or_else(|e| panic!("history must list under the default limit: {e:?}"))
+        .next()
+        .unwrap_or_else(|| panic!("the committed request must be in history"))
+        .unwrap_or_else(|e| panic!("a request over the default limit must read back: {e:?}"));
+    assert!(
+        entry.evidence[0].bytes == vec![5; 64 << 20],
+        "the evidence read back differs"
+    );
+    assert!(revision(&s, "E").is_some());
+    assert!(
+        crate::verify::run(&s.inner, crate::VerifyLevel::Scrub)
+            .unwrap()
+            .is_consistent(),
+        "a store written under a raised limit is reported inconsistent"
+    );
+    // The default still refuses a new request of that size.
+    assert!(commit(&s, "again", over_64_mib()).is_err());
+}
+
 #[test]
 fn the_computed_request_length_matches_the_encoding_for_every_change_shape() {
     use crate::records::{encode_request, encoded_request_len};
@@ -1030,6 +1121,90 @@ fn the_computed_request_length_matches_the_encoding_for_every_change_shape() {
         Precondition::Absent,
         Precondition::AtRevision(Revision(u64::MAX)),
     ];
+    // Lengths worked out from the layout, independently of either function: version 1, change
+    // count 4, per change a tag 1 and its fields (each identifier, body or kind 4 + its bytes; a
+    // precondition 1, or 9 with a revision; a content index 1, or 9 when present), content count 4
+    // and per binding 32 + 8, evidence count 4 and per item label and bytes as fields, removal
+    // mode 1. An empty request is 1 + 4 + 4 + 4 + 1 = 14 bytes.
+    let one = |c: Change| ChangeSet {
+        changes: vec![c],
+        ..ChangeSet::default()
+    };
+    let worked = [
+        (ChangeSet::default(), 14),
+        (
+            one(Change::PutContext {
+                id: id(1),
+                expect: Precondition::Any,
+                body: vec![1],
+                content: None,
+            }),
+            14 + 1 + 5 + 1 + 5 + 1,
+        ),
+        (
+            one(Change::PutContext {
+                id: id(1),
+                expect: Precondition::AtRevision(Revision(3)),
+                body: vec![1],
+                content: Some(0),
+            }),
+            14 + 1 + 5 + 9 + 5 + 9,
+        ),
+        (
+            one(Change::RemoveContext {
+                id: id(1),
+                expect: Precondition::Absent,
+            }),
+            14 + 1 + 5 + 1,
+        ),
+        (
+            one(Change::PutRelationship {
+                id: rid(1),
+                expect: Precondition::Any,
+                kind: kind.clone(),
+                source: id(1),
+                target: id(1),
+            }),
+            14 + 1 + 5 + 1 + 5 + 5 + 5,
+        ),
+        (
+            one(Change::RemoveRelationship {
+                id: rid(1),
+                expect: Precondition::AtRevision(Revision(3)),
+            }),
+            14 + 1 + 5 + 9,
+        ),
+        (
+            ChangeSet {
+                content: vec![ContentBinding {
+                    token: StagingToken(vec![1]),
+                    content: ContentRef {
+                        digest: ContentDigest([1; 32]),
+                        len: 1,
+                    },
+                }],
+                ..ChangeSet::default()
+            },
+            14 + 32 + 8,
+        ),
+        (
+            ChangeSet {
+                evidence: vec![Evidence {
+                    label: vec![2],
+                    bytes: vec![3],
+                }],
+                ..ChangeSet::default()
+            },
+            14 + 5 + 5,
+        ),
+    ];
+    for (cs, len) in &worked {
+        assert_eq!(
+            encoded_request_len(cs),
+            *len,
+            "the computed length must follow the request layout: {cs:?}"
+        );
+    }
     let mut checked = 0;
     for p in &preconditions {
         for content in [None, Some(0), Some(usize::MAX)] {

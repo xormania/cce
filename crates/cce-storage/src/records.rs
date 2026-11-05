@@ -10,7 +10,9 @@
 //! | `0x04` | target, kind, source, relationship id    | empty (incoming index)    |
 //! | `0x05` | history position (u64 big-endian)        | [`ExtentRef`] of entry    |
 //! | `0x06` | attempt id                               | [`AttemptValue`]          |
-//! | `0x07` | content digest                           | [`ExtentRef`] of its [`Manifest`] |
+//! | `0x07` | content digest                           | [`ContentEntry`]: its [`Manifest`] extent and users, or no longer retained |
+//! | `0x08` | retiring generation, kind, page or offset (fixed width) | retired page's incarnation or extent's length |
+//! | `0x09` | history position (u64 big-endian)        | attempt id of the removed entry (marker) |
 //!
 //! Components use the order-preserving encoding in `codec::key_component`.
 
@@ -32,6 +34,9 @@ pub(crate) const P_ATTEMPT: u8 = 0x06;
 pub(crate) const P_CONTENT: u8 = 0x07;
 /// Retirement records: space a published generation no longer reaches.
 pub(crate) const P_RETIRED: u8 = 0x08;
+/// Markers of removed history entries, by position. The value is the attempt id the entry
+/// recorded; nothing else of the entry is kept.
+pub(crate) const P_HISTORY_REMOVED: u8 = 0x09;
 
 /// Kind byte of a retired metadata page in a retirement key.
 pub(crate) const RETIRED_PAGE: u8 = 0;
@@ -39,9 +44,12 @@ pub(crate) const RETIRED_PAGE: u8 = 0;
 pub(crate) const RETIRED_EXTENT: u8 = 1;
 
 /// Version tags of the canonical request encoding used for attempt fingerprints. Version 2 ends
-/// with the removal mode; version 1 (no mode, read as preserving views) is still decoded.
+/// with the removal mode; version 1 (no mode, read as preserving views) is still decoded. Version
+/// 3 is version 2 with history removal changes; a request with none is still written as version
+/// 2, so its fingerprint and encoding do not change.
 const REQUEST_ENCODING_V1: u8 = 1;
 const REQUEST_ENCODING_V2: u8 = 2;
+const REQUEST_ENCODING_V3: u8 = 3;
 
 pub(crate) fn key(prefix: u8, parts: &[&[u8]]) -> Vec<u8> {
     let mut k = vec![prefix];
@@ -118,6 +126,13 @@ pub(crate) fn retired_extent_key(generation: u64, offset: u64) -> Vec<u8> {
 
 pub(crate) fn history_key(pos: u64) -> Vec<u8> {
     let mut k = vec![P_HISTORY];
+    k.extend_from_slice(&pos.to_be_bytes());
+    k
+}
+
+/// Key of the marker left by removing the history entry at `pos`.
+pub(crate) fn removed_history_key(pos: u64) -> Vec<u8> {
+    let mut k = vec![P_HISTORY_REMOVED];
     k.extend_from_slice(&pos.to_be_bytes());
     k
 }
@@ -328,7 +343,15 @@ fn dec_id<T>(d: &mut Dec, f: fn(Vec<u8>) -> Result<T, StorageError>) -> Result<T
 /// logical request restaged elsewhere has the same encoding.
 pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
     let mut e = Enc::default();
-    e.u8(REQUEST_ENCODING_V2);
+    let removes_history = changes
+        .changes
+        .iter()
+        .any(|c| matches!(c, Change::RemoveHistory { .. }));
+    e.u8(if removes_history {
+        REQUEST_ENCODING_V3
+    } else {
+        REQUEST_ENCODING_V2
+    });
     e.u32(changes.changes.len() as u32);
     for c in &changes.changes {
         match c {
@@ -367,6 +390,10 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
                 e.u8(4).bytes(id.as_bytes());
                 enc_expect(&mut e, expect);
             }
+            Change::RemoveHistory { position } => {
+                e.u8(5).u64(position.0);
+            }
+            _ => unreachable!("check_request_bounds refuses unknown changes before encoding"),
         }
     }
     e.u32(changes.content.len() as u32);
@@ -381,11 +408,12 @@ pub(crate) fn encode_request(changes: &ChangeSet) -> Vec<u8> {
         RemovalMode::PreserveViews => 0,
         RemovalMode::RequireQuiescence => 1,
     });
-    debug_assert_eq!(e.buf.len() as u64, encoded_request_len(changes));
+    // The request limit is checked against `encoded_request_len`: it must be exact.
+    assert_eq!(e.buf.len() as u64, encoded_request_len(changes));
     e.buf
 }
 
-/// Exact length of `encode_request(changes)`, computed without encoding (checked in debug builds).
+/// Exact length of `encode_request(changes)`, computed without encoding (checked by every encoding).
 pub(crate) fn encoded_request_len(changes: &ChangeSet) -> u64 {
     let field = |len: usize| 4 + len as u64;
     let expect = |p: &Precondition| match p {
@@ -421,6 +449,8 @@ pub(crate) fn encoded_request_len(changes: &ChangeSet) -> u64 {
                     + field(target.as_bytes().len())
             }
             Change::RemoveRelationship { id, expect: p } => field(id.as_bytes().len()) + expect(p),
+            Change::RemoveHistory { .. } => 8,
+            _ => unreachable!("check_request_bounds refuses unknown changes before encoding"),
         };
     }
     n += 4 + changes.content.len() as u64 * (32 + 8);
@@ -438,6 +468,21 @@ pub(crate) fn check_request_bounds(
     limit: u64,
     total_limit: u64,
 ) -> Result<(), StorageError> {
+    // A kind of change this build does not know cannot be encoded; refuse it first.
+    if let Some(c) = changes.changes.iter().find(|c| {
+        !matches!(
+            c,
+            Change::PutContext { .. }
+                | Change::RemoveContext { .. }
+                | Change::PutRelationship { .. }
+                | Change::RemoveRelationship { .. }
+                | Change::RemoveHistory { .. }
+        )
+    }) {
+        return Err(StorageError::InvalidRequest(format!(
+            "unsupported change {c:?}"
+        )));
+    }
     let limit = limit.min(u32::MAX as u64);
     let total_limit = total_limit.min(u32::MAX as u64);
     let check = |what: &str, len: usize| {
@@ -473,12 +518,29 @@ pub(crate) fn check_request_bounds(
 
 /// Fingerprint binding an attempt identity to its exact logical request.
 pub(crate) fn fingerprint(attempt: &AttemptId, changes: &ChangeSet) -> [u8; 32] {
+    fingerprint_encoded(attempt, &encode_request(changes))
+}
+
+/// The fingerprint of an attempt and its request as encoded.
+fn fingerprint_encoded(attempt: &AttemptId, request: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"cce.attempt.v1\0");
     h.update((attempt.as_bytes().len() as u32).to_le_bytes());
     h.update(attempt.as_bytes());
-    h.update(encode_request(changes));
+    h.update(request);
     h.finalize().into()
+}
+
+/// The attempt of a stored history entry and the fingerprint of its request bytes exactly as
+/// stored, whatever their encoding version: what its commit recorded.
+pub(crate) fn stored_fingerprint(b: &[u8]) -> Result<(AttemptId, [u8; 32]), StorageError> {
+    let mut d = Dec::new(b, "history entry");
+    d.u64()?;
+    let attempt = dec_id(&mut d, AttemptId::new)?;
+    let request = d.bytes()?;
+    d.finish()?;
+    let fp = fingerprint_encoded(&attempt, request);
+    Ok((attempt, fp))
 }
 
 /// Encodes a retained history entry (stored as a content extent).
@@ -498,11 +560,14 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
     d.finish()?;
     let mut d = Dec::new(req, "history request");
     let version = d.u8()?;
-    if version != REQUEST_ENCODING_V1 && version != REQUEST_ENCODING_V2 {
+    if !matches!(
+        version,
+        REQUEST_ENCODING_V1 | REQUEST_ENCODING_V2 | REQUEST_ENCODING_V3
+    ) {
         return Err(StorageError::Unsupported("history request encoding".into()));
     }
     let n = d.count(2)?;
-    let mut changes = Vec::with_capacity(n);
+    let mut changes = Vec::with_capacity(d.capacity_for(n, 2));
     for _ in 0..n {
         changes.push(match d.u8()? {
             1 => {
@@ -536,11 +601,14 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
                 id: dec_id(&mut d, RelationshipId::new)?,
                 expect: dec_expect(&mut d)?,
             },
+            5 if version == REQUEST_ENCODING_V3 => Change::RemoveHistory {
+                position: HistoryPosition(d.u64()?),
+            },
             t => return Err(corrupt(format!("history change tag {t}"))),
         });
     }
     let nc = d.count(40)?;
-    let mut content = Vec::with_capacity(nc);
+    let mut content = Vec::with_capacity(d.capacity_for(nc, 40));
     for _ in 0..nc {
         content.push(ContentRef {
             digest: ContentDigest(d.array()?),
@@ -556,15 +624,23 @@ pub(crate) fn decode_history(b: &[u8]) -> Result<HistoryEntry, StorageError> {
         ));
     }
     let ne = d.count(8)?;
-    let mut evidence = Vec::with_capacity(ne);
+    let mut evidence = Vec::with_capacity(d.capacity_for(ne, 8));
     for _ in 0..ne {
         evidence.push(Evidence {
             label: d.bytes()?.to_vec(),
             bytes: d.bytes()?.to_vec(),
         });
     }
-    if version == REQUEST_ENCODING_V2 && d.u8()? > 1 {
+    if version != REQUEST_ENCODING_V1 && d.u8()? > 1 {
         return Err(corrupt("history request removal mode"));
+    }
+    // Version 3 is written only for a request that removes history.
+    if version == REQUEST_ENCODING_V3
+        && !changes
+            .iter()
+            .any(|c| matches!(c, Change::RemoveHistory { .. }))
+    {
+        return Err(corrupt("history request version 3 removes no history"));
     }
     d.finish()?;
     Ok(HistoryEntry {
@@ -668,7 +744,8 @@ impl Manifest {
         for x in &self.segments {
             x.enc(&mut e);
         }
-        debug_assert_eq!(e.buf.len() as u64, Self::encoded_len(self.segments.len()));
+        // Manifest read limits are computed from `encoded_len`: it must be exact.
+        assert_eq!(e.buf.len() as u64, Self::encoded_len(self.segments.len()));
         e.buf
     }
 
@@ -682,7 +759,7 @@ impl Manifest {
             len: d.u64()?,
         };
         let n = d.count(48)?;
-        let mut segments = Vec::with_capacity(n);
+        let mut segments = Vec::with_capacity(d.capacity_for(n, 48));
         let mut total: u64 = 0;
         for _ in 0..n {
             let x = ExtentRef::dec(&mut d)?;

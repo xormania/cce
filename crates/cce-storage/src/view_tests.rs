@@ -357,7 +357,7 @@ fn an_admitted_commit_completes_after_its_caller_goes_away() {
         v.history(HistoryPosition(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
-            .expect("a retained history entry is unreadable")
+            .unwrap_or_else(|e| panic!("a retained history entry is unreadable: {e:?}"))
             .len(),
         1,
         "the commit must apply exactly once"

@@ -58,13 +58,13 @@ impl ContentPool {
     }
 
     /// Free extents as `(offset, len, retiring generation)`, by offset.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz-api"))]
     pub(crate) fn free(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
         self.free.iter().map(|(o, (l, g))| (*o, *l, *g))
     }
 
     /// Reservations by staging serial.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz-api"))]
     pub(crate) fn held(&self) -> impl Iterator<Item = (u64, &[Reuse])> + '_ {
         self.held.iter().map(|(s, rs)| (*s, rs.as_slice()))
     }
@@ -75,7 +75,7 @@ impl ContentPool {
     }
 
     /// Reservations owned by uncertain publications: staging serial, attempt, generation.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz-api"))]
     pub(crate) fn uncertain(&self) -> impl Iterator<Item = (u64, &AttemptId, u64, &[Reuse])> + '_ {
         self.uncertain
             .iter()
@@ -120,7 +120,7 @@ impl ContentPool {
     }
 
     /// Extents taken and still being written, by any taker.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzz-api"))]
     pub(crate) fn taking(&self) -> Vec<Reuse> {
         self.taking.iter().map(|(_, r)| *r).collect()
     }
@@ -185,7 +185,7 @@ impl ContentPool {
             .iter()
             .filter(|(offset, (len, retired_at))| {
                 *len >= need
-                    && *retired_at <= bound
+                    && crate::engine::may_reuse(*retired_at, Some(bound))
                     && below.is_none_or(|b| offset.checked_add(need).is_some_and(|end| end <= b))
             })
             .min_by_key(|(offset, (len, _))| (*len, **offset))

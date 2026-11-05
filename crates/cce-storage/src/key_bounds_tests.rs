@@ -211,7 +211,8 @@ fn four_full_length_identifiers_without_zero_bytes_fit() {
     let full = identifiers(4 * 255, 5);
     assert!(full.iter().all(|v| v.len() == 255 && !v.contains(&0)));
     let rel = relationship(&s, "full-endpoints", &full);
-    commit(&s, "full", vec![rel]).unwrap();
+    commit(&s, "full", vec![rel])
+        .unwrap_or_else(|e| panic!("four full-length identifiers must commit: {e:?}"));
     assert_eq!(observe(&s, &full).0.len(), 2, "both directions");
     drop(s);
     sim.release();

@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from textwrap import dedent
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -17,12 +18,46 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools' / 'ci'))
 import drift_runner as runner
 from drift_contracts import evaluate
+from test_drift_execution import command_log, witness_step, RUST_COMMAND
 
 HEAD = 'a' * 40
 BASE = 'b' * 40
 OTHER = 'c' * 40
 TRUSTED = 'd' * 40
 REPOSITORY = 'xormania/cce'
+
+
+def literal_step_script(workflow, title):
+    """Read a named fixture step's direct or literal-block script from its input."""
+    lines = workflow.splitlines()
+    starts = [index for index, line in enumerate(lines) if line.strip() == '- name: ' + title]
+    if len(starts) != 1:
+        raise AssertionError('Fixture must contain one named execution step')
+    start = starts[0]
+    step_indent = len(lines[start]) - len(lines[start].lstrip())
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        indent = len(line) - len(line.lstrip())
+        if line.strip() and indent <= step_indent:
+            break
+        if not line.lstrip().startswith('run:'):
+            continue
+        value = line.lstrip()[len('run:'):].strip()
+        if value not in ('|', '|-', '|+'):
+            if not value:
+                raise AssertionError('Fixture execution script is empty')
+            return value
+        block = []
+        for content in lines[index + 1:]:
+            content_indent = len(content) - len(content.lstrip())
+            if content.strip() and content_indent <= indent:
+                break
+            block.append(content)
+        script = dedent('\n'.join(block)).strip('\n')
+        if not script.strip():
+            raise AssertionError('Fixture execution script is empty')
+        return script
+    raise AssertionError('Fixture execution step has no literal run script')
 
 
 class FakeApi:
@@ -168,7 +203,7 @@ class DataEvidenceTests(unittest.TestCase):
         claims, semantic, limits, failed = runner.data_evidence(source(), self.env(),
                                                                lambda _repo, _token: api)
         self.assertFalse(failed)
-        self.assertEqual(limits, [])
+        self.assertEqual(limits, ['decision_data_not_configured'])
         self.assertTrue(claims[0]['applicable'])
         result = evaluate({'source': source(), 'claims': claims})
         self.assertIn('claim_case_mismatch', [v['code'] for v in result['violations']])
@@ -205,7 +240,7 @@ class DataEvidenceTests(unittest.TestCase):
 
     def test_required_data_absence_is_distinct_from_optional_setup(self):
         result = runner.data_evidence(source(), {})
-        self.assertEqual(result, ([], [], ['data_not_configured'], False))
+        self.assertEqual(result, ([], [], ['data_not_configured', 'decision_data_not_configured'], False))
         result = runner.data_evidence(source(), {'DRIFT_DATA_REQUIRED': 'true'})
         self.assertTrue(result[-1])
         env = self.env(True)
@@ -232,26 +267,30 @@ class ExecutionEvidenceTests(unittest.TestCase):
                  'run_attempt': 1, 'status': 'completed'}]
         for row in runs:
             row.update(conclusion='success', head_branch='feature', pull_requests=[])
-        runs.append({'id':13, 'name':'leak-guard', 'path':'.github/workflows/leak-guard.yml',
-                     'head_sha':HEAD, 'head_repository':{'full_name':REPOSITORY}, 'event':'pull_request',
-                     'run_number':3, 'run_attempt':1, 'status':'completed', 'conclusion':'success',
-                     'pull_requests':[{'number':9,'head':{'sha':HEAD},'base':{'sha':BASE}}]})
+        files = {path: (ROOT / path).read_text() for path in
+                 ['.github/workflows/' + name + '.yml' for name in ('drift-input', 'rust', 'leak-scan')]
+                 + ['tools/ci/leak_scan_trusted.sh', 'tools/ci/leak_scan.sh']}
         return FakeApi({
             '/actions/runs?head_sha=' + HEAD + '&per_page=50': {'workflow_runs': runs},
             '/pulls/9':{'state':'open','head':{'sha':HEAD},'base':{'sha':BASE},'merge_commit_sha':TRUSTED},
             '/actions/runs/11/jobs?per_page=50': {'jobs': [{'id': 111, 'conclusion': 'success', 'steps': [
-                {'name': 'Unit and replay tests', 'conclusion': 'success'}]}]},
+                witness_step('Unit and replay tests')]}]},
             '/actions/runs/12/jobs?per_page=50': {'jobs': [{'id': 112, 'conclusion': 'success', 'steps': [
-                {'name': 'Format', 'conclusion': 'success'},
-                {'name': 'Clippy', 'conclusion': 'success'},
-                {'name': 'Test', 'conclusion': test_status}]}]},
-            '/actions/runs/13/jobs?per_page=50':{'jobs':[{'id':113,'conclusion':'success','steps':[
-                {'name':'Scan PR text, commits and diff','conclusion':'success'}]}]},
-        }, files={'.github/workflows/'+name+'.yml':(ROOT/'.github/workflows'/(name+'.yml')).read_text()
-                  for name in ('drift-input','rust','leak-guard')},
-           logs={111: 'Ran 27 tests in 0.3s\nOK\n',
-                 112: 'test result: ok. 10 passed; 0 failed; 0 ignored\n',
-                 113:'[command]/usr/bin/git log -1 --format=%H\n'+TRUSTED+'\nScan finished\n'})
+                witness_step('Format'), witness_step('Clippy', number=2),
+                witness_step('Test', test_status, number=3)]}]},
+            '/commits/' + HEAD + '/check-runs?check_name=scan&per_page=100': {'check_runs': [{
+                'id': 501, 'app': {'id': 15368}, 'status': 'completed', 'conclusion': 'success',
+                'started_at': '2026-11-04T10:00:00Z',
+                'details_url': 'https://github.com/' + REPOSITORY + '/runs/501',
+                'output': {'summary': 'leak-scan run 13\nno private markers in PR text, commit messages, added lines or file names'}}]},
+            '/actions/runs/13': {'id': 13, 'name': 'leak-scan', 'path': '.github/workflows/leak-scan.yml',
+                                 'event': 'workflow_run', 'head_sha': TRUSTED,
+                                 'head_repository': {'full_name': REPOSITORY}, 'status': 'completed',
+                                 'conclusion': 'success', 'run_attempt': 1},
+        }, files=files,
+           logs={111: command_log(literal_step_script(files['.github/workflows/drift-input.yml'],
+                                                     'Unit and replay tests'), 'Ran 27 tests in 0.3s\nOK\n'),
+                 112: command_log(RUST_COMMAND, 'test result: ok. 10 passed; 0 failed; 0 ignored\n')})
 
     def test_successful_steps_are_identified_by_actual_candidate(self):
         checks, limits, waiting = runner.execution_checks(self.api_for(), source(), False)
@@ -270,11 +309,12 @@ class ExecutionEvidenceTests(unittest.TestCase):
         api = self.api_for()
         checks, _, waiting = runner.execution_checks(api, source(), True)
         self.assertFalse(waiting)
-        self.assertEqual([row['id'] for row in checks], ['Unit and replay tests','Scan PR text, commits and diff'])
+        self.assertEqual([row['id'] for row in checks], ['Unit and replay tests','Trusted leak scan'])
         self.assertFalse(any(call[0].startswith('/actions/runs/12/jobs') for call in api.calls))
 
     def test_absent_required_execution_does_not_become_success(self):
-        api = FakeApi({'/actions/runs?head_sha=' + HEAD + '&per_page=50': {'workflow_runs': []}})
+        api = FakeApi({'/actions/runs?head_sha=' + HEAD + '&per_page=50': {'workflow_runs': []},
+                       '/commits/' + HEAD + '/check-runs?check_name=scan&per_page=100': {'check_runs': []}})
         checks, limits, waiting = runner.execution_checks(api, source(), False)
         self.assertTrue(waiting or evaluate({'source':source(),'checks':checks})['violations'])
         self.assertIn('producer_definition_unverified', limits)
@@ -294,8 +334,9 @@ class ExecutionEvidenceTests(unittest.TestCase):
 
     def test_success_with_zero_tests_does_not_establish_execution(self):
         api = self.api_for()
-        api.logs[111] = 'Ran 0 tests in 0.0s\nOK\n'
-        api.logs[112] = 'test result: ok. 0 passed; 0 failed; 0 ignored\n'
+        api.logs[111] = command_log(literal_step_script(api.files['.github/workflows/drift-input.yml'],
+                                                     'Unit and replay tests'), 'Ran 0 tests in 0.0s\nOK\n')
+        api.logs[112] = command_log(RUST_COMMAND, 'test result: ok. 0 passed; 0 failed; 0 ignored\n')
         observations = []
         checks, _, _ = runner.execution_checks(api, source(), False, observations)
         result = evaluate({'source': source(), 'checks': checks})
@@ -412,7 +453,7 @@ class PublishingTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
         runner.save(root / 'control.json', value)
-        api = FakeApi({'/pulls/9': {'state': 'open', 'head': {'sha': current}},
+        api = FakeApi({'/pulls/9': {'state': 'open', 'head': {'sha': current}, 'base': {'sha': BASE}},
                        '/commits/' + HEAD + '/check-runs?check_name=CCE%20drift%20contracts&per_page=100':
                        {'check_runs': []}})
         with patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
@@ -431,6 +472,36 @@ class PublishingTests(unittest.TestCase):
         result, posts, _ = self.publish_control(value)
         self.assertEqual(result, 1)
         self.assertEqual(posts[-1][2]['conclusion'], 'failure')
+
+    def test_unaccepted_workflow_publishes_a_clear_policy_failure(self):
+        value = control(violations=[{'code': 'workflow_definition_awaiting_acceptance', 'subject': 'f' * 24}])
+        result, posts, root = self.publish_control(value)
+        self.assertEqual(result, 1)
+        self.assertEqual(posts[-1][2]['conclusion'], 'failure')
+        summary = (root / 'public' / 'summary.md').read_text()
+        self.assertIn('Workflow definition awaiting acceptance. Test execution is unverified by this analysis.', summary)
+        self.assertNotIn('required_check_not_executed', summary)
+        self.assertNotIn('required_check_failed', summary)
+
+    def test_execution_failure_does_not_claim_workflow_acceptance_is_pending(self):
+        value = control(violations=[{'code': 'required_check_failed', 'subject': 'f' * 24}])
+        result, posts, root = self.publish_control(value)
+        self.assertEqual(result, 1)
+        self.assertEqual(posts[-1][2]['conclusion'], 'failure')
+        self.assertNotIn('Workflow definition awaiting acceptance.',
+                         (root / 'public' / 'summary.md').read_text())
+
+    def test_policy_summary_does_not_publish_raw_producer_identity_or_reason(self):
+        marker = 'untrusted-private-definition-marker'
+        normalized = {'source': source(), 'checks': [
+            {'id': marker, 'status': 'unknown', 'required': True, 'executed': None,
+             'source_sha': HEAD, 'definition_status': 'awaiting_acceptance', 'reason': marker}]}
+        violations = evaluate(normalized)['violations']
+        _, posts, root = self.publish_control(control(violations=violations))
+        public = json.dumps(posts) + (root / 'public' / 'summary.md').read_text()
+        public += (root / 'public' / 'state.json').read_text()
+        self.assertIn('Workflow definition awaiting acceptance.', public)
+        self.assertNotIn(marker, public)
 
     def test_older_result_cannot_clear_newer_candidate(self):
         result, posts, root = self.publish_control(control(), current=OTHER)
@@ -460,6 +531,9 @@ class CollectionIntegrationTests(unittest.TestCase):
                'head_repository': {'full_name': REPOSITORY},
                'path': '.github/workflows/drift-input.yml', 'status': 'completed',
                'conclusion': 'success', 'head_branch': 'feature'}
+        files = {'README.md': 'The reader preserves the expected bytes.',
+                 **{'.github/workflows/'+name+'.yml':(ROOT/'.github/workflows'/(name+'.yml')).read_text()
+                    for name in ('drift-input','rust','leak-guard')}}
         api = FakeApi({
             '/actions/runs/7': run,
             '/commits/' + HEAD: {'parents': [{'sha': BASE}]},
@@ -472,14 +546,15 @@ class CollectionIntegrationTests(unittest.TestCase):
                  'head_sha': HEAD, 'head_repository': {'full_name': REPOSITORY}, 'event': 'push', 'run_number': 1,
                  'run_attempt': 1, 'status': 'completed'}]},
             '/actions/runs/7/jobs?per_page=50': {'jobs': [{'id': 71, 'conclusion': 'success', 'steps': [
-                {'name': 'Unit and replay tests', 'conclusion': 'success'}]}]},
-        }, {'README.md': 'The reader preserves the expected bytes.',
-            **{'.github/workflows/'+name+'.yml':(ROOT/'.github/workflows'/(name+'.yml')).read_text()
-               for name in ('drift-input','rust','leak-guard')}}, logs={71: 'Ran 27 tests in 0.3s\nOK\n'})
+                witness_step('Unit and replay tests')]}]},
+        }, files, logs={71: command_log(literal_step_script(files['.github/workflows/drift-input.yml'],
+                                                           'Unit and replay tests'),
+                                      'Ran 27 tests in 0.3s\nOK\n')})
         event = {'workflow_run': {'id': 7, 'run_attempt': 1, 'head_sha': HEAD}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             value = runner.collect(api, event, 'workflow_run', root, {'JEV_TRUSTED_SHA': TRUSTED})
+            self.assertFalse(value['waiting'])
             self.assertFalse(value['violations'])
             self.assertGreater(value['selected'], 0)
             packets = runner.load(root / 'private' / 'packets.json')

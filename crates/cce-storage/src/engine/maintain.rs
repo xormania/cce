@@ -6,8 +6,9 @@ use cce_core::storage::{AttemptId, CommitError, StorageError};
 
 use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use super::{Fence, Inner, MaintenanceSpace, Reuse, Taken, lock, rejected, sha256};
+use super::{BufferHold, Fence, Inner, MaintenanceSpace, Reuse, Taken, lock, rejected, sha256};
 use crate::codec::{corrupt, key_components};
 use crate::format::PageRef;
 use crate::format::{Descriptor, PAGE_SIZE, PageKind, decode_page};
@@ -18,6 +19,13 @@ use crate::records::{
 };
 use crate::tree::{Cursor, MAX_HEIGHT, Node, NodeSource, TreeTxn};
 use crate::{MaintenanceBudget, MaintenanceReport, MaintenanceTask};
+
+/// Manifests are read up to the format's maximum (a u32 segment count), as by readers: the open's
+/// segment limit bounds staging only.
+fn manifest_limit() -> u64 {
+    Manifest::encoded_len(u32::MAX as usize)
+}
+const MANIFEST: &str = "content manifest";
 
 impl Inner {
     pub(crate) fn maintain(
@@ -96,6 +104,7 @@ impl Inner {
                 )));
             }
             let mut page = vec![0; PAGE_SIZE];
+            self.counters.pages_read.fetch_add(1, Ordering::Relaxed);
             self.io
                 .read_at(FileId::Meta, at.page * PAGE_SIZE as u64, &mut page)?;
             match Node::decode(&decode_page(cur.store, PageKind::Node, at, &page)?)? {
@@ -148,9 +157,38 @@ impl Inner {
         Ok(reach)
     }
 
-    /// Reads extent `x` straight from the content file and checks it against its digest.
-    fn read_raw(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+    /// Reads manifest extent `x` straight from the content file and checks it against its digest.
+    /// Its length is bounded by the format's maximum, and its digest is first checked by streaming
+    /// it through one chunk, so a damaged length never makes this hold more than a chunk before
+    /// the extent proves authentic.
+    pub(crate) fn read_raw(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+        if x.len > manifest_limit() {
+            return Err(corrupt(format!(
+                "manifest of {} bytes exceeds the format's {} byte maximum",
+                x.len,
+                manifest_limit()
+            )));
+        }
         let len = usize::try_from(x.len).map_err(|_| corrupt("extent too large"))?;
+        if len > super::VERIFY_CHUNK {
+            let mut chunk = vec![0; super::VERIFY_CHUNK];
+            let mut digest = <sha2::Sha256 as sha2::Digest>::new();
+            let mut done = 0;
+            while done < len {
+                let n = (len - done).min(super::VERIFY_CHUNK);
+                self.io
+                    .read_at(FileId::Content, x.offset + done as u64, &mut chunk[..n])?;
+                sha2::Digest::update(&mut digest, &chunk[..n]);
+                done += n;
+            }
+            let got: [u8; 32] = sha2::Digest::finalize(digest).into();
+            if got != x.digest {
+                return Err(corrupt(format!(
+                    "content extent at {}: digest mismatch",
+                    x.offset
+                )));
+            }
+        }
         let mut buf = vec![0; len];
         self.io.read_at(FileId::Content, x.offset, &mut buf)?;
         if sha256(&buf) != x.digest {
@@ -172,7 +210,10 @@ impl Inner {
             let (_, v) = entry?;
             if let ContentEntry::Live { manifest, .. } = ContentEntry::decode(&v)? {
                 used.push((manifest.offset, manifest.len));
-                for s in Manifest::decode(&self.read_extent(&manifest)?)?.segments {
+                for s in
+                    Manifest::decode(&self.read_extent(&manifest, manifest_limit(), MANIFEST)?)?
+                        .segments
+                {
                     used.push((s.offset, s.len));
                 }
             }
@@ -189,24 +230,12 @@ impl Inner {
             }
         }
         // Stagings of this process are not published; their manifests may lie beyond committed
-        // content, so they are read directly and checked against their digest.
+        // content, so they are read straight from the file, bounded and checked against their
+        // digest like every other manifest read.
         let staged: Vec<ExtentRef> = lock(&self.state).staged.values().map(|(m, _)| *m).collect();
         for m in staged {
             used.push((m.offset, m.len));
-            let mut buf = vec![
-                0;
-                usize::try_from(m.len).map_err(|_| StorageError::Integrity(
-                    "manifest too large".into()
-                ))?
-            ];
-            self.io.read_at(FileId::Content, m.offset, &mut buf)?;
-            if sha256(&buf) != m.digest {
-                return Err(StorageError::Integrity(format!(
-                    "staged manifest at {}: digest mismatch",
-                    m.offset
-                )));
-            }
-            for s in Manifest::decode(&buf)?.segments {
+            for s in Manifest::decode(&self.read_raw(&m)?)?.segments {
                 used.push((s.offset, s.len));
             }
         }
@@ -362,8 +391,12 @@ impl Inner {
             if let ContentEntry::Live { manifest, .. } =
                 ContentEntry::decode(&v).map_err(rejected)?
             {
-                let m = Manifest::decode(&self.read_extent(&manifest).map_err(rejected)?)
-                    .map_err(rejected)?;
+                let m = Manifest::decode(
+                    &self
+                        .read_extent(&manifest, manifest_limit(), MANIFEST)
+                        .map_err(rejected)?,
+                )
+                .map_err(rejected)?;
                 let end = m
                     .segments
                     .iter()
@@ -429,7 +462,10 @@ impl Inner {
             // Copy one segment at a time, through the verified read.
             let mut segments = Vec::with_capacity(m.segments.len());
             for (s, &at) in m.segments.iter().zip(&placed) {
-                let data = self.read_extent(s).map_err(rejected)?;
+                let _held = BufferHold::new(self, s.len);
+                let data = self
+                    .read_extent(s, crate::records::SEGMENT_MAX, "content segment")
+                    .map_err(rejected)?;
                 self.io
                     .write_at(FileId::Content, at, &data)
                     .map_err(rejected)?;

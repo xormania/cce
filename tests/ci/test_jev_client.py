@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import socket
 import unittest
+from unittest import mock
 import urllib.error
 
 
@@ -26,16 +27,18 @@ def packet():
 
 
 def response(value=None, choices=None):
-    payload = client.payload_for(value or packet())
+    value = value or packet()
     choices = choices or {"proof": "supported", "witness": "semantic_behavior",
-                          "support_1": "e1", "support_2": "e2"}
+                          "support": "e1"}
     return {"model": client.MODEL,
             "answers": {name: {"type": "choice", "choice": choices.get(name, "insufficient_context")}
-                        for name in payload["questions"]},
+                        for name in [*value["questions"], "support"]},
             "usage": {"input_tokens": 500, "output_tokens": 80, "total_tokens": 580}}
 
 
 class Handle(io.BytesIO):
+    status = 200
+
     def __enter__(self):
         return self
 
@@ -61,10 +64,25 @@ class PayloadTests(unittest.TestCase):
         value = packet()
         payload = client.payload_for(value)
         self.assertEqual(payload["model"], "jev-1.14.0")
-        self.assertEqual(set(payload["questions"]), {"proof", "witness", "support_1", "support_2"})
-        self.assertEqual(set(payload["questions"]["support_1"]["criteria"]), {"e1", "e2", "none"})
+        self.assertEqual(set(payload["questions"]), {"proof", "witness", "support"})
+        self.assertEqual(set(payload["questions"]["support"]["criteria"]), {"e1", "e2", "none"})
         self.assertEqual(payload["state"]["excerpts"], value["excerpts"])
         self.assertIn("untrusted data", payload["questions"]["proof"]["instructions"])
+
+    def test_support_question_is_standalone_and_names_requested_relationships(self):
+        value = packet()
+        question = client.payload_for(value)["questions"].get("support")
+        self.assertIsNotNone(question)
+        self.assertEqual(question["type"], "choice")
+        instructions = question["instructions"].lower()
+        for relationship in value["questions"]:
+            self.assertIn(relationship, instructions)
+        self.assertIn("relevant", instructions)
+        self.assertIn("none", instructions)
+        self.assertNotIn("answers", client.payload_for(value)["state"])
+
+    def test_question_version_identifies_the_standalone_support_contract(self):
+        self.assertEqual(client.QUESTION_VERSION, 2)
 
     def test_opaque_subject_and_public_source_are_validated(self):
         for location, bad in (("subject", "private-label"), ("source", {"repository": "hidden-data"})):
@@ -111,38 +129,60 @@ class ResponseTests(unittest.TestCase):
             "supported": .9, "overstated": .05, "contradicted": .03, "insufficient_context": .02})
         clean = client.validate_response(value, self.payload)
         self.assertFalse(clean["abstained"])
-        self.assertEqual(clean["supporting_excerpt_ids"], ["e1", "e2"])
+        self.assertEqual(clean["supporting_excerpt_ids"], ["e1"])
         self.assertEqual(clean["answers"]["proof"]["confidence"], .9)
 
     def test_one_support_is_sufficient(self):
-        value = response()
-        value["answers"]["support_2"]["choice"] = "none"
-        self.assertEqual(client.validate_response(value, self.payload)["supporting_excerpt_ids"], ["e1"])
+        supplied = packet()
+        supplied["excerpts"] = supplied["excerpts"][:1]
+        value = response(supplied)
+        result = client.diagnose(supplied, key="key", opener=Opener(value))
+        self.assertEqual(result["status"], "diagnosed")
+        clean = client.validate_response(value, client.payload_for(supplied))
+        self.assertFalse(clean["abstained"])
+        self.assertEqual(clean["supporting_excerpt_ids"], ["e1"])
 
-    def test_duplicate_support_is_rejected_instead_of_repaired(self):
+    def test_old_two_support_answer_inventory_is_rejected(self):
         value = response()
-        value["answers"]["support_2"]["choice"] = "e1"
-        with self.assertRaises(ValueError):
+        value["answers"].pop("support")
+        value["answers"]["support_1"] = {"type": "choice", "choice": "e1"}
+        value["answers"]["support_2"] = {"type": "choice", "choice": "e2"}
+        with self.assertRaisesRegex(ValueError, "^answer_inventory_mismatch$"):
+            client.validate_response(value, self.payload)
+
+    def test_current_inventory_rejects_extra_legacy_support_slots(self):
+        value = response()
+        value["answers"]["support_1"] = {"type": "choice", "choice": "e1"}
+        value["answers"]["support_2"] = {"type": "choice", "choice": "e2"}
+        with self.assertRaisesRegex(ValueError, "^answer_inventory_mismatch$"):
             client.validate_response(value, self.payload)
 
     def test_unsupported_nonabstention_is_rejected(self):
         value = response()
-        for name in ("support_1", "support_2"):
-            value["answers"][name]["choice"] = "none"
+        value["answers"]["support"]["choice"] = "none"
         with self.assertRaises(ValueError):
             client.validate_response(value, self.payload)
 
     def test_full_abstention_allows_no_support(self):
         value = response(choices={"proof": "insufficient_context", "witness": "insufficient_context",
-                                  "support_1": "none", "support_2": "none"})
-        self.assertTrue(client.validate_response(value, self.payload)["abstained"])
+                                  "support": "none"})
+        result = client.diagnose(packet(), key="key", opener=Opener(value))
+        self.assertEqual(result["status"], "abstained")
+        clean = client.validate_response(value, self.payload)
+        self.assertTrue(clean["abstained"])
+        self.assertEqual(clean["supporting_excerpt_ids"], [])
+
+    def test_partial_abstention_without_a_reference_is_unsupported(self):
+        value = response(choices={"proof": "insufficient_context", "witness": "semantic_behavior", "support": "none"})
+        with self.assertRaisesRegex(ValueError, "^unsupported_diagnosis$"):
+            client.validate_response(value, self.payload)
 
     def test_wrong_model_inventory_choice_and_invented_reference_are_rejected(self):
         changes = [lambda value: value.update(model="other-model"),
                    lambda value: value["answers"].pop("proof"),
                    lambda value: value["answers"].update(extra={"type": "choice", "choice": "hidden"}),
                    lambda value: value["answers"]["proof"].update(choice="arbitrary provider prose"),
-                   lambda value: value["answers"]["support_1"].update(choice="e9")]
+                   lambda value: value["answers"]["support"].update(choice="e9")]
         for change in changes:
             value = response()
             change(value)
@@ -189,7 +229,7 @@ class TransportTests(unittest.TestCase):
 
     def test_abstention_is_distinct_from_diagnosed(self):
         body = response(choices={"proof": "insufficient_context", "witness": "insufficient_context",
-                                 "support_1": "none", "support_2": "none"})
+                                 "support": "none"})
         result = client.diagnose(packet(), key="key", opener=Opener(body))
         self.assertEqual(result["status"], "abstained")
 
@@ -255,6 +295,167 @@ class TransportTests(unittest.TestCase):
 
     def test_redirect_handler_refuses_redirect(self):
         self.assertIsNone(client._NoRedirect().redirect_request(None, None, 302, "", {}, "https://example.invalid"))
+
+
+class DiagnosticTests(unittest.TestCase):
+    def diagnostic(self, body):
+        result = client.diagnose(packet(), key="test-key", opener=Opener(body))
+        self.assertEqual(result["status"], "malformed_response")
+        return result["diagnostic"]
+
+    def test_http_failures_identify_auth_rate_limit_and_other_errors_without_text(self):
+        marker = "private-http-error-marker"
+        for status, reason in ((401, "authentication_failed"), (403, "forbidden"),
+                               (429, "rate_limited"), (302, "redirect_refused"), (503, "http_error")):
+            with self.subTest(status=status):
+                error = urllib.error.HTTPError(client.ENDPOINT, status, marker,
+                                               {"Location": marker}, io.BytesIO(marker.encode()))
+                opener = Opener(error=error)
+                result = client.diagnose(packet(), key=marker, opener=opener)
+                self.assertEqual(result["status"], "provider_failure")
+                diagnostic = result["diagnostic"]
+                self.assertEqual((diagnostic["stage"], diagnostic["reason"]), ("http", reason))
+                self.assertEqual(diagnostic["http_status"], status)
+                self.assertEqual(diagnostic["response_bytes_read"], len(marker))
+                self.assertFalse(diagnostic["response_truncated"])
+                self.assertEqual(len(opener.calls), 1)
+                self.assertNotIn(marker, json.dumps(result))
+
+    def test_transport_reasons_do_not_invent_an_http_response(self):
+        for error, reason in ((TimeoutError("private detail"), "request_timeout"),
+                              (urllib.error.URLError(socket.timeout("private detail")), "request_timeout"),
+                              (urllib.error.URLError("private detail"), "network_error"),
+                              (OSError("private detail"), "io_error")):
+            with self.subTest(reason=reason):
+                result = client.diagnose(packet(), key="key", opener=Opener(error=error))
+                diagnostic = result["diagnostic"]
+                self.assertEqual((diagnostic["stage"], diagnostic["reason"]), ("transport", reason))
+                self.assertIsNone(diagnostic["http_status"])
+                self.assertIsNone(diagnostic["response_bytes_read"])
+                self.assertNotIn("private detail", json.dumps(result))
+
+    def test_response_read_timeout_preserves_observed_http_status(self):
+        class SlowHandle(Handle):
+            def read(self, _limit):
+                raise TimeoutError("private detail")
+        class SlowOpener:
+            def open(self, *_args, **_kwargs):
+                return SlowHandle()
+        result = client.diagnose(packet(), key="key", opener=SlowOpener())
+        self.assertEqual(result["diagnostic"]["reason"], "response_read_timeout")
+        self.assertEqual(result["diagnostic"]["http_status"], 200)
+        self.assertIsNone(result["diagnostic"]["response_bytes_read"])
+
+    def test_oversized_response_reports_only_observed_prefix_length(self):
+        result = client.diagnose(packet(), key="key", opener=Opener(b"x" * (client.MAX_RESPONSE + 100)))
+        diagnostic = result["diagnostic"]
+        self.assertEqual((diagnostic["stage"], diagnostic["reason"]), ("body", "response_too_large"))
+        self.assertEqual(diagnostic["response_bytes_read"], client.MAX_RESPONSE + 1)
+        self.assertTrue(diagnostic["response_truncated"])
+        self.assertIsNone(result["response_sha256"])
+
+    def test_decode_reasons_are_distinct_from_response_schema(self):
+        for raw, reason in ((b"not-json", "json_invalid"), (b"\xff", "encoding_invalid"),
+                            (b'{"x":1,"x":2}', "json_duplicate_field"),
+                            (b'{"x":NaN}', "json_nonfinite_number"),
+                            (b'{"x":1e10000}', "json_nonfinite_number")):
+            with self.subTest(reason=reason):
+                diagnostic = self.diagnostic(raw)
+                self.assertEqual((diagnostic["stage"], diagnostic["reason"]), ("json", reason))
+                self.assertNotIn("response_type", diagnostic)
+        with mock.patch.object(client.json, "loads", side_effect=RecursionError("private detail")):
+            diagnostic = self.diagnostic(b"[]")
+            self.assertEqual((diagnostic["stage"], diagnostic["reason"]), ("json", "json_nesting_limit"))
+            self.assertNotIn("private detail", json.dumps(diagnostic))
+        for raw, kind in ((b"[]", "array"), (b"null", "null"), (b"true", "boolean")):
+            diagnostic = self.diagnostic(raw)
+            self.assertEqual(diagnostic["reason"], "response_not_object")
+            self.assertEqual(diagnostic["response_type"], kind)
+
+    def test_model_and_inventory_rejections_are_separate(self):
+        cases = [
+            (lambda value: value.pop("model"), "model_missing"),
+            (lambda value: value.update(model=None), "model_type_invalid"),
+            (lambda value: value.update(model="private-model-name"), "model_mismatch"),
+            (lambda value: value.pop("answers"), "answers_missing"),
+            (lambda value: value.update(answers=[]), "answers_not_object"),
+            (lambda value: value["answers"].pop("proof"), "answer_inventory_mismatch"),
+        ]
+        for mutate, reason in cases:
+            with self.subTest(reason=reason):
+                value = response()
+                mutate(value)
+                diagnostic = self.diagnostic(value)
+                self.assertEqual((diagnostic["stage"], diagnostic["reason"]), ("schema", reason))
+                self.assertNotIn("private-model-name", json.dumps(diagnostic))
+
+    def test_answer_and_numeric_rejections_identify_only_the_known_question(self):
+        cases = [(None, "answer_not_object"),
+                 ({"type": "private-type", "choice": "supported"}, "answer_type_invalid"),
+                 ({"type": "choice", "choice": "private-choice"}, "choice_not_allowed"),
+                 ({"type": "choice", "choice": "supported", "confidence": True}, "confidence_invalid"),
+                 ({"type": "choice", "choice": "supported", "probabilities": {}}, "probability_inventory_mismatch")]
+        for answer, reason in cases:
+            with self.subTest(reason=reason):
+                value = response()
+                value["answers"]["proof"] = answer
+                diagnostic = self.diagnostic(value)
+                self.assertEqual(diagnostic["reason"], reason)
+                self.assertEqual(diagnostic["question"], "proof")
+                self.assertNotIn("private-", json.dumps(diagnostic))
+        for probabilities, reason in (({name: True for name in client.CRITERIA["proof"]}, "probability_value_invalid"),
+                                      ({name: .5 for name in client.CRITERIA["proof"]}, "probability_total_invalid")):
+            value = response()
+            value["answers"]["proof"]["probabilities"] = probabilities
+            self.assertEqual(self.diagnostic(value)["reason"], reason)
+
+    def test_local_support_policy_rejection_is_not_json_failure(self):
+        value = response()
+        value["answers"]["support"]["choice"] = "none"
+        diagnostic = self.diagnostic(value)
+        self.assertEqual((diagnostic["stage"], diagnostic["reason"]), ("policy", "unsupported_diagnosis"))
+        self.assertEqual(diagnostic["http_status"], 200)
+
+    def test_shape_metadata_contains_counts_and_types_without_unknown_names(self):
+        marker = "private-schema-marker"
+        value = response()
+        value[marker] = marker
+        value["error"] = {marker: marker}
+        value["answers"].pop("proof")
+        value["answers"][marker] = {"choice": marker}
+        diagnostic = self.diagnostic(value)
+        self.assertEqual(diagnostic["known_field_types"],
+                         {"model": "string", "answers": "object", "usage": "object", "error": "object"})
+        self.assertEqual(diagnostic["unknown_field_count"], 1)
+        self.assertEqual(diagnostic["expected_answer_count"], 3)
+        self.assertEqual(diagnostic["answer_count"], 3)
+        self.assertEqual(diagnostic["missing_answer_count"], 1)
+        self.assertEqual(diagnostic["unexpected_answer_count"], 1)
+        self.assertNotIn(marker, json.dumps(diagnostic))
+
+    def test_public_diagnostic_projection_rejects_unbounded_or_unknown_fields(self):
+        good = self.diagnostic(b"not-json")
+        self.assertEqual(client.public_diagnostic(good), good)
+        for changed in ({"stage": "private-stage"}, {"reason": "private-reason"},
+                        {"stage": "http"}, {"http_status": True}, {"http_status": 999},
+                        {"response_bytes_read": client.MAX_RESPONSE + 2},
+                        {"response_truncated": 1}, {"unknown_field_count": -1},
+                        {"expected_answer_count": 8}, {"question": "private-question"},
+                        {"response_type": "private-type"},
+                        {"known_field_types": {"private-key": "string"}},
+                        {"known_field_types": {"answers": "private-type"}},
+                        {"private-extra": "private-value"}):
+            with self.subTest(changed=changed):
+                self.assertIsNone(client.public_diagnostic(dict(good, **changed)))
+
+    def test_success_and_missing_credentials_keep_existing_record_shapes(self):
+        for body in (response(), response(choices={"proof": "insufficient_context", "witness": "insufficient_context",
+                                                  "support": "none"})):
+            result = client.diagnose(packet(), key="key", opener=Opener(body))
+            self.assertNotIn("diagnostic", result)
+        opener = Opener()
+        self.assertNotIn("diagnostic", client.diagnose(packet(), opener=opener))
+        self.assertEqual(opener.calls, [])
 
 
 if __name__ == "__main__":

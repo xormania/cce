@@ -271,7 +271,11 @@ fn read_only_opens_are_refused_while_owned_and_never_change_the_store() {
     let mut ro = Driver::spawn();
     answered(ro.step(&open_ro), "first read-only open");
     let mut ro2 = Driver::spawn();
-    answered(ro2.step(&open_ro), "second read-only open");
+    let step = ro2.step(&open_ro);
+    assert!(
+        matches!(&step, Step::Answered(lines) if !lines.iter().any(|l| l.starts_with("error "))),
+        "a second read-only open must share the store with the first: {step:?}"
+    );
     for (what, d) in [("first", &mut ro), ("second", &mut ro2)] {
         assert_eq!(
             answered(d.step("dump A,B,C"), "dump"),
@@ -394,6 +398,43 @@ fn store_files_are_real_and_damage_yields_explicit_errors() {
     assert_eq!(
         answered(d.step("dump A,B,C"), "dump"),
         bundle.expected_dump(1)
+    );
+}
+
+#[test]
+fn a_failing_shell_setup_never_starts_the_driver() {
+    // Neighbour: after a setup that succeeds, the driver starts and answers (here, an error).
+    let mut started = Driver::spawn_with_shell("true");
+    let step = started.step("no-such-command");
+    assert!(
+        matches!(&step, Step::Answered(lines) if lines.iter().any(|l| l.starts_with("error "))),
+        "a succeeding setup must start the driver: {step:?}"
+    );
+    // A setup that fails ends the shell before the driver starts: nothing answers.
+    let mut d = Driver::spawn_with_shell("false");
+    let step = d.step("no-such-command");
+    assert!(
+        matches!(&step, Step::Exited { lines, code: Some(c) } if lines.is_empty() && *c != 0),
+        "a failing setup must not start the driver: {step:?}"
+    );
+}
+
+#[test]
+fn the_driver_reports_tokens_that_are_not_hex_as_errors() {
+    // A multibyte character splits a two-byte pair; a sign is accepted by integer parsing.
+    for token in ["a\u{e9}b", "+1"] {
+        let step = Driver::spawn().step(&format!("stage s hex {token}"));
+        assert!(
+            matches!(&step, Step::Answered(lines) if lines.iter().any(|l| l.starts_with("error not hex"))),
+            "{token:?}: expected a not-hex error line, got {step:?}"
+        );
+    }
+    // Neighbour: valid hex gets past parsing (and fails only for want of a store).
+    let step = Driver::spawn().step("stage s hex 0aFf");
+    assert!(
+        matches!(&step, Step::Answered(lines)
+            if lines.iter().any(|l| l.starts_with("error ") && !l.starts_with("error not hex"))),
+        "valid hex must parse: {step:?}"
     );
 }
 

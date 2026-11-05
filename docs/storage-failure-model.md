@@ -12,6 +12,19 @@ What the `cce-storage` engine promises today, under which assumptions, and how i
 - Data that was durable does not change on its own. Media corruption is a separate fault class.
 - A file's existence is durable only after its directory is synced.
 
+## Trust boundaries
+
+The engine distinguishes five kinds of threat. It handles each differently, and "local" does not
+mean trusted.
+
+| Threat | What the engine does | What it does not do |
+|---|---|---|
+| Resource pressure from the calling process | Bounds each request (`max_request_len`, 64 MiB by default) and each content stream (at most 2^20 segments of 64 KiB, 64 GiB, not configurable), and refuses work over a bound with an explicit error and no logical effect. A stream refused at its limit may already have written segments: the content file can grow and is not shrunk, and a later staging reuses that space. | It does not decide what a caller is allowed to store or change: authorization belongs to the host. There is no limit yet on the total content held by outstanding stagings. |
+| Malformed stored bytes (accidental damage, torn or reordered writes, media errors) | Verifies checksums before decoding, caps every count and length before allocating or reading, and verifies content in chunks before holding it whole (see "Store files on disk"). `cce-verify` reports structural damage without changing the store. | Damage that leaves a valid checksum, which is improbable but possible, is detected only where structure or digests disagree. |
+| Deliberate forgery of stored bytes | Nothing beyond the checks above: checksums are not keyed, and a forged record with a valid checksum is accepted (see the limitations under "Store files on disk"). `cce-verify` reports the inconsistencies it can see, such as an attempt record that the history does not back. | Stored bytes are not authenticated or encrypted. |
+| Filesystem guarantees | Relies on the platform assumptions above for durability and ordering. | It cannot detect a filesystem that acknowledges `fsync` without making data durable. |
+| Concurrent changes to the store directory by another process with write access | At open: refuses a store file that is a symlink or special file, and requires each opened handle to be the regular file at its path (same device and inode). An owning engine process excludes every other engine process through an advisory lock on `LOCK`; read-only inspection opens share that lock with each other, never with an owner. | The store directory itself may be a symlink and is not identity-checked. After open, it does not detect a file that is renamed, replaced or written underneath it, or a directory that is moved. A process that ignores the advisory lock is not stopped. Anyone who can write the directory can change the store. |
+
 ## Commit protocol
 
 1. Validate the attempt identity and the change's preconditions against the newest committed state.
@@ -61,6 +74,18 @@ from an interrupted write of that record. With two checksummed slots, recovery t
 the older record and reports the damaged slot; it cannot prove whether the newer one was ever
 acknowledged.
 
+### Receipt guard
+
+A caller that keeps receipt information independently of the store (its identity, and the highest
+history position of a commit receipt it retained) can pass it as `StoreOptions::guard`. Once the
+publication record is selected, and before anything is synced or written, an open (read-write or
+read-only) with a guard is refused with `StorageError::GuardRefused` if the store has another
+identity or its published logical history position is below the guarded minimum. The store's data
+is left untouched; a read-write open takes the store's lock first, and so may create its lock file
+if it was missing. The check compares history positions, not generations, which also advance without new
+history. It is a rollback floor only: a store at or above the minimum may still hold a different
+history than the one the receipts came from. Without a guard, opening is unchanged.
+
 ## Uncertain outcomes
 
 If writing or syncing the publication record fails, the commit returns `Indeterminate`: the record
@@ -106,6 +131,10 @@ The simulator tests run the production engine with a simulated I/O adapter. They
 - **Damaged durable bytes** in specific places: a newest publication record with a bad checksum or
   torn after any number of bytes, both publication records damaged, the newest root page damaged,
   a content file shorter than the newest record claims, and a damaged content segment.
+- **Arbitrary bytes into every decoder:** fuzz targets (in `crates/cce-storage/fuzz`, run on demand
+  with a nightly toolchain, not in CI) feed arbitrary input to each decoder of stored bytes and to a
+  read-only open that reads a whole store image through. The ordinary tests replay the committed
+  seed inputs and every saved finding through the same entry points.
 
 Separately, real processes are killed and the store is reopened by a fresh process (process exit,
 not power loss); one scenario run on the filesystem adapter and on the simulator must issue the
@@ -174,9 +203,24 @@ digest and length. Commits refuse to continue when the generation or page counte
 **Limitation:** checksums detect accidental damage, not deliberate forgery. A store crafted with
 valid checksums but inconsistent structures is only partly validated today: publication cursors,
 extent bounds and content digests are checked; every node reference must lie inside committed
-metadata with an incarnation no newer than the current generation; and a traversal may load at most
-as many nodes as the store has pages, so a shared or cyclic subtree fails instead of looping. Full
-structural validation of hostile stores is not implemented yet.
+metadata with an incarnation no newer than the current generation; every loaded node holds only
+keys, separators and entries within the limits every write enforces, which splitting relies on; and
+a traversal may load at most as many nodes as the store has pages, so a shared or cyclic subtree
+fails instead of looping. Every committed extent, including a manifest a commit retires, is read
+within its format maximum and committed content and verified in chunks before it is held whole. A
+crafted extent whose length and SHA-256 match real committed bytes is indistinguishable from a
+valid one and is read whole. The traversal bound is the page count the store itself records, so a
+crafted store with a large page count and a sparse metadata file can still cost work in proportion
+to that count, one page at a time. Full structural validation of hostile stores is not implemented
+yet.
+
+Stored bytes are not authenticated: checksums are not keyed, so anyone who can write the store files
+can produce records the engine accepts. In particular, the engine trusts attempt records. A
+checksum-valid attempt record that the history does not back (one naming another attempt's entry, or
+a position with no entry) makes `outcome` report that attempt as committed, and makes a retry of it
+return a receipt for that position without applying its changes. `cce-verify` reports such a record
+as an attempt finding. Accidental damage cannot produce one: it needs a record written with a valid
+checksum, by deliberate editing or by an engine defect.
 
 ## Requests the format cannot hold
 
@@ -222,6 +266,29 @@ store is closing), then waits until every admitted commit has resolved, so no co
 admitted commit takes: a commit blocked in I/O (for example a filesystem that never completes a
 sync) keeps `close` waiting with it.
 
+## Staging budget
+
+The total content length of a handle's outstanding stagings, those staged and neither committed nor
+discarded, is bounded by `StoreOptions::max_staged_bytes` (64 GiB by default; manifests are not
+counted). A staging that would take the total past it fails with `ResourceExhausted` and changes no
+logical or accounted state: it is not registered, any retired space it took is returned, and nothing
+refers to the bytes it already wrote. Those bytes are not reclaimed either: a stream refused part-way
+may already have written segments past the end of committed content, so the content file can grow by
+up to the budget that remained (64 GiB by default) and is never shrunk; the next staging writes over
+that space and reuses it. A staging with a declared length is refused before
+its source is read; otherwise the check runs before each segment is written, against the
+outstanding total at that moment, so a commit or discard that finishes meanwhile counts. Reads,
+commits and discards are never refused by the budget, and lowering it never affects what is already
+staged or committed.
+
+A staging's share is released when a commit that binds it publishes, or when it is discarded. A
+commit rejected for a conflict keeps its stagings outstanding, so they can be committed later. The
+stagings of a commit whose publication is uncertain stay outstanding until the store is reopened;
+nothing else releases them. A handle dropped without commit or discard keeps its share for the life
+of the open store. A retry of a committed attempt needs no staging and is never refused by the
+budget; a host that restages the same bytes for a retry is refused, like any staging, until budget
+is released.
+
 ## Ownership
 
 One process owns a store at a time, through exclusive advisory locks on `LOCK`, `meta.cce` and
@@ -258,6 +325,67 @@ filesystems. They do not defend against another process with write permission to
 their containing namespace; such a process can write an opened file directly or replace path
 components while an open is in progress. Network filesystems may not provide the same locking
 behavior.
+
+The lock belongs to the open lock file, and a child process keeps a copy of every open file from the
+moment it is created. A child that starts another program drops the copy when it does; a child that
+does not keeps it for its whole life. So right after a handle closes, an open of the same store can
+fail with `Busy` while a child of this process, or of another process that had the store open,
+still holds the copy: briefly while a child is being started, for as long as it runs if it never
+starts another program. Exclusion is never weakened, and nothing is written. Retrying the open is
+safe; the engine itself never retries.
+
+## Integrity inspection
+
+`NativeReadOnly::verify` and the `cce-verify <store-dir> [--json] [--scrub]` command inspect a store
+through the read-only open. They never write, sync or repair; the store files are
+byte-identical afterwards. Because the read-only open is refused while another process owns the
+store, inspection cannot run against a live owner.
+
+The structure level checks, for the current publication record:
+
+- both publication slots, reporting what each holds; a valid record in the wrong slot is a finding;
+- the zero padding after every reachable page's payload, after a valid publication record and in an
+  empty slot: writers zero-fill it, and it is outside the checksum, so readers ignore it, but a
+  non-zero byte there is a finding naming the page or slot and the offset;
+- every metadata page reachable from the root decodes and belongs to this store, lies within
+  committed metadata, has the incarnation its parent recorded (no newer than the generation), and
+  is reached only once; all leaves are at the same depth; every key and separator lies within the
+  range its parent assigns;
+- every record's key family, key components and identifiers, and its value encoding, and that its
+  key and the whole record are within the 1800-byte limits every writer enforces;
+- every relationship has both directional index entries, and every index entry matches a
+  relationship;
+- every context's bound content has a content entry for content that is still retained, and each
+  retained content entry counts exactly the contexts that bind it; content a history entry binds has
+  a content entry, which may record content that is no longer retained; every extent lies within
+  committed content;
+- history positions are exactly 1 through the committed position, and each history entry's attempt
+  record points back to it with the fingerprint of the request bytes the entry stores; every attempt
+  record points at an entry;
+- every retirement record decodes and is no newer than the state; a retired tree page is retired
+  once, lies among the tree's pages and is not reachable; every tree page is reachable or retired;
+  and the content-file extents the state uses or has retired (manifests, history entries, retired
+  extents and, at the scrub level, segments) do not overlap. Space that a staging wrote but no commit
+  bound is not accounted for: abandoning a staging leaks its space.
+
+It reads the history entries but no content bytes, and holds every record for the cross-checks, so
+its memory grows with the metadata. A relationship whose source or target context is absent, never
+created or since removed, is valid and not a finding: storage enforces no referential integrity and
+removes no relationship when a context goes, only the caller's preconditions and the consistency of
+relationship records with both indexes.
+
+The scrub level (`VerifyLevel::Scrub`, `--scrub`) also reads every committed content stream: each
+retained content entry's manifest must describe the content its key names, every segment must match its
+SHA-256, the whole stream must match the content's digest and length, and every context's binding
+and every history entry's binding of retained content must match its content's manifest; content
+that is no longer retained is never read. Manifests and segments are read through the verified
+read, one at a time; the report counts the content bytes read.
+
+`--json` prints one JSON object per line in a deterministic order: a summary, both slots, the
+recovery diagnostics, each finding (`check`, `location`, `detail`), and a result line. Findings name
+pages by number and records by key family and a hash prefix of the key; output never contains stored
+bodies, content, evidence or identifiers. Exit status: 0 consistent, 1 inconsistencies found, 2 the
+store could not be inspected (missing, owned, unsupported or unreadable) or the arguments are wrong.
 
 ## Removal and live readers
 
@@ -313,7 +441,8 @@ space, which is proportional to the metadata (as for the integrity check).
 
 - `ReclaimContentHoles` retires content-file space below the committed length that no published
   structure reaches, no retirement record covers, and no staging of this process holds or has
-  discarded, within the budget.
+  discarded, within the budget. After a complete step an identical call finds nothing, unless
+  something is committed or discarded in between.
 - `RebuildRelationshipIndexes` removes every relationship index entry and writes both entries of
   each relationship record again, in one publication; the old index is not consulted. It runs only
   when asked, for example after an integrity check reports index findings. Its memory grows with the
@@ -336,7 +465,13 @@ space, which is proportional to the metadata (as for the integrity check).
   never extends the metadata file. Each part publishes only if it moved something. The page part
   holds the writer lock throughout because it writes only metadata and at most the page budget,
   about what a commit writes; the content part copies up to the content budget of stream bytes,
-  which is why it copies without the lock.
+  which is why it copies without the lock. For content, a complete report means the step finished
+  what it found within its budget. For tree pages it means the step rewrote every tree page or none
+  could move; it is incomplete when only some moved, because of the page budget or because only
+  that many fit into lower retired pages, or when the page budget is zero. A relocation is complete
+  only if both parts are. Neither means a further step finds nothing: the space a step retires, and
+  space retired while a view was pinned once that view is gone, can lie below data a later step
+  moves.
 
 What a step holds in memory, and what it reads:
 

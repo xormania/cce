@@ -124,8 +124,10 @@ pub struct StagedContent {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StagingToken(pub Vec<u8>);
 
-/// One logical mutation. Names logical identities only; never pages or index entries.
+/// One logical mutation. Names logical identities only; never pages or index entries. New kinds
+/// of change may be added.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Change {
     /// Create or replace a context record.
     PutContext {
@@ -150,6 +152,12 @@ pub enum Change {
         id: RelationshipId,
         expect: Precondition,
     },
+    /// Remove the retained history entry at `position`, as the host designates. Its changes,
+    /// evidence and content references are no longer kept; the position is not reused and the
+    /// attempt it recorded still returns its original receipt. Records and relationships are not
+    /// changed by it. The entry must be retained in the current state: removing a position that is
+    /// already removed, or that does not exist, rejects the whole change set.
+    RemoveHistory { position: HistoryPosition },
 }
 
 /// One complete logical change submitted atomically.
@@ -281,8 +289,6 @@ pub enum AttemptOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StorageError {
-    /// The operation is not implemented yet.
-    NotImplemented(&'static str),
     InvalidRequest(String),
     /// A store already exists, or a required store is missing.
     StoreState(String),
@@ -298,6 +304,15 @@ pub enum StorageError {
     /// The content was committed once, but no record uses it any more and storage no longer keeps
     /// its bytes. Retained history may still name it by digest and length.
     ContentNotRetained,
+    /// The request is valid, but a configured resource limit leaves no room for it now. No logical
+    /// or accounted state changed (a refused staging may still have written unreferenced bytes,
+    /// which later stagings reuse); it can succeed once the resource is released (the message says
+    /// what releases it).
+    ResourceExhausted(String),
+    /// An open guarded by retained receipt information was refused: the store has another
+    /// identity, or its published history position is below the retained minimum. The store's
+    /// data was left untouched (a read-write open may have created the store's lock file).
+    GuardRefused(String),
 }
 
 impl fmt::Display for StorageError {

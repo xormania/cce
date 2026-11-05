@@ -60,7 +60,11 @@ def current_candidate(api, source):
     if not isinstance(pulls, list) or any(type(number) is not int or number <= 0 for number in pulls):
         raise ValueError('invalid_check_source')
     if pulls:
+        base = source.get('base_sha')
+        if not isinstance(base, str) or not SHA.fullmatch(base):
+            raise ValueError('invalid_check_source')
         return any(row.get('state') == 'open' and row.get('head', {}).get('sha') == head
+                   and row.get('base', {}).get('sha') == base
                    for row in (api.api('/pulls/' + str(number)) for number in pulls))
     branch = source.get('branch')
     if not isinstance(branch, str) or not branch or len(branch) > 255:

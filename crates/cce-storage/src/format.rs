@@ -21,12 +21,15 @@ pub(crate) const FIRST_NODE_PAGE: u64 = 2;
 pub(crate) const PAGE_HEADER_LEN: usize = 48;
 pub(crate) const PAGE_PAYLOAD_MAX: usize = PAGE_SIZE - PAGE_HEADER_LEN;
 /// magic 4 + version 2 + required features 4 + store 16 + six counters 8 each + crc 4.
-const DESC_LEN: usize = 4 + 2 + 4 + 16 + 8 * 6 + 4;
+pub(crate) const DESC_LEN: usize = 4 + 2 + 4 + 16 + 8 * 6 + 4;
 /// Length of the publication record of format versions before 5, which had no required features.
 const EARLIER_DESC_LEN: usize = 4 + 2 + 16 + 8 * 6 + 4;
-/// Required features this build implements: none yet. A publication record that requires any
-/// other is refused as unsupported, like an unknown format version.
-pub(crate) const KNOWN_REQUIRED_FEATURES: u32 = 0;
+/// Required feature: a history marker may be present (some retained history entry was removed).
+/// Set by the first publication that removes history and carried by every later one.
+pub(crate) const FEATURE_HISTORY_MARKERS: u32 = 1 << 0;
+/// Required features this build implements. A publication record that requires any other is
+/// refused as unsupported, like an unknown format version.
+pub(crate) const KNOWN_REQUIRED_FEATURES: u32 = FEATURE_HISTORY_MARKERS;
 
 /// Identity of one store; recorded in every page and publication record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -77,6 +80,27 @@ pub(crate) fn encode_page(
     Ok(e.buf)
 }
 
+/// Where the zero padding of a stored page begins: after the payload of a node page whose header
+/// claims a payload that fits, or after the record of a publication slot.
+pub(crate) fn padding_start(page: &[u8], slot: bool) -> Option<usize> {
+    if slot {
+        return Some(DESC_LEN);
+    }
+    let len = u32::from_le_bytes(page.get(40..44)?.try_into().ok()?) as usize;
+    (len <= PAGE_PAYLOAD_MAX).then_some(PAGE_HEADER_LEN + len)
+}
+
+/// Offset in `page` of the first non-zero byte of its padding, if any. This build zero-fills the rest
+/// of every page it writes; the padding is outside the checksum, so readers ignore it and only the
+/// integrity check reports a non-zero byte there (as damage or foreign bytes near the page).
+pub(crate) fn first_padding_byte(page: &[u8], slot: bool) -> Option<usize> {
+    let from = padding_start(page, slot)?;
+    page.get(from..)?
+        .iter()
+        .position(|&b| b != 0)
+        .map(|i| from + i)
+}
+
 /// Decodes and validates a node page read from `at`.
 pub(crate) fn decode_page(
     store: StoreId,
@@ -96,14 +120,8 @@ pub(crate) fn decode_page(
         return Err(corrupt(format!("page {}: bad magic", at.page)));
     }
     let version = d.u16()?;
-    if version != FORMAT_VERSION {
-        return Err(StorageError::Unsupported(format!(
-            "page {}: format version {version}",
-            at.page
-        )));
-    }
     let k = d.u8()?;
-    let _reserved = d.u8()?;
+    let reserved = d.u8()?;
     let s = d.array::<16>()?;
     let page = d.u64()?;
     let inc = d.u64()?;
@@ -112,10 +130,24 @@ pub(crate) fn decode_page(
     if len > PAGE_PAYLOAD_MAX {
         return Err(corrupt(format!("page {}: payload length {len}", at.page)));
     }
+    // The checksum covers the whole header: only an intact page can claim another encoding, and a
+    // damaged version or reserved byte is reported as damage.
     let mut check = bytes[..PAGE_HEADER_LEN + len].to_vec();
     check[PAGE_HEADER_LEN - 4..PAGE_HEADER_LEN].fill(0);
     if crc32fast::hash(&check) != crc {
         return Err(corrupt(format!("page {}: checksum mismatch", at.page)));
+    }
+    if version != FORMAT_VERSION {
+        return Err(StorageError::Unsupported(format!(
+            "page {}: format version {version}",
+            at.page
+        )));
+    }
+    if reserved != 0 {
+        return Err(StorageError::Unsupported(format!(
+            "page {}: reserved header byte {reserved:#04x} is set",
+            at.page
+        )));
     }
     if s != store.0 {
         return Err(corrupt(format!(
@@ -151,6 +183,8 @@ pub(crate) struct Descriptor {
     pub content_len: u64,
     /// Last committed logical history position (0 = none).
     pub history_pos: u64,
+    /// Required features a reader must implement to read this state.
+    pub features: u32,
 }
 
 impl Descriptor {
@@ -163,8 +197,7 @@ impl Descriptor {
         let mut e = Enc::default();
         e.raw(&DESC_MAGIC)
             .u16(FORMAT_VERSION)
-            // Required features: this build writes none.
-            .u32(0)
+            .u32(self.features)
             .raw(&self.store.0)
             .u64(self.generation)
             .u64(self.root.page)
@@ -222,7 +255,8 @@ pub(crate) fn decode_slot(bytes: &[u8]) -> Slot {
         if v != FORMAT_VERSION {
             return Ok(Err(format!("format version {v}")));
         }
-        let unknown = d.u32()? & !KNOWN_REQUIRED_FEATURES;
+        let features = d.u32()?;
+        let unknown = features & !KNOWN_REQUIRED_FEATURES;
         if unknown != 0 {
             return Ok(Err(format!("unknown required features {unknown:#x}")));
         }
@@ -236,6 +270,7 @@ pub(crate) fn decode_slot(bytes: &[u8]) -> Slot {
             next_page: d.u64()?,
             content_len: d.u64()?,
             history_pos: d.u64()?,
+            features,
         }))
     };
     match parse(&mut d) {
@@ -250,6 +285,39 @@ mod tests {
     use super::*;
 
     const S: StoreId = StoreId([7; 16]);
+
+    #[test]
+    fn padding_starts_right_after_the_payload_and_after_the_record() {
+        let at = PageRef {
+            page: 5,
+            incarnation: 3,
+        };
+        // A payload and a record whose last byte is not zero, so the boundary is exact.
+        let mut p = encode_page(S, PageKind::Node, at, b"payload").unwrap();
+        assert_eq!(first_padding_byte(&p, false), None);
+        p[PAGE_HEADER_LEN + 7] = 1;
+        assert_eq!(first_padding_byte(&p, false), Some(PAGE_HEADER_LEN + 7));
+        let full = encode_page(S, PageKind::Node, at, &[9; PAGE_PAYLOAD_MAX]).unwrap();
+        assert_eq!(
+            first_padding_byte(&full, false),
+            None,
+            "a full page has no padding"
+        );
+        let d = Descriptor {
+            store: S,
+            generation: 1,
+            root: at,
+            next_page: 6,
+            content_len: 0,
+            history_pos: 0,
+            features: 0,
+        };
+        let mut r = d.encode();
+        assert_ne!(r[DESC_LEN - 1], 0, "the record's last byte");
+        assert_eq!(first_padding_byte(&r, true), None);
+        r[DESC_LEN] = 1;
+        assert_eq!(first_padding_byte(&r, true), Some(DESC_LEN));
+    }
 
     #[test]
     fn page_roundtrip_and_rejections() {
@@ -282,6 +350,35 @@ mod tests {
     }
 
     #[test]
+    fn a_record_in_this_layout_naming_an_older_version_is_unsupported() {
+        // No engine writes this: the current layout, intact under its own checksum, but carrying
+        // an older version number. It must not be read as a current record.
+        let d = Descriptor {
+            store: S,
+            generation: 9,
+            root: PageRef {
+                page: 4,
+                incarnation: 9,
+            },
+            next_page: 5,
+            content_len: 100,
+            history_pos: 2,
+            features: 0,
+        };
+        for version in [FORMAT_VERSION - 1, 1, 0] {
+            let mut older = d.encode();
+            older[4..6].copy_from_slice(&version.to_le_bytes());
+            let crc = crc32fast::hash(&older[..DESC_LEN - 4]);
+            older[DESC_LEN - 4..DESC_LEN].copy_from_slice(&crc.to_le_bytes());
+            assert_eq!(
+                decode_slot(&older),
+                Slot::Unsupported(format!("format version {version}")),
+                "a current-layout record naming version {version}"
+            );
+        }
+    }
+
+    #[test]
     fn descriptor_slots_classify_empty_valid_torn_and_unsupported() {
         let d = Descriptor {
             store: S,
@@ -293,6 +390,7 @@ mod tests {
             next_page: 5,
             content_len: 100,
             history_pos: 2,
+            features: 0,
         };
         let bytes = d.encode();
         assert_eq!(decode_slot(&bytes), Slot::Valid(d));
@@ -309,7 +407,7 @@ mod tests {
             Slot::Unsupported(format!("format version {}", FORMAT_VERSION + 1))
         );
         // Required features this build lacks: unsupported, whatever the bit.
-        for bit in [0, 31] {
+        for bit in [1, 31] {
             let mut needs = bytes.clone();
             needs[6..10].copy_from_slice(&(1u32 << bit).to_le_bytes());
             let crc = crc32fast::hash(&needs[..DESC_LEN - 4]);

@@ -1,66 +1,25 @@
 name: leak-guard
-# Fails a PR if its title, body, commit messages or added lines match private markers.
-# The marker regex lives in a repository secret (Settings > Secrets and variables > Actions >
-# Secrets > PRIVATE_MARKERS), so the list itself is never committed or shown in logs.
-# A missing secret or an invalid pattern fails the check: an unscanned PR must never look clean.
-# Limits: PRs from forks and Dependabot get no secrets, so this check fails on them by design;
-# PR comments and review comments are not scanned.
-# Re-runs when the PR body is edited.
+# Starts the trusted leak scan for a pull request. This workflow runs the pull request's own
+# definition, so it uses no secrets and produces no `scan` check. When it completes,
+# .github/workflows/leak-scan.yml runs from the default branch, reads the pull request as data and
+# publishes the required `scan` check (see docs/ci-leak-scan.md).
+# Re-runs when the PR text is edited, so the scan sees the current title and body.
 
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: leak-guard-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
-  scan:
+  trigger:
+    name: Start trusted leak scan
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    env:
-      MARKERS: ${{ secrets.PRIVATE_MARKERS }}
-      BASE: ${{ github.event.pull_request.base.sha }}
-      HEAD: ${{ github.event.pull_request.head.sha }}
+    timeout-minutes: 2
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Scan PR text, commits and diff
-        run: |
-          set -euo pipefail
-          if [ -z "${MARKERS}" ]; then echo "::error::PRIVATE_MARKERS secret is not available; nothing was scanned"; exit 1; fi
-          # grep exits 2 on an invalid pattern; never treat that as "no match".
-          rc=0; grep -Ei -- "$MARKERS" /dev/null || rc=$?
-          if [ "$rc" -ge 2 ]; then echo "::error::PRIVATE_MARKERS is not a valid extended regex; nothing was scanned"; exit 1; fi
-          jq -r '.pull_request.title, (.pull_request.body // "")' "$GITHUB_EVENT_PATH" > /tmp/pr.txt
-          git log --format='%B' "$BASE..$HEAD" > /tmp/commits.txt
-          # Mark added lines with '>' so file headers ("+++ b/...") can never be confused with real
-          # additions such as a source line that itself starts with "++". --text and the two --no-*
-          # flags make every added line visible even if attributes mark a file binary or filter it.
-          git diff --text --no-ext-diff --no-textconv --output-indicator-new='>' "$BASE...$HEAD" -U0 > /tmp/diff.txt
-          # -a: a diff containing binary content (NUL bytes) must still be read line by line; without
-          # it grep reports only "binary file matches" and extracts nothing, so nothing is scanned.
-          rc=0; grep -a '^>' /tmp/diff.txt | cut -c2- > /tmp/added.txt || rc=$?
-          if [ "$rc" -ge 2 ]; then echo "::error::could not extract added lines (grep exit $rc)"; exit 1; fi
-          if [ "$(grep -ac '^>' /tmp/diff.txt || true)" -gt 0 ] && [ ! -s /tmp/added.txt ]; then
-            echo "::error::the diff adds lines but none were extracted; nothing was scanned"; exit 1
-          fi
-          git diff --name-only "$BASE...$HEAD" > /tmp/files.txt
-          fail=0
-          for f in pr commits added files; do
-            rc=0; grep -naEi -- "$MARKERS" "/tmp/$f.txt" > "/tmp/$f.hits" || rc=$?
-            if [ "$rc" -eq 0 ]; then
-              echo "::error::private marker found in PR $f (rewrite it; matches not echoed)"
-              wc -l < "/tmp/$f.hits"
-              fail=1
-            elif [ "$rc" -ge 2 ]; then
-              echo "::error::scan of PR $f failed (grep exit $rc)"
-              fail=1
-            fi
-          done
-          exit $fail
+      - name: Hand over to the trusted scan
+        run: echo "The leak-scan workflow scans this pull request from the default branch's code."

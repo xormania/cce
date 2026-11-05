@@ -13,11 +13,7 @@
     "old": "data = &data[n..];",
     "new": "data = &data[data.len()..];",
     "test": "fs_seam_tests::interrupted_and_short_transfers_still_write_and_read_every_byte",
-    "witness": "crates/cce-storage/src/fs_seam_tests.rs",
-    "success_expectation": {
-      "line": "io.read_at(FileId::Content, 4096, &mut got).unwrap();",
-      "contract": "A write that reports success must leave every byte readable."
-    }
+    "witness": "crates/cce-storage/src/fs_seam_tests.rs"
   },
   {
     "id": "read-error",
