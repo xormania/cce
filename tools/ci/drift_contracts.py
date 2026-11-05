@@ -18,6 +18,7 @@ MAX_ID_BYTES = 4096
 QUESTION_KINDS = frozenset({"proof", "guarantee", "witness", "deferral", "resolution"})
 VIOLATION_CODES = frozenset({
     "required_check_not_executed", "required_check_failed", "evidence_candidate_mismatch",
+    "workflow_definition_awaiting_acceptance",
     "claim_case_mismatch", "semantic_disposition_conflict", "semantic_catch_not_demonstrated",
 })
 LIMITATION_CODES = frozenset({"no_evidence", "unscoped_claim", "unscoped_mutation", "missing_evidence_identity", "incomplete_case_inventory"})
@@ -124,11 +125,20 @@ def evaluate(bundle: dict) -> dict:
         status = row.get("status")
         if not isinstance(status, str) or status not in _CHECK_STATES:
             _invalid()
-        executed = _boolean(row, "executed")
+        definition_status = row.get("definition_status")
+        if "definition_status" in row:
+            if (definition_status != "awaiting_acceptance" or row.get("executed", False) is not None
+                    or status != "unknown"):
+                _invalid()
+            executed = None
+        else:
+            executed = _boolean(row, "executed")
         matches = _identity_matches(row, "source_sha", head, limitations)
         if not _boolean(row, "required"):
             continue
-        if not executed or status in {"skipped", "blocked", "cancelled", "not_exercised", "unknown"}:
+        if definition_status == "awaiting_acceptance":
+            fail("workflow_definition_awaiting_acceptance", subject)
+        elif not executed or status in {"skipped", "blocked", "cancelled", "not_exercised", "unknown"}:
             fail("required_check_not_executed", subject)
         elif status == "fail":
             fail("required_check_failed", subject)

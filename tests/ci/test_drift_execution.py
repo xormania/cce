@@ -189,8 +189,33 @@ class ExecutionTests(unittest.TestCase):
         checks, limits, _ = self.collect()
         self.assertIn("producer_definition_unaccepted", limits)
         self.assertIn("rust:trusted-definition", [row["id"] for row in checks])
-        self.assertIn("required_check_not_executed", [v["code"] for v in self.violations(checks)])
+        policy = next(row for row in checks if row["id"] == "rust:trusted-definition")
+        self.assertEqual(policy.get("definition_status"), "awaiting_acceptance")
+        self.assertIsNone(policy["executed"])
+        self.assertEqual(policy["status"], "unknown")
+        self.assertTrue(policy["required"])
+        self.assertEqual(policy["source_sha"], HEAD)
+        self.assertEqual([v["code"] for v in self.violations(checks)],
+                         ["workflow_definition_awaiting_acceptance"])
         self.assertNotIn("producer_merge_identity_unavailable", limits)
+
+    def test_unaccepted_definition_does_not_hide_another_producers_failed_check(self):
+        self.change_rust()
+        self.api.responses["/actions/runs/11/jobs?per_page=50"]["jobs"][0]["steps"][0]["conclusion"] = "failure"
+        checks, limits, waiting = self.collect()
+        self.assertEqual(sorted(v["code"] for v in self.violations(checks)),
+                         ["required_check_failed", "workflow_definition_awaiting_acceptance"])
+        self.assertIn("producer_definition_unaccepted", limits)
+        self.assertFalse(waiting)
+
+    def test_unaccepted_definition_does_not_hide_another_producers_skipped_check(self):
+        self.change_rust()
+        self.api.responses["/actions/runs/11/jobs?per_page=50"]["jobs"][0]["steps"][0]["conclusion"] = "skipped"
+        checks, limits, waiting = self.collect()
+        self.assertEqual(sorted(v["code"] for v in self.violations(checks)),
+                         ["required_check_not_executed", "workflow_definition_awaiting_acceptance"])
+        self.assertIn("producer_definition_unaccepted", limits)
+        self.assertFalse(waiting)
 
     def test_owner_acceptance_of_this_head_lets_the_changed_producer_certify(self):
         self.change_rust()
@@ -202,6 +227,28 @@ class ExecutionTests(unittest.TestCase):
         rust = [row for row in checks if row["id"] in {"Format", "Clippy", "Test"}]
         self.assertEqual(len(rust), 3)
         self.assertTrue(all(row["producer_acceptance"] == {"pull": 9, "review": 1} for row in rust))
+
+    def test_changed_merge_workflow_without_acceptance_is_reported_as_policy(self):
+        self.pr_rust()
+        path = ".github/workflows/rust.yml"
+        self.api.files[path, MERGE] = self.api.files[path, MERGE].replace(
+            "cargo clippy --locked --workspace --all-targets -- --deny warnings",
+            "cargo clippy --locked --workspace --all-targets -- --deny warnings\n          cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings")
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = []
+        checks, limits, waiting = self.collect()
+        self.assertEqual([v["code"] for v in self.violations(checks)],
+                         ["workflow_definition_awaiting_acceptance"])
+        self.assertIn("producer_definition_unaccepted", limits)
+        self.assertFalse(waiting)
+
+    def test_owner_accepted_definition_still_reports_a_skipped_check(self):
+        self.change_rust()
+        self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
+        self.api.responses["/actions/runs/12/jobs?per_page=50"]["jobs"][0]["steps"][2]["conclusion"] = "skipped"
+        checks, limits, waiting = self.collect()
+        self.assertEqual([v["code"] for v in self.violations(checks)], ["required_check_not_executed"])
+        self.assertIn("producer_definition_owner_accepted_rust", limits)
+        self.assertFalse(waiting)
 
     def test_acceptance_by_another_account_stale_head_or_later_change_request_is_refused(self):
         for reviews in ([self.review("helper-bot")],
@@ -254,7 +301,7 @@ class ExecutionTests(unittest.TestCase):
         self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
         self.api.responses["/actions/runs/12/jobs?per_page=50"]["jobs"][0]["steps"][2]["conclusion"] = "failure"
         checks, _, _ = self.collect()
-        self.assertIn("required_check_failed", [v["code"] for v in self.violations(checks)])
+        self.assertEqual([v["code"] for v in self.violations(checks)], ["required_check_failed"])
         self.change_rust()
         self.api.responses["/pulls/9/reviews?per_page=100&page=1"] = [self.review(self.OWNER)]
         self.api.responses[RUNS]["workflow_runs"] = [run("drift-input", 11)]
@@ -286,7 +333,8 @@ class ExecutionTests(unittest.TestCase):
         self.api.files[".github/workflows/rust.yml", MERGE] = "name: rust\n"
         checks, limits, _ = self.collect()
         self.assertIn("producer_definition_unverified", limits)
-        self.assertIn("required_check_not_executed", [v["code"] for v in self.violations(checks)])
+        self.assertEqual([v["code"] for v in self.violations(checks)],
+                         ["workflow_definition_awaiting_acceptance"])
         self.assertIn(("log", 112), self.api.calls)
 
     # The leak scan: the trusted producer's `scan` check on the candidate head.

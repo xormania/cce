@@ -45,14 +45,22 @@ and the coverage line names each accepted producer
 (`producer_definition_owner_accepted_<producer>`). After the
 change merges, the default branch's copy is the trusted definition again.
 
-Execution findings are reported separately, each with its remedy:
+A workflow awaiting acceptance produces `workflow_definition_awaiting_acceptance`.
+Its normalized policy row has `definition_status = "awaiting_acceptance"` and
+`executed = null`: the analysis has not verified execution under an accepted
+definition. It does not assert that tests failed or never ran. This policy finding
+keeps the contract result unsuccessful until acceptance can be established.
+Actual execution findings continue to use their own codes.
+
+Execution and acceptance findings are reported separately, each with its remedy:
 
 | Code | Meaning | Remedy |
 |---|---|---|
 | `required_check_failed` | The producer ran and the step failed. | Fix the failure. |
 | `required_execution_unavailable` | No applicable run exists yet. | Wait for or start the run. |
 | `producer_merge_identity_unavailable` | The run happened, but its merge commit cannot be identified (for example the PR conflicts with its base). | Update the branch from its base. |
-| `producer_definition_unaccepted` | The candidate changes a producer definition and the owner has not approved this head. | Owner review of this head, or drop the workflow change. |
+| `workflow_definition_awaiting_acceptance` | A workflow definition has not satisfied the acceptance policy; test execution remains unverified by this analysis. | Obtain owner review of this head, or drop the workflow change; align the actual run’s workflow with the accepted definition if the merge commit differs. |
+| `producer_definition_unaccepted` | Collection reason retained for the workflow acceptance finding. | Inspect the workflow acceptance finding. |
 | `unsupported_producer_definition` | The steps cannot be recognized. | Keep the named direct-command steps. |
 
 Jev answers independent typed questions about proof, guarantees, witnesses,
