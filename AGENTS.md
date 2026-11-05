@@ -60,5 +60,6 @@ comments, and committed files must stand on their own:
   describe future work the change does not implement.
 - Do not commit files supplied as instructions or reference material.
 - If unsure whether something belongs, leave it out and ask xor.
-- The `leak-guard` check scans PR text, commit messages, and added lines. If it
-  fails, rewrite the text; do not work around the check.
+- The `scan` check (trusted `leak-scan` workflow) scans PR text, commit messages,
+  added lines and file names. If it fails, rewrite the text; do not work around
+  the check.

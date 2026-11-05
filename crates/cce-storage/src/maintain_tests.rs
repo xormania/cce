@@ -181,6 +181,28 @@ fn leaked(payload: usize, discard: bool) -> (SimIo, NativeStore, u64) {
 /// The published state's audit: reachable structures are disjoint, nothing is retired twice, and no
 /// retired extent overlaps a reachable one.
 fn audit(sim: &SimIo) {
+    assert_eq!(findings(sim), Vec::<String>::new(), "integrity check");
+    audit_physical(sim);
+}
+
+/// Every finding of the public integrity check, reading every content stream, as `check: detail`,
+/// sorted. Runs on a copy, so the store may stay open.
+fn findings(sim: &SimIo) -> Vec<String> {
+    let copy = Inner::open_read_only(Box::new(sim.after_process_exit()), Options::default())
+        .unwrap_or_else(|e| panic!("a read-only copy of the store must open: {e:?}"));
+    let report = crate::verify::run(&copy, crate::VerifyLevel::Scrub)
+        .unwrap_or_else(|e| panic!("the integrity check must run to completion: {e:?}"));
+    let mut found: Vec<String> = report
+        .findings
+        .iter()
+        .map(|f| format!("{}: {}", f.check, f.detail))
+        .collect();
+    found.sort();
+    found
+}
+
+/// The engine's own physical invariants, which the integrity check does not state the same way.
+fn audit_physical(sim: &SimIo) {
     assert_eq!(
         crate::audit::check_retirement(sim),
         Ok(()),
@@ -304,6 +326,46 @@ fn reclaiming_on_a_store_without_holes_does_nothing() {
     assert_eq!(r.content_bytes_reclaimed, 0);
     assert!(r.complete);
     assert_eq!(r.generation, generation, "nothing to do publishes nothing");
+}
+
+#[test]
+fn a_damaged_manifest_of_a_pending_staging_stops_hole_reclaim() {
+    use crate::io::{FileId, Io};
+    let sim = SimIo::new();
+    let s = create(&sim);
+    let pending: Vec<u8> = (0..90_000u32).map(|i| (i % 227) as u8).collect();
+    let staged = s.stage_content(&mut &pending[..]).unwrap();
+    commit(
+        &s,
+        "cover",
+        ChangeSet {
+            changes: vec![put("B", "b", None)],
+            ..ChangeSet::default()
+        },
+    );
+    // The staging's manifest comes first in its extents. Its last byte belongs to the last
+    // segment's digest, so the damaged manifest still decodes; only its own digest exposes it.
+    let (offset, len) = s.inner.staged_extents_for_test(&staged).unwrap()[0];
+    let mut last = [0u8; 1];
+    sim.read_at(FileId::Content, offset + len - 1, &mut last)
+        .unwrap();
+    sim.write_at(FileId::Content, offset + len - 1, &[last[0] ^ 0x5a])
+        .unwrap();
+    let generation = s.inner.snapshot().unwrap().desc.generation;
+    let r = s.maintain(
+        MaintenanceTask::ReclaimContentHoles,
+        MaintenanceBudget::default(),
+    );
+    assert!(
+        matches!(&r, Err(cce_core::storage::CommitError::Rejected(StorageError::Integrity(m)))
+            if m.contains(&format!("{offset}"))),
+        "a damaged staged manifest must stop the step as damage naming it: {r:?}"
+    );
+    assert_eq!(
+        s.inner.snapshot().unwrap().desc.generation,
+        generation,
+        "the refused step published"
+    );
 }
 
 #[test]
@@ -523,6 +585,14 @@ fn rebuilding_the_relationship_indexes_restores_the_submitted_edges_only_when_as
         (out.clone(), inc.clone())
     );
     damage(&s);
+    // The integrity check reports both: r1 has no incoming entry, and C's entry has no record.
+    assert_eq!(
+        findings(&sim),
+        [
+            "relationship-index: no incoming index entry",
+            "relationship-index: no matching relationship record",
+        ]
+    );
     // The damage shows through the port: r1 is missing from B's incoming listing, and listing C's
     // outgoing relationships fails on the entry without a record.
     let mut v = s.begin().unwrap();
@@ -2244,6 +2314,7 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
     let (mut checked, mut cases) = (0, 0);
     for (name, image, task, budget, partial) in SWEEPS {
         let base = image();
+        let before_findings = findings(&base);
         // The uncut step: what it changes, and how many mutating operations it makes.
         let probe = base.after_process_exit();
         let trace = Arc::new(Mutex::new(Vec::new()));
@@ -2302,11 +2373,22 @@ fn every_cut_of_a_maintenance_step_recovers_the_state_before_or_after_it() {
                 let pristine = img.after_process_exit();
                 with_repro(&label, &[("image", &pristine)], &trace, || {
                     let recovered = open(&img);
-                    audit(&img);
+                    audit_physical(&img);
                     let got = logical(&recovered);
                     assert!(
                         got == before || got == after,
                         "{label}: a state between the two"
+                    );
+                    // The integrity check sees what the state holds: the damage the step repairs
+                    // (index rebuild) until it is published, nothing after.
+                    assert_eq!(
+                        findings(&img),
+                        if got == before {
+                            before_findings.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        "{label}: integrity check"
                     );
                     let published = recovered.inner.snapshot().unwrap().desc.generation;
                     assert!(published <= r.generation, "{label}: published {published}");
@@ -2538,4 +2620,63 @@ fn a_fenced_store_refuses_maintenance_and_writes_nothing() {
         assert_eq!(sim.ops(), ops, "{name}: maintenance wrote while fenced");
         assert_eq!(s.inner.snapshot().unwrap().desc.generation, generation);
     }
+}
+
+/// A store over `sim` whose reads are tallied per file.
+fn tallied(sim: &SimIo) -> (NativeStore, std::sync::Arc<std::sync::Mutex<FileReads>>) {
+    let reads = std::sync::Arc::new(std::sync::Mutex::new(FileReads::default()));
+    let s = NativeStore {
+        inner: Inner::open(
+            Box::new(Sizes {
+                sim: sim.clone(),
+                largest: Default::default(),
+                reads: reads.clone(),
+            }),
+            Options::default(),
+        )
+        .unwrap(),
+    };
+    (s, reads)
+}
+
+#[test]
+fn reclaiming_holes_counts_every_metadata_page_it_reads() {
+    let (sim, s, _) = leaked(100_000, false);
+    drop(s);
+    sim.release();
+    let (s, reads) = tallied(&sim);
+    let pages_before = s.stats().unwrap().pages_read;
+    let meta_before = reads.lock().unwrap()[0].1;
+    let r = s
+        .maintain(
+            MaintenanceTask::ReclaimContentHoles,
+            MaintenanceBudget::default(),
+        )
+        .unwrap();
+    assert!(r.content_bytes_reclaimed > 0, "nothing was reclaimed");
+    let pages = s.stats().unwrap().pages_read - pages_before;
+    let meta = reads.lock().unwrap()[0].1 - meta_before;
+    assert_eq!(
+        pages * crate::format::PAGE_SIZE as u64,
+        meta,
+        "pages_read must count every metadata page read from the file"
+    );
+}
+
+#[test]
+fn relocation_counts_its_copy_buffer_as_held_content_buffer() {
+    let sim = fragmented();
+    let (s, _) = tallied(&sim);
+    assert_eq!(s.stats().unwrap().content_buffer_bytes_peak, 0);
+    let r = s
+        .maintain(MaintenanceTask::Relocate, MaintenanceBudget::default())
+        .unwrap();
+    assert!(r.content_bytes_moved > 0, "nothing moved");
+    let st = s.stats().unwrap();
+    assert_eq!(
+        st.content_buffer_bytes_peak,
+        crate::engine::CONTENT_CHUNK as u64,
+        "the copy holds one segment at a time"
+    );
+    assert_eq!(st.content_buffer_bytes, 0, "the copy released its buffer");
 }

@@ -1,0 +1,66 @@
+[package]
+name = "cce-storage-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cce-storage = { path = "..", features = ["fuzz-api"] }
+
+# Not a member of the repository workspace: ordinary builds, tests and CI never compile the fuzz
+# targets, which need a nightly toolchain and cargo-fuzz.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "page"
+path = "fuzz_targets/page.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slots"
+path = "fuzz_targets/slots.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "node"
+path = "fuzz_targets/node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "history"
+path = "fuzz_targets/history.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "records"
+path = "fuzz_targets/records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image"
+path = "fuzz_targets/image.rs"
+test = false
+doc = false
+bench = false

@@ -21,12 +21,20 @@ Missing logs or still-running source jobs leave validation incomplete, not passe
 A collection error replaces the candidate's previous success with failure or an
 in-progress result. The publisher rechecks the branch/PR head and check ownership;
 an older consumer cannot clear a newer candidate or overwrite a newer analysis.
+For a PR, publication also rechecks the collected base revision. A changed base
+invalidates the earlier evaluation even when the branch head has not moved.
+
+Test counts are attributed to the required step's trusted command and execution
+interval. Missing or ambiguous step output leaves evidence incomplete. A positive
+unittest discovery count consisting entirely of skipped cases does not prove test
+execution; a different step's count cannot supply the missing witness.
 
 Producer names and printed test counts alone are insufficient. The collector
 compares producer workflow contents with the trusted checkout before accepting
 execution. PR producers also identify the checked-out merge commit and current
-base. The applicable PR leak scan is evaluated alongside tooling and Rust tests;
-an emitted skipped-scan message cannot certify execution.
+base. For a pull request, the trusted leak scan's `scan` check is evaluated
+alongside tooling and Rust tests (see `docs/ci-leak-scan.md`). A scan that
+reports it could not run cannot certify execution.
 
 For a Markdown follow-up to a mixed PR, an earlier Rust push run can supply evidence
 only when a bounded ancestor comparison proves every intervening changed and
@@ -35,8 +43,32 @@ run, attempt and workflow hash remain attached. An applicable newer failure is
 preserved. An unfiltered PR producer still requires its current merge-candidate run.
 
 Changing a producer definition cannot certify that definition through its own
-output. A mismatch with the trusted definition fails validation; such changes need
-execution through an existing trusted producer before its results can be accepted.
+output. A changed definition is accepted only when the repository owner's latest
+review of the pull request's exact head commit approves it; a later push needs a
+new review, and an approval from any other account, of an older head, or followed
+by a change request does not count. Every review page is read, and an
+unreadable or unbounded review list fails closed. Accepted rows record the review,
+and the coverage line names each accepted producer
+(`producer_definition_owner_accepted_<producer>`). After the
+change merges, the default branch's copy is the trusted definition again.
+
+A workflow awaiting acceptance produces `workflow_definition_awaiting_acceptance`.
+Its normalized policy row has `definition_status = "awaiting_acceptance"` and
+`executed = null`: the analysis has not verified execution under an accepted
+definition. It does not assert that tests failed or never ran. This policy finding
+keeps the contract result unsuccessful until acceptance can be established.
+Actual execution findings continue to use their own codes.
+
+Execution and acceptance findings are reported separately, each with its remedy:
+
+| Code | Meaning | Remedy |
+|---|---|---|
+| `required_check_failed` | The producer ran and the step failed. | Fix the failure. |
+| `required_execution_unavailable` | No applicable run exists yet. | Wait for or start the run. |
+| `producer_merge_identity_unavailable` | The run happened, but its merge commit cannot be identified (for example the PR conflicts with its base). | Update the branch from its base. |
+| `workflow_definition_awaiting_acceptance` | A workflow definition has not satisfied the acceptance policy; test execution remains unverified by this analysis. | Obtain owner review of this head, or drop the workflow change; align the actual run’s workflow with the accepted definition if the merge commit differs. |
+| `producer_definition_unaccepted` | Collection reason retained for the workflow acceptance finding. | Inspect the workflow acceptance finding. |
+| `unsupported_producer_definition` | The steps cannot be recognized. | Keep the named direct-command steps. |
 
 Jev answers independent typed questions about proof, guarantees, witnesses,
 deferrals and resolutions. These answers are advisory. They never change test
@@ -124,6 +156,18 @@ receipt is compared per run; raw aggregate `caught` cannot override the accepted
 disposition. The adapter reads at most twelve current mutation receipts and
 reports bounded/incomplete input rather than silently claiming all were checked.
 
+Mapped cases and per-group status evaluation share a 1,000-case bound; the
+separate normalized-evidence inventory remains bounded at 256 rows. An oversized
+optional input reports a coverage limitation; requiring that input makes the
+missing coverage unsuccessful. No late case is silently dropped.
+
+Mutation receipts retain their raw exit codes. Negative subprocess returns and
+Linux shell signal exits (129 through 192) cannot certify an assertion catch.
+An optional `exit_convention = "subprocess"` identifies positive application
+exit codes, while `"shell"` identifies shell encoding. Without that field,
+signal-looking codes are treated conservatively. An explicit `aborted = true`
+always takes precedence; normal assertion exits such as 101 remain usable.
+
 Set repository variable `DRIFT_DATA_REQUIRED=true` only when this data source is
 configured and required for candidate acceptance. Missing credentials, invalid
 data or an unproven data/candidate association then fails required validation.
@@ -148,6 +192,14 @@ history window and reports when no reusable baseline exists. It does not promise
 permanent suppression. Changed evidence or model/tooling configuration reopens
 analysis; unrelated candidate identity alone does not change packet fingerprints.
 
+Completed provider results are checkpointed individually by atomic replacement.
+If a later request is interrupted, publication preserves the completed prefix and
+reports a partial provider stage. It neither repeats unfinished requests nor
+turns an advisory-provider interruption into a deterministic test failure.
+Re-entering a partial phase requires a new explicit replay; a completed phase is
+idempotent. These checkpoints protect against step interruption, not loss of the
+entire runner or an artifact upload that never occurs.
+
 Deferred packet fingerprints remain visible and get priority on the next
 evaluation of that source context. Source jobs, explicit rechecks and the bounded
 scan provide further evaluations. A changed-file comparison is limited to forty
@@ -165,6 +217,19 @@ per run, with unfinished work ahead of tracked results and rotation to avoid
 starvation. The retained inventory is bounded at two hundred recipes; overflow is
 reported as continuing coverage loss.
 
+A healthy public change retires an older finding only when correction metadata
+ties it to the affected lines in the same uniquely identified function or
+document section. Another change in the same file or function is insufficient.
+The metadata contains bounded hashes, not source excerpts. A real repair or
+restoration can close the finding; ambiguous identity stays unfinished. Legacy
+recipes can acquire this metadata by reconstructing their pinned original input.
+
+Tooling changes invalidate cached diagnoses while preserving validated unfinished
+recipes and the newest published queue. Retention overflow is a historical lower
+bound, not a current outstanding-work count; repeatedly seeing the same omitted
+inventory does not increase it. Older incompatible counters retain a coverage
+loss indicator without claiming their accumulated number is accurate.
+
 Reservation artifacts preserve these recipes before a provider call, including if
 the job is cancelled before publication. Missing credentials do not reserve an
 unattempted request. The latest published queue supersedes older snapshots so a
@@ -179,3 +244,97 @@ defect/healthy replays, actual isolated CLI execution, provider rejection and
 non-execution, private marker handling, bounded artifacts, deduplication and
 candidate check lifecycle. Synthetic provider replies validate integration behavior;
 they are not measurements of the model's diagnostic accuracy.
+
+## Owner decisions and claims (optional data)
+
+With versioned data configured (`DRIFT_DATA_REPOSITORY`, `DRIFT_DATA_TOKEN`,
+`DRIFT_DATA_FILES`), the observer also reads a decision ledger and selected status
+documents at one pinned data revision. Configure them in `DRIFT_DATA_FILES` as
+`"ledger": "<path>"` and `"documents": ["<path>", ...]` (at most 24). Use a token
+that can only read that repository's contents.
+
+The ledger links each question to the answers that settle it, the work they
+authorize and agent proposals. `tools/ci/drift_ledger.py` resolves it
+deterministically: an answer is replaced only by one that names it in
+`supersedes` (never by date), two unordered answers are a conflict, a proposal is
+never an answer, a proposal that would impose a restriction a deferral excludes
+is flagged, and an unanswered question must name the operation it blocks. The
+same module prints the current view for agents (`drift_ledger.py view`).
+
+Ledger format 2 records who recorded each answer (`recorded_by`). An owner answer
+also carries the owner's words (`quote`), or says why only a transcription
+survives (`quote_unavailable`). Work closes as `done` (with evidence),
+`withdrawn` (with a reason) or `superseded` (naming its successor). Open work
+under a replaced answer is reported, so it is never left behind silently.
+
+Every entry has a revision `rev`. Writers publish through
+`drift_ledger.py update --base READ --current LATEST --proposed EDITED --out FILE`.
+It applies the writer's changes onto the latest ledger by entry identity and
+keeps other writers' unrelated changes. It refuses:
+
+- a change to an entry that someone else changed since it was read (stale
+  revision, even if the value was changed back);
+- a change that does not advance `rev` by one;
+- an edited answer (record a new answer that supersedes it instead);
+- a removed entry;
+- an identity reused with different content.
+
+Re-applying changes that are already published reports `unchanged`, so a retry
+after a lost response has no duplicate effect.
+
+### Scoped context for agent sessions
+
+`tools/ci/ledger_context.py` reads the same ledger for one session's current work
+instead of printing every record:
+
+- `brief` renders the records that govern a scope (a JSON descriptor with an
+  objective, the work items in hand and who set it): current answers to questions
+  marked `applies = "always"`, each work item with the current answer to its
+  question and that answer's `forbids`, and every missing decision, conflict and
+  finding. Without a scope it covers all open work and says so. Other current
+  records are only named (identity and question title): the budget is a
+  ceiling, and loading one in full takes a relevance judgment.
+  The whole output, including the caller's header, stays within a character and
+  byte budget. Text is never cut: governing records that do not fit are named with
+  the read that returns them.
+- `read ID...` (or `read inventory`) returns the exact stored fields, written as
+  TOML, in pages. A cursor is bound to the ledger snapshot and the request, so a
+  page from a changed ledger is refused instead of mixed.
+- `changes` compares a held checkpoint with the ledger and reports added, changed,
+  superseded, unchanged, missing and unknown records separately. A record whose
+  status changed (for example an answer that was superseded) counts as changed.
+
+The summary in each line is the recorder's wording. The brief marks whether the
+owner's own words are stored with it (`quoted`) or only a paraphrase survives;
+`read` shows the quotation as stored. An owner quotation may be longer than other
+text fields, so a long message is kept whole.
+
+The writer keeps everything the reader accepts:
+- every TOML value, including booleans, floats (also `inf` and `nan`), dates and
+  times, inline tables, arrays and quoted keys;
+- top-level data outside the entries;
+- full-line comments.
+
+It reads back what it wrote and refuses (`serialization_mismatch`) if anything
+differs. The output file is replaced in one step. A comment after a value on the
+same line cannot be kept in place, so an update containing one is refused
+(`inline_comment_not_kept`) rather than dropping it.
+
+Each finding (for example a document line presenting a settled question as still
+waiting for the owner) becomes one private packet. It contains only:
+
+- the claim's surrounding document lines (not the document's path);
+- the applicable answer's fields: identity, question, authority, outcome, date
+  given, summary, excluded restrictions, superseded answers and source path;
+- any answer it superseded (identity, questions, summary, superseded by);
+- for a proposal or work finding, that record's identity, questions, answer,
+  summary, state and restrictions;
+- the finding itself: code, question, answer, proposal or work identity and line.
+
+Packet identities are keyed with the ledger's content, so a public reference
+cannot confirm a guessed finding. Jev's answer is advisory; findings never fail a
+candidate. Public output keeps only opaque codes such as `decision_record_findings`.
+
+Without decision data the summary states that private owner-decision consistency
+was not checked. A data-only correction is evaluated by the next run (or a
+dispatched run with `force`), which reads the data repository's current revision.

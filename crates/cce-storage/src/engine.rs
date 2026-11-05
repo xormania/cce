@@ -18,8 +18,8 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use cce_core::storage::{
     AttemptId, AttemptOutcome, Change, ChangeSet, CommitError, CommitReceipt, ContentDigest,
     ContentReader, ContentRef, ContextId, ContextRecord, Direction, HistoryEntry, HistoryPosition,
-    Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery, RemovalMode,
-    Revision, StagedContent, StagingToken, StorageError,
+    MAX_ID_LEN, Precondition, Relationship, RelationshipId, RelationshipKind, RelationshipQuery,
+    RemovalMode, Revision, StagedContent, StagingToken, StorageError,
 };
 use sha2::{Digest, Sha256};
 
@@ -62,14 +62,19 @@ pub(crate) struct Options {
     /// Largest length of any variable-length request field (record body, evidence label or bytes)
     /// and of any request list; bounded by the 32-bit length prefixes of the encoding.
     pub max_request_field: u64,
-    /// Largest encoded size of a whole request, which history stores as one length-prefixed field.
+    /// Largest encoded size of a whole request this open writes, which history stores as one
+    /// length-prefixed field. Reads are bounded by the format, not by this.
     pub max_request_len: u64,
+    /// Retained receipt information an open checks before touching the store.
+    pub guard: Option<crate::ReceiptGuard>,
 }
 
 /// Default number of recent commits whose write sets are kept for conflict validation.
 pub(crate) const DEFAULT_CONFLICT_WINDOW: usize = 4096;
 /// Default number of admitted commits that may wait for the commit worker.
 pub(crate) const DEFAULT_COMMIT_QUEUE: usize = 64;
+/// Default largest encoded request a store writes: 64 MiB, well below the format's `u32` limit.
+pub(crate) const DEFAULT_MAX_REQUEST_LEN: u64 = 64 << 20;
 
 impl Default for Options {
     fn default() -> Self {
@@ -79,7 +84,8 @@ impl Default for Options {
             commit_queue: DEFAULT_COMMIT_QUEUE,
             max_content_segments: DEFAULT_MAX_CONTENT_SEGMENTS,
             max_request_field: u32::MAX as u64,
-            max_request_len: u32::MAX as u64,
+            max_request_len: DEFAULT_MAX_REQUEST_LEN,
+            guard: None,
         }
     }
 }
@@ -96,6 +102,11 @@ pub(crate) struct Counters {
     pub pages_reused: AtomicU64,
     /// Staged content bytes written into retired content extents.
     pub content_bytes_reused: AtomicU64,
+    pub pages_read: AtomicU64,
+    pub pages_read_at_open: AtomicU64,
+    pub entries_visited: AtomicU64,
+    pub content_buffer_bytes: AtomicU64,
+    pub content_buffer_bytes_peak: AtomicU64,
 }
 
 /// The committed state a view reads.
@@ -480,6 +491,12 @@ impl NodeSink for PageWriter<'_> {
 }
 
 impl NodeSource for Inner {
+    fn entry_visited(&self) {
+        self.counters
+            .entries_visited
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn load(&self, at: PageRef) -> Result<Arc<Node>, StorageError> {
         let cur = lock(&self.state).current;
         let offset = at.page.checked_mul(PAGE_SIZE as u64);
@@ -498,6 +515,7 @@ impl NodeSource for Inner {
             return Ok(n.clone());
         }
         self.counters.cache_misses.fetch_add(1, Ordering::Relaxed);
+        self.counters.pages_read.fetch_add(1, Ordering::Relaxed);
         let mut buf = vec![0; PAGE_SIZE];
         self.io
             .read_at(FileId::Meta, offset.unwrap_or_default(), &mut buf)?;
@@ -523,6 +541,15 @@ impl NodeSource for Inner {
         Ok(node)
     }
 }
+
+/// Largest buffer held for a committed extent before its digest is verified. The same size as a
+/// content segment today, but a separate bound: it governs read buffering, not segment layout.
+const VERIFY_CHUNK: usize = 64 * 1024;
+
+/// Largest history entry the format can hold: its position, the length-prefixed attempt identifier
+/// and the length-prefixed encoded request. Reads are bounded by this, not by the open's options,
+/// which bound only what the open writes.
+pub(crate) const HISTORY_ENTRY_MAX: u64 = 8 + 4 + MAX_ID_LEN as u64 + 4 + u32::MAX as u64;
 
 impl Inner {
     pub fn create(
@@ -568,13 +595,19 @@ impl Inner {
     pub fn open(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
         io.open()?;
         let (desc, diagnostics) = read_publication(&*io)?;
+        check_guard(&desc, opts.guard)?;
         // The selected record and everything it references may still be only in the operating
         // system's cache (the previous owner exited before its barrier). Make them durable before
         // any receipt or new commit can rely on them.
         io.sync(FileId::Content)?;
         io.sync(FileId::Meta)?;
         let inner = Arc::new(Self::new(io, desc, diagnostics, opts));
+        inner
+            .counters
+            .pages_read
+            .fetch_add(PUBLICATION_SLOTS, Ordering::Relaxed);
         inner.load_content_pool()?;
+        inner.opened();
         inner.start_worker(opts.commit_queue)?;
         Ok(inner)
     }
@@ -585,9 +618,40 @@ impl Inner {
     pub fn open_read_only(io: Box<dyn Io>, opts: Options) -> Result<Arc<Self>, StorageError> {
         io.open_read_only()?;
         let (desc, diagnostics) = read_publication(&*io)?;
+        check_guard(&desc, opts.guard)?;
         let mut inner = Self::new(io, desc, diagnostics, opts);
         inner.read_only = true;
+        inner
+            .counters
+            .pages_read
+            .fetch_add(PUBLICATION_SLOTS, Ordering::Relaxed);
+        inner.opened();
         Ok(Arc::new(inner))
+    }
+
+    /// Fixes the count of pages read while opening.
+    fn opened(&self) {
+        let n = self.counters.pages_read.load(Ordering::Relaxed);
+        self.counters.pages_read_at_open.store(n, Ordering::Relaxed);
+    }
+
+    /// Notes `n` more bytes held in content stream buffers, keeping the peak.
+    fn buffer_held(&self, n: u64) {
+        let now = self
+            .counters
+            .content_buffer_bytes
+            .fetch_add(n, Ordering::Relaxed)
+            + n;
+        self.counters
+            .content_buffer_bytes_peak
+            .fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// Notes `n` bytes of content stream buffers released.
+    fn buffer_released(&self, n: u64) {
+        self.counters
+            .content_buffer_bytes
+            .fetch_sub(n, Ordering::Relaxed);
     }
 
     fn refuse_if_read_only(&self, what: &str) -> Result<(), StorageError> {
@@ -923,14 +987,14 @@ impl Inner {
             if let Retired::Page {
                 generation, page, ..
             } = decode_retired(&k, &v)?
-                && page_bound.is_some_and(|b| generation <= b)
+                && may_reuse(generation, page_bound)
             {
                 pages.push(page);
             }
         }
         let extents = lock(&self.pool)
             .free()
-            .filter(|(_, _, retired_at)| content_bound.is_some_and(|b| *retired_at <= b))
+            .filter(|(_, _, retired_at)| may_reuse(*retired_at, content_bound))
             .map(|(offset, len, _)| (offset, len))
             .collect();
         Ok((pages, extents))
@@ -1086,6 +1150,18 @@ impl Inner {
         finish_pending(&self.pending, attempt);
     }
 
+    /// Both publication slots as stored now (inspection). Reads only.
+    pub(crate) fn publication_slots(&self) -> Result<Vec<Slot>, StorageError> {
+        (0..2u64)
+            .map(|s| {
+                let mut buf = vec![0; PAGE_SIZE];
+                self.io
+                    .read_at(FileId::Meta, s * PAGE_SIZE as u64, &mut buf)?;
+                Ok(decode_slot(&buf))
+            })
+            .collect()
+    }
+
     /// The current committed state without a pin (tests only: production reads go through
     /// `pin_current`, so nothing they can reach is reused under them).
     #[cfg(test)]
@@ -1169,7 +1245,20 @@ impl Inner {
         lock(&self.cache).capacity
     }
 
-    pub(crate) fn read_extent(&self, x: &ExtentRef) -> Result<Vec<u8>, StorageError> {
+    /// Reads and verifies a committed extent of at most `limit` bytes. The recorded length is
+    /// checked against `limit` and the committed content before anything is allocated or read.
+    pub(crate) fn read_extent(
+        &self,
+        x: &ExtentRef,
+        limit: u64,
+        what: &str,
+    ) -> Result<Vec<u8>, StorageError> {
+        if x.len > limit {
+            return Err(corrupt(format!(
+                "{what} of {} bytes exceeds the {limit} byte limit",
+                x.len
+            )));
+        }
         let committed = lock(&self.state).current.content_len;
         if x.offset
             .checked_add(x.len)
@@ -1181,13 +1270,32 @@ impl Inner {
             )));
         }
         let len = usize::try_from(x.len).map_err(|_| corrupt("extent too large"))?;
+        let mismatch = || corrupt(format!("content extent at {}: digest mismatch", x.offset));
+        // A recorded length can be damaged while still in bounds. Before holding more than one
+        // chunk, verify the extent's digest by streaming it through one reused chunk buffer;
+        // nothing read in this pass is kept or interpreted.
+        if len > VERIFY_CHUNK {
+            let mut chunk = vec![0; VERIFY_CHUNK];
+            let mut hash = Sha256::new();
+            let mut at = x.offset;
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(VERIFY_CHUNK);
+                self.io.read_at(FileId::Content, at, &mut chunk[..n])?;
+                hash.update(&chunk[..n]);
+                at += n as u64;
+                left -= n;
+            }
+            let got: [u8; 32] = hash.finalize().into();
+            if got != x.digest {
+                return Err(mismatch());
+            }
+        }
+        // The length is now authentic: hold the extent whole and check it again as decoded.
         let mut buf = vec![0; len];
         self.io.read_at(FileId::Content, x.offset, &mut buf)?;
         if sha256(&buf) != x.digest {
-            return Err(corrupt(format!(
-                "content extent at {}: digest mismatch",
-                x.offset
-            )));
+            return Err(mismatch());
         }
         Ok(buf)
     }
@@ -1231,6 +1339,7 @@ impl Inner {
         let mut len = 0u64;
         let mut segments = Vec::new();
         let mut buf = vec![0; CONTENT_CHUNK];
+        let _held = BufferHold::new(self, CONTENT_CHUNK as u64);
         loop {
             // Fill one segment (short reads and interruptions are retried), then write it.
             // With a declared length, never ask for more than one byte past it, and reject as
@@ -1885,7 +1994,19 @@ impl Inner {
                     if now == 0 {
                         t.put(ck, ContentEntry::Removed.encode())
                             .map_err(rejected)?;
-                        self.retire_content(t, &manifest, generation, &mut retired)?;
+                        // A committed manifest, named by the stored index: read it like any
+                        // reader does, bounded and verified before it is held whole.
+                        let m = Manifest::decode(
+                            &self
+                                .read_extent(
+                                    &manifest,
+                                    Manifest::encoded_len(u32::MAX as usize),
+                                    "content manifest",
+                                )
+                                .map_err(rejected)?,
+                        )
+                        .map_err(rejected)?;
+                        self.retire_content(t, &manifest, &m, generation, &mut retired)?;
                     } else {
                         live.push((manifest.offset, manifest.len));
                         if now as u64 != n {
@@ -1929,7 +2050,10 @@ impl Inner {
             }
         }
         for o in orphans {
-            self.retire_content(t, &o, generation, &mut retired)?;
+            // Staged by this instance in this commit, possibly beyond the committed length.
+            let m = Manifest::decode(&self.read_written_extent(&o).map_err(rejected)?)
+                .map_err(rejected)?;
+            self.retire_content(t, &o, &m, generation, &mut retired)?;
         }
         Ok((retired, live))
     }
@@ -1940,12 +2064,11 @@ impl Inner {
         &self,
         t: &mut TreeTxn,
         manifest: &ExtentRef,
+        m: &Manifest,
         generation: u64,
         retired: &mut Vec<(u64, u64)>,
     ) -> Result<(), CommitError> {
-        let m = Manifest::decode(&self.read_written_extent(manifest).map_err(rejected)?)
-            .map_err(rejected)?;
-        for x in std::iter::once(*manifest).chain(m.segments) {
+        for x in std::iter::once(*manifest).chain(m.segments.iter().copied()) {
             t.put(
                 retired_extent_key(generation, x.offset),
                 x.len.to_le_bytes().to_vec(),
@@ -2002,6 +2125,7 @@ impl Inner {
     /// current generation is `next - 1`): retired at most two generations before `next`, so
     /// neither publication slot reaches it, and no later than the oldest generation a live view
     /// or content reader pins. `None`: nothing may be reused.
+    /// See [`may_reuse`] for how the bound is applied.
     fn reusable_through(&self, next: u64) -> Option<u64> {
         let oldest_pin = lock(&self.pins).keys().next().copied();
         next.checked_sub(2)
@@ -2261,6 +2385,57 @@ impl Inner {
         (s == self.store.0 && inst == self.instance).then_some(serial)
     }
 
+    /// Space use of the current state (see `SpaceReport`): a walk of a pinned snapshot, holding no
+    /// lock across it. Retirements are split by the reuse rule as of that snapshot.
+    pub(crate) fn space_report(self: &Arc<Self>) -> Result<crate::SpaceReport, StorageError> {
+        let (snap, _pin, ()) = self.pin_current_then(false, |_| ());
+        let d = snap.desc;
+        let through = self.reusable_through(d.generation.saturating_add(1));
+        let mut r = crate::SpaceReport::default();
+        // Every tree page the state reaches.
+        let mut stack = vec![d.root];
+        while let Some(at) = stack.pop() {
+            r.live_pages += 1;
+            if r.live_pages > d.next_page {
+                return Err(corrupt("tree reaches more pages than the store has"));
+            }
+            if let Node::Branch { children, .. } = &*self.load(at)? {
+                stack.extend(children.iter().copied());
+            }
+        }
+        let mut c = Cursor::new(&**self, d.root, &[P_CONTENT], None, d.next_page)?;
+        while let Some((_, v)) = c.next_entry()? {
+            if let ContentEntry::Live { manifest, .. } = ContentEntry::decode(&v)? {
+                let limit = Manifest::encoded_len(u32::MAX as usize);
+                r.live_content_bytes +=
+                    Manifest::decode(&self.read_extent(&manifest, limit, "content manifest")?)?
+                        .content
+                        .len;
+            }
+        }
+        let mut c = Cursor::new(&**self, d.root, &[P_HISTORY], None, d.next_page)?;
+        while let Some((_, v)) = c.next_entry()? {
+            r.history_entries += 1;
+            r.history_bytes += ExtentRef::decode(&v)?.len;
+        }
+        let mut c = Cursor::new(&**self, d.root, &[P_RETIRED], None, d.next_page)?;
+        while let Some((k, v)) = c.next_entry()? {
+            match decode_retired(&k, &v)? {
+                Retired::Page { generation, .. } if may_reuse(generation, through) => {
+                    r.retired_pages_reusable += 1;
+                }
+                Retired::Page { .. } => r.retired_pages_protected += 1,
+                Retired::Extent {
+                    generation, len, ..
+                } if may_reuse(generation, through) => r.retired_content_bytes_reusable += len,
+                Retired::Extent { len, .. } => r.retired_content_bytes_protected += len,
+            }
+        }
+        r.meta_file_bytes = self.io.len(FileId::Meta)?;
+        r.content_file_bytes = self.io.len(FileId::Content)?;
+        Ok(r)
+    }
+
     /// Total length of retired content extents no staging holds.
     pub fn reusable_content_bytes(&self) -> u64 {
         lock(&self.pool).free_bytes()
@@ -2430,7 +2605,8 @@ impl Inner {
         )?;
         Ok(cursor.map(move |entry| {
             let (_, v) = entry?;
-            decode_history(&self.read_extent(&ExtentRef::decode(&v)?)?)
+            let x = ExtentRef::decode(&v)?;
+            decode_history(&self.read_extent(&x, HISTORY_ENTRY_MAX, "history entry")?)
         }))
     }
 
@@ -2445,14 +2621,9 @@ impl Inner {
             ContentEntry::Live { manifest, .. } => manifest,
             ContentEntry::Removed => return Err(StorageError::ContentNotRetained),
         };
-        let limit = Manifest::encoded_len(self.max_segments);
-        if x.len > limit {
-            return Err(corrupt(format!(
-                "content manifest of {} bytes exceeds the {limit} byte limit",
-                x.len
-            )));
-        }
-        let m = Manifest::decode(&self.read_extent(&x)?)?;
+        // The format's maximum (a u32 segment count): the open's segment limit bounds staging only.
+        let limit = Manifest::encoded_len(u32::MAX as usize);
+        let m = Manifest::decode(&self.read_extent(&x, limit, "content manifest")?)?;
         if m.content != *c {
             return Err(corrupt(
                 "content manifest does not match the requested digest and length",
@@ -2490,6 +2661,7 @@ impl Inner {
             manifest: m,
             next: 0,
             buf: Vec::new(),
+            held: 0,
             pos: 0,
             total: Sha256::new(),
             failed: None,
@@ -2616,6 +2788,28 @@ impl ConflictLog {
     }
 }
 
+/// Refuses an open whose selected record contradicts the caller's retained receipt information,
+/// before anything is synced or written: another store identity, or a published logical history
+/// position below the retained minimum. Generations are not compared: a store may publish
+/// generations that do not move the history position.
+fn check_guard(d: &Descriptor, guard: Option<crate::ReceiptGuard>) -> Result<(), StorageError> {
+    let Some(g) = guard else {
+        return Ok(());
+    };
+    if d.store.0 != g.store_id {
+        return Err(StorageError::GuardRefused(
+            "the store's identity differs from the guarded identity".into(),
+        ));
+    }
+    if d.history_pos < g.min_history_position.0 {
+        return Err(StorageError::GuardRefused(format!(
+            "published history position {} is below the guarded minimum {}",
+            d.history_pos, g.min_history_position.0
+        )));
+    }
+    Ok(())
+}
+
 /// A retirement record taken from the committed tree: key, value and the retired page.
 type RetiredRecord = (Vec<u8>, Vec<u8>, u64);
 
@@ -2678,16 +2872,14 @@ fn settle_allocation(
                 Retired::Page {
                     generation, page, ..
                 } => {
-                    if reusable_through.is_some_and(|b| generation <= b)
-                        && below.is_none_or(|b| page < b)
-                    {
+                    if may_reuse(generation, reusable_through) && below.is_none_or(|b| page < b) {
                         return Ok(Some((k, v, page)));
                     }
                     generation
                 }
                 Retired::Extent { generation, .. } => generation,
             };
-            if reusable_through.is_none_or(|b| retired_at > b) {
+            if !may_reuse(retired_at, reusable_through) {
                 break;
             }
         }
@@ -2736,6 +2928,17 @@ fn settle_allocation(
     )))
 }
 
+/// The reuse rule, in one place: space retired at generation `retired_at` may be taken when it is
+/// no later than `through` (from `Inner::reusable_through`: two generations before the one being
+/// written, and no later than the oldest generation a live view or content reader pins). `None`:
+/// nothing may be taken. Space this forbids is what the space report calls protected.
+pub(crate) fn may_reuse(retired_at: u64, through: Option<u64>) -> bool {
+    through.is_some_and(|b| retired_at <= b)
+}
+
+/// Publication records, one per slot page at the start of the metadata file.
+const PUBLICATION_SLOTS: u64 = 2;
+
 /// Reads both publication slots and selects the record to recover from, checking its cursors
 /// against the files. Reads only.
 fn read_publication(io: &dyn Io) -> Result<(Descriptor, Vec<String>), StorageError> {
@@ -2746,7 +2949,7 @@ fn read_publication(io: &dyn Io) -> Result<(Descriptor, Vec<String>), StorageErr
         )));
     }
     let mut slots = Vec::new();
-    for s in 0..2u64 {
+    for s in 0..PUBLICATION_SLOTS {
         let mut buf = vec![0; PAGE_SIZE];
         io.read_at(FileId::Meta, s * PAGE_SIZE as u64, &mut buf)?;
         slots.push(decode_slot(&buf));
@@ -3022,6 +3225,8 @@ pub(crate) struct SegmentReader {
     manifest: Manifest,
     next: usize,
     buf: Vec<u8>,
+    /// Bytes of `buf`'s allocation counted as held in the store's content buffer counter.
+    held: u64,
     pos: usize,
     total: Sha256,
     failed: Option<String>,
@@ -3029,7 +3234,44 @@ pub(crate) struct SegmentReader {
     _pin: Option<Pin>,
 }
 
+/// Counts a content stream buffer as held for the guard's life.
+struct BufferHold<'a> {
+    inner: &'a Inner,
+    n: u64,
+}
+
+impl<'a> BufferHold<'a> {
+    fn new(inner: &'a Inner, n: u64) -> Self {
+        inner.buffer_held(n);
+        Self { inner, n }
+    }
+}
+
+impl Drop for BufferHold<'_> {
+    fn drop(&mut self) {
+        self.inner.buffer_released(self.n);
+    }
+}
+
+impl Drop for SegmentReader {
+    fn drop(&mut self) {
+        self.inner.buffer_released(self.held);
+    }
+}
+
 impl SegmentReader {
+    /// Keeps the store's buffer counter equal to the bytes `buf` has allocated. A shorter segment
+    /// reuses the allocation, so its capacity, not its length, is what the reader holds.
+    fn account(&mut self) {
+        let now = self.buf.capacity() as u64;
+        if now > self.held {
+            self.inner.buffer_held(now - self.held);
+        } else {
+            self.inner.buffer_released(self.held - now);
+        }
+        self.held = now;
+    }
+
     /// Holds `pin` (normally a clone of the issuing view's pin) for the reader's life.
     pub(crate) fn pinned(mut self, pin: Pin) -> Self {
         self._pin = Some(pin);
@@ -3086,11 +3328,16 @@ impl Read for SegmentReader {
                 if got != self.manifest.content.digest.0 {
                     let why = "content stream digest mismatch".to_string();
                     self.failed = Some(why.clone());
+                    // A failed reader holds no buffer.
+                    self.buf = Vec::new();
+                    self.account();
+                    self.pos = 0;
                     return Err(io::Error::new(io::ErrorKind::InvalidData, why));
                 }
                 return Ok(0);
             };
             self.buf.resize(x.len as usize, 0);
+            self.account();
             if let Err(e) = self
                 .inner
                 .io
@@ -3099,7 +3346,9 @@ impl Read for SegmentReader {
                 // Nothing of a segment that was not read and verified may stay readable.
                 let why = format!("content segment {} at offset {}: {e}", self.next, x.offset);
                 self.failed = Some(why.clone());
-                self.buf.clear();
+                // Free the allocation: a failed reader holds no buffer.
+                self.buf = Vec::new();
+                self.account();
                 self.pos = 0;
                 return Err(io::Error::other(why));
             }
@@ -3109,7 +3358,9 @@ impl Read for SegmentReader {
                     self.next, x.offset
                 );
                 self.failed = Some(why.clone());
-                self.buf.clear();
+                // Free the allocation: a failed reader holds no buffer.
+                self.buf = Vec::new();
+                self.account();
                 self.pos = 0;
                 return Err(io::Error::new(io::ErrorKind::InvalidData, why));
             }

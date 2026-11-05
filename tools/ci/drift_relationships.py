@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 from bisect import bisect_right
 import hashlib
+import json
 import posixpath
 import re
 import time
@@ -197,6 +198,47 @@ def _range(text, path, line=0, symbol=''):
     return lines, max(0, line - 5), min(len(lines), line + 12), ''
 
 
+def _corrective_side(text, path, changed, position):
+    """Identify unique changed lines within one named function or section.
+
+    These hashes are identity evidence, not a judgment that a change is a fix.
+    Repeated lines, unnamed contexts and multi-context edits stay ambiguous.
+    """
+    if text is None:
+        return None
+    lines = text.splitlines()
+    meaningful = lambda value: bool(value.strip()) and bool(re.search(r'[\w]', value))
+    changed = [line for line in changed if 0 <= line < len(lines) and meaningful(lines[line])]
+    if len(changed) > 16:
+        return None
+    positions = changed or [position]
+    blocks = _blocks(text, path) if path.endswith(('.rs', '.py')) else []
+    if path.endswith('.md'):
+        headings = [(i, value.strip()) for i, value in enumerate(lines) if re.match(r'^#{1,6}\s', value)]
+        blocks = [(start, headings[index + 1][0] if index + 1 < len(headings) else len(lines), name)
+                  for index, (start, name) in enumerate(headings)]
+    matches = [block for block in blocks if all(block[0] <= line < block[1] for line in positions)]
+    if not matches:
+        return None
+    start, end, name = min(matches, key=lambda block: block[1] - block[0])
+    if sum(block[2] == name for block in blocks) != 1:
+        return None
+    context = [line.strip() for line in lines[start:end]]
+    values = [lines[line].strip() for line in changed]
+    if any(context.count(value) != 1 for value in values):
+        return None
+    anchor = hashlib.sha256(json.dumps([path, name], separators=(',', ':')).encode()).hexdigest()
+    return anchor, sorted(hashlib.sha256(value.encode()).hexdigest() for value in values)
+
+
+def corrective_identity(before, after, before_path, path, old_changed, new_changed, old_line, new_line):
+    left = _corrective_side(before, before_path, old_changed, old_line)
+    right = _corrective_side(after, path, new_changed, new_line)
+    if not left or not right or left[0] != right[0] or not (left[1] or right[1]):
+        return None
+    return {'anchor': left[0], 'before': left[1], 'after': right[1]}
+
+
 class Collector:
     def __init__(self, api, source):
         self.api, self.source = api, source
@@ -366,11 +408,11 @@ def public_changes(api, source):
             old_line = max(0, int(hunk[1]) - 1) if hunk else 0
             new_line = max(0, int(hunk[3]) - 1) if hunk else 0
             hunk_text = ''
+            old_changed, new_changed = [], []
             if hunk:
                 end = hunks[index + 1].start() if index + 1 < len(hunks) else len(patch)
                 hunk_text = patch[hunk.start():end]
                 old_cursor, new_cursor = old_line, new_line
-                old_changed, new_changed = [], []
                 for diff_line in hunk_text.splitlines()[1:]:
                     if diff_line.startswith('-'):
                         old_changed.append(old_cursor)
@@ -400,9 +442,14 @@ def public_changes(api, source):
                 if omitted:
                     collector.limitations.add('relationship_context_incomplete')
             excerpts += collector.linked(path, '\n'.join(contexts), source['head_sha'], preferred)
-            rows.append({'id': path + '#relationship-' + str(index + 1), 'public_path':path,
+            row = {'id': path + '#relationship-' + str(index + 1), 'public_path':path,
                          'public_line':new_line + 1, 'excerpts':excerpts[:MAX_EXCERPTS],
-                         'questions':['proof', 'guarantee']})
+                         'questions':['proof', 'guarantee']}
+            correction = corrective_identity(before, after, before_path, path,
+                                             old_changed, new_changed, old_line, new_line)
+            if correction:
+                row['correction'] = correction
+            rows.append(row)
     return rows, sorted(collector.limitations), bool(files) and all(row['filename'].endswith('.md') for row in files)
 
 
