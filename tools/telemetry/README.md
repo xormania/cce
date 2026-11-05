@@ -65,3 +65,34 @@ configured timeout bounds database lock waiting, not filesystem synchronization.
 An empty database means coverage is unknown. Failed capture can lose observations
 whose source cannot replay them. Keep the live database and its journal sidecars
 together; a copy of an open database file is not a verified snapshot.
+
+
+Context producers can call `agent_telemetry.cce.observe_emission` with an action
+returning `(text, metadata)`. The original pair is returned unchanged. The command
+adapter also wraps an existing context command:
+
+```sh
+python -m agent_telemetry.cce --config profile.toml --session-id session-1 -- context-command
+```
+
+It forwards the command's output and exit status and records its observed emission.
+Capture and cleanup failures use a separate diagnostic. Consumption and delivery
+remain unknown. Integrations are opt-in: invoke the original command to disable
+capture. This package does not install hooks or collect native transcripts.
+
+Credentials are filtered by structured field names, including `authorization`,
+`api_key`, `password`, and access/refresh token fields. Usage fields such as
+`input_tokens` are retained. Redaction policy and affected JSON paths accompany
+each event. This filter does not discover secrets embedded in arbitrary text or
+binary artifacts; sources must supply approved content. Artifact names are hashes,
+not user-supplied paths. Missing captured content fails verification. Orphan scans
+only report unreferenced objects.
+
+The SQLite adapter rejects observed symbolic links and nonprivate database files.
+Its path checks and SQLite's file open are separate operations: protection against
+hostile concurrent replacement of database directories is not enforced. Artifact
+operations instead traverse directories through descriptors without following
+links. Durability depends on local filesystem synchronization guarantees; process
+termination checks do not establish power-loss behavior. A lock budget does not
+bound every filesystem operation. Querying a live WAL database uses SQLite's normal
+reader coordination and may require existing or writable journal sidecars.
