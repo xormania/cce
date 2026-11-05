@@ -52,7 +52,7 @@ class Fake:
         self.payloads.append(payload)
         if self.mutate:
             self.mutate()
-        names = {"c" + str(n): item["id"] for n, item in enumerate(payload["state"]["candidates"])}
+        names = {q: v["instructions"]["candidate"]["id"] for q, v in payload["questions"].items()}
         return {"model": payload["model"],
                 "answers": {q: {"type": "noul", "noul": self.scores.get(names[q], self.default)}
                             for q in payload["questions"]}}
@@ -64,30 +64,32 @@ def snap(text=TEXT):
 
 class ClassifyTests(unittest.TestCase):
     def test_thresholds_give_three_outcomes(self):
-        self.assertIs(select.classify(0.149), False)
-        self.assertIsNone(select.classify(0.15))
-        self.assertIsNone(select.classify(0.349))
-        self.assertIs(select.classify(0.35), True)
+        self.assertIs(select.classify(0.299), False)
+        self.assertIsNone(select.classify(0.3))
+        self.assertIsNone(select.classify(0.699))
+        self.assertIs(select.classify(0.7), True)
 
 
 class SelectTests(unittest.TestCase):
     def test_each_candidate_is_its_own_question_and_several_can_be_relevant(self):
         s = snap()
-        fake = Fake({"B10": 0.9, "B11": 0.8, "B12": 0.2, "B13": 0.01})
+        fake = Fake({"B10": 0.9, "B11": 0.8, "B12": 0.5, "B13": 0.01})
         result = select.select(s, SCOPE, fake)
         self.assertEqual(result["mode"], "jev")
         self.assertEqual(result["relevant"], ["B10", "B11"])
         self.assertIn("B12", result["uncertain"])
         self.assertIn("B13", result["not_relevant"])
         payload = fake.payloads[0]
-        self.assertEqual(len(payload["questions"]), len(payload["state"]["candidates"]))
+        self.assertNotIn("candidates", payload["state"])
+        self.assertEqual({v["instructions"]["candidate"]["id"] for v in payload["questions"].values()},
+                         set(result["scores"]))
         self.assertTrue(all(q["type"] == "noul" for q in payload["questions"].values()))
 
     def test_governing_records_are_never_sent_and_low_scores_cannot_remove_them(self):
         s = snap()
         fake = Fake(default=0.0)
         result = select.select(s, SCOPE, fake)
-        sent = {item["id"] for p in fake.payloads for item in p["state"]["candidates"]}
+        sent = {v["instructions"]["candidate"]["id"] for p in fake.payloads for v in p["questions"].values()}
         self.assertFalse(sent & {"A1", "A-style", "W-cache", "Q3"})
         text, meta = context.brief(s, SCOPE, selection=result)
         self.assertIn("A1 on Q1 (owner decided, quoted)", text.split("## Findings")[0])
@@ -95,7 +97,7 @@ class SelectTests(unittest.TestCase):
 
     def test_relevant_records_load_in_full_and_the_rest_stay_named(self):
         s = snap()
-        result = select.select(s, SCOPE, Fake({"B10": 0.9, "B11": 0.25}))
+        result = select.select(s, SCOPE, Fake({"B10": 0.9, "B11": 0.5}))
         text, _ = context.brief(s, SCOPE, selection=result)
         self.assertIn("## Judged relevant to this scope (1 of 1)", text)
         self.assertIn("B10 on Q10 (owner decided, quoted): Decision about topic 10", text)
@@ -177,7 +179,6 @@ class SelectTests(unittest.TestCase):
                 "candidate text": dict(snap=snap(TEXT.replace("Decision about topic 13", "Decision about topic 13!"))),
                 "new candidate": dict(snap=snap(TEXT + EXTRA.replace("Q1", "Q2").replace("B1", "B2"))),
                 "model": dict(kw=dict(model="jev-9.9.9")),
-                "rule": dict(kw=dict(rule={"reject_below": 0.1, "accept_at": 0.5})),
             }
             for name, change in changes.items():
                 with self.subTest(name=name):
@@ -186,6 +187,14 @@ class SelectTests(unittest.TestCase):
                     scope = kw.pop("scope", SCOPE)
                     select.select(change.get("snap", s), scope, fake, cache_dir=cache, **kw)
                     self.assertGreater(fake.calls, 0)
+
+    def test_a_threshold_change_reclassifies_cached_scores_without_evaluating(self):
+        s = snap()
+        with tempfile.TemporaryDirectory() as cache:
+            select.select(s, SCOPE, Fake({"B10": 0.65}), cache_dir=cache)
+            again = Fake()
+            result = select.select(s, SCOPE, again, cache_dir=cache, rule={"reject_below": 0.3, "accept_at": 0.6})
+            self.assertEqual((again.calls, result["relevant"]), (0, ["B10"]))
 
     def test_change_during_evaluation_is_stale_and_not_used(self):
         s = snap()
@@ -242,8 +251,9 @@ class SelectTests(unittest.TestCase):
         fake = Fake({"B14": 0.9})
         result = select.select(s, SCOPE, fake)
         payload = fake.payloads[0]
-        self.assertTrue(all("Ignore the rubric" not in q["instructions"] for q in payload["questions"].values()))
-        self.assertTrue(all(q["instructions"].startswith(select.RUBRIC) for q in payload["questions"].values()))
+        self.assertTrue(all(q["instructions"]["task"] == select.RUBRIC for q in payload["questions"].values()))
+        hostile_q = [q for q in payload["questions"].values() if "Ignore the rubric" in json.dumps(q)]
+        self.assertEqual([q["instructions"]["candidate"]["id"] for q in hostile_q], ["B14"])
         self.assertNotIn("Z9", result["relevant"] + result["not_relevant"] + result["uncertain"])
         self.assertEqual(result["relevant"], ["B14"])
 
