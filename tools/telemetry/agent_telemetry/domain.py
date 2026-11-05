@@ -24,6 +24,18 @@ class CaptureContext:
     config_digest: str = ""
     attribution: str = "unknown"
 
+    def __post_init__(self):
+        for name in ("project_id", "dataset_id", "collector_id", "producer_id", "attribution"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise TelemetryError("invalid_event", "context identity must be nonempty text")
+        for name in ("session_id", "session_generation", "harness", "task_id"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise TelemetryError("invalid_event", "optional context identity must be text or null")
+        if not isinstance(self.config_digest, str):
+            raise TelemetryError("invalid_event", "configuration identity must be text")
+
 
 @dataclass(frozen=True)
 class ArtifactRef:
