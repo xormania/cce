@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools' / 'ci'))
 import drift_check as dc
 
 HEAD, OTHER = 'a' * 40, 'b' * 40
-SOURCE = {'head_sha':HEAD, 'branch':'topic', 'pulls':[7]}
+SOURCE = {'head_sha':HEAD, 'base_sha':OTHER, 'branch':'topic', 'pulls':[7]}
 
 
 def row(identity=10, head=HEAD, owner='cce-drift:8:1', app='github-actions'):
@@ -19,9 +19,9 @@ def row(identity=10, head=HEAD, owner='cce-drift:8:1', app='github-actions'):
 
 
 class API:
-    def __init__(self, rows=None, current=HEAD, state='open'):
+    def __init__(self, rows=None, current=HEAD, state='open', base=OTHER):
         self.rows = {r['id']:copy.deepcopy(r) for r in (rows or [])}
-        self.current, self.state = current, state
+        self.current, self.state, self.base = current, state, base
         self.calls = []
 
     def api(self, path, method='GET', value=None):
@@ -29,7 +29,7 @@ class API:
         if path.startswith('/commits/'):
             return {'check_runs':list(copy.deepcopy(self.rows).values())}
         if path.startswith('/pulls/'):
-            return {'state':self.state, 'head':{'sha':self.current}}
+            return {'state':self.state, 'head':{'sha':self.current}, 'base':{'sha':self.base}}
         if path.startswith('/branches/'):
             return {'commit':{'sha':self.current}}
         if path == '/check-runs':
@@ -94,6 +94,21 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(api.rows[identity]['head_sha'], HEAD)
         self.assertEqual(api.rows[identity]['conclusion'], 'cancelled')
         self.assertNotIn('Old success', api.rows[identity]['output']['summary'])
+
+    def test_changed_base_cannot_receive_old_success(self):
+        api = API()
+        identity = dc.begin(api, SOURCE)
+        api.base = 'c' * 40
+        self.assertFalse(dc.complete(api, identity, SOURCE, 'success', 'Old merge success.'))
+        self.assertEqual(api.rows[identity]['conclusion'], 'cancelled')
+
+    def test_missing_base_is_not_a_current_pr_candidate(self):
+        api = API(base=None)
+        self.assertFalse(dc.current_candidate(api, SOURCE))
+
+    def test_another_pull_with_only_matching_head_cannot_supply_freshness(self):
+        api = API(base='c' * 40)
+        self.assertFalse(dc.current_candidate(api, dict(SOURCE, pulls=[7, 8])))
 
     def test_closed_pull_is_not_current(self):
         api = API(state='closed')
