@@ -8,7 +8,10 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import json
+import tomllib
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools/ci"))
@@ -517,6 +520,172 @@ supersedes = ["D1"]
             (root / "current.toml").write_text((root / "ours.toml").read_text())
             done = subprocess.run(command, capture_output=True, text=True, check=True)
             self.assertEqual(done.stdout.strip(), "unchanged")
+
+
+# Values the reader accepts beyond the fields it validates. Every one must come back unchanged.
+EXOTIC = r"""
+[[question]]
+id = "Q7"
+rev = 1
+title = "Exotic values"
+asked = "q.md#7"
+text = "tab\tnew\nline quote\" backslash\\ del\u007f \u00e9 \u2603 #not-a-comment"
+literal = 'C:\path\x'
+multiline = '''
+first
+second'''
+yes = true
+no = false
+big = 9007199254740993
+negative = -42
+small = 1.5e-3
+negzero = -0.0
+plusinf = inf
+minusinf = -inf
+notanumber = nan
+when = 2026-11-04T10:00:00Z
+offset = 2026-11-04T10:00:00.123456-05:00
+local = 2026-11-04T10:00:00.5
+day = 2026-11-04
+clock = 07:32:00
+mixed = [1, "two", 3.0, true, [4], { five = 5 }]
+empty_list = []
+empty_table = {}
+nested = { inner = { deep = "x", "dotted.key" = 1 }, "with space" = 2 }
+"note.a" = "a quoted key with a dot"
+"key with space" = "spaced"
+"del\u007fkey" = "a key with DEL"
+"""
+
+
+def _same(a, b):
+    if isinstance(a, float) and isinstance(b, float) and a != a and b != b:
+        return True
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)) and type(a) is type(b):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+class WriterRoundTripTests(unittest.TestCase):
+    """read -> update -> write -> read keeps every accepted value, unrelated record and comment."""
+
+    def merged(self, base, current, proposed):
+        text, conflicts = ledger.update(base, current, proposed)
+        self.assertEqual(conflicts, [])
+        return text
+
+    def row(self, text, eid):
+        return ledger._entries(ledger.load(text))[eid][1]
+
+    def test_every_value_the_reader_accepts_survives_an_update(self):
+        proposed = BASE + EXOTIC
+        ledger.load(proposed)  # accepted by the reader
+        text = self.merged(BASE, BASE, proposed)
+        self.assertTrue(_same(self.row(text, "Q7"), self.row(proposed, "Q7")))
+        self.assertTrue(_same(tomllib.loads(text)["question"][-1], tomllib.loads(proposed)["question"][-1]))
+
+    def test_unrelated_records_with_such_values_are_kept_unchanged(self):
+        base = BASE + EXOTIC
+        proposed = base + WORK
+        text = self.merged(base, base, proposed)
+        before, after = ledger._entries(ledger.load(base)), ledger._entries(ledger.load(text))
+        for eid in before:
+            self.assertTrue(_same(before[eid], after[eid]), eid)
+        self.assertIn("W1", after)
+        # An unchanged entry holding nan is not a change (nan != nan must not demand a new revision).
+        self.assertEqual(ledger.update(base, base, base)[1], [])
+
+    def test_owner_quotations_are_written_back_verbatim(self):
+        quote = 'He said: "keep it" \u2014 tab\there, backslash \\ and del \u007f. # not a comment'
+        answer = ('[[answer]]\nid = "D4"\nrev = 1\nquestions = ["Q4"]\nauthority = "owner"\nrecorded_by = "r"\n'
+                  'quote = ' + json.dumps(quote) + '\noutcome = "decided"\ngiven = "d"\nsource = "s"\nsummary = "s"\n')
+        text = self.merged(BASE, BASE, BASE + answer)
+        self.assertEqual(self.row(text, "D4")["quote"], quote)
+
+    def test_top_level_data_and_tables_are_kept_and_merged(self):
+        base = BASE.replace("version = 2\n", 'version = 2\nowner = "x"\n', 1) + '[meta]\nnote = "keep"\n"a.b" = 1\n'
+        self.assertNotIn("[meta]", base.split("[[")[0])  # a table after entries is still top-level data
+        text = self.merged(base, base, base + WORK)
+        data = tomllib.loads(text)
+        self.assertEqual((data["owner"], data["meta"]), ("x", {"note": "keep", "a.b": 1}))
+        changed = base.replace('note = "keep"', 'note = "changed"')
+        text = self.merged(base, base, changed)
+        self.assertEqual(tomllib.loads(text)["meta"]["note"], "changed")
+        theirs = base.replace('note = "keep"', 'note = "theirs"')
+        _, conflicts = ledger.update(base, theirs, changed)
+        self.assertEqual([c["code"] for c in conflicts], ["top_level_conflict"])
+
+    def test_full_line_comments_are_kept_and_an_inline_comment_is_refused(self):
+        base = "# header line\n" + BASE + "\n# section: work\n" + WORK.replace(
+            'owner = "agent-a"', '# owner line note\nowner = "agent-a"')
+        proposed = base.replace("# header line", "# header line (edited)") + "\n# new section\n" + REQUIRED
+        current = base.replace("# section: work", "# section: work (theirs)")
+        text = self.merged(base, current, proposed)
+        for comment in ("# header line (edited)", "# section: work (theirs)", "# owner line note", "# new section"):
+            self.assertIn(comment, text)
+        inline = proposed.replace('summary = "Implement bulk export"', 'summary = "Implement bulk export" # why')
+        merged, conflicts = ledger.update(base, base, inline)
+        self.assertIsNone(merged)
+        self.assertEqual([c["code"] for c in conflicts], ["inline_comment_not_kept"])
+        # A hash inside a string is not a comment.
+        hashed = proposed.replace('summary = "Implement bulk export"', 'summary = "Export #3 # not a comment"')
+        self.assertIn('"Export #3 # not a comment"', self.merged(base, base, hashed))
+
+    def test_multi_line_values_with_comments_inside_are_kept(self):
+        # Review finding: a comment line inside a multi-line array made the writer crash.
+        entry = ('[[question]]\nid = "Q8"\nrev = 1\ntitle = "t"\nasked = "a"\nvalues = [\n'
+                 '# note inside the array\n  1,\n  [[2], 3],\n  "x # not a comment",\n]\nafter = "kept"\n')
+        top = '# about the list\nlist = [\n# why\n  "a",\n]\n'
+        text = BASE.replace("version = 2\n", "version = 2\n" + top, 1) + entry
+        ledger.load(text)
+        self.assertEqual(ledger.update(text, text, text)[1], [])
+        merged = self.merged(text, text, text + WORK)
+        self.assertTrue(_same(self.row(merged, "Q8"), self.row(text, "Q8")))
+        self.assertEqual(tomllib.loads(merged)["list"], ["a"])
+        lines = merged.splitlines()
+        for comment, field in (("# note inside the array", "values = "), ("# why", "list = "),
+                               ("# about the list", "list = ")):
+            # Each comment stays with its field: it comes just before that field's line.
+            self.assertLess(lines.index(comment), [i for i, l in enumerate(lines) if l.startswith(field)][0])
+        self.assertNotIn(("Q8", "1,"), ledger._comments(text)[0])
+
+    def test_a_failed_write_publishes_nothing(self):
+        # The writer re-reads what it wrote; any difference refuses the whole update.
+        with mock.patch.object(ledger, "_value", side_effect=lambda v: '"damaged"' if v == "x" else ORIGINAL_VALUE(v)):
+            merged, conflicts = ledger.update(BASE, BASE, BASE + EXOTIC.replace('deep = "x"', 'deep = "x"'))
+        self.assertIsNone(merged)
+        self.assertEqual([c["code"] for c in conflicts], ["serialization_mismatch"])
+        # Damaged top-level data or a lost comment in the written text is caught the same way.
+        base = "# keep this note\n" + BASE + '[meta]\nnote = "keep"\n'
+        real = ledger.serialize
+        for damage in (lambda t: t.replace('note = "keep"', 'note = "lost"'), lambda t: t.replace("# keep this note\n", "")):
+            with mock.patch.object(ledger, "serialize", side_effect=lambda *a, **k: damage(real(*a, **k))):
+                merged, conflicts = ledger.update(base, base, base + WORK)
+            self.assertIsNone(merged)
+            self.assertEqual([c["code"] for c in conflicts], ["serialization_mismatch"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "base.toml").write_text(BASE)
+            (root / "proposed.toml").write_text(BASE + EXOTIC)
+            (root / "out.toml").write_text("previous output\n")
+            command = [sys.executable, "-I", "-B", str(ROOT / "tools/ci/drift_ledger.py"), "update",
+                       "--base", str(root / "base.toml"), "--current", str(root / "base.toml"),
+                       "--proposed", str(root / "proposed.toml"), "--out", str(root / "out.toml")]
+            # Interrupted replace: the target keeps its previous content and no partial file is left.
+            with mock.patch.object(ledger.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    ledger._write_atomic(str(root / "out.toml"), "new content\n")
+            self.assertEqual((root / "out.toml").read_text(), "previous output\n")
+            self.assertEqual(sorted(p.name for p in root.iterdir()),
+                             ["base.toml", "out.toml", "proposed.toml"])
+            done = subprocess.run(command, capture_output=True, text=True, check=True)
+            self.assertEqual(done.stdout.strip(), "updated")
+            self.assertTrue(_same(self.row((root / "out.toml").read_text(), "Q7"), self.row(BASE + EXOTIC, "Q7")))
+
+
+ORIGINAL_VALUE = ledger._value if hasattr(ledger, "_value") else None
 
 
 if __name__ == "__main__":

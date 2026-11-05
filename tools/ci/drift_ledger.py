@@ -27,11 +27,13 @@ re-applying changes that are already published is a no-op.
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import json
 import os
 import re
 import sys
+import tempfile
 import tomllib
 
 AUTHORITIES = frozenset({"owner", "requirement"})
@@ -346,28 +348,204 @@ def _entries(model):
     return {row["id"]: (kind, row) for kind, key in KINDS for row in model[key].values()}
 
 
+KINDS_NAMES = frozenset(kind for kind, _ in KINDS)
+BARE_KEY = re.compile(r"[A-Za-z0-9_-]+\Z")
+TRIPLE = ('"' * 3, "'" * 3)
+
+
+def _same(a, b):
+    """Value equality as TOML means it: types must match and nan equals nan."""
+    if isinstance(a, float) and isinstance(b, float) and a != a and b != b:
+        return True
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+def _string(value):
+    # A JSON string is a TOML basic string, except that TOML also forbids a raw DEL character.
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def _key(key):
+    return key if BARE_KEY.fullmatch(key) else _string(key)
+
+
 def _value(value):
-    if isinstance(value, bool) or not isinstance(value, (str, int, list)):
-        raise LedgerError("unserializable_value")
+    """Write any value tomllib can return so that reading it back gives the identical value."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, float):
+        if value != value:
+            return "nan"
+        if value in (float("inf"), float("-inf")):
+            return "inf" if value > 0 else "-inf"
+        return repr(value)
+    if isinstance(value, str):
+        return _string(value)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
     if isinstance(value, list):
         return "[" + ", ".join(_value(v) for v in value) + "]"
-    # A JSON string is a valid TOML basic string (same escapes, \uXXXX for control characters).
-    return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        return "{ " + ", ".join(_key(k) + " = " + _value(v) for k, v in value.items()) + " }"
+    raise LedgerError("unserializable_value")
 
 
-def serialize(entries, header=""):
-    """Write entries (kind, row) as a ledger; parsing the result gives the same rows back."""
-    out = [header.rstrip("\n")] if header.strip() else []
+def _scan_line(line, quote):
+    """Scan one line outside of strings.
+
+    Returns (quote still open at the end of the line, True if a comment follows content on the
+    line, net change in bracket depth from [ ] { } outside strings).
+    """
+    i, depth = 0, 0
+    while i < len(line):
+        if quote is None:
+            if line.startswith(TRIPLE, i):
+                quote = line[i:i + 3]
+                i += 3
+                continue
+            if line[i] in "\"'":
+                quote = line[i]
+            elif line[i] == "#":
+                return None, True, depth
+            elif line[i] in "[{":
+                depth += 1
+            elif line[i] in "]}":
+                depth -= 1
+        elif quote in TRIPLE:
+            if quote == TRIPLE[0] and line[i] == "\\":
+                i += 2
+                continue
+            if line.startswith(quote, i):
+                quote = None
+                i += 3
+                continue
+        else:
+            if quote == '"' and line[i] == "\\":
+                i += 2
+                continue
+            if line[i] == quote:
+                quote = None
+        i += 1
+    return (quote if quote in TRIPLE else None), False, depth
+
+
+def _comments(text):
+    """Full-line comments by anchor, and whether any comment follows content on the same line.
+
+    Anchors: ("header",) for comments before the version line; ("top", key) for comments before
+    or inside a top-level key or before a [table] line; ("top", table, key) inside a table;
+    (entry id,) for comments just before an entry's [[kind]] line; (entry id, key) for comments
+    before or inside an entry's key; ("trailer",) after the last content. Lines that continue a
+    multi-line string or array are never read as keys or table headers.
+    """
+    anchors, pending, inline, entries, current = {}, [], False, [], None
+    open_quote, depth, field, table = None, 0, None, None
+    name = lambda key: next(iter(tomllib.loads(key + " = 0")))
+    for line in text.splitlines():
+        stripped = line.strip()
+        inside = open_quote is not None or depth > 0
+        if open_quote is None and stripped.startswith("#"):
+            pending.append(line)
+            continue
+        if open_quote is None and not stripped:
+            continue
+        open_quote, has_comment, delta = _scan_line(line, open_quote)
+        inline = inline or has_comment
+        if inside:
+            # A comment inside a multi-line value is kept with the field that holds it.
+            if pending:
+                field.extend(pending)
+                pending = []
+            depth += delta
+            continue
+        depth += delta
+        if stripped.startswith("[["):
+            current = {"comments": pending, "keys": {}}
+            entries.append(current)
+            field = []
+        elif stripped.startswith("["):
+            current = None
+            table = next(iter(tomllib.loads(stripped)))
+            field = anchors.setdefault(("top", table), [])
+            field.extend(pending)
+        else:
+            key = stripped.split("=", 1)[0].strip()
+            if current is None:
+                anchor = (("header",) if table is None and name(key) == "version" else
+                          ("top", name(key)) if table is None else ("top", table, name(key)))
+                field = anchors.setdefault(anchor, [])
+                field.extend(pending)
+            else:
+                field = current["keys"].setdefault(key, [])
+                field.extend(pending)
+                if key == "id":
+                    try:
+                        current["id"] = tomllib.loads(stripped)["id"]
+                    except (tomllib.TOMLDecodeError, KeyError):
+                        pass
+        pending = []
+    for entry in entries:
+        if "id" not in entry:
+            continue
+        if entry["comments"]:
+            anchors[(entry["id"],)] = entry["comments"]
+        for key, block in entry["keys"].items():
+            if block:
+                anchors[(entry["id"], name(key))] = block
+    if pending:
+        anchors[("trailer",)] = pending
+    return {anchor: block for anchor, block in anchors.items() if block}, inline
+
+
+def _extras(text):
+    """Top-level data outside the version and the entry arrays (accepted by the reader)."""
+    return {k: v for k, v in tomllib.loads(text).items() if k != "version" and k not in KINDS_NAMES}
+
+
+def serialize(entries, header="", extras=None, comments=None):
+    """Write a ledger; reading it back gives the same entries, top-level data and full-line comments.
+
+    ``header`` is the leading comment block for callers that pass only that; a ("header",) anchor
+    in ``comments`` takes its place.
+    """
+    comments = dict(comments or {})
+    head = comments.pop(("header",), None)
+    out = list(head) if head is not None else ([header.rstrip("\n")] if header.strip() else [])
     out.append("version = " + str(VERSION))
+    extras = extras or {}
+    for k, v in extras.items():
+        if not isinstance(v, dict):
+            out.extend(comments.get(("top", k), []))
+            out.append(_key(k) + " = " + _value(v))
+    for name, table in extras.items():
+        if isinstance(table, dict):
+            out.append("")
+            out.extend(comments.get(("top", name), []))
+            out.append("[" + _key(name) + "]")
+            for k, v in table.items():
+                out.extend(comments.get(("top", name, k), []))
+                out.append(_key(k) + " = " + _value(v))
     for kind, _ in KINDS:
         for k, row in entries:
             if k != kind:
                 continue
             out.append("")
+            out.extend(comments.get((row["id"],), []))
             out.append("[[" + kind + "]]")
-            out.extend(key + " = " + _value(val) for key, val in row.items())
+            for key, val in row.items():
+                out.extend(comments.get((row["id"], key), []))
+                out.append(_key(key) + " = " + _value(val))
+    trailer = comments.get(("trailer",))
+    if trailer:
+        out += [""] + trailer
     return "\n".join(out) + "\n"
 
 
@@ -380,6 +558,28 @@ def _header(text):
     return "\n".join(lines)
 
 
+def _three_way(base, current, proposed):
+    """Merge one keyed collection the way entries merge. Returns (merged, conflicting keys)."""
+    merged, conflicts = dict(current), []
+    for key in list(base) + [k for k in proposed if k not in base]:
+        b, p, c = base.get(key), proposed.get(key), current.get(key)
+        if _same(b, p):
+            continue
+        if _same(c, b) or _same(c, p):
+            if p is None:
+                merged.pop(key, None)
+            else:
+                merged[key] = p
+        else:
+            conflicts.append(key)
+    return merged, conflicts
+
+
+def _mismatch():
+    return None, [{"code": "serialization_mismatch", "id": "-",
+                   "remedy": "nothing was written; report this ledger content as a writer defect"}]
+
+
 def update(base_text, current_text, proposed_text):
     """Apply a writer's changes onto the current ledger.
 
@@ -387,14 +587,16 @@ def update(base_text, current_text, proposed_text):
     ``current`` the latest published ledger. Returns (merged text, conflicts). With conflicts the
     merged text is None and nothing may be published; each conflict names the entry and remedy.
     The comparison is by entry identity and full content, including ``rev``, so an entry that
-    changed and changed back (A -> B -> A) still counts as changed.
+    changed and changed back (A -> B -> A) still counts as changed. Every value the reader accepts
+    is written back unchanged, as are top-level data outside the entries and full-line comments.
+    The written text is read back and must match exactly; otherwise nothing is returned.
     """
     base, current, proposed = (_entries(load(t)) for t in (base_text, current_text, proposed_text))
     conflicts = []
     changed = {}
     for eid in list(base) + [e for e in proposed if e not in base]:
         b, p = base.get(eid), proposed.get(eid)
-        if b == p:
+        if _same(b, p):
             continue
         c = current.get(eid)
         if p is None:
@@ -404,7 +606,7 @@ def update(base_text, current_text, proposed_text):
         if b is None:
             if p[1]["rev"] != 1:
                 conflicts.append({"code": "new_entry_revision", "id": eid, "remedy": "a new entry starts at rev 1"})
-            elif c is not None and c != p:
+            elif c is not None and not _same(c, p):
                 conflicts.append({"code": "identity_reused", "id": eid,
                                   "remedy": "the identity is already published with other content; use a new one"})
             else:
@@ -418,25 +620,61 @@ def update(base_text, current_text, proposed_text):
         elif p[1]["rev"] != b[1]["rev"] + 1:
             conflicts.append({"code": "revision_not_advanced", "id": eid,
                               "remedy": "set rev to " + str(b[1]["rev"] + 1)})
-        elif c == p:
+        elif _same(c, p):
             changed[eid] = p
-        elif c != b:
+        elif not _same(c, b):
             conflicts.append({"code": "stale_revision", "id": eid, "expected_rev": b[1]["rev"],
                               "found": "removed" if c is None else "rev " + str(c[1]["rev"]),
                               "remedy": "re-read the current ledger and reapply this change"})
         else:
             changed[eid] = p
+    extras, extra_conflicts = _three_way(*(_extras(t) for t in (base_text, current_text, proposed_text)))
+    conflicts += [{"code": "top_level_conflict", "id": key,
+                   "remedy": "re-read the current ledger and reapply this change"} for key in extra_conflicts]
+    (base_notes, _), (current_notes, _), (proposed_notes, inline) = (
+        _comments(t) for t in (base_text, current_text, proposed_text))
+    if inline:
+        conflicts.append({"code": "inline_comment_not_kept", "id": "-",
+                          "remedy": "move the comment onto its own line above the value"})
+    notes, note_conflicts = _three_way(base_notes, current_notes, proposed_notes)
+    conflicts += [{"code": "comment_conflict", "id": ":".join(map(str, key)),
+                   "remedy": "re-read the current ledger and reapply the comment change"} for key in note_conflicts]
     if conflicts:
         return None, conflicts
     merged = [changed.get(eid, entry) for eid, entry in current.items()]
     merged += [changed[eid] for eid in changed if eid not in current]
-    text = serialize(merged, _header(current_text) or _header(proposed_text))
     try:
-        resolve(load(text))
+        text = serialize(merged, extras=extras, comments=notes)
+        back = load(text)
+    except LedgerError:
+        return _mismatch()
+    written = _entries(back)
+    if (set(written) != {row["id"] for _, row in merged}
+            or any(not _same(written[row["id"]], (kind, row)) for kind, row in merged)
+            or not _same(_extras(text), extras) or _comments(text)[0] != notes):
+        return _mismatch()
+    try:
+        resolve(back)
     except LedgerError as error:
         return None, [{"code": "merged_ledger_invalid", "id": str(error),
                        "remedy": "re-read the current ledger; a change you rely on was altered"}]
     return text, []
+
+
+def _write_atomic(path, text):
+    """Replace ``path`` with ``text`` in one step: readers see the old file or the new one, never a part."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, temporary = tempfile.mkstemp(dir=directory, prefix=".ledger-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        raise
 
 
 def _inside(root, path):
@@ -491,8 +729,7 @@ def _update_command(args):
         for c in conflicts:
             print("conflict: " + ", ".join(k + "=" + str(v) for k, v in c.items()))
         return 3
-    with open(args.out, "w", encoding="utf-8") as stream:
-        stream.write(merged)
+    _write_atomic(args.out, merged)
     # A retry after a lost publication response finds its changes already present.
     print("unchanged" if tomllib.loads(merged) == tomllib.loads(texts[1]) else "updated")
     return 0

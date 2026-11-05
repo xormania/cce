@@ -234,6 +234,17 @@ keeps other writers' unrelated changes. It refuses:
 Re-applying changes that are already published reports `unchanged`, so a retry
 after a lost response has no duplicate effect.
 
+The writer keeps everything the reader accepts:
+- every TOML value, including booleans, floats (also `inf` and `nan`), dates and
+  times, inline tables, arrays and quoted keys;
+- top-level data outside the entries;
+- full-line comments.
+
+It reads back what it wrote and refuses (`serialization_mismatch`) if anything
+differs. The output file is replaced in one step. A comment after a value on the
+same line cannot be kept in place, so an update containing one is refused
+(`inline_comment_not_kept`) rather than dropping it.
+
 Each finding (for example a document line presenting a settled question as still
 waiting for the owner) becomes one private packet. It contains only:
 
