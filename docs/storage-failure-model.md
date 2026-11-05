@@ -12,6 +12,19 @@ What the `cce-storage` engine promises today, under which assumptions, and how i
 - Data that was durable does not change on its own. Media corruption is a separate fault class.
 - A file's existence is durable only after its directory is synced.
 
+## Trust boundaries
+
+The engine distinguishes five kinds of threat. It handles each differently, and "local" does not
+mean trusted.
+
+| Threat | What the engine does | What it does not do |
+|---|---|---|
+| Resource pressure from the calling process | Bounds each request (`max_request_len`, 64 MiB by default) and each content stream (at most 2^20 segments of 64 KiB, 64 GiB, not configurable), and refuses work over a bound with an explicit error and no logical effect. A stream refused at its limit may already have written segments: the content file can grow and is not shrunk, and a later staging reuses that space. | It does not decide what a caller is allowed to store or change: authorization belongs to the host. There is no limit yet on the total content held by outstanding stagings. |
+| Malformed stored bytes (accidental damage, torn or reordered writes, media errors) | Verifies checksums before decoding, caps every count and length before allocating or reading, and verifies content in chunks before holding it whole (see "Store files on disk"). `cce-verify` reports structural damage without changing the store. | Damage that leaves a valid checksum, which is improbable but possible, is detected only where structure or digests disagree. |
+| Deliberate forgery of stored bytes | Nothing beyond the checks above: checksums are not keyed, and a forged record with a valid checksum is accepted (see the limitations under "Store files on disk"). `cce-verify` reports the inconsistencies it can see, such as an attempt record that the history does not back. | Stored bytes are not authenticated or encrypted. |
+| Filesystem guarantees | Relies on the platform assumptions above for durability and ordering. | It cannot detect a filesystem that acknowledges `fsync` without making data durable. |
+| Concurrent changes to the store directory by another process with write access | At open: refuses a store file that is a symlink or special file, and requires each opened handle to be the regular file at its path (same device and inode). An owning engine process excludes every other engine process through an advisory lock on `LOCK`; read-only inspection opens share that lock with each other, never with an owner. | The store directory itself may be a symlink and is not identity-checked. After open, it does not detect a file that is renamed, replaced or written underneath it, or a directory that is moved. A process that ignores the advisory lock is not stopped. Anyone who can write the directory can change the store. |
+
 ## Commit protocol
 
 1. Validate the attempt identity and the change's preconditions against the newest committed state.
