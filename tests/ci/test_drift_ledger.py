@@ -337,6 +337,14 @@ class StructureTests(unittest.TestCase):
                     ledger.load(text)
                 self.assertTrue(str(raised.exception).startswith(code), str(raised.exception))
 
+    def test_owner_quotation_may_exceed_other_text_limits_but_summaries_may_not(self):
+        long = "w" * (ledger.MAX_TEXT + 500)
+        text = BASE.replace('quote = "owner words"', 'quote = "' + long + '"', 1)
+        model = ledger.load(text)
+        self.assertIn(long, [a.get("quote") for a in model["answers"].values()])
+        with self.assertRaises(ledger.LedgerError):
+            ledger.load(BASE.replace('title = "Read-only mode"', 'title = "' + long + '"', 1))
+
     def test_command_line_view_reads_only_inside_its_root_and_states_precedence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
