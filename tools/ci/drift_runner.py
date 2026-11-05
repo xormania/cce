@@ -467,6 +467,8 @@ def summary(control):
         lines.append('No reusable baseline was available in the bounded history window.')
     for violation in control['violations']:
         lines.append('- `' + violation['code'] + '`; reference `' + violation['subject'] + '`.')
+        if violation['code'] == 'workflow_definition_awaiting_acceptance':
+            lines.append('  Workflow definition awaiting acceptance. Test execution is unverified by this analysis.')
     for row in control.get('results', []):
         record = row['record']
         lines.append('- Jev: `' + record['status'] + '`' + (' (reused; no request)' if record.get('reused') else '') + '; reference `' + record['subject'] + '`.')

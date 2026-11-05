@@ -44,6 +44,14 @@ def _row(identity, status="unknown", executed=False, source_sha=None, **metadata
             "status": status, "source_sha": source_sha, **metadata}
 
 
+def _definition_failure(identity, source_sha, reason):
+    row = _row(identity, source_sha=source_sha, reason=reason)
+    if reason == "producer_definition_unaccepted":
+        # This row describes policy validation, not an observed test execution.
+        row.update(definition_status="awaiting_acceptance", executed=None)
+    return row
+
+
 def _steps(text, producer):
     """Recognize named direct-command steps from the trusted definition only.
 
@@ -303,7 +311,7 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
             path, trusted, expected, acceptance = _definition(api, source, producer, root)
         except (ValueError, KeyError, OSError, UnicodeError, urllib.error.URLError) as error:
             reason = str(error) if str(error) in _DEFINITION_REASONS else "producer_definition_unavailable"
-            checks.append(_row(producer + ":trusted-definition", source_sha=source["head_sha"], reason=reason))
+            checks.append(_definition_failure(producer + ":trusted-definition", source["head_sha"], reason))
             limits += ["producer_definition_unverified", reason]
             continue
         if acceptance is not None:
@@ -372,7 +380,7 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
             else:
                 reason = ("producer_definition_unaccepted" if str(error) == "producer_definition_mismatch"
                           else "producer_definition_unavailable")
-                checks.append(_row(producer + ":trusted-definition", source_sha=source["head_sha"], reason=reason))
+                checks.append(_definition_failure(producer + ":trusted-definition", source["head_sha"], reason))
                 limits += ["producer_definition_unverified", reason]
             continue
         if observations is not None and logs:
