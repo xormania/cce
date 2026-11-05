@@ -170,6 +170,17 @@ class SQLiteRepository:
             self.db = None
 
     def append(self, event, captured_at, cursor=None):
+        try:
+            return self._append(event, captured_at, cursor)
+        except TelemetryError as error:
+            status = "deferred" if error.code == "busy" else "unavailable"
+            if error.code in ("invalid_event", "identity_mismatch", "conflict"):
+                status = "rejected"
+            return CaptureResult(status, reason=error.code)
+        except (ValueError, TypeError, OverflowError):
+            return CaptureResult("rejected", reason="invalid_event")
+
+    def _append(self, event, captured_at, cursor=None):
         validate(event)
         if self.readonly:
             raise TelemetryError("readonly", "inspection connection cannot append")

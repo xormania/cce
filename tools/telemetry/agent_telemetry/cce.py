@@ -1,6 +1,5 @@
 """Observe context emission without assigning delivery or consumption semantics."""
 
-from dataclasses import asdict
 import json
 import subprocess
 import sys
@@ -13,6 +12,13 @@ from .domain import CaptureContext, Event
 from .sqlite import SQLiteRepository
 
 
+def _diagnostic(message):
+    try:
+        print("telemetry: " + message, file=sys.stderr)
+    except Exception:
+        pass
+
+
 def observe_emission(action, collector, context, *, event_id=None):
     """Return the original (text, metadata) pair, even when capture fails."""
     start = time.monotonic_ns()
@@ -20,16 +26,15 @@ def observe_emission(action, collector, context, *, event_id=None):
     elapsed = time.monotonic_ns() - start
     try:
         text, metadata = result
-        collector.record(Event(
+        capture = collector.record(Event(
             event_id or str(uuid.uuid4()), "cce.context.emitted",
             json.dumps({"text": text, "metadata": metadata, "duration_ns": elapsed,
                         "emitted_bytes": len(text.encode()), "consumed": None,
                         "delivery": "unknown"}, ensure_ascii=False), context))
+        if capture.status not in ("recorded", "duplicate"):
+            _diagnostic("emission capture unavailable")
     except Exception:
-        try:
-            print("telemetry: emission capture unavailable", file=sys.stderr)
-        except Exception:
-            pass
+        _diagnostic("emission capture unavailable")
     return result
 
 
@@ -55,7 +60,7 @@ def main(argv=None):
         repository = SQLiteRepository(config.database, timeout_ms=config.timeout_ms)
         collector = Collector(repository,
                               FileArtifactStore(config.artifact_root) if config.artifacts_enabled else None,
-                              health=lambda status: print("telemetry: " + json.dumps(status), file=sys.stderr))
+                              health=lambda status: _diagnostic(json.dumps(status)))
         context = CaptureContext(config.project_id, config.dataset_id, config.collector_id,
                                  config.producer_id, session_id=args.session_id,
                                  config_digest=config.digest, attribution="explicit")
@@ -65,10 +70,13 @@ def main(argv=None):
             "emitted_bytes": len(result.stdout), "consumed": None, "delivery": "unknown",
         }, ensure_ascii=False), context, completeness="complete" if result.returncode == 0 else "partial"))
     except Exception:
-        print("telemetry: emission capture unavailable", file=sys.stderr)
+        _diagnostic("emission capture unavailable")
     finally:
         if repository is not None:
-            repository.close()
+            try:
+                repository.close()
+            except Exception:
+                _diagnostic("storage close failed")
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 
