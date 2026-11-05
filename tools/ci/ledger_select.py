@@ -149,6 +149,54 @@ def scope_areas(snap, scope, governing, evaluate, model=jev_client.MODEL):
     return chosen, "evaluated"
 
 
+TAG_QUESTION = ("The state holds one record from an owner decision ledger: a question with its current "
+                "answers and the work under them. Is the work this record governs in the named subject area?")
+TAG_FLOOR = 0.3      # below this for every area: leave the record untagged (shown as unknown)
+# A second area only when it reaches this score. Off by default: in the first tagging run the
+# second-best area was often a word association (a ledger "writer" scored 0.95 for the storage write path).
+TAG_SECONDARY = None
+
+
+def tag_record(snap, qid):
+    """The record text used to choose a question's areas: the question, its current answers (summary
+    and restrictions) and the work under them. Owner quotations are not included."""
+    records = snap["records"]
+    row = records[qid]["row"]
+    answers = [records[a]["row"] for a in records[qid]["links"]["current"]]
+    return {"question": {k: row[k] for k in ("id", "title", "affects") if row.get(k)},
+            "answers": [{"summary": a["summary"], **({"must_not_become": a["forbids"]} if a.get("forbids") else {})}
+                        for a in answers],
+            "work": [records[w]["row"]["summary"] for a in answers for w in records[a["id"]]["links"]["work"]]}
+
+
+def suggest_areas(snap, qid, evaluate, model=jev_client.MODEL, secondary=TAG_SECONDARY):
+    """Areas for one question: the best-scoring area (if any reaches TAG_FLOOR) and, when ``secondary``
+    is a score, at most one more that reaches it. Returns (areas, scores); evaluator failures raise SelectionError."""
+    names = sorted(snap["areas"])
+    if not names:
+        return [], {}
+    payload = {"model": model, "state": tag_record(snap, qid),
+               "questions": {"a" + str(n): {"type": "noul", "instructions": TAG_QUESTION + " Area: " + name + ": "
+                                            + snap["areas"][name],
+                                            "criteria": {"true": "The governed work is in this area.",
+                                                         "false": "The governed work is not in this area."}}
+                             for n, name in enumerate(names)}}
+    try:
+        raw = validate(evaluate(payload), payload)
+    except SelectionError:
+        raise
+    except Exception as error:  # noqa: BLE001
+        raise SelectionError("provider_unavailable") from error
+    scores = {name: raw["a" + str(n)] for n, name in enumerate(names)}
+    ranked = sorted(names, key=lambda n: -scores[n])
+    if scores[ranked[0]] < TAG_FLOOR:
+        return [], scores
+    chosen = [ranked[0]]
+    if secondary is not None and len(ranked) > 1 and scores[ranked[1]] >= secondary:
+        chosen.append(ranked[1])
+    return chosen, scores
+
+
 def _scope_state(snap, scope, governing):
     scope = scope or {}
     kinds = {rid: snap["records"][rid]["kind"] for rid in governing}

@@ -335,6 +335,27 @@ class SelectTests(unittest.TestCase):
         self.assertEqual((result["areas"], result["areas_from"]), ([], "unavailable"))
         self.assertIn("B11", result["uncertain"])
 
+    def test_suggested_areas_are_one_primary_and_at_most_one_clear_secondary(self):
+        s = self.area_ledger()
+
+        def scored(table):
+            def evaluate(payload):
+                return {"model": payload["model"], "answers": {
+                    q: {"type": "noul", "noul": next(v for k, v in table.items() if "Area: " + k in body["instructions"])}
+                    for q, body in payload["questions"].items()}}
+            return evaluate
+
+        self.assertEqual(select.suggest_areas(s, "Q1", scored({"cache": 0.9, "export": 0.75}))[0], ["cache"])
+        self.assertEqual(select.suggest_areas(s, "Q1", scored({"cache": 0.9, "export": 0.75}), secondary=0.7)[0],
+                         ["cache", "export"])
+        self.assertEqual(select.suggest_areas(s, "Q1", scored({"cache": 0.9, "export": 0.6}), secondary=0.7)[0], ["cache"])
+        self.assertEqual(select.suggest_areas(s, "Q1", scored({"cache": 0.2, "export": 0.1}))[0], [])
+        state = select.tag_record(s, "Q1")
+        self.assertEqual(state["answers"][0]["summary"], "Evict by size, largest first")
+        self.assertNotIn("quote", json.dumps(state))
+        with self.assertRaises(select.SelectionError):
+            select.suggest_areas(s, "Q1", lambda p: (_ for _ in ()).throw(OSError("down")))
+
     def test_no_candidates_needs_no_evaluation(self):
         fake = Fake()
         result = select.select(snap(LEDGER.replace('state = "done"\nevidence = "commit 123"', 'state = "open"')),
