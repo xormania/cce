@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import sqlite3
 import stat
+import uuid
 from .artifacts import directory
 from .domain import (CaptureResult, Receipt, TelemetryError, canonical,
                      observation_digest, validate)
@@ -55,6 +56,14 @@ def version_check(db):
             not metadata.get("dataset_id") or not metadata.get("collector_id")):
         raise TelemetryError("schema_version", "unsupported database format")
     return metadata
+
+
+def check_unpaired_sidecars(path):
+    if not path.exists():
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = Path(str(path) + suffix)
+            if (sidecar.exists() or sidecar.is_symlink()) and not path.exists():
+                raise TelemetryError("unsafe_path", "database sidecars exist without a database")
 
 
 def settings(db, timeout_ms):
@@ -137,16 +146,18 @@ class SQLiteRepository:
                 raise TelemetryError("identity_mismatch", "different collector already initialized")
             return existing
         parent_fd = directory(path.parent, create=True)
-        os.close(parent_fd)
-        check_path(path)
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-        except FileExistsError:
-            return cls.initialize(path, dataset_id=dataset_id, collector_id=collector_id, timeout_ms=timeout_ms)
-        os.close(fd)
+        name = ".pending-database-" + uuid.uuid4().hex
+        temporary = path.parent / name
+        created = False
         db = None
         try:
-            db = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, isolation_level=None,
+            check_path(path)
+            check_unpaired_sidecars(path)
+            fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600,
+                         dir_fd=parent_fd)
+            created = True
+            os.close(fd)
+            db = sqlite3.connect(temporary.as_uri() + "?mode=rw", uri=True, isolation_level=None,
                                  timeout=timeout_ms / 1000)
             db.execute("PRAGMA journal_mode=WAL")
             settings(db, timeout_ms)
@@ -157,17 +168,44 @@ class SQLiteRepository:
                 ("format", "agent-telemetry-v1"), ("dataset_id", dataset_id), ("collector_id", collector_id)))
             db.execute("PRAGMA user_version=1")
             db.commit()
-            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            # Publish only a complete main file. No connection may keep using the
+            # temporary name once the same inode becomes visible at the final name.
+            checkpoint = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if tuple(checkpoint) != (0, 0, 0):
+                raise TelemetryError("busy", "database initialization checkpoint incomplete")
+            db.close()
+            db = None
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
             try:
-                os.fsync(parent)
+                os.fsync(fd)
             finally:
-                os.close(parent)
+                os.close(fd)
+            check_path(path)
+            check_unpaired_sidecars(path)
+            try:
+                os.link(name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                        follow_symlinks=False)
+            except FileExistsError:
+                # A concurrent initializer owns the destination; validate it below.
+                pass
+            os.fsync(parent_fd)
         except sqlite3.Error as error:
             raise translate(error) from error
         finally:
-            if db is not None:
-                db.close()
-        return cls(path, timeout_ms=timeout_ms)
+            try:
+                if db is not None:
+                    db.close()
+            finally:
+                try:
+                    if created:
+                        for suffix in ("", "-wal", "-shm", "-journal"):
+                            try:
+                                os.unlink(name + suffix, dir_fd=parent_fd)
+                            except FileNotFoundError:
+                                pass
+                finally:
+                    os.close(parent_fd)
+        return cls.initialize(path, dataset_id=dataset_id, collector_id=collector_id, timeout_ms=timeout_ms)
 
     def close(self):
         if getattr(self, "db", None) is not None:
