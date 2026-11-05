@@ -345,6 +345,15 @@ class StructureTests(unittest.TestCase):
         with self.assertRaises(ledger.LedgerError):
             ledger.load(BASE.replace('title = "Read-only mode"', 'title = "' + long + '"', 1))
 
+    def test_summary_over_the_text_limit_is_refused_while_a_long_quotation_is_kept(self):
+        long = "w" * (ledger.MAX_TEXT + 500)
+        with_quote = BASE.replace('quote = "owner words"', 'quote = "' + long + '"', 1)
+        self.assertIn('summary = "', with_quote)
+        head, tail = with_quote.split('summary = "', 1)
+        with self.assertRaises(ledger.LedgerError) as caught:
+            ledger.load(head + 'summary = "' + long + tail)
+        self.assertEqual(str(caught.exception), "invalid_field:summary")
+
     def test_command_line_view_reads_only_inside_its_root_and_states_precedence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
