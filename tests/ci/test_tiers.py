@@ -3,9 +3,13 @@ one end-to-end run on a scratch repository."""
 import json
 import os
 from pathlib import Path
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -473,6 +477,241 @@ class Timeouts(unittest.TestCase):
                 if alive:
                     __import__("time").sleep(0.1)
             self.assertFalse(alive, "the test binary's child kept running after the timeout")
+
+
+# Each script names its processes in the file given as its argument once it is ready to be stopped.
+SCRIPT_START = """\
+import os, signal, subprocess, sys, time
+def record(*pids):
+    tmp = sys.argv[1] + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(" ".join(map(str, pids)))
+    os.replace(tmp, sys.argv[1])
+"""
+
+# Stops the way the side-by-side runner does: its command has a session of its own, which a signal
+# to the wrapper's group never reaches, so only the wrapper's cleanup can stop it. The cleanup takes
+# a moment, which a caller has to allow.
+WRAPPER = SCRIPT_START + """\
+child = subprocess.Popen(["sleep", "60"], start_new_session=True)
+def stop(_signum, _frame):
+    raise KeyboardInterrupt
+signal.signal(signal.SIGTERM, stop)
+record(os.getpid(), child.pid)
+try:
+    child.wait()
+except KeyboardInterrupt:
+    time.sleep(0.3)
+    os.killpg(child.pid, signal.SIGTERM)
+    child.wait()
+    print("wrapper cleanup finished", flush=True)
+    sys.exit(1)
+"""
+
+IGNORES_SIGTERM = SCRIPT_START + """\
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+record(os.getpid())
+time.sleep(60)
+"""
+
+# The command itself stops on SIGTERM; one process of its group does not.
+GROUP_MEMBER_IGNORES_SIGTERM = SCRIPT_START + """\
+member = ("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+          "print('ready', flush=True); time.sleep(60)")
+child = subprocess.Popen([sys.executable, "-c", member], stdout=subprocess.PIPE)
+child.stdout.readline()
+record(os.getpid(), child.pid)
+time.sleep(60)
+"""
+
+# Far beyond any wait below; the wait with this timeout expires once the command is ready instead.
+EXPIRES_WHEN_READY = 600
+
+
+def running(pid):
+    """A zombie has stopped; it only waits for its parent to collect it."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return stat.rpartition(")")[2].split()[0] != "Z"
+
+
+def appeared(path, seconds=30):
+    deadline = time.monotonic() + seconds
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return path.exists()
+
+
+class StoppingCommands(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.pids = self.root / "pids"
+        self.log = self.root / "log"
+        self.addCleanup(self.stop_strays)
+
+    def recorded(self):
+        return [int(p) for p in self.pids.read_text().split()] if self.pids.exists() else []
+
+    def stop_strays(self):
+        for pid in self.recorded():
+            if running(pid):
+                os.kill(pid, signal.SIGKILL)
+
+    def still_running(self):
+        """The recorded processes left running, after allowing a signal time to take effect."""
+        self.assertTrue(self.pids.exists(), "the command never recorded its processes")
+        deadline = time.monotonic() + 5
+        left = [p for p in self.recorded() if running(p)]
+        while left and time.monotonic() < deadline:
+            time.sleep(0.01)
+            left = [p for p in left if running(p)]
+        return left
+
+    def script(self, source):
+        return [sys.executable, "-c", source, str(self.pids)]
+
+    def run_until_expired(self, argv):
+        """run_logged, with its timeout expiring as a real one does, but only once the command is
+        ready: no test has to guess how long a start takes on a busy machine."""
+        ready = self.pids
+
+        class Expiring(subprocess.Popen):
+            def wait(self, timeout=None):
+                if timeout == EXPIRES_WHEN_READY:
+                    while not ready.exists() and self.poll() is None:
+                        time.sleep(0.01)
+                    if self.poll() is None:
+                        raise subprocess.TimeoutExpired(self.args, timeout)
+                return super().wait(timeout)
+
+        with mock.patch.object(subprocess, "Popen", Expiring):
+            return t.run_logged(argv, self.root, dict(os.environ), self.log, EXPIRES_WHEN_READY)
+
+    def fake_cargo(self, before_start=""):
+        """Stands in for Cargo: answers a version query, otherwise runs until stopped."""
+        tmp, pids = shlex.quote(f"{self.pids}.tmp"), shlex.quote(str(self.pids))
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        cargo = bin_dir / "cargo"
+        cargo.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in --version|-V) echo "cargo 0.0.0"; exit 0;; esac\n'
+            f"{before_start}\n"
+            "sleep 60 &\n"
+            f'echo "$$ $!" > {tmp}\n'
+            f"mv {tmp} {pids}\n"
+            "wait\n"
+        )
+        cargo.chmod(0o755)
+        return cargo
+
+    def scratch_repo(self):
+        repo = self.root / "repo"
+        repo.mkdir()
+        for args in (["init", "-q"], ["config", "user.name", "Fixture"],
+                     ["config", "user.email", "fixture@example.test"],
+                     ["commit", "-q", "--allow-empty", "-m", "fixture"]):
+            subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def sidebyside_argv(self, cargo):
+        """The real comparison on a scratch repository: `cargo` is the first command it starts."""
+        catalog = self.root / "faults.json"
+        catalog.write_text(json.dumps([{"id": "never-reached"}]))
+        return [sys.executable, str(ROOT / "tools/testkit/sidebyside.py"),
+                "--repo", str(self.scratch_repo()), "--original", "HEAD", "--candidate", "HEAD",
+                "--catalog", str(catalog), "--cargo", str(cargo),
+                "--output", str(self.root / "comparison")]
+
+    def start(self, argv, env=None):
+        with open(self.log, "w") as f:
+            p = subprocess.Popen(argv, stdout=f, stderr=subprocess.STDOUT, env=env,
+                                 start_new_session=True)
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        return p
+
+    def stop_when_ready(self, p):
+        self.assertTrue(appeared(self.pids), self.log.read_text())
+        p.terminate()
+        try:
+            return p.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("it did not exit after SIGTERM")
+
+    def test_a_timeout_lets_a_wrapper_stop_a_child_in_its_own_session(self):
+        code, text = self.run_until_expired(self.script(WRAPPER))
+        self.assertIsNone(code)
+        self.assertIn("wrapper cleanup finished", text)
+        self.assertEqual(self.still_running(), [])
+
+    def test_a_command_ignoring_sigterm_is_killed_after_the_grace_period(self):
+        with mock.patch.object(t, "STOP_GRACE_SECONDS", 0.2):
+            code, _ = self.run_until_expired(self.script(IGNORES_SIGTERM))
+        self.assertIsNone(code)
+        self.assertEqual(self.still_running(), [])
+
+    def test_a_group_member_ignoring_sigterm_is_killed_when_the_command_itself_stops(self):
+        with mock.patch.object(t, "STOP_GRACE_SECONDS", 0.2):
+            code, _ = self.run_until_expired(self.script(GROUP_MEMBER_IGNORES_SIGTERM))
+        self.assertIsNone(code)
+        self.assertEqual(self.still_running(), [])
+
+    def test_an_interruption_stops_the_command_and_is_raised_again(self):
+        self.addCleanup(signal.signal, signal.SIGINT,
+                        signal.signal(signal.SIGINT, signal.default_int_handler))
+
+        def interrupt_when_ready():
+            if appeared(self.pids):
+                os.kill(os.getpid(), signal.SIGINT)
+
+        thread = threading.Thread(target=interrupt_when_ready)
+        thread.start()
+        self.addCleanup(thread.join)
+        with self.assertRaises(KeyboardInterrupt):
+            t.run_logged(self.script(WRAPPER), self.root, dict(os.environ), self.log,
+                         EXPIRES_WHEN_READY)
+        self.assertIn("wrapper cleanup finished", self.log.read_text())
+        self.assertEqual(self.still_running(), [])
+
+    def test_a_normal_exit_returns_its_code_and_all_its_output(self):
+        source = ("import sys; print('out', flush=True); print('err', file=sys.stderr, flush=True);"
+                  " sys.exit(3)")
+        code, text = t.run_logged([sys.executable, "-c", source], self.root, dict(os.environ),
+                                  self.log, 60)
+        self.assertEqual((code, text), (3, "out\nerr\n"))
+        self.assertEqual(self.log.read_text(), text)
+
+    def test_sidebyside_stops_its_command_group_on_sigterm_and_exits_non_zero(self):
+        code = self.stop_when_ready(self.start(self.sidebyside_argv(self.fake_cargo())))
+        self.assertEqual(self.still_running(), [])
+        self.assertEqual(code, 1)
+        report = json.loads((self.root / "comparison/results.json").read_text())
+        self.assertEqual(report["status"], "incomplete")
+        self.assertIn("KeyboardInterrupt", report["error"])
+
+    def test_a_timeout_during_sidebyside_stops_a_command_that_ignores_sigterm(self):
+        # The side-by-side runner's cleanup needs its own grace period before it kills this
+        # command, and the caller's real grace period has to outlast that.
+        cargo = self.fake_cargo("trap '' TERM")
+        code, text = self.run_until_expired(self.sidebyside_argv(cargo))
+        self.assertIsNone(code)
+        self.assertEqual(self.still_running(), [])
+        self.assertIn("KeyboardInterrupt", text)
+
+    def test_stopping_the_runner_itself_stops_the_running_command(self):
+        cargo = self.fake_cargo()
+        env = dict(os.environ, PATH=f"{cargo.parent}{os.pathsep}{os.environ['PATH']}")
+        p = self.start([sys.executable, str(ROOT / "tools/tiers/run_tiers.py"),
+                        "--repo", str(self.scratch_repo()), "--tier", "format",
+                        "--output", str(self.root / "run")], env)
+        code = self.stop_when_ready(p)
+        self.assertEqual(self.still_running(), [], "the tier's command outlived the runner")
+        self.assertNotEqual(code, 0)
 
 
 if __name__ == "__main__":

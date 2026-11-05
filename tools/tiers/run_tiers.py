@@ -362,23 +362,40 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+# Longer than the side-by-side runner needs to stop its own command group.
+STOP_GRACE_SECONDS = 15
+
+
 def run_logged(argv, cwd, env, log, timeout):
-    """Runs `argv` in a process group of its own, writing combined output to `log`. On timeout
-    the whole group is killed, so test binaries and their children stop with Cargo. Returns
-    (exit code or None on timeout, text)."""
+    """Runs `argv` in a process group of its own, writing combined output to `log`. On timeout or
+    interruption the group is stopped, so test binaries and their children stop with Cargo.
+    Returns (exit code or None on timeout, text)."""
     with open(log, "w") as f:
         p = subprocess.Popen(argv, cwd=cwd, env=env, stdout=f, stderr=subprocess.STDOUT,
                              start_new_session=True)
         try:
             code = p.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            p.wait()
+            stop_group(p)
             code = None
+        except KeyboardInterrupt:
+            stop_group(p)
+            raise
     return code, Path(log).read_text(errors="replace")
+
+
+def stop_group(p):
+    """Stops the process group of `p`: first SIGTERM, so a command that puts its own children in
+    other sessions (the side-by-side runner) has time to stop them, then SIGKILL."""
+    for sig, grace in ((signal.SIGTERM, STOP_GRACE_SECONDS), (signal.SIGKILL, None)):
+        try:
+            os.killpg(p.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            p.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def campaign_argv(tier, batch):
@@ -583,4 +600,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # A stopped runner stops its command too: the command is in a session of its own.
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     sys.exit(main())
