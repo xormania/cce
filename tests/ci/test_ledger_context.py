@@ -121,6 +121,65 @@ def with_answer(text, block):
     return text + "\n" + block
 
 
+SCOPE = {"objective": "eviction", "work": ["W-cache"], "origin": "lead"}
+
+
+def question_with_answer(number, title="Topic"):
+    return f"""
+[[question]]
+id = "Q{number}"
+rev = 1
+title = "{title} {number}"
+asked = "q#{number}"
+
+[[answer]]
+id = "B{number}"
+rev = 1
+questions = ["Q{number}"]
+authority = "owner"
+outcome = "decided"
+given = "day 3"
+source = "session"
+summary = "Decision {number}"
+recorded_by = "lead"
+quote = "words {number}"
+"""
+
+
+RIVAL = """
+[[answer]]
+id = "A2-rival"
+rev = 1
+questions = ["Q2"]
+authority = "owner"
+outcome = "decided"
+given = "day 3"
+source = "session"
+summary = "A rival answer to the export question"
+recorded_by = "lead"
+quote = "use the other format"
+"""
+
+
+def proposal(identity, question, summary, extra=""):
+    return f"""
+[[proposal]]
+id = "{identity}"
+rev = 1
+by = "agent"
+summary = "{summary}"
+state = "open"
+questions = ["{question}"]
+{extra}
+"""
+
+
+def sections(text):
+    """The governing and other-records sections of a brief."""
+    governing = text.split("## Governing")[1].split("## Findings")[0]
+    return governing, text.split("## Other current records")[1]
+
+
 class BriefTests(unittest.TestCase):
     def test_scope_brings_its_governing_answer_with_restrictions_and_standing_directions(self):
         s = snap()
@@ -381,6 +440,137 @@ questions = ["Q2"]
         self.assertEqual(governing.count("- W-a ("), 1)
         self.assertEqual(governing.count("- W-b ("), 1)
 
+    def test_character_and_byte_limits_apply_independently(self):
+        s = snap(LEDGER + "".join(question_with_answer(n) for n in range(10, 40)))
+        text, meta = context.brief(s, SCOPE, head="é" * 100, max_chars=800, max_bytes=10 ** 6)
+        self.assertLessEqual(len(text), 800)
+        text, meta = context.brief(s, SCOPE, head="é" * 100, max_chars=10 ** 6, max_bytes=800)
+        self.assertLessEqual(len(text.encode()), 800)
+        self.assertGreater(len(text.encode()), len(text))
+
+    def test_long_candidate_titles_fall_back_to_bare_identities(self):
+        title = "A question title long enough to matter in a list"
+        s = snap(LEDGER + "".join(question_with_answer(n, title) for n in range(10, 40)))
+        whole, meta = context.brief(s, SCOPE, max_chars=10 ** 6)
+        self.assertIn(title, whole)
+        budget = meta["chars"] - 30 * len(title) // 2
+        text, meta = context.brief(s, SCOPE, max_chars=budget)
+        self.assertLessEqual(meta["chars"], budget)
+        self.assertEqual(meta["unlisted"], 0)
+        _, other = sections(text)
+        for n in range(10, 40):
+            self.assertIn("Q" + str(n), other)
+        self.assertNotIn(title, text)
+
+    def test_candidates_beyond_the_budget_are_counted_not_dropped(self):
+        s = snap(LEDGER + "".join(question_with_answer(n) for n in range(100, 200)))
+        text, meta = context.brief(s, SCOPE, max_chars=1500)
+        self.assertLessEqual(meta["chars"], 1500)
+        self.assertEqual(meta["pending"], [])
+        candidates = 101  # A2 and the hundred added answers
+        self.assertGreater(meta["unlisted"], 0)
+        self.assertGreater(len(meta["cards"]), 0)
+        self.assertEqual(len(meta["cards"]) + meta["unlisted"], candidates)
+        _, other = sections(text)
+        self.assertIn("- " + str(meta["unlisted"]) + " more not listed: read inventory", other)
+        for rid in meta["cards"]:
+            self.assertIn("Q" + rid[1:] if rid != "A2" else "Q2", other)
+
+    def test_standing_question_is_named_without_its_title(self):
+        standing = """
+[[question]]
+id = "T-other"
+rev = 1
+title = "A standing wording that the identity already says"
+asked = "standing direction"
+
+[[answer]]
+id = "A-other"
+rev = 1
+questions = ["T-other"]
+authority = "owner"
+outcome = "decided"
+given = "day 3"
+source = "session"
+summary = "Another direction"
+recorded_by = "lead"
+quote = "other words"
+"""
+        text, _ = context.brief(snap(LEDGER + standing), SCOPE)
+        _, other = sections(text)
+        self.assertIn("T-other", other)
+        self.assertNotIn("A standing wording", text)
+
+    def test_candidates_are_ordered_answers_proposals_work_and_numbers_naturally(self):
+        other_work = """
+[[work]]
+id = "W-other"
+rev = 1
+answer = "A2"
+summary = "Other open work"
+owner = "agent-b"
+state = "open"
+"""
+        extra = question_with_answer(10) + proposal("P-other", "Q10", "Some proposal") + other_work
+        text, _ = context.brief(snap(LEDGER + extra), SCOPE)
+        _, other = sections(text)
+        names = ("Q2 Export format", "Q10 Topic", "P-other", "W-other")
+        for name in names:
+            self.assertIn(name, other)
+        positions = [other.index(name) for name in names]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_no_other_records_says_none(self):
+        s = snap('version = 2\n\n[[question]]\nid = "Q1"\nrev = 1\ntitle = "t"\nasked = "a"\n')
+        text, _ = context.brief(s, None)
+        self.assertIn("## Other current records (0; not judged for this scope)\n- none\n", text)
+
+    def test_findings_are_delivered_from_the_caller_and_the_ledger(self):
+        text, _ = context.brief(snap(LEDGER, [{"code": "stale_list", "document": "board"}]), SCOPE)
+        self.assertIn("## Findings (1)\n- code=stale_list, document=board\n", text)
+
+    def test_conflicting_answers_govern_any_scope_and_are_named_in_findings(self):
+        s = snap(LEDGER + RIVAL)
+        text, _ = context.brief(s, SCOPE)
+        governing, _ = sections(text)
+        self.assertIn("Export format waits for the schema review", governing)
+        self.assertIn("A rival answer to the export question", governing)
+        self.assertIn("code=conflicting_answers_without_supersession, question=Q2, answers=A2,A2-rival", text)
+        page = context.read(s, ["Q2"])["text"]
+        self.assertIn("## Q2: question, question, rev 1, conflict,", page)
+        self.assertIn("## A2-rival: answer, owner direction, rev 1, conflicting,", page)
+
+    def test_proposal_restricting_a_deferred_decision_governs_any_scope_and_says_so(self):
+        ledger_text = LEDGER.replace('quote_unavailable = "only a paraphrase was kept"',
+                                     'quote_unavailable = "only a paraphrase was kept"\nforbids = ["csv export"]')
+        restricting = proposal("P-csv", "Q2", "Ban the other formats", 'restricts = ["csv export"]')
+        text, _ = context.brief(snap(ledger_text + restricting), SCOPE)
+        governing, _ = sections(text)
+        self.assertIn("Ban the other formats CONFLICTS with deferred A2: needs an owner decision", governing)
+
+    def test_proposal_on_a_governing_question_governs(self):
+        text, _ = context.brief(snap(LEDGER + proposal("P-evict", "Q1", "Evict in batches")), SCOPE)
+        governing, _ = sections(text)
+        self.assertIn("Evict in batches", governing)
+
+    def test_missing_decision_without_a_stated_operation_says_so(self):
+        unstated = '\n[[question]]\nid = "Q9"\nrev = 1\ntitle = "Open point"\nasked = "a"\n'
+        text, _ = context.brief(snap(LEDGER + unstated), SCOPE)
+        self.assertIn("Q9 (question, missing): Open point. Affects: NOT STATED", text)
+
+    def test_scope_line_shows_the_objective_its_work_and_who_set_it(self):
+        text, _ = context.brief(snap(), SCOPE)
+        self.assertIn("Scope: eviction | work: W-cache | set by: lead\n", text)
+
+    def test_brief_states_owner_precedence_and_what_agent_records_are(self):
+        text, _ = context.brief(snap(), SCOPE)
+        self.assertIn("Direct instructions from the owner in the current session take precedence over this view", text)
+        self.assertIn("Work and proposal entries are agent records, not decisions.", text)
+
+    def test_token_estimate_follows_the_bytes(self):
+        _, meta = context.brief(snap(), SCOPE, head="é" * 10)
+        self.assertEqual(meta["tokens_estimate"], (meta["bytes"] + 3) // 4)
+
     def test_quote_and_summary_stay_distinct(self):
         s = snap()
         text, _ = context.brief(s, {"objective": "x", "work": ["W-cache"], "origin": "lead"})
@@ -462,6 +652,50 @@ class ReadTests(unittest.TestCase):
                     context.read(s, ["Q1"], bound + ":" + offset, max_chars=300)
                 self.assertEqual(caught.exception.code, "invalid_cursor")
 
+    def test_read_brings_the_records_needed_to_read_it_in_context(self):
+        s = snap(LEDGER + proposal("P-evict", "Q1", "Evict in batches"))
+        for ref, expected in (("W-cache", "## A1:"), ("A1", "## Q1:"), ("P-evict", "## Q1:"), ("Q1", "## P-evict:")):
+            with self.subTest(ref):
+                self.assertIn(expected, context.read(s, [ref])["text"])
+
+    def test_inventory_lists_every_record_once(self):
+        s = snap()
+        text = context.read(s, ["inventory"])["text"]
+        for rid in s["records"]:
+            self.assertEqual(text.count("\n- " + rid + " "), 1, rid)
+
+    def test_inventory_classes_follow_the_scope(self):
+        s = snap()
+        scoped = context.read(s, ["inventory"], scope={"objective": "x", "work": [], "origin": "lead"})["text"]
+        self.assertIn("- A1 answer rev 1 current [candidate]", scoped)
+        self.assertIn("- A1 answer rev 1 current [governing]", context.read(s, ["inventory"], scope=SCOPE)["text"])
+
+    def test_page_smaller_than_the_minimum_is_refused(self):
+        with self.assertRaises(context.ContextError) as caught:
+            context.read(snap(), ["Q1"], max_chars=199)
+        self.assertEqual(caught.exception.code, "page_too_small")
+
+    def test_malformed_cursor_and_cursor_past_the_end_are_refused(self):
+        s = snap()
+        bound = context.read(s, ["Q1"], max_chars=300)["next"].rsplit(":", 1)[0]
+        for name, cursor in (("not a cursor", "nonsense"), ("text offset", bound + ":abc"), ("past the end", bound + ":999999")):
+            with self.subTest(name):
+                with self.assertRaises(context.ContextError) as caught:
+                    context.read(s, ["Q1"], cursor, max_chars=300)
+                self.assertEqual(caught.exception.code, "invalid_cursor")
+
+    def test_pages_end_on_line_boundaries_when_lines_are_short(self):
+        s = snap()
+        page = context.read(s, ["Q1"], max_chars=300)
+        self.assertIsNotNone(page["next"])
+        while page["next"]:
+            self.assertTrue(page["text"].endswith("\n"), page["text"])
+            page = context.read(s, ["Q1"], page["next"], max_chars=300)
+
+    def test_read_of_a_withdrawn_question_says_so(self):
+        withdrawn = '\n[[question]]\nid = "Q9"\nrev = 1\ntitle = "Moot"\nasked = "a"\nwithdrawn = "made moot"\n'
+        self.assertIn("## Q9: question, question, rev 1, withdrawn,", context.read(snap(LEDGER + withdrawn), ["Q9"])["text"])
+
     def test_question_read_includes_all_its_answers(self):
         page = context.read(snap(), ["Q1"])["text"]
         for rid in ("## Q1:", "## A1:", "## A1-old:"):
@@ -481,6 +715,19 @@ class ReadTests(unittest.TestCase):
 
 
 class ChangeTests(unittest.TestCase):
+    def test_checkpoint_returned_by_changes_reads_back_as_all_unchanged(self):
+        s = snap()
+        held = context.changes(s, None)["checkpoint"]
+        result = context.changes(s, held)
+        self.assertEqual(result["unchanged"], sorted(s["records"]))
+        self.assertEqual(result["changed"] + result["added"] + result["missing"] + result["unknown"], [])
+
+    def test_checkpoint_with_digests_that_are_not_text_is_unknown(self):
+        s = snap()
+        result = context.changes(s, {"records": {rid: 1 for rid in s["records"]}})
+        self.assertEqual(result["unknown"], sorted(s["records"]))
+        self.assertEqual(result["changed"], [])
+
     def test_without_checkpoint_everything_is_unknown_not_unchanged(self):
         result = context.changes(snap(), None)
         self.assertEqual(result["unchanged"], [])
@@ -659,6 +906,24 @@ print(os.getcwd() in [os.path.realpath(entry) for entry in sys.path if entry])
                                   capture_output=True, text=True, cwd=os.path.realpath(tmp))
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.strip(), "False")
+
+    def test_read_pages_through_a_record_on_the_command_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "ledger.toml").write_text(LEDGER)
+            common = ("read", "--root", tmp, "--ledger", tmp + "/ledger.toml", "Q1")
+            whole = self.run_tool(*common, cwd=tmp).stdout.rsplit("-- page", 1)[0]
+            got, arguments, pages = "", ("--max-chars", "300"), 0
+            while pages < 50:
+                done = self.run_tool(*common, *arguments, cwd=tmp)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                body, line = done.stdout.rsplit("-- page", 1)
+                got, pages = got + body, pages + 1
+                if "next: --cursor " not in line:
+                    break
+                arguments = ("--max-chars", "300", "--cursor", line.split("next: --cursor ")[1].strip())
+            self.assertGreater(pages, 1)
+            self.assertLess(pages, 50, "the cursor did not advance")
+            self.assertEqual(got, whole)
 
     def unreadable_ledgers(self, tmp):
         """A missing file, a directory and undecodable bytes: each cannot be read as a ledger."""
