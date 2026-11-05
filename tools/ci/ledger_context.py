@@ -245,6 +245,9 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
     ``reader`` is the command a session runs to read records (shown in locators).
     """
     max_bytes = max_bytes or max_chars
+    frame = (head.rstrip("\n") + "\n" if head else "") + (foot.rstrip("\n") + "\n" if foot else "")
+    if len(frame) > max_chars or len(frame.encode("utf-8")) > max_bytes:
+        raise ContextError("frame_exceeds_budget", "shorten the header and footer or raise the budget")
     governing, work, notes = _governing(snap, scope)
     candidates = _candidates(snap, governing)
     view = snap["view"]
@@ -325,11 +328,20 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
         more = len(candidates)
     text = assemble(full, cards, pending, more)
     if not fits(text):
-        # Even the frame does not fit: name what is missing instead of cutting text.
-        lines = [head.rstrip("\n")] if head else []
-        lines += ["Context too large for this channel: nothing loaded. Governing records: "
-                  + ", ".join(governing) + ". Read them: " + reader + " inventory"]
-        text = "\n".join(lines) + "\n"
+        # Even the frame does not fit: name what is missing instead of cutting text, with the
+        # identities when they fit and only their count and the inventory read when they do not.
+        def overflow(names):
+            lines = [head.rstrip("\n")] if head else []
+            lines.append("Context too large for this channel: nothing loaded. " + str(len(governing))
+                         + " governing records" + (": " + ", ".join(names) if names else "")
+                         + ". Read them: " + reader + " inventory")
+            if foot:
+                lines.append(foot.rstrip("\n"))
+            return "\n".join(lines) + "\n"
+
+        text = overflow(governing)
+        if not fits(text):
+            text = overflow([])
         pending, more, cards = list(governing), len(candidates), []
     chars, nbytes = size(text)
     meta = {"chars": chars, "bytes": nbytes, "tokens_estimate": (nbytes + 3) // 4, "selection": "deterministic",
@@ -491,7 +503,7 @@ def main(argv=None):
     scope = json.loads(_read_inside(root, args.scope)) if args.scope else None
     try:
         snap = snapshot(_read_inside(root, args.ledger))
-    except ledger.LedgerError as error:
+    except (ledger.LedgerError, OSError, UnicodeError) as error:
         if args.command == "changes":
             held = json.loads(_read_inside(root, args.checkpoint)) if args.checkpoint else None
             print(json.dumps(changes(None, held, scope), indent=1))
