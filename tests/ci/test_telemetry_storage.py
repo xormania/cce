@@ -119,6 +119,70 @@ else:
 '''
 
 
+INITIALIZER = r'''
+import json
+from pathlib import Path
+import sqlite3
+import sys
+
+original_connect = sqlite3.connect
+paused = False
+
+class PausingInitialization(sqlite3.Connection):
+    def execute(self, statement, parameters=()):
+        global paused
+        result = super().execute(statement, parameters)
+        if not paused and statement.lstrip().upper().startswith("CREATE TABLE"):
+            paused = True
+            filename = super().execute("PRAGMA database_list").fetchone()[2]
+            tables = super().execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+            print(json.dumps({"phase": "schema-created", "file_exists": Path(filename).exists(), "tables": tables}), flush=True)
+            sys.stdin.readline()
+        return result
+
+def connect(*args, **kwargs):
+    kwargs["factory"] = PausingInitialization
+    return original_connect(*args, **kwargs)
+
+sqlite3.connect = connect
+from agent_telemetry.sqlite import SQLiteRepository
+repository = SQLiteRepository.initialize(sys.argv[1], dataset_id="dataset", collector_id="collector")
+print(json.dumps({"phase": "initialized"}), flush=True)
+repository.close()
+'''
+
+
+RACING_INITIALIZER = r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+original_link = os.link
+paused = False
+
+def link(*args, **kwargs):
+    global paused
+    if not paused:
+        paused = True
+        print(json.dumps({"phase": "install-ready", "target_present": Path(sys.argv[1]).exists()}), flush=True)
+        sys.stdin.readline()
+    return original_link(*args, **kwargs)
+
+os.link = link
+from agent_telemetry.domain import CaptureContext, Event, TelemetryError
+from agent_telemetry.sqlite import SQLiteRepository
+path, identity, dataset, collector = sys.argv[1:]
+try:
+    repository = SQLiteRepository.initialize(path, dataset_id=dataset, collector_id=collector)
+    result = repository.append(Event(identity, "sample", "{}", CaptureContext("project", dataset, collector, "worker")), "2026-01-02T03:04:05+00:00")
+    repository.close()
+    print(json.dumps({"phase": "recorded", "status": result.status, "identity": identity}), flush=True)
+except TelemetryError as error:
+    print(json.dumps({"phase": "refused", "code": error.code}), flush=True)
+'''
+
+
 class SQLiteStorageTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -533,6 +597,131 @@ class SQLiteStorageTests(unittest.TestCase):
                         path, dataset_id="dataset", collector_id="collector", timeout_ms=timeout)
                 self.assertFalse(path.exists(), "invalid configuration created a database")
                 self.assertFalse(path.parent.exists(), "invalid configuration created directories")
+
+    def test_failed_schema_creation_can_be_retried_without_removing_storage(self):
+        observed = []
+        original_connect = sqlite3.connect
+
+        class FailingInitialization(sqlite3.Connection):
+            def execute(connection, statement, parameters=()):
+                result = super().execute(statement, parameters)
+                if not observed and statement.lstrip().upper().startswith("CREATE TABLE"):
+                    filename = super().execute("PRAGMA database_list").fetchone()[2]
+                    tables = super().execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+                    observed.append((Path(filename).exists(), tables))
+                    error = sqlite3.OperationalError("injected schema storage failure")
+                    error.sqlite_errorcode = sqlite3.SQLITE_FULL
+                    raise error
+                return result
+
+        def connect(*args, **kwargs):
+            kwargs["factory"] = FailingInitialization
+            return original_connect(*args, **kwargs)
+
+        with mock.patch.object(sqlite3, "connect", side_effect=connect):
+            with self.assertRaises(TelemetryError):
+                SQLiteRepository.initialize(self.path, dataset_id="dataset", collector_id="collector")
+        self.assertEqual(len(observed), 1, "schema failure was not injected")
+        self.assertTrue(observed[0][0], "fault must follow actual storage creation")
+        self.assertGreaterEqual(observed[0][1], 1, "fault must follow actual schema creation")
+        try:
+            repository = self.initialize()
+        except TelemetryError as error:
+            self.fail(f"initialization retry required manual storage removal: {error.code}")
+        result = repository.append(self.event("after-failure"), FIRST_CAPTURE)
+        self.assertEqual(result.status, "recorded")
+        self.assertEqual([row["event_id"] for row in repository.query()], ["after-failure"])
+
+    def test_killed_schema_initializer_can_be_retried_without_removing_storage(self):
+        environment = dict(os.environ, PYTHONPATH=str(PACKAGE_ROOT))
+        process = subprocess.Popen([sys.executable, "-u", "-c", INITIALIZER, str(self.path)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, env=environment)
+        self.addCleanup(self.reap, process)
+        reached = self.packet(process)
+        self.assertEqual(reached["phase"], "schema-created")
+        self.assertTrue(reached["file_exists"])
+        self.assertGreaterEqual(reached["tables"], 1)
+        process.kill()
+        output, _ = process.communicate(timeout=10)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertNotIn('"phase": "initialized"', output)
+        try:
+            repository = self.initialize()
+        except TelemetryError as error:
+            self.fail(f"killed initialization blocked retry: {error.code}")
+        self.assertEqual(repository.query(), [])
+        first = repository.append(self.event("after-restart"), FIRST_CAPTURE)
+        replay = repository.append(self.event("after-restart"), LATER_CAPTURE)
+        self.assertEqual((first.status, replay.status), ("recorded", "duplicate"))
+        self.assertEqual(first.receipt, replay.receipt)
+        self.assertEqual(len(repository.query()), 1)
+
+    def test_initialization_does_not_recover_an_unrelated_unversioned_database(self):
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("CREATE TABLE unrelated_records(value TEXT)")
+            connection.execute("INSERT INTO unrelated_records VALUES ('retained')")
+            connection.commit()
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 0)
+        finally:
+            connection.close()
+        self.path.chmod(0o600)
+        before = self.path.read_bytes()
+        with self.assertRaises(TelemetryError):
+            SQLiteRepository.initialize(self.path, dataset_id="dataset", collector_id="collector")
+        self.assertEqual(self.path.read_bytes(), before)
+        connection = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)
+        try:
+            self.assertEqual(connection.execute("SELECT value FROM unrelated_records").fetchall(), [("retained",)])
+        finally:
+            connection.close()
+
+    def initialization_race(self, second_dataset="dataset", second_collector="collector"):
+        processes = []
+        for identity, dataset, collector in (("winner", "dataset", "collector"),
+                                               ("second", second_dataset, second_collector)):
+            process = subprocess.Popen(
+                [sys.executable, "-u", "-c", RACING_INITIALIZER, str(self.path), identity, dataset, collector],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=dict(os.environ, PYTHONPATH=str(PACKAGE_ROOT)),
+            )
+            self.addCleanup(self.reap, process)
+            processes.append(process)
+        for process in processes:
+            ready = self.packet(process)
+            self.assertEqual(ready["phase"], "install-ready")
+            self.assertFalse(ready["target_present"], "both initializers must finish private schema creation before publication")
+        winner, second = processes
+        self.release(winner)
+        first = self.packet(winner)
+        _, errors = winner.communicate(timeout=10)
+        self.assertEqual(winner.returncode, 0, errors)
+        self.assertEqual((first["phase"], first.get("status")), ("recorded", "recorded"))
+        before = self.inspect()
+        self.assertEqual([row["event_id"] for row in before.query()], ["winner"])
+        before.close()
+        self.release(second)
+        result = self.packet(second)
+        _, errors = second.communicate(timeout=10)
+        self.assertEqual(second.returncode, 0, errors)
+        return result
+
+    def test_concurrent_initializers_preserve_the_winners_acknowledged_event(self):
+        result = self.initialization_race()
+        self.assertEqual((result["phase"], result.get("status")), ("recorded", "recorded"))
+        repository = self.inspect()
+        self.assertEqual([row["event_id"] for row in repository.query()], ["winner", "second"])
+        self.assertEqual((repository.status()["dataset_id"], repository.status()["collector_id"]),
+                         ("dataset", "collector"))
+
+    def test_concurrent_initializer_refuses_a_winner_with_different_identity(self):
+        result = self.initialization_race("other-dataset", "other-collector")
+        self.assertEqual(result, {"phase": "refused", "code": "identity_mismatch"})
+        repository = self.inspect()
+        self.assertEqual([row["event_id"] for row in repository.query()], ["winner"])
+        self.assertEqual((repository.status()["dataset_id"], repository.status()["collector_id"]),
+                         ("dataset", "collector"))
 
     def test_every_writer_connection_enforces_durable_connection_settings(self):
         observed = []
