@@ -70,6 +70,13 @@ LAYOUTS = ("shared", "per_record")
 PARALLEL = 8
 
 
+AREA_ACCEPT = 0.5
+# Inside the scope's areas a record is loaded from this score up (instead of the rule's accept_at).
+AREA_FLOOR = 0.5
+AREA_QUESTION = ("The state describes a session's objective and work. Does this work fall in the named "
+                 "subject area, so that decisions about that area could apply to it?")
+
+
 class SelectionError(ValueError):
     pass
 
@@ -101,6 +108,45 @@ def card(snap, rid):
         out["summary"] = row["summary"]
         out["questions"] = list(rec["links"]["questions"])
     return out
+
+
+def record_areas(snap, rid):
+    """Areas of a record: those of its questions (an answer's, a work item's answer's, a proposal's)."""
+    rec, records = snap["records"][rid], snap["records"]
+    if rec["kind"] == "question":
+        questions = [rid]
+    elif rec["kind"] == "work":
+        questions = records[rec["links"]["answer"]]["links"]["questions"]
+    else:
+        questions = rec["links"]["questions"]
+    return sorted({a for q in questions for a in records[q]["row"].get("areas", []) if a in snap["areas"]})
+
+
+def scope_areas(snap, scope, governing, evaluate, model=jev_client.MODEL):
+    """(areas, how): named in the scope, else those of its work items, else asked of the evaluator
+    (one question per area; accepted at AREA_ACCEPT, otherwise the best one). Failure gives no areas."""
+    if not snap["areas"]:
+        return [], "none defined"
+    named = [a for a in (scope or {}).get("areas", []) if a in snap["areas"]]
+    if named:
+        return sorted(named), "scope"
+    work = [rid for rid in governing if snap["records"][rid]["kind"] == "work"]
+    if (scope or {}).get("work") and work:
+        return sorted({a for rid in work for a in record_areas(snap, rid)}), "work items"
+    names = sorted(snap["areas"])
+    payload = {"model": model, "state": _scope_state(snap, scope, governing),
+               "questions": {"a" + str(n): {"type": "noul", "instructions": AREA_QUESTION + " Area: "
+                                            + name + ": " + snap["areas"][name],
+                                            "criteria": {"true": "The work falls in this area.",
+                                                         "false": "The work does not touch this area."}}
+                             for n, name in enumerate(names)}}
+    try:
+        scores = validate(evaluate(payload), payload)
+    except Exception:  # noqa: BLE001 - areas are an aid; without them the plain rule applies
+        return [], "unavailable"
+    by_name = {name: scores["a" + str(n)] for n, name in enumerate(names)}
+    chosen = [n for n in names if by_name[n] >= AREA_ACCEPT] or [max(names, key=by_name.get)]
+    return chosen, "evaluated"
 
 
 def _scope_state(snap, scope, governing):
@@ -218,7 +264,8 @@ def _store(cache_dir, key, value):
 
 
 def select(snap, scope, evaluate, *, model=jev_client.MODEL, rule=RULE, cache_dir=None, current=None,
-           max_questions=MAX_QUESTIONS, max_bytes=MAX_REQUEST, layout="shared", parallel=PARALLEL):
+           max_questions=MAX_QUESTIONS, max_bytes=MAX_REQUEST, layout="shared", parallel=PARALLEL,
+           use_areas=False, area_floor=AREA_FLOOR):
     """Judge the scope's candidates. Returns a selection:
 
     ``relevant``, ``not_relevant``, ``uncertain`` and ``unexamined`` (identity lists, together exactly
@@ -241,7 +288,20 @@ def select(snap, scope, evaluate, *, model=jev_client.MODEL, rule=RULE, cache_di
 
     result = {"fingerprint": key, "snapshot": snap["id"], "scope": observed[1], "model": model, "rule": dict(rule),
               "relevant": [], "not_relevant": [], "uncertain": [], "unexamined": [], "scores": {},
-              "failures": [], "mode": "none", "state": "current", "cache_hit": False}
+              "failures": [], "mode": "none", "state": "current", "cache_hit": False,
+              "areas": [], "areas_from": "not used", "area_promoted": []}
+
+    def promote():
+        # Inside the scope's areas an uncertain score from area_floor up is enough to load the record.
+        if not use_areas:
+            return
+        areas, how = scope_areas(snap, scope, governing, evaluate, model)
+        result["areas"], result["areas_from"] = areas, how
+        for rid in list(result["uncertain"]):
+            if result["scores"].get(rid, 0) >= area_floor and set(record_areas(snap, rid)) & set(areas):
+                result["uncertain"].remove(rid)
+                result["relevant"].append(rid)
+                result["area_promoted"].append(rid)
     if not cards:
         return finish(result)
     with _lock(cache_dir, key) if cache_dir else contextlib.nullcontext():
@@ -251,6 +311,7 @@ def select(snap, scope, evaluate, *, model=jev_client.MODEL, rule=RULE, cache_di
             for rid in ids:
                 verdict = classify(hit["scores"][rid], rule)
                 result["relevant" if verdict else "uncertain" if verdict is None else "not_relevant"].append(rid)
+            promote()
             return finish(result)
         state = _scope_state(snap, scope, governing)
         if layout == "per_record":
@@ -285,6 +346,7 @@ def select(snap, scope, evaluate, *, model=jev_client.MODEL, rule=RULE, cache_di
                 result["scores"][item["id"]] = score
                 verdict = classify(score, rule)
                 result["relevant" if verdict else "uncertain" if verdict is None else "not_relevant"].append(item["id"])
+        promote()
         judged = len(result["scores"])
         result["mode"] = "jev" if judged == len(cards) else "partial" if judged else "fallback"
         result = finish(result)

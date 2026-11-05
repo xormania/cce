@@ -44,6 +44,7 @@ import json
 import os
 import re
 import sys
+import tomllib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import drift_ledger as ledger  # noqa: E402
@@ -72,7 +73,11 @@ def snapshot(text, findings=()):
     model = ledger.load(text)
     view, resolved = ledger.resolve(model)
     snap = {"id": hashlib.sha256(text.encode("utf-8")).hexdigest(), "model": model, "view": view,
-            "findings": list(resolved) + list(findings), "records": {}}
+            "findings": list(resolved) + list(findings), "records": {}, "areas": {}}
+    # Optional top-level [areas] table: area name -> description. Questions name their areas.
+    table = tomllib.loads(text).get("areas", {})
+    if isinstance(table, dict):
+        snap["areas"] = {k: v for k, v in table.items() if isinstance(v, str) and v.strip()}
     snap["records"] = _records(model, view)
     return snap
 

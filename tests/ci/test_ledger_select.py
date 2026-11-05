@@ -292,6 +292,49 @@ class SelectTests(unittest.TestCase):
         with self.assertRaises(select.SelectionError):
             select.select(s, SCOPE, Fake(), layout="other")
 
+    def area_ledger(self):
+        text = TEXT.replace("version = 2\n", 'version = 2\n[areas]\ncache = "Caching"\nexport = "Exports"\n', 1)
+        text = text.replace('title = "Cache eviction policy"', 'title = "Cache eviction policy"\nareas = ["cache"]')
+        text = text.replace('title = "Topic 10"', 'title = "Topic 10"\nareas = ["cache"]')
+        text = text.replace('title = "Topic 11"', 'title = "Topic 11"\nareas = ["export"]')
+        return snap(text)
+
+    def test_in_area_records_load_from_the_floor_and_others_need_the_rule(self):
+        s = self.area_ledger()
+        self.assertEqual(select.record_areas(s, "W-cache"), ["cache"])
+        result = select.select(s, SCOPE, Fake({"B10": 0.55, "B11": 0.55, "B12": 0.45}), use_areas=True)
+        self.assertEqual((result["areas"], result["areas_from"]), (["cache"], "work items"))
+        self.assertEqual(result["area_promoted"], ["B10"])
+        self.assertIn("B10", result["relevant"])
+        self.assertIn("B11", result["uncertain"])
+        self.assertIn("B12", result["uncertain"])
+        plain = select.select(s, SCOPE, Fake({"B10": 0.55}))
+        self.assertIn("B10", plain["uncertain"])
+
+    def test_scope_without_work_asks_for_its_areas_and_survives_failure(self):
+        s = self.area_ledger()
+        scope = {"objective": "speed up exports", "work": [], "origin": "lead"}
+
+        def evaluate(payload):
+            if "a0" in payload["questions"]:
+                return {"model": payload["model"], "answers": {
+                    q: {"type": "noul", "noul": 0.9 if "export" in v["instructions"] else 0.1}
+                    for q, v in payload["questions"].items()}}
+            return Fake({"B11": 0.6})(payload)
+
+        result = select.select(s, scope, evaluate, use_areas=True)
+        self.assertEqual((result["areas"], result["areas_from"]), (["export"], "evaluated"))
+        self.assertIn("B11", result["relevant"])
+
+        def broken(payload):
+            if "a0" in payload["questions"]:
+                raise OSError("down")
+            return Fake({"B11": 0.6})(payload)
+
+        result = select.select(s, scope, broken, use_areas=True)
+        self.assertEqual((result["areas"], result["areas_from"]), ([], "unavailable"))
+        self.assertIn("B11", result["uncertain"])
+
     def test_no_candidates_needs_no_evaluation(self):
         fake = Fake()
         result = select.select(snap(LEDGER.replace('state = "done"\nevidence = "commit 123"', 'state = "open"')),

@@ -119,6 +119,8 @@ def load(text):
         _text(q, "asked")
         _text(q, "affects", required=False)
         _text(q, "withdrawn", required=False)
+        # Subject areas (names from the ledger's top-level [areas] table) used to match records to work.
+        _terms(q, "areas")
         # A short name for lists that only name the question (the title stays the full wording).
         _text(q, "label", required=False, limit=40)
         # "always": a standing direction that applies to every scope (included in every scoped brief).
