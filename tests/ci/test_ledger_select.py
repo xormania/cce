@@ -5,6 +5,7 @@ from pathlib import Path
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -361,6 +362,195 @@ class SelectTests(unittest.TestCase):
         result = select.select(snap(LEDGER.replace('state = "done"\nevidence = "commit 123"', 'state = "open"')),
                                {"objective": "all", "work": ["W-cache", "W-old"], "origin": "lead"}, fake)
         self.assertEqual((result["mode"], fake.calls), ("none", 0))
+
+
+class OverflowTests(unittest.TestCase):
+    """The budget cannot hold even the frame, so the notice stands in for every required record."""
+
+    GOVERNING = ["A-style", "Q3", "A1", "W-cache"]
+    OTHERS = ["A2", "B10", "B11", "B12", "B13", "B14", "B15"]
+    TINY = 300  # Far below the frame, well above the notice with every name.
+    NOTICE = re.compile(r"Context too large for this channel: nothing loaded\. (\d+) (required|governing) records"
+                        r"(?:: (.*?))?\. Read them: read inventory")
+
+    def assert_notice(self, text, label, count, names):
+        match = self.NOTICE.fullmatch(text.rstrip("\n"))
+        self.assertIsNotNone(match, text)
+        self.assertEqual(match.group(2), label, text)
+        self.assertEqual(int(match.group(1)), count, text)
+        self.assertCountEqual(match.group(3).split(", ") if match.group(3) else [], names, text)
+
+    def test_notice_counts_and_names_governing_and_judged_relevant_records(self):
+        s = snap()
+        result = select.select(s, SCOPE, Fake({"B10": 0.9, "B11": 0.8, "B12": 0.5}))
+        text, meta = context.brief(s, SCOPE, selection=result, max_chars=self.TINY)
+        self.assert_notice(text, "required", 6, self.GOVERNING + ["B10", "B11"])
+        self.assertNotIn("B12", text)
+        self.assertNotIn("Decision about topic 10", text)
+        self.assertLessEqual(meta["chars"], self.TINY)
+        self.assertTrue(meta["fits"])
+
+    def test_any_candidate_judged_relevant_makes_them_required_records(self):
+        s = snap()
+        calls = []
+
+        def first_batch_fails(payload):
+            calls.append(payload)
+            if len(calls) == 1:
+                raise OSError("down")
+            return Fake({"B15": 0.9})(payload)
+
+        cases = {
+            "one relevant": (select.select(s, SCOPE, Fake({"B13": 0.9})), ["B13"]),
+            "every candidate relevant": (select.select(s, SCOPE, Fake(default=0.9)), self.OTHERS),
+            "partial selection": (select.select(s, SCOPE, first_batch_fails, max_questions=2), ["B15"]),
+        }
+        for name, (result, relevant) in cases.items():
+            with self.subTest(name):
+                text, meta = context.brief(s, SCOPE, selection=result, max_chars=self.TINY)
+                self.assert_notice(text, "required", len(self.GOVERNING) + len(relevant), self.GOVERNING + relevant)
+                self.assertCountEqual(meta["pending"], self.GOVERNING + relevant)
+
+    def test_no_candidate_judged_relevant_keeps_them_governing_records(self):
+        s = snap()
+        judged = select.select(s, SCOPE, Fake({"B10": 0.9}))
+        cases = {
+            "no selection": None,
+            "all judged not relevant": select.select(s, SCOPE, Fake(default=0.0)),
+            "all uncertain": select.select(s, SCOPE, Fake(default=0.5)),
+            "evaluation failed": select.select(s, SCOPE, lambda p: (_ for _ in ()).throw(OSError("down"))),
+            "stale": dict(judged, state="stale"),
+            "another scope": select.select(s, dict(SCOPE, objective="other"), Fake({"B10": 0.9})),
+            "another ledger": select.select(snap(TEXT.replace("topic 15", "topic 15 revised")), SCOPE,
+                                            Fake({"B10": 0.9})),
+            "a relevant identity that is no candidate": dict(judged, relevant=["A1"]),
+        }
+        for name, selection in cases.items():
+            with self.subTest(name):
+                text, meta = context.brief(s, SCOPE, selection=selection, max_chars=self.TINY)
+                self.assert_notice(text, "governing", 4, self.GOVERNING)
+                self.assertCountEqual(meta["pending"], self.GOVERNING)
+                self.assertEqual(meta["unlisted"], len(self.OTHERS))
+
+    def test_a_relevant_identity_that_also_governs_is_counted_once(self):
+        s = snap()
+        result = select.select(s, SCOPE, Fake({"B10": 0.9}))
+        text, meta = context.brief(s, SCOPE, selection=dict(result, relevant=["A1", "B10"]), max_chars=self.TINY)
+        self.assert_notice(text, "required", 5, self.GOVERNING + ["B10"])
+        self.assertCountEqual(meta["pending"], self.GOVERNING + ["B10"])
+
+    def test_every_record_stays_pending_or_counted_as_unlisted(self):
+        s = snap()
+        result = select.select(s, SCOPE, Fake({"B10": 0.9, "B14": 0.9}))
+        _, meta = context.brief(s, SCOPE, selection=result, max_chars=self.TINY)
+        self.assertCountEqual(meta["pending"], self.GOVERNING + ["B10", "B14"])
+        self.assertEqual(meta["cards"], [])
+        self.assertEqual(meta["unlisted"], len(self.OTHERS) - 2)
+
+    def test_records_required_only_by_judgment_are_still_counted_named_and_pending(self):
+        s = snap("version = 2\n" + EXTRA)
+        scope = {"objective": "topics", "work": [], "origin": "lead"}
+        result = select.select(s, scope, Fake({"B10": 0.9, "B11": 0.9}))
+        text, meta = context.brief(s, scope, selection=result, max_chars=self.TINY)
+        self.assert_notice(text, "required", 2, ["B10", "B11"])
+        self.assertCountEqual(meta["pending"], ["B10", "B11"])
+
+    def test_header_and_footer_surround_the_notice_and_the_reader_is_named(self):
+        s = snap()
+        result = select.select(s, SCOPE, Fake({"B10": 0.9}))
+        text, _ = context.brief(s, SCOPE, head="STATE: test", foot="footer", reader="tool read",
+                                selection=result, max_chars=self.TINY)
+        lines = text.split("\n")
+        self.assertEqual((lines[0], lines[2:]), ("STATE: test", ["footer", ""]))
+        self.assert_notice(lines[1].replace("tool read inventory", "read inventory"), "required", 5,
+                           self.GOVERNING + ["B10"])
+        self.assertTrue(lines[1].endswith("Read them: tool read inventory"), text)
+
+    def long_name_case(self):
+        """A relevant identity whose length alone decides whether the names fit."""
+        long_id = "B10" + "x" * 61
+        s = snap(TEXT.replace('id = "B10"', 'id = "' + long_id + '"'))
+        result = select.select(s, SCOPE, Fake({long_id: 0.9}))
+        return s, result, long_id
+
+    def test_names_appear_exactly_while_they_fit_then_only_the_count(self):
+        s, result, long_id = self.long_name_case()
+        required = self.GOVERNING + [long_id]
+        named, _ = context.brief(s, SCOPE, selection=result, max_chars=self.TINY)
+        self.assert_notice(named, "required", 5, required)
+        for keyword in ("max_chars", "max_bytes"):
+            with self.subTest(keyword):
+                budget = {"max_chars": 10 ** 6, "max_bytes": 10 ** 6}
+                budget[keyword] = len(named)
+                text, meta = context.brief(s, SCOPE, selection=result, **budget)
+                self.assertEqual(text, named)
+                self.assertCountEqual(meta["pending"], required)
+                # One short of the names: governing names alone would still fit, but none may be partly shown.
+                budget[keyword] = len(named) - 1
+                text, meta = context.brief(s, SCOPE, selection=result, **budget)
+                self.assert_notice(text, "required", 5, [])
+                self.assertLessEqual(len(text), budget[keyword])
+                self.assertEqual((meta["chars"], meta["bytes"]), (len(text), len(text.encode())))
+                self.assertTrue(meta["fits"])
+                self.assertCountEqual(meta["pending"], required)
+                self.assertEqual(meta["cards"], [])
+
+    def test_the_count_alone_fills_the_budget_exactly_and_less_is_refused(self):
+        s, result, long_id = self.long_name_case()
+        expected = "Context too large for this channel: nothing loaded. 5 required records. Read them: read inventory\n"
+        short = len(expected)
+        try:
+            text, meta = context.brief(s, SCOPE, selection=result, max_chars=short)
+        except context.ContextError as error:
+            self.fail("refused although the count fits: " + error.code)
+        self.assertEqual(text, expected)
+        self.assertCountEqual(meta["pending"], self.GOVERNING + [long_id])
+        with self.assertRaises(context.ContextError) as caught:
+            context.brief(s, SCOPE, selection=result, max_chars=short - 1)
+        self.assertEqual(caught.exception.code, "frame_exceeds_budget")
+
+    def test_a_byte_budget_forces_the_count_when_characters_would_allow_the_names(self):
+        s, result, long_id = self.long_name_case()
+        head = "\u00e9" * 40
+        named, _ = context.brief(s, SCOPE, head=head, selection=result, max_chars=self.TINY, max_bytes=10 ** 6)
+        self.assertIn(long_id, named)
+        budget = len(named.encode()) - 1
+        self.assertGreaterEqual(budget, len(named))
+        text, meta = context.brief(s, SCOPE, head=head, selection=result, max_chars=budget, max_bytes=budget)
+        self.assertEqual(text.split("\n")[0], head)
+        self.assert_notice(text.split("\n")[1], "required", 5, [])
+        self.assertLessEqual(len(text.encode()), budget)
+        self.assertCountEqual(meta["pending"], self.GOVERNING + [long_id])
+
+    def test_many_long_relevant_identities_at_the_default_budget_give_the_count(self):
+        ids = ["B" + str(n).zfill(63) for n in range(150)]
+        rows = "".join(f"""
+[[question]]
+id = "Q{n + 100}"
+rev = 1
+title = "Topic {n + 100}"
+asked = "q#{n + 100}"
+
+[[answer]]
+id = "{rid}"
+rev = 1
+questions = ["Q{n + 100}"]
+authority = "owner"
+outcome = "decided"
+given = "day 3"
+source = "session"
+summary = "Decision {n + 100}"
+recorded_by = "lead"
+quote = "words"
+""" for n, rid in enumerate(ids))
+        s = snap(TEXT + rows)
+        result = select.select(s, SCOPE, Fake({rid: 0.9 for rid in ids}))
+        self.assertCountEqual(result["relevant"], ids)
+        text, meta = context.brief(s, SCOPE, selection=result)
+        self.assert_notice(text, "required", 154, [])
+        self.assertLessEqual(len(text.encode()), context.DEFAULT_MAX_CHARS)
+        self.assertCountEqual(meta["pending"], self.GOVERNING + ids)
+        self.assertEqual(meta["unlisted"], len(self.OTHERS))
 
 
 class Response(io.BytesIO):
