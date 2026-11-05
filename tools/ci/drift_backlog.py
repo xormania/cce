@@ -54,6 +54,36 @@ def scope_for(source, repository='xormania/cce'):
     return hashlib.sha256(_canonical([repository, source['branch']])).hexdigest()
 
 
+def safe_correction(value):
+    if not isinstance(value, dict) or set(value) != {'anchor', 'before', 'after'}:
+        return None
+    if not isinstance(value['anchor'], str) or not _HASH.fullmatch(value['anchor']):
+        return None
+    for key in ('before', 'after'):
+        rows = value[key]
+        if (not isinstance(rows, list) or len(rows) > 16 or any(
+                not isinstance(row, str) or not _HASH.fullmatch(row) for row in rows)
+                or rows != sorted(set(rows))):
+            return None
+    if not (value['before'] or value['after']):
+        return None
+    return {key: list(value[key]) if key != 'anchor' else value[key] for key in value}
+
+
+def corrects(current, previous):
+    """A healthy change must touch the earlier affected lines in the same context."""
+    current, previous = safe_correction(current), safe_correction(previous)
+    if not current or not previous or current['anchor'] != previous['anchor']:
+        return False
+    if previous['after']:
+        return (set(previous['after']).issubset(current['before'])
+                and not set(previous['after']).intersection(current['after']))
+    # A deletion has no surviving line to edit: restoring the removed lines is
+    # the unambiguous corrective transition available from the retained hashes.
+    return (set(previous['before']).issubset(current['after'])
+            and not set(previous['before']).intersection(current['before']))
+
+
 def descriptor(packet, fingerprint, kind='public', *, data_ref=None,
                data_key=None, repository='xormania/cce'):
     """Project a packet into an allowlisted reconstruction recipe.
@@ -71,6 +101,11 @@ def descriptor(packet, fingerprint, kind='public', *, data_ref=None,
     result = {'fingerprint': fingerprint, 'subject': packet['subject'],
               'scope': scope_for(source, repository), 'kind': kind,
               'source': source, 'state': 'deferred'}
+    if 'correction' in packet:
+        correction = safe_correction(packet['correction'])
+        if correction is None or kind != 'public':
+            raise ValueError('Invalid backlog correction')
+        result['correction'] = correction
     if kind == 'data':
         if (not isinstance(data_ref, str) or not _SHA.fullmatch(data_ref) or
                 not isinstance(data_key, str) or not _HASH.fullmatch(data_key)):
@@ -86,12 +121,17 @@ def safe_descriptor(value, repository='xormania/cce'):
     if not isinstance(value, dict) or value.get('state') not in STATES:
         return None
     allowed = {'fingerprint', 'subject', 'scope', 'kind', 'source', 'state'}
+    if 'correction' in value:
+        allowed.add('correction')
     if value.get('kind') == 'data':
         allowed |= {'data_ref', 'data_key'}
     if set(value) != allowed:
         return None
     try:
-        clean = descriptor({'subject': value['subject'], 'source': value['source']},
+        packet = {'subject': value['subject'], 'source': value['source']}
+        if 'correction' in value:
+            packet['correction'] = value['correction']
+        clean = descriptor(packet,
                            value['fingerprint'], value['kind'],
                            data_ref=value.get('data_ref'), data_key=value.get('data_key'),
                            repository=repository)
@@ -109,7 +149,8 @@ def merge(previous, current, *, finished=(), reserved=(), previous_overflow=0,
 
     Only a validated result or an explicit caller disposition belongs in
     ``finished``. A reservation is retained as unfinished, without retrying it.
-    Overflow is a durable coverage count, never a claim of successful analysis.
+    Overflow is a durable lower bound on historical coverage loss. Omitted
+    identities are not retained, so repeated inventories cannot be added safely.
     """
     if (not isinstance(previous, list) or not isinstance(current, list) or
             type(maximum) is not int or not 0 < maximum <= MAX_BACKLOG or
@@ -130,9 +171,13 @@ def merge(previous, current, *, finished=(), reserved=(), previous_overflow=0,
         key = (clean['scope'], fingerprint_key)
         if key not in rows:
             rows[key] = clean
+        elif 'correction' not in rows[key] and 'correction' in clean:
+            # The same fingerprint supplies newly reconstructed identity for a
+            # legacy recipe without changing its original candidate or status.
+            rows[key]['correction'] = clean['correction']
         if fingerprint_key in reserved:
             rows[key]['state'] = 'reserved'
-    overflow = previous_overflow + max(0, len(rows) - maximum)
+    overflow = max(previous_overflow, max(0, len(rows) - maximum))
     limitations = []
     if invalid:
         limitations.append('backlog_recipe_invalid')
@@ -188,6 +233,9 @@ def reconstruct(items, collector, fingerprint, *, scope=None,
             clean['state'] = 'unavailable'
             limitations.add('backlog_source_unavailable')
             continue
+        correction = safe_correction(packet.get('correction'))
+        if clean['kind'] == 'public' and correction:
+            clean['correction'] = correction
         if clean['state'] != 'tracked':
             clean['state'] = 'deferred'
         if not any(fingerprint(existing) == clean['fingerprint'] for existing in packets):
