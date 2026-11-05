@@ -96,7 +96,9 @@ fn read_version(v: &mut crate::NativeView, rng: &mut u64) -> u64 {
         .map(|h| h.unwrap().position.0)
         .collect();
     assert_eq!(positions, (1..=n + 1).collect::<Vec<_>>(), "view of v{n}");
-    let mut reader = v.content(&r.content.unwrap()).unwrap();
+    let mut reader = v
+        .content(&r.content.unwrap())
+        .unwrap_or_else(|e| panic!("view of v{n}: its content must stay readable: {e:?}"));
     let mut got = Vec::new();
     loop {
         let mut buf = vec![0; 1 + (xorshift(rng) % 20_000) as usize];

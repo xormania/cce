@@ -128,7 +128,7 @@ fn history_len(s: &NativeStore) -> usize {
         .history(HistoryPosition(0))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
-        .expect("a retained history entry is unreadable")
+        .unwrap_or_else(|e| panic!("a retained history entry is unreadable: {e:?}"))
         .len()
 }
 
@@ -455,7 +455,7 @@ fn racing_different_requests_under_one_attempt_id_commit_exactly_one() {
             .unwrap()
             .history(HistoryPosition(0))
             .unwrap()
-            .map(Result::unwrap)
+            .map(|h| h.unwrap_or_else(|e| panic!("a retained history entry is unreadable: {e:?}")))
             .filter(|h| h.attempt == id)
             .collect();
         assert_eq!(
