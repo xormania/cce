@@ -539,6 +539,120 @@ supersedes = ["D1"]
             self.assertEqual(done.stdout.strip(), "unchanged")
 
 
+def corrected(text, eid, rev=2, words="corrected"):
+    """The same ledger with one answer's quote and summary changed, written at revision ``rev``."""
+    head, marker, tail = text.partition('id = "' + eid + '"\nrev = 1\n')
+    assert marker, eid
+    block, bracket, rest = tail.partition("[[")
+    lines = []
+    for line in block.split("\n"):
+        if line.startswith("quote = "):
+            line = 'quote = "' + words + ' words"'
+        elif line.startswith("summary = "):
+            line = 'summary = "' + words + ' summary"'
+        lines.append(line)
+    return head + 'id = "' + eid + '"\nrev = ' + str(rev) + "\n" + "\n".join(lines) + bracket + rest
+
+
+class OwnerEditTests(unittest.TestCase):
+    """An answer the owner asked to have corrected may change in place; every other answer may not."""
+
+    def merged(self, base, current, proposed, *named):
+        text, conflicts = ledger.update(base, current, proposed, owner_edits=named)
+        self.assertEqual(conflicts, [])
+        return text
+
+    def refused(self, base, current, proposed, *named):
+        text, conflicts = ledger.update(base, current, proposed, owner_edits=named)
+        self.assertIsNone(text)
+        return [(c["code"], c["id"]) for c in conflicts]
+
+    def command(self, base, current, proposed, *named):
+        """Run the command line; returns (exit code, printed output, written ledger or None)."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "base.toml").write_text(base)
+            (root / "current.toml").write_text(current)
+            (root / "proposed.toml").write_text(proposed)
+            options = [part for eid in named for part in ("--owner-edit", eid)]
+            done = subprocess.run([sys.executable, "-I", "-B", str(ROOT / "tools/ci/drift_ledger.py"), "update",
+                                   "--base", str(root / "base.toml"), "--current", str(root / "current.toml"),
+                                   "--proposed", str(root / "proposed.toml"), "--out", str(root / "out.toml"),
+                                   *options], capture_output=True, text=True)
+            out = root / "out.toml"
+            return done.returncode, done.stdout, out.read_text() if out.exists() else None
+
+    def test_changed_answer_that_is_not_named_is_refused_even_with_its_revision_advanced(self):
+        edited = corrected(BASE, "D1")
+        self.assertEqual(self.refused(BASE, BASE, edited), [("answer_modified", "D1")])
+        self.assertIsNone(ledger.update(BASE, BASE, edited)[0])
+
+    def test_command_line_refuses_a_changed_answer_without_the_option_and_writes_nothing(self):
+        code, printed, written = self.command(BASE, BASE, corrected(BASE, "D1"))
+        self.assertEqual(code, 3)
+        self.assertIn("code=answer_modified, id=D1", printed)
+        self.assertIsNone(written)
+
+    def test_named_answer_is_corrected_in_place_and_the_rest_of_the_ledger_is_unchanged(self):
+        base = "# kept note\n" + BASE.replace("version = 2\n", 'version = 2\nowner = "x"\n', 1) + WORK + '[meta]\nnote = "keep"\n'
+        text = self.merged(base, base, corrected(base, "D1"), "D1")
+        row = entry(text, "D1")
+        self.assertEqual((row["rev"], row["quote"], row["summary"]), (2, "corrected words", "corrected summary"))
+        # The written ledger is what the same ledger writes without the edit, apart from the corrected answer.
+        self.assertEqual(text, corrected(self.merged(base, base, base), "D1"))
+        # In place: still the answer to its question, with no replacement and no history entry.
+        current, findings = view(text)
+        self.assertEqual(findings, [])
+        self.assertEqual([(r["answer"], r["summary"]) for r in current["decisions"] if r["question"] == "Q1"],
+                         [("D1", "corrected summary")])
+        self.assertEqual(current["historical"], [])
+
+    def test_command_line_option_may_be_repeated_to_correct_several_answers(self):
+        proposed = corrected(corrected(BASE, "D1"), "D5")
+        code, printed, written = self.command(BASE, BASE, proposed, "D1", "D5")
+        self.assertEqual((code, printed.strip()), (0, "updated"))
+        self.assertEqual((entry(written, "D1")["summary"], entry(written, "D5")["summary"]),
+                         ("corrected summary", "corrected summary"))
+
+    def test_correction_keeps_another_writers_change_to_a_different_entry(self):
+        base = BASE + WORK
+        theirs = base.replace('state = "open"', 'state = "withdrawn"\nreason = "r"').replace('id = "W1"\nrev = 1', 'id = "W1"\nrev = 2')
+        text = self.merged(base, theirs, corrected(base, "D1"), "D1")
+        self.assertEqual((entry(text, "D1")["summary"], entry(text, "W1")["state"]), ("corrected summary", "withdrawn"))
+
+    def test_named_answer_must_advance_its_revision_by_exactly_one(self):
+        for rev in (1, 3):
+            with self.subTest(rev=rev):
+                self.assertEqual(self.refused(BASE, BASE, corrected(BASE, "D1", rev=rev), "D1"),
+                                 [("revision_not_advanced", "D1")])
+
+    def test_named_answer_changed_by_someone_else_since_the_base_is_stale(self):
+        theirs = corrected(BASE, "D1", words="other")
+        self.assertEqual(self.refused(BASE, theirs, corrected(BASE, "D1"), "D1"), [("stale_revision", "D1")])
+
+    def test_naming_one_answer_does_not_allow_changing_another(self):
+        proposed = corrected(corrected(BASE, "D1"), "D5")
+        self.assertEqual(self.refused(BASE, BASE, proposed, "D1"), [("answer_modified", "D5")])
+        code, printed, written = self.command(BASE, BASE, proposed, "D1")
+        self.assertEqual(code, 3)
+        self.assertIn("code=answer_modified, id=D5", printed)
+        self.assertNotIn("id=D1", printed)
+        self.assertIsNone(written)
+
+    def test_named_answer_left_unchanged_causes_no_change(self):
+        self.assertEqual(self.merged(BASE, BASE, BASE, "D1"), self.merged(BASE, BASE, BASE))
+        self.assertEqual(entry(self.merged(BASE, BASE, BASE + WORK, "D1"), "D1"), entry(BASE, "D1"))
+        code, printed, _ = self.command(BASE, BASE, BASE, "D1")
+        self.assertEqual((code, printed.strip()), (0, "unchanged"))
+
+    def test_named_answer_may_not_be_removed(self):
+        before, marker, after = BASE.partition('[[answer]]\nid = "D1"')
+        self.assertTrue(marker)
+        without = before + after[after.index("[[answer]]"):]
+        self.assertNotIn("D1", ledger._entries(ledger.load(without)))
+        self.assertEqual(self.refused(BASE, BASE, without, "D1"), [("entry_removed", "D1")])
+
+
 # Values the reader accepts beyond the fields it validates. Every one must come back unchanged.
 EXOTIC = r"""
 [[question]]
