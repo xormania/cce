@@ -6,6 +6,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -25,7 +26,7 @@ from drift_execution import execution_checks
 from drift_relationships import public_changes
 from drift_data import data_evidence as collect_data, config_key as data_config_key
 import drift_backlog as backlog
-from jev_client import MODEL, CRITERIA, diagnose
+from jev_client import MODEL, CRITERIA, diagnose, public_diagnostic
 
 VERSION = 2
 CHECK = 'CCE drift contracts'
@@ -266,6 +267,69 @@ def safe_state_entry(row):
     return True
 
 
+def provider_stage(control):
+    value = control.get('provider_status', 'not_executed')
+    return value if isinstance(value, str) and value in {'not_executed', 'partial', 'completed'} else 'unavailable'
+
+
+def public_observations(rows):
+    """Retain this run's attempts separately from the reusable answer cache.
+
+    Reconstruct metadata from allowlists: neither response text nor exception
+    messages belong in public artifacts, including on a failed validation path.
+    """
+    observations = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        record = row.get('record')
+        fingerprint = row.get('fingerprint')
+        if (not isinstance(record, dict) or record.get('provider_request_attempted') is not True
+                or record.get('reused') or not isinstance(fingerprint, str)
+                or not re.fullmatch('[0-9a-f]{64}', fingerprint)):
+            continue
+        subject, status = record.get('subject'), record.get('status')
+        if (not isinstance(subject, str) or not re.fullmatch('[0-9a-f]{8,64}', subject)
+                or not isinstance(status, str) or status not in {
+                    'diagnosed', 'abstained', 'malformed_response', 'provider_failure', 'timeout'}):
+            continue
+        clean = {'subject': subject, 'status': status, 'provider_request_attempted': True,
+                 'full_response_retained': False, 'advisory_only': True}
+        for key in ('requested_model', 'observed_model'):
+            if record.get(key) == MODEL:
+                clean[key] = MODEL
+            elif record.get(key) is None:
+                clean[key] = None
+        for key, maximum in (('question_version', 1000), ('provider_request_attempts', 1)):
+            value = record.get(key)
+            if type(value) is int and 0 <= value <= maximum:
+                clean[key] = value
+        for key in ('request_sha256', 'response_sha256'):
+            value = record.get(key)
+            if value is None or (isinstance(value, str) and re.fullmatch('[0-9a-f]{64}', value)):
+                clean[key] = value
+        latency = record.get('latency_seconds')
+        if type(latency) in (int, float) and 0 <= latency <= 86400 and math.isfinite(latency):
+            clean['latency_seconds'] = latency
+        usage = record.get('usage')
+        if isinstance(usage, dict):
+            clean['usage'] = {key: usage[key] for key in ('input_tokens', 'output_tokens', 'total_tokens')
+                              if type(usage.get(key)) is int and 0 <= usage[key] <= 10**12}
+        elif usage is None:
+            clean['usage'] = None
+        provenance = record.get('source', {})
+        if isinstance(provenance, dict) and provenance.get('repository') == 'xormania/cce' and all(
+                isinstance(provenance.get(key), str) and SHA.fullmatch(provenance[key]) for key in ('head_sha', 'base_sha')):
+            clean['source'] = {key: provenance[key] for key in ('repository', 'head_sha', 'base_sha')}
+        diagnostic = public_diagnostic(record.get('diagnostic'))
+        if diagnostic is not None:
+            clean['diagnostic'] = diagnostic
+        observations.append({'fingerprint': fingerprint, 'record': clean})
+        if len(observations) == MAX_CALLS:
+            break
+    return observations
+
+
 def source_for(api, event, event_name, manual_sha=''):
     if event_name == 'workflow_run':
         announced = event['workflow_run']
@@ -498,8 +562,8 @@ def summary(control):
              'Deterministic violations: ' + str(len(control['violations'])) + '.',
              'Semantic packets selected: ' + str(control['selected']) +
              '; deferred: ' + str(len(control['pending'])) + '.']
-    lines.append('Provider stage: `' + control.get('provider_status','not_executed') + '`.')
-    if control.get('provider_status') == 'partial':
+    lines.append('Provider stage: `' + provider_stage(control) + '`.')
+    if provider_stage(control) == 'partial':
         lines.append('Provider execution was interrupted or incomplete; completed packet results: ' +
                      str(control.get('provider_completed', 0)) + ' of ' + str(control['selected']) +
                      '. Unfinished requests are not automatically replayed.')
@@ -515,9 +579,25 @@ def summary(control):
         lines.append('- `' + violation['code'] + '`; reference `' + violation['subject'] + '`.')
         if violation['code'] == 'workflow_definition_awaiting_acceptance':
             lines.append('  Workflow definition awaiting acceptance. Test execution is unverified by this analysis.')
+    observations = public_observations(control.get('results', []))
+    diagnostics = {row['fingerprint']: row['record'].get('diagnostic') for row in observations}
+    accepted = sum(row['record']['status'] in {'diagnosed', 'abstained'} for row in observations)
+    lines.append('Current provider attempts retained: ' + str(len(observations)) +
+                 '; accepted answers: ' + str(accepted) +
+                 '; failed or rejected: ' + str(len(observations) - accepted) + '.')
     for row in control.get('results', []):
         record = row['record']
         lines.append('- Jev: `' + record['status'] + '`' + (' (reused; no request)' if record.get('reused') else '') + '; reference `' + record['subject'] + '`.')
+        diagnostic = diagnostics.get(row['fingerprint'])
+        if diagnostic:
+            details = ['`' + diagnostic['stage'] + '/' + diagnostic['reason'] + '`']
+            if diagnostic.get('http_status') is not None:
+                details.append('HTTP ' + str(diagnostic['http_status']))
+            if diagnostic.get('response_bytes_read') is not None:
+                details.append(str(diagnostic['response_bytes_read']) + ' response bytes read')
+            if diagnostic.get('response_truncated'):
+                details.append('response exceeded retention bound')
+            lines.append('  Rejection: ' + '; '.join(details) + '.')
         location = control.get('locations', {}).get(row['fingerprint'])
         if isinstance(location, dict) and safe_path(location.get('path')) and SHA.fullmatch(location.get('head_sha','')):
             path = location['path']
@@ -546,6 +626,7 @@ def publish(api, out):
     control = load(root/'control.json')
     public = root/'public'
     rows = control.get('results', [])
+    provider = {'provider_status': provider_stage(control), 'observations': public_observations(rows)}
     finished = {row['fingerprint'] for row in rows if settled(row['record'])}
     current = set(control.get('current_fingerprints', []))
     healthy_keys = {row['fingerprint'] for row in rows if row['fingerprint'] in current and settled(row['record'])}
@@ -579,7 +660,7 @@ def publish(api, out):
             complete_check(api, control['check_id'], control['source'], 'success', 'Superseded candidate.')
         save(public/'state.json', {'version':VERSION, 'trusted_sha':control['trusted_sha'],
             'engine_hash':control['engine_hash'], 'entries':[], 'pending':control['pending'], 'superseded':True,
-            'backlog':control.get('backlog', []), 'backlog_overflow':control.get('backlog_overflow', 0)})
+            'backlog':control.get('backlog', []), 'backlog_overflow':control.get('backlog_overflow', 0), **provider})
         return 0
     failed = bool(control['violations'] or control['data_failed'])
     status = 'completed' if failed or not control['waiting'] else 'in_progress'
@@ -590,7 +671,7 @@ def publish(api, out):
     entries.update({r['fingerprint']:r for r in rows if r['record']['status'] in {'diagnosed','abstained'}})
     save(public/'state.json', {'version':VERSION, 'trusted_sha':control['trusted_sha'],
           'engine_hash':control['engine_hash'], 'entries':list(entries.values())[-200:], 'pending':control['pending'],
-          'backlog':control.get('backlog', []), 'backlog_overflow':control.get('backlog_overflow', 0)})
+          'backlog':control.get('backlog', []), 'backlog_overflow':control.get('backlog_overflow', 0), **provider})
     (public/'summary.md').write_text(summary(control))
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as f:

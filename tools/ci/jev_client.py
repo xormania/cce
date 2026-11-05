@@ -61,6 +61,77 @@ INSTRUCTIONS = (
     "insufficient_context when the supplied evidence cannot establish the answer."
 )
 
+DIAGNOSTIC_REASONS = {
+    "http": {"authentication_failed", "forbidden", "rate_limited", "redirect_refused", "http_error"},
+    "transport": {"request_timeout", "response_read_timeout", "network_error", "io_error"},
+    "body": {"response_too_large"},
+    "json": {"json_invalid", "encoding_invalid", "json_duplicate_field",
+             "json_nonfinite_number", "json_nesting_limit"},
+    "schema": {"response_not_object", "model_missing", "model_type_invalid", "model_mismatch",
+               "answers_missing", "answers_not_object", "answer_inventory_mismatch",
+               "answer_not_object", "answer_type_invalid", "choice_not_allowed",
+               "confidence_invalid", "probability_inventory_mismatch", "probability_value_invalid",
+               "probability_total_invalid", "validation_error"},
+    "policy": {"duplicate_support", "unsupported_diagnosis"},
+}
+_FIELD_TYPES = {"object", "array", "string", "number", "boolean", "null", "other"}
+_KNOWN_FIELDS = ("model", "answers", "usage", "error", "data", "results", "choices")
+_COUNT_LIMITS = {
+    "unknown_field_count": MAX_RESPONSE, "expected_answer_count": len(CRITERIA) + 2,
+    "missing_answer_count": len(CRITERIA) + 2, "answer_count": MAX_RESPONSE,
+    "unexpected_answer_count": MAX_RESPONSE,
+}
+
+
+def public_diagnostic(value):
+    """Copy a strictly bounded failure summary, or refuse it without echoing input.
+
+    This is also the publication boundary for retained failure observations. No
+    provider strings, unknown field names, or response values pass through it.
+    """
+    required = {"version", "stage", "reason", "http_status", "response_bytes_read", "response_truncated"}
+    optional = {"response_type", "known_field_types", "question"} | set(_COUNT_LIMITS)
+    if (not isinstance(value, dict) or not required <= set(value)
+            or set(value) - required - optional
+            or type(value["version"]) is not int or value["version"] != 1):
+        return None
+    stage, reason = value["stage"], value["reason"]
+    if (not isinstance(stage, str) or stage not in DIAGNOSTIC_REASONS
+            or not isinstance(reason, str) or reason not in DIAGNOSTIC_REASONS[stage]):
+        return None
+    for field, low, high in (("http_status", 100, 599), ("response_bytes_read", 0, MAX_RESPONSE + 1)):
+        number = value[field]
+        if number is not None and (type(number) is not int or not low <= number <= high):
+            return None
+    if type(value["response_truncated"]) is not bool:
+        return None
+    for field, high in _COUNT_LIMITS.items():
+        if field in value and (type(value[field]) is not int or not 0 <= value[field] <= high):
+            return None
+    if "question" in value and (not isinstance(value["question"], str)
+                                or value["question"] not in {*CRITERIA, "support_1", "support_2"}):
+        return None
+    if "response_type" in value and (not isinstance(value["response_type"], str)
+                                     or value["response_type"] not in _FIELD_TYPES):
+        return None
+    if "known_field_types" in value:
+        fields = value["known_field_types"]
+        if (not isinstance(fields, dict) or set(fields) - set(_KNOWN_FIELDS)
+                or any(not isinstance(kind, str) or kind not in _FIELD_TYPES for kind in fields.values())):
+            return None
+    clean = dict(value)
+    if "known_field_types" in clean:
+        clean["known_field_types"] = dict(clean["known_field_types"])
+    return clean
+
+
+class ResponseValidationError(ValueError):
+    """An existing ValueError contract with a fixed, publishable failure code."""
+
+    def __init__(self, stage, reason, question=None):
+        super().__init__(reason)
+        self.stage, self.reason, self.question = stage, reason, question
+
 
 def canonical(value):
     """Serialize bounded state deterministically and refuse non-finite values."""
@@ -73,21 +144,30 @@ def _json(raw):
         result = {}
         for key, value in pairs:
             if key in result:
-                raise ValueError("Duplicate response field")
+                raise ResponseValidationError("json", "json_duplicate_field")
             result[key] = value
         return result
 
     def invalid(_value):
-        raise ValueError("Non-finite response number")
+        raise ResponseValidationError("json", "json_nonfinite_number")
 
     def finite(raw_number):
         number = float(raw_number)
         if not math.isfinite(number):
-            raise ValueError("Non-finite response number")
+            raise ResponseValidationError("json", "json_nonfinite_number")
         return number
 
-    return json.loads(raw, object_pairs_hook=unique, parse_constant=invalid,
-                      parse_float=finite)
+    try:
+        return json.loads(raw, object_pairs_hook=unique, parse_constant=invalid,
+                          parse_float=finite)
+    except ResponseValidationError:
+        raise
+    except UnicodeError:
+        raise ResponseValidationError("json", "encoding_invalid") from None
+    except RecursionError:
+        raise ResponseValidationError("json", "json_nesting_limit") from None
+    except ValueError:
+        raise ResponseValidationError("json", "json_invalid") from None
 
 
 def _source(packet):
@@ -157,40 +237,53 @@ def _probability(value):
 
 def validate_response(response, payload):
     """Return only allowlisted choices and bounded numeric metadata."""
-    if (not isinstance(response, dict) or response.get("model") != MODEL
-            or not isinstance(response.get("answers"), dict)
-            or set(response["answers"]) != set(payload["questions"])):
-        raise ValueError("Invalid provider answer inventory")
+    if not isinstance(response, dict):
+        raise ResponseValidationError("schema", "response_not_object")
+    if "model" not in response:
+        raise ResponseValidationError("schema", "model_missing")
+    if not isinstance(response["model"], str):
+        raise ResponseValidationError("schema", "model_type_invalid")
+    if response["model"] != MODEL:
+        raise ResponseValidationError("schema", "model_mismatch")
+    if "answers" not in response:
+        raise ResponseValidationError("schema", "answers_missing")
+    if not isinstance(response["answers"], dict):
+        raise ResponseValidationError("schema", "answers_not_object")
+    if set(response["answers"]) != set(payload["questions"]):
+        raise ResponseValidationError("schema", "answer_inventory_mismatch")
     selected = {}
     for name, question in payload["questions"].items():
         answer = response["answers"][name]
-        if (not isinstance(answer, dict) or answer.get("type") != "choice"
-                or not isinstance(answer.get("choice"), str)
-                or answer["choice"] not in question["criteria"]):
-            raise ValueError("Invalid provider choice")
+        if not isinstance(answer, dict):
+            raise ResponseValidationError("schema", "answer_not_object", name)
+        if answer.get("type") != "choice":
+            raise ResponseValidationError("schema", "answer_type_invalid", name)
+        if not isinstance(answer.get("choice"), str) or answer["choice"] not in question["criteria"]:
+            raise ResponseValidationError("schema", "choice_not_allowed", name)
         clean = {"choice": answer["choice"]}
         confidence = answer.get("confidence")
         if confidence is not None:
             if not _probability(confidence):
-                raise ValueError("Invalid provider confidence")
+                raise ResponseValidationError("schema", "confidence_invalid", name)
             clean["confidence"] = confidence
         probabilities = answer.get("probabilities")
         if probabilities is not None:
-            if (not isinstance(probabilities, dict)
-                    or set(probabilities) != set(question["criteria"])
-                    or not all(_probability(value) for value in probabilities.values())
-                    or abs(sum(probabilities.values()) - 1) > 0.02):
-                raise ValueError("Invalid provider probabilities")
+            if not isinstance(probabilities, dict) or set(probabilities) != set(question["criteria"]):
+                raise ResponseValidationError("schema", "probability_inventory_mismatch", name)
+            if not all(_probability(value) for value in probabilities.values()):
+                raise ResponseValidationError("schema", "probability_value_invalid", name)
+            if abs(sum(probabilities.values()) - 1) > 0.02:
+                raise ResponseValidationError("schema", "probability_total_invalid", name)
             clean["probabilities"] = dict(probabilities)
         selected[name] = clean
     supports = [selected[name]["choice"] for name in ("support_1", "support_2")
                 if selected[name]["choice"] != "none"]
     if len(supports) != len(set(supports)):
-        raise ValueError("Duplicate supporting reference")
+        raise ResponseValidationError("policy", "duplicate_support")
     answers = {name: value for name, value in selected.items() if name in CRITERIA}
     abstained = all(value["choice"] == "insufficient_context" for value in answers.values())
     if not abstained and not supports:
-        raise ValueError("Unsupported provider diagnosis")
+        raise ResponseValidationError("policy", "unsupported_diagnosis")
     return {"answers": answers, "supporting_excerpt_ids": supports, "abstained": abstained}
 
 
@@ -208,6 +301,28 @@ def _telemetry(response, record):
     if isinstance(usage, dict):
         record["usage"] = {key: usage[key] for key in ("input_tokens", "output_tokens", "total_tokens")
                            if type(usage.get(key)) is int and 0 <= usage[key] <= 10**12}
+
+
+def _field_type(value):
+    return {dict: "object", list: "array", str: "string", int: "number", float: "number",
+            bool: "boolean", type(None): "null"}.get(type(value), "other")
+
+
+def _response_shape(response, payload):
+    """Describe decoded structure without retaining arbitrary keys or values."""
+    shape = {"response_type": _field_type(response)}
+    if not isinstance(response, dict):
+        return shape
+    shape["known_field_types"] = {name: _field_type(response[name]) for name in _KNOWN_FIELDS
+                                  if name in response}
+    shape["unknown_field_count"] = len(set(response) - set(_KNOWN_FIELDS))
+    shape["expected_answer_count"] = len(payload["questions"])
+    answers = response.get("answers")
+    if isinstance(answers, dict):
+        shape["answer_count"] = len(answers)
+        shape["missing_answer_count"] = len(set(payload["questions"]) - set(answers))
+        shape["unexpected_answer_count"] = len(set(answers) - set(payload["questions"]))
+    return shape
 
 
 def diagnose(packet, key="", opener=None):
@@ -242,23 +357,46 @@ def diagnose(packet, key="", opener=None):
     start = time.monotonic()
     record["provider_request_attempted"] = True
     record["provider_request_attempts"] = 1
+    http_status = None
+    response_bytes_read = None
+    response_truncated = False
+    reading_response = False
+    decoded = False
+    response = None
+    failure = None
     try:
         with opener.open(request, timeout=TIMEOUT) as handle:
+            status = getattr(handle, "status", None)
+            if type(status) is int and 100 <= status <= 599:
+                http_status = status
+            reading_response = True
             raw = handle.read(MAX_RESPONSE + 1)
+        response_bytes_read = len(raw)
+        response_truncated = len(raw) > MAX_RESPONSE
         if len(raw) > MAX_RESPONSE:
             record["status"] = "malformed_response"
+            failure = ResponseValidationError("body", "response_too_large")
         else:
             record["response_sha256"] = hashlib.sha256(raw).hexdigest()
             response = _json(raw)
+            decoded = True
             _telemetry(response, record)
             record["diagnosis"] = validate_response(response, payload)
             record["status"] = "abstained" if record["diagnosis"]["abstained"] else "diagnosed"
     except urllib.error.HTTPError as error:
         record["status"] = "provider_failure"
+        if type(error.code) is int and 100 <= error.code <= 599:
+            http_status = error.code
+        reason = {401: "authentication_failed", 403: "forbidden", 429: "rate_limited"}.get(http_status)
+        if reason is None:
+            reason = "redirect_refused" if http_status is not None and 300 <= http_status < 400 else "http_error"
+        failure = ResponseValidationError("http", reason)
         # Error bodies may contain secrets or supplied evidence. Read bounded bytes
         # for a fingerprint only; never parse or return their text.
         try:
             raw = error.read(MAX_RESPONSE + 1)
+            response_bytes_read = len(raw)
+            response_truncated = len(raw) > MAX_RESPONSE
             if len(raw) <= MAX_RESPONSE:
                 record["response_sha256"] = hashlib.sha256(raw).hexdigest()
         except (OSError, TimeoutError):
@@ -267,11 +405,34 @@ def diagnose(packet, key="", opener=None):
             error.close()
     except (TimeoutError, socket.timeout):
         record["status"] = "timeout"
+        failure = ResponseValidationError("transport", "response_read_timeout" if reading_response else "request_timeout")
     except urllib.error.URLError as error:
-        record["status"] = "timeout" if isinstance(error.reason, (TimeoutError, socket.timeout)) else "provider_failure"
+        if isinstance(error.reason, (TimeoutError, socket.timeout)):
+            record["status"] = "timeout"
+            reason = "response_read_timeout" if reading_response else "request_timeout"
+        else:
+            record["status"] = "provider_failure"
+            reason = "network_error"
+        failure = ResponseValidationError("transport", reason)
+    except ResponseValidationError as error:
+        record["status"] = "malformed_response"
+        failure = error
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
         record["status"] = "malformed_response"
+        failure = ResponseValidationError("schema", "validation_error")
     except OSError:
         record["status"] = "provider_failure"
+        failure = ResponseValidationError("transport", "io_error")
+    if failure is not None:
+        diagnostic = {
+            "version": 1, "stage": failure.stage, "reason": failure.reason,
+            "http_status": http_status, "response_bytes_read": response_bytes_read,
+            "response_truncated": response_truncated,
+        }
+        if decoded:
+            diagnostic.update(_response_shape(response, payload))
+        if failure.question is not None:
+            diagnostic["question"] = failure.question
+        record["diagnostic"] = public_diagnostic(diagnostic)
     record["latency_seconds"] = round(time.monotonic() - start, 6)
     return record

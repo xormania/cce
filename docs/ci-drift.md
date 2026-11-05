@@ -209,6 +209,33 @@ history window and reports when no reusable baseline exists. It does not promise
 permanent suppression. Changed evidence or model/tooling configuration reopens
 analysis; unrelated candidate identity alone does not change packet fingerprints.
 
+`drift-state` also retains an `observations` list for this run's completed provider
+attempts, including rejected responses. It holds at most four records, separately
+from the reusable successful answers in `entries`. Reused answers and requests
+that were never attempted are excluded. Each observation keeps allowlisted model,
+usage, latency, request/response hashes and public source identity where available.
+Failures additionally carry a versioned diagnostic with a fixed stage and reason,
+HTTP status, bytes read and truncation flag. JSON type names and answer inventory
+counts can explain a shape mismatch without retaining provider field values,
+unknown field names, error bodies or private evidence. Oversized responses have a
+bounded byte count and no complete-response hash.
+
+The summary distinguishes HTTP/transport failures, invalid JSON, response-schema
+violations and local acceptance rules, such as `policy/duplicate_support`.
+`malformed_response` alone does not establish that the provider returned invalid
+JSON. Two independently evaluated support questions can select the same excerpt;
+the current client rejects that combination. These observations expose the reason
+without changing the questions, acceptance rules, retries or check verdicts.
+
+Top-level `provider_status` distinguishes completed, partial and unexecuted phases;
+an unrecognized status is reported as `unavailable`. Completed observations survive
+partial execution and superseded-candidate publication. They are per-run evidence,
+not a cumulative history or reusable answers; inspect each run's artifact to compare
+attempts. A request interrupted before checkpointing has no completed observation.
+Older rejected responses discarded by earlier publishers cannot be reconstructed
+from their coarse summary labels. New diagnostics begin when this code runs from
+the trusted default branch.
+
 Completed provider results are checkpointed individually by atomic replacement.
 If a later request is interrupted, publication preserves the completed prefix and
 reports a partial provider stage. It neither repeats unfinished requests nor
