@@ -77,6 +77,15 @@ fn rel_lines(dump: Vec<String>) -> Vec<String> {
     dump.into_iter().filter(|l| l.starts_with("rel ")).collect()
 }
 
+/// The relationship lines the driver dumps for `node`; the dump itself must succeed.
+fn dumped_edges(r: &mut Driver, node: &str) -> Vec<String> {
+    let step = r.step(&format!("dump {node}"));
+    match step {
+        Step::Answered(lines) if !lines.iter().any(|l| l.starts_with("error ")) => rel_lines(lines),
+        other => panic!("the edges of {node} must read back: {other:?}"),
+    }
+}
+
 /// Commits the commands in batches of `batch` changes.
 fn commit_all(d: &mut Driver, model: &mut Model, cmds: &[String], batch: usize, tag: &str) {
     for (n, chunk) in cmds.chunks(batch).enumerate() {
@@ -140,7 +149,7 @@ fn relationship_indexes_span_many_pages_and_survive_writer_kill() {
     let mut r = Driver::spawn();
     answered(r.step(&format!("open {}", store.display())), "open");
     for node in ["HUB", "N00007", "M00599", "S00150", "T00299", "nobody"] {
-        let got = rel_lines(answered(r.step(&format!("dump {node}")), "dump"));
+        let got = dumped_edges(&mut r, node);
         assert_eq!(got, model.expected(node), "edges of {node}");
     }
     assert_eq!(model.expected("HUB").len(), 1500);
@@ -181,7 +190,7 @@ fn replaced_and_removed_relationships_leave_no_stale_index_entries() {
     let mut r = Driver::spawn();
     answered(r.step(&format!("open {}", store.display())), "open");
     for node in ["HUB", "N00000", "N00449", "R00006", "M00000", "S00000"] {
-        let got = rel_lines(answered(r.step(&format!("dump {node}")), "dump"));
+        let got = dumped_edges(&mut r, node);
         assert_eq!(got, model.expected(node), "edges of {node} after edits");
     }
 

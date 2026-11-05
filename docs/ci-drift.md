@@ -42,13 +42,30 @@ renamed path matches the trusted producer's Markdown filter. Its actual revision
 run, attempt and workflow hash remain attached. An applicable newer failure is
 preserved. An unfiltered PR producer still requires its current merge-candidate run.
 
-Changing a producer definition cannot certify that definition through its own
-output. A changed definition is accepted only when the repository owner's latest
-review of the pull request's exact head commit approves it; a later push needs a
-new review, and an approval from any other account, of an older head, or followed
-by a change request does not count. Every review page is read, and an
-unreadable or unbounded review list fails closed. Accepted rows record the review,
-and the coverage line names each accepted producer
+Changed Python provisioning can be validated automatically when it preserves the
+test contract. The supported form adds the trusted, commit-pinned `setup-uv`
+action with an exact numeric uv version and disabled caching, then installs an
+exact Python version and runs the unchanged unittest command through
+`uv run --no-project --python` with that same version. The setup step must be
+immediately before the test step. Removing that setup and interpreter wrapper
+must leave the entire workflow identical to the trusted definition. The same
+comparison supports later runtime version updates and a return to direct Python.
+Changes to discovery arguments, conditions, environment, triggers, permissions,
+other steps or action pins do not qualify. This is a bounded compatibility rule,
+not a general YAML or shell equivalence checker.
+
+Automatic validation records `producer_acceptance.policy = "python-runtime-v1"`
+and `producer_definition_auto_validated_drift_input`. It proves compatibility
+only: the actual candidate definition, full command, source revision and test
+output must still match the execution evidence. Failed, zero-test or all-skipped
+runs remain unsuccessful; candidate assertions cannot certify execution.
+
+For changes outside that supported form, acceptance still requires the repository
+owner's latest approving review of the pull request's exact head commit. A later
+push needs a new review, and an approval from another account, of an older head,
+or followed by a change request does not count. Every review page is read, and an
+unreadable or unbounded review list fails closed. Owner-accepted rows record the
+review, and the coverage line names each such producer
 (`producer_definition_owner_accepted_<producer>`). After the
 change merges, the default branch's copy is the trusted definition again.
 
@@ -191,6 +208,33 @@ until explicit replay or history expiration. The collector inspects a bounded
 history window and reports when no reusable baseline exists. It does not promise
 permanent suppression. Changed evidence or model/tooling configuration reopens
 analysis; unrelated candidate identity alone does not change packet fingerprints.
+
+`drift-state` also retains an `observations` list for this run's completed provider
+attempts, including rejected responses. It holds at most four records, separately
+from the reusable successful answers in `entries`. Reused answers and requests
+that were never attempted are excluded. Each observation keeps allowlisted model,
+usage, latency, request/response hashes and public source identity where available.
+Failures additionally carry a versioned diagnostic with a fixed stage and reason,
+HTTP status, bytes read and truncation flag. JSON type names and answer inventory
+counts can explain a shape mismatch without retaining provider field values,
+unknown field names, error bodies or private evidence. Oversized responses have a
+bounded byte count and no complete-response hash.
+
+The summary distinguishes HTTP/transport failures, invalid JSON, response-schema
+violations and local acceptance rules, such as `policy/duplicate_support`.
+`malformed_response` alone does not establish that the provider returned invalid
+JSON. Two independently evaluated support questions can select the same excerpt;
+the current client rejects that combination. These observations expose the reason
+without changing the questions, acceptance rules, retries or check verdicts.
+
+Top-level `provider_status` distinguishes completed, partial and unexecuted phases;
+an unrecognized status is reported as `unavailable`. Completed observations survive
+partial execution and superseded-candidate publication. They are per-run evidence,
+not a cumulative history or reusable answers; inspect each run's artifact to compare
+attempts. A request interrupted before checkpointing has no completed observation.
+Older rejected responses discarded by earlier publishers cannot be reconstructed
+from their coarse summary labels. New diagnostics begin when this code runs from
+the trusted default branch.
 
 Completed provider results are checkpointed individually by atomic replacement.
 If a later request is interrupted, publication preserves the completed prefix and

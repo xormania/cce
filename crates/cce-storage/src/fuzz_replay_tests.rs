@@ -1,6 +1,7 @@
 //! Stable side of fuzzing: the committed seed inputs are exactly what their generator produces and
 //! are valid inputs for their targets, and every seed and every saved finding replays through the
-//! same harness functions the fuzz targets call.
+//! same harness functions the fuzz targets call. Seeded mutations of the seeds sweep every
+//! decoder deterministically (`decoder report:`), and seeded random inputs sweep the `ops` target.
 //!
 //! Seeds live in `fuzz/seeds/<target>/` and saved findings (minimized crashing, hanging or
 //! oversized inputs) in `fuzz/regressions/<target>/`. Regenerate the seeds after a format change
@@ -20,6 +21,10 @@ use crate::engine::{Inner, Options};
 use crate::format::{Descriptor, PageKind, PageRef, StoreId, decode_slot, encode_page};
 use crate::fuzz_api::{self, TARGETS, join_image, split_image};
 use crate::io::FileId;
+use crate::model::{
+    ByteRun, ChangeSpec, ContentPick, ContentSpec, ExpectSpec, Op, ReadSpec,
+    double_binding_sequence, merge_skip_sequence, ops_from_bytes, ops_to_bytes, plain,
+};
 use crate::records::{AttemptValue, ContextValue, ExtentRef, Manifest, RelValue, encode_history};
 use crate::sim::SimIo;
 use crate::tree::Node;
@@ -239,7 +244,197 @@ fn seeds() -> BTreeMap<(&'static str, String), Vec<u8>> {
     add("image", "empty-store", image_of(&empty));
     add("image", "rich-store", image_of(&rich));
     add("image", "branching-store", image_of(&branching_store()));
+
+    for (name, run, ops) in ops_seed_sources() {
+        add("ops", name, ops_to_bytes(run, &ops));
+    }
     out
+}
+
+/// The runs and sequences the `ops` seeds encode.
+fn ops_seed_sources() -> Vec<(&'static str, ByteRun, Vec<Op>)> {
+    let merge_skip = merge_skip_sequence();
+    let double = double_binding_sequence();
+    vec![
+        (
+            "merge-skip-regression",
+            ByteRun::Complete,
+            merge_skip.clone(),
+        ),
+        (
+            "double-binding-regression",
+            ByteRun::Complete,
+            double.clone(),
+        ),
+        ("staging-lifecycle", ByteRun::Complete, staging_lifecycle()),
+        ("maintenance", ByteRun::Complete, maintenance_sequence()),
+        (
+            "crash-in-maintenance",
+            ByteRun::Crash { cut: 41 },
+            maintenance_sequence(),
+        ),
+        (
+            "failure-in-maintenance",
+            ByteRun::Failure {
+                cut: 33,
+                lossy: false,
+                live: true,
+            },
+            maintenance_sequence(),
+        ),
+        // The first commit's data barrier fails and drops its writes; the store keeps running.
+        (
+            "lossy-barrier-failure",
+            ByteRun::Failure {
+                cut: 6,
+                lossy: true,
+                live: true,
+            },
+            staging_lifecycle(),
+        ),
+        (
+            "crash-in-merge-skip",
+            ByteRun::Crash { cut: 37 },
+            merge_skip.clone(),
+        ),
+        (
+            "failure-in-merge-skip",
+            ByteRun::Failure {
+                cut: 21,
+                lossy: false,
+                live: true,
+            },
+            merge_skip,
+        ),
+        (
+            "failure-after-publication",
+            ByteRun::AfterPublication {
+                pick: 0,
+                live: true,
+            },
+            double,
+        ),
+    ]
+}
+
+/// Each `ops` seed decodes to exactly the run and steps it was made from (an encoding that drops
+/// a step or a change would silently replay a different sequence).
+#[test]
+fn ops_seeds_decode_to_the_sequences_they_encode() {
+    for (name, run, ops) in ops_seed_sources() {
+        let (got_run, got) = ops_from_bytes(&ops_to_bytes(run, &ops));
+        assert_eq!(got_run, run, "{name}");
+        assert_eq!(format!("{got:?}"), format!("{ops:?}"), "{name}");
+    }
+}
+
+/// Commits content of every size and a relationship, removes records to leave retired space,
+/// holds a view across relocation, reclaim and an index rebuild, reads and commits from it, and
+/// reopens.
+fn maintenance_sequence() -> Vec<Op> {
+    let fresh = |ctx: u8, seed: u8, size: u8| ChangeSpec::PutContext {
+        ctx,
+        expect: ExpectSpec::Any,
+        body: 3,
+        content: Some(ContentPick::Fresh(ContentSpec { seed, size })),
+    };
+    let maintain = |task: u8, pages: u8, bytes: u8| Op::Maintain { task, pages, bytes };
+    vec![
+        Op::Commit(plain(vec![
+            fresh(0, 1, 5),
+            fresh(1, 2, 6),
+            ChangeSpec::PutRelationship {
+                rel: 2,
+                expect: ExpectSpec::Any,
+                kind: 1,
+                source: 0,
+                target: 2,
+            },
+        ])),
+        Op::Commit(plain(vec![fresh(2, 3, 7), crate::model::put(4, 3)])),
+        Op::Commit(plain(vec![
+            crate::model::remove(0),
+            crate::model::remove(1),
+        ])),
+        Op::Hold(vec![ReadSpec::Context(2), ReadSpec::Content(2)]),
+        maintain(2, 15, 3),
+        Op::ReadHeld {
+            slot: 0,
+            reads: vec![ReadSpec::Content(2)],
+        },
+        maintain(0, 0, 3),
+        maintain(1, 0, 0),
+        Op::CommitFromHeld {
+            slot: 0,
+            request: plain(vec![crate::model::put(3, 2)]),
+        },
+        maintain(2, 0, 0),
+        Op::Reopen,
+        maintain(2, 15, 3),
+        Op::Check,
+    ]
+}
+
+/// Stages, binds earlier stagings, holds and reads views, submits, retries, discards and
+/// reopens: every kind of step at least once.
+fn staging_lifecycle() -> Vec<Op> {
+    let with_staged = |ctx: u8, k: u8| ChangeSpec::PutContext {
+        ctx,
+        expect: ExpectSpec::Any,
+        body: 1,
+        content: Some(ContentPick::Staged(k)),
+    };
+    vec![
+        Op::Stage(ContentSpec { seed: 3, size: 5 }),
+        Op::Stage(ContentSpec { seed: 4, size: 0 }),
+        Op::Commit(plain(vec![
+            with_staged(1, 0),
+            ChangeSpec::PutRelationship {
+                rel: 1,
+                expect: ExpectSpec::Absent,
+                kind: 0,
+                source: 1,
+                target: 2,
+            },
+        ])),
+        Op::Hold(vec![
+            ReadSpec::Context(1),
+            ReadSpec::Relationships {
+                from: 1,
+                outgoing: true,
+                kind: None,
+                page: 1,
+            },
+        ]),
+        Op::SubmitAndPoll(plain(vec![crate::model::put(2, 2)])),
+        Op::ReadHeld {
+            slot: 0,
+            reads: vec![ReadSpec::Content(1)],
+        },
+        Op::CommitFromHeld {
+            slot: 0,
+            request: plain(vec![crate::model::put(1, 6)]),
+        },
+        Op::Retry {
+            pick: 0,
+            identical: true,
+        },
+        Op::Retry {
+            pick: 1,
+            identical: false,
+        },
+        Op::Discard {
+            pick: 0,
+            refused: true,
+        },
+        Op::Discard {
+            pick: 0,
+            refused: false,
+        },
+        Op::Release(0),
+        Op::Reopen,
+        Op::Check,
+    ]
 }
 
 fn files_in(dir: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -318,6 +513,11 @@ fn seeds_are_valid_inputs_for_their_targets() {
                 );
                 assert!(opened.is_ok(), "{what}: {:?}", opened.err());
             }
+            "ops" => {
+                let (run, ops) = ops_from_bytes(&bytes);
+                assert!(!ops.is_empty(), "{what}: no steps");
+                assert_eq!(ops_to_bytes(run, &ops), bytes, "{what}: not canonical");
+            }
             other => panic!("seed for unknown target {other}"),
         }
     }
@@ -340,7 +540,7 @@ fn every_seed_and_saved_finding_replays_through_its_harness() {
     assert_eq!(
         TARGETS.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
         [
-            "page", "slots", "node", "manifest", "history", "records", "image"
+            "page", "slots", "node", "manifest", "history", "records", "image", "ops"
         ]
     );
 }
@@ -464,5 +664,183 @@ fn write_seeds() {
         let dir = root.join(target);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(name), bytes).unwrap();
+    }
+}
+
+/// Seeded pseudo-random inputs (xorshift), so the `ops` decoder and harness are exercised on
+/// stable without a fuzzing toolchain.
+fn random_inputs(seed: u64, n: usize, most: usize) -> Vec<Vec<u8>> {
+    let mut r = seed | 1;
+    let mut next = move || {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        r
+    };
+    (0..n)
+        .map(|_| {
+            let len = (next() % (most as u64 + 1)) as usize;
+            (0..len).map(|_| next() as u8).collect()
+        })
+        .collect()
+}
+
+#[test]
+fn ops_inputs_decode_to_steps_their_encoding_reproduces() {
+    for data in random_inputs(0x0b5e_ed00_0000_0001, 2_000, 400) {
+        let (run, ops) = ops_from_bytes(&data);
+        let again = ops_to_bytes(run, &ops);
+        let (run2, ops2) = ops_from_bytes(&again);
+        assert_eq!(run, run2, "{data:?}");
+        assert_eq!(format!("{ops:?}"), format!("{ops2:?}"), "{data:?}");
+        assert_eq!(ops_to_bytes(run2, &ops2), again, "{data:?}");
+    }
+}
+
+/// Budget: `CCE_OPS_SWEEP_CASES` inputs (default 200) from the seed `CCE_OPS_SWEEP_SEED`.
+#[test]
+fn seeded_random_operation_inputs_run_through_the_ops_harness() {
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .map(|v| {
+                v.parse()
+                    .unwrap_or_else(|_| panic!("{name} must be a number"))
+            })
+            .unwrap_or(default)
+    };
+    let cases = env("CCE_OPS_SWEEP_CASES", 200) as usize;
+    let seed = env("CCE_OPS_SWEEP_SEED", 0x0b5e_ed00_0000_0002);
+    let mut steps = 0;
+    for data in random_inputs(seed, cases, 300) {
+        steps += ops_from_bytes(&data).1.len();
+        fuzz_api::run("ops", &data);
+    }
+    println!("ops sweep: {{\"cases\":{cases},\"seed\":\"{seed:#x}\",\"steps\":{steps}}}");
+    assert!(steps > cases, "the sweep ran almost no steps");
+}
+
+/// One seeded mutation of `input`: between one and eight edits (bit flips, byte overwrites with
+/// random or boundary values, insertions, deletions, truncation, and splices from another seed of
+/// the same target), so most inputs keep the seed's structure and fail, if at all, deep inside it.
+fn mutate(mut input: Vec<u8>, pool: &[Vec<u8>], next: &mut impl FnMut() -> u64) -> Vec<u8> {
+    let most = pool.iter().map(Vec::len).max().unwrap_or(0) * 2 + 16;
+    for _ in 0..1 + next() % 8 {
+        let len = input.len() as u64;
+        let at = |n: u64| (n % len.max(1)) as usize;
+        match next() % 8 {
+            0 if len > 0 => {
+                let i = at(next());
+                input[i] ^= 1 << (next() % 8);
+            }
+            1 if len > 0 => {
+                let i = at(next());
+                input[i] = next() as u8;
+            }
+            2 if len > 0 => {
+                let i = at(next());
+                input[i] = [0, 1, 0x7f, 0x80, 0xfe, 0xff][(next() % 6) as usize];
+            }
+            3 if input.len() < most => {
+                let i = (next() % (len + 1)) as usize;
+                input.insert(i, next() as u8);
+            }
+            4 if len > 0 => {
+                input.remove(at(next()));
+            }
+            5 => input.truncate((next() % (len + 1)) as usize),
+            6 => {
+                let other = &pool[(next() % pool.len() as u64) as usize];
+                if !other.is_empty() && len > 0 {
+                    let from = (next() % other.len() as u64) as usize;
+                    let n = (1 + next() % 64) as usize;
+                    let to = at(next());
+                    for (k, b) in other[from..].iter().take(n).enumerate() {
+                        if let Some(slot) = input.get_mut(to + k) {
+                            *slot = *b;
+                        }
+                    }
+                }
+            }
+            _ if len > 8 => {
+                // An 8-byte little-endian field set to a boundary value.
+                let i = at(next()).min(input.len() - 8);
+                let v: u64 = [0, 1, u64::MAX, u64::from(u32::MAX), 1 << 32][(next() % 5) as usize];
+                input[i..i + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            _ => {}
+        }
+    }
+    input
+}
+
+/// Budget: `CCE_DECODER_CASES` mutated inputs per decoder target (default 10000) from the seed
+/// `CCE_DECODER_SEED`. Deterministic and independent of a fuzzing toolchain: each input runs
+/// through the same harness function the fuzz target calls, and any panic fails with the target,
+/// case and input. Prints one `decoder report:` line with valid and malformed counts per target.
+#[test]
+fn seeded_mutations_of_the_seeds_run_through_every_decoder() {
+    let env = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .map(|v| {
+                v.parse()
+                    .unwrap_or_else(|_| panic!("{name} must be a number"))
+            })
+            .unwrap_or(default)
+    };
+    let cases = env("CCE_DECODER_CASES", 10_000);
+    let seed = env("CCE_DECODER_SEED", 0x0dec_0de5_eed0_0001);
+    let all = seeds();
+    let mut per_target = serde_json::Map::new();
+    let mut total = 0u64;
+    for (target, harness) in TARGETS.iter().filter(|(t, _)| *t != "ops") {
+        let pool: Vec<Vec<u8>> = all
+            .iter()
+            .filter(|((t, _), _)| t == target)
+            .map(|(_, b)| b.clone())
+            .collect();
+        assert!(!pool.is_empty(), "no seed for {target}");
+        let mut r =
+            seed ^ target.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            }) | 1;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let (mut valid, mut malformed) = (0u64, 0u64);
+        for case in 0..cases {
+            let base = pool[(next() % pool.len() as u64) as usize].clone();
+            let input = mutate(base, &pool, &mut next);
+            match std::panic::catch_unwind(|| harness(&input)) {
+                Ok(true) => valid += 1,
+                Ok(false) => malformed += 1,
+                Err(_) => panic!(
+                    "{target} case {case} (seed {seed:#x}) panicked on input {}",
+                    input.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                ),
+            }
+        }
+        total += cases;
+        per_target.insert(
+            target.to_string(),
+            serde_json::json!({"cases": cases, "valid": valid, "malformed": malformed}),
+        );
+    }
+    let report = serde_json::json!({
+        "seed": format!("{seed:#x}"),
+        "cases": total,
+        "per_target": per_target,
+        "passed": true,
+    });
+    println!("decoder report: {report}");
+    for (target, counts) in &per_target {
+        assert!(
+            counts["valid"].as_u64() > Some(0) && counts["malformed"].as_u64() > Some(0),
+            "the {target} sweep reached only one outcome: {counts}"
+        );
     }
 }
