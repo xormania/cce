@@ -52,7 +52,10 @@ class Fake:
         self.payloads.append(payload)
         if self.mutate:
             self.mutate()
-        names = {"c" + str(n): item["id"] for n, item in enumerate(payload["state"]["candidates"])}
+        if "candidate" in payload["state"]:
+            names = {"c0": payload["state"]["candidate"]["id"]}
+        else:
+            names = {"c" + str(n): item["id"] for n, item in enumerate(payload["state"]["candidates"])}
         return {"model": payload["model"],
                 "answers": {q: {"type": "noul", "noul": self.scores.get(names[q], self.default)}
                             for q in payload["questions"]}}
@@ -255,6 +258,39 @@ class SelectTests(unittest.TestCase):
         self.assertTrue(all("Ignore the rubric" not in q["instructions"] for q in payload["questions"].values()))
         self.assertNotIn("Z9", result["relevant"] + result["not_relevant"] + result["uncertain"])
         self.assertEqual(result["relevant"], ["B14"])
+
+    def test_per_record_layout_sends_one_candidate_per_request(self):
+        s = snap()
+        lock = threading.Lock()
+        fake = Fake({"B10": 0.9})
+
+        def evaluate(payload):
+            with lock:
+                if payload["state"]["candidate"]["id"] == "B11":
+                    raise OSError("down")
+                return fake(payload)
+
+        result = select.select(s, SCOPE, evaluate, layout="per_record")
+        candidates = context._candidates(s, context._governing(s, SCOPE)[0])
+        self.assertEqual(fake.calls, len(candidates) - 1)
+        for payload in fake.payloads:
+            self.assertNotIn("candidates", payload["state"])
+            self.assertEqual(list(payload["questions"]), ["c0"])
+            self.assertIn("`candidate` (" + payload["state"]["candidate"]["id"] + ")",
+                          payload["questions"]["c0"]["instructions"])
+        self.assertEqual(result["relevant"], ["B10"])
+        self.assertEqual(result["unexamined"], ["B11"])
+        self.assertEqual(result["mode"], "partial")
+
+    def test_layout_is_part_of_the_fingerprint(self):
+        s = snap()
+        with tempfile.TemporaryDirectory() as cache:
+            select.select(s, SCOPE, Fake({"B10": 0.9}), cache_dir=cache)
+            fake = Fake()
+            select.select(s, SCOPE, fake, cache_dir=cache, layout="per_record")
+            self.assertGreater(fake.calls, 0)
+        with self.assertRaises(select.SelectionError):
+            select.select(s, SCOPE, Fake(), layout="other")
 
     def test_no_candidates_needs_no_evaluation(self):
         fake = Fake()

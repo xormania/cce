@@ -28,6 +28,7 @@ instruction, and nothing the evaluator returns can add a record, change the rubr
 """
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -61,6 +62,12 @@ CRITERIA = {"true": "The candidate directly constrains, authorizes, forbids, def
                     "action this scope's objective or work items will take.",
             "false": "The candidate only shares a subject, subsystem or vocabulary with the scope, concerns "
                      "other work, or would not change what this scope's work does or how it is checked."}
+
+
+# "shared": one state with the scope and a batch of candidates, one question per candidate.
+# "per_record": one request per candidate; its state holds the scope and that candidate only.
+LAYOUTS = ("shared", "per_record")
+PARALLEL = 8
 
 
 class SelectionError(ValueError):
@@ -116,6 +123,14 @@ def _payload(model, state, cards):
     return {"model": model, "state": dict(state, candidates=cards), "questions": questions}
 
 
+def _record_payload(model, state, item):
+    question = (RUBRIC.replace("lists candidate records", "holds one candidate record")
+                .replace("Judge only the candidate this question names, on its own. ", "")
+                + " This question is about `candidate` (" + item["id"] + ").")
+    return {"model": model, "state": dict(state, candidate=item),
+            "questions": {"c0": {"type": "noul", "instructions": question, "criteria": dict(CRITERIA)}}}
+
+
 def batches(model, state, cards, max_questions=MAX_QUESTIONS, max_bytes=MAX_REQUEST):
     """Split cards into requests within the budgets. Returns (batches, too_large_ids).
 
@@ -154,9 +169,9 @@ def validate(response, payload):
     return scores
 
 
-def fingerprint(snap, scope, cards, governing, model, max_questions, max_bytes):
+def fingerprint(snap, scope, cards, governing, model, max_questions, max_bytes, layout="shared"):
     # The thresholds are not part of the evaluation: cached scores are classified with the current rule.
-    return context._digest({"version": VERSION, "rubric": [RUBRIC_VERSION, RUBRIC, CRITERIA],
+    return context._digest({"version": VERSION, "rubric": [RUBRIC_VERSION, RUBRIC, CRITERIA], "layout": layout,
                             "model": model, "budget": [max_questions, max_bytes], "scope": scope or {},
                             "governing": {rid: snap["records"][rid]["digest"] for rid in governing},
                             "cards": cards})
@@ -203,7 +218,7 @@ def _store(cache_dir, key, value):
 
 
 def select(snap, scope, evaluate, *, model=jev_client.MODEL, rule=RULE, cache_dir=None, current=None,
-           max_questions=MAX_QUESTIONS, max_bytes=MAX_REQUEST):
+           max_questions=MAX_QUESTIONS, max_bytes=MAX_REQUEST, layout="shared", parallel=PARALLEL):
     """Judge the scope's candidates. Returns a selection:
 
     ``relevant``, ``not_relevant``, ``uncertain`` and ``unexamined`` (identity lists, together exactly
@@ -214,7 +229,9 @@ def select(snap, scope, evaluate, *, model=jev_client.MODEL, rule=RULE, cache_di
     governing, _, _ = context._governing(snap, scope)
     ids = context._candidates(snap, governing)
     cards = [card(snap, rid) for rid in ids]
-    key = fingerprint(snap, scope, cards, governing, model, max_questions, max_bytes)
+    if layout not in LAYOUTS:
+        raise SelectionError("unknown_layout")
+    key = fingerprint(snap, scope, cards, governing, model, max_questions, max_bytes, layout)
     observed = (snap["id"], context.scope_fingerprint(scope))
 
     def finish(result):
@@ -236,16 +253,30 @@ def select(snap, scope, evaluate, *, model=jev_client.MODEL, rule=RULE, cache_di
                 result["relevant" if verdict else "uncertain" if verdict is None else "not_relevant"].append(rid)
             return finish(result)
         state = _scope_state(snap, scope, governing)
-        groups, too_large = batches(model, state, cards, max_questions, max_bytes)
+        if layout == "per_record":
+            groups, too_large = [], []
+            for item in cards:
+                payload = _record_payload(model, state, item)
+                (too_large.append(item["id"]) if len(jev_client.canonical(payload)) > max_bytes
+                 else groups.append(([item], payload)))
+        else:
+            parts, too_large = batches(model, state, cards, max_questions, max_bytes)
+            groups = [(group, _payload(model, state, group)) for group in parts]
         result["unexamined"] += too_large
         if too_large:
             result["failures"].append({"reason": "record_exceeds_request_budget", "ids": too_large})
-        for group in groups:
-            payload = _payload(model, state, group)
+
+        def run(entry):
+            group, payload = entry
             try:
-                scores = validate(evaluate(payload), payload)
+                return group, validate(evaluate(payload), payload), None
             except Exception as error:  # noqa: BLE001 - any evaluator failure keeps the batch unexamined
-                reason = error.args[0] if isinstance(error, SelectionError) else type(error).__name__
+                return group, None, error.args[0] if isinstance(error, SelectionError) else type(error).__name__
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(parallel, len(groups) or 1))) as pool:
+            outcomes = list(pool.map(run, groups))
+        for group, scores, reason in outcomes:
+            if scores is None:
                 result["unexamined"] += [item["id"] for item in group]
                 result["failures"].append({"reason": str(reason), "ids": [item["id"] for item in group]})
                 continue
