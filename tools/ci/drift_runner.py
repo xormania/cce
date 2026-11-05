@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.error
@@ -56,7 +57,17 @@ def load(path):
 def save(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(canonical(value) + b'\n')
+    # An interrupted checkpoint must leave the last complete JSON readable.
+    data = canonical(value) + b'\n'
+    descriptor, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -142,26 +153,40 @@ class GitHub:
                 if artifact['name'] not in {'drift-state', 'drift-reservation'} or artifact.get('expired'):
                     continue
                 state = self.archive(artifact['id'], 'reservation.json' if artifact['name'] == 'drift-reservation' else 'state.json')
-                if state.get('version') == VERSION and state.get('engine_hash') == engine_hash():
+                if state.get('version') == VERSION:
                     found = True
+                    same_engine = state.get('engine_hash') == engine_hash()
                     if artifact['name'] == 'drift-reservation':
-                        reserved.update(x for x in state.get('fingerprints', []) if isinstance(x,str) and re.fullmatch('[0-9a-f]{64}',x))
+                        if same_engine:
+                            reserved.update(x for x in state.get('fingerprints', []) if isinstance(x,str) and re.fullmatch('[0-9a-f]{64}',x))
                         run_reservation = state
                     else:
                         run_state = state
-                        for row in state.get('entries', []):
-                            if safe_state_entry(row):
-                                entries.setdefault(row['fingerprint'], row)
-                        pending.extend(x for x in state.get('pending', []) if isinstance(x,str) and re.fullmatch('[0-9a-f]{64}',x) and x not in pending)
+                        if same_engine:
+                            for row in state.get('entries', []):
+                                if safe_state_entry(row):
+                                    entries.setdefault(row['fingerprint'], row)
+                            pending.extend(x for x in state.get('pending', []) if isinstance(x,str) and re.fullmatch('[0-9a-f]{64}',x) and x not in pending)
             # Each published snapshot contains the entire retained queue. An
             # older snapshot cannot resurrect work retired by a newer one.
             # Newer reservations without publication survive cancellation.
             if not snapshot_found:
                 snapshot = run_state if run_state is not None else run_reservation
                 if snapshot is not None:
-                    recipes.extend(row for row in snapshot.get('backlog', []) if backlog.safe_descriptor(row))
+                    for row in snapshot.get('backlog', []):
+                        clean = backlog.safe_descriptor(row)
+                        if clean:
+                            # A tooling change invalidates diagnoses, not the
+                            # existence of unfinished work or latest-queue order.
+                            if snapshot.get('engine_hash') != engine_hash():
+                                clean['state'] = 'deferred'
+                            recipes.append(clean)
                     count = snapshot.get('backlog_overflow', 0)
                     if type(count) is int and count >= 0:
+                        if snapshot.get('engine_hash') != engine_hash():
+                            # Older counters may include repeated omissions;
+                            # retain only the coverage loss known to be real.
+                            count = int(count > 0)
                         overflow = max(overflow, count)
                 snapshot_found = run_state is not None
         carried = backlog.merge(recipes, [], finished=[key for key,row in entries.items() if settled(row['record'])],
@@ -270,7 +295,7 @@ def source_for(api, event, event_name, manual_sha=''):
         raise ValueError('invalid_base')
     return {'repository':api.repository, 'head_sha':head, 'base_sha':base,
             'run_id':run['id'], 'attempt':run['run_attempt'], 'branch':active[0]['head']['ref'] if active else run['head_branch'],
-            'pulls':[p['number'] for p in active]}
+            'pulls':[p['number'] for p in active if p['base']['sha'] == base]}
 
 
 def bounded_excerpt(text, limit=6000):
@@ -331,8 +356,12 @@ def settled(record):
 
 def packet_inventory(source, rows):
     packets = evaluate({'source':source, 'semantic':rows})['packets']
+    origins = {hashlib.sha256(('semantic\0'+row['id']).encode()).hexdigest()[:24]: row for row in rows}
     for packet in packets:
         packet['source'] = source
+        correction = origins.get(packet['subject'], {}).get('correction')
+        if correction:
+            packet['correction'] = correction
     return packets
 
 
@@ -359,6 +388,8 @@ def collect(api, event, event_name, out, env, source=None, check_id=None):
     for packet in result['packets']:
         packet['source'] = source
         row = origins.get(packet['subject'], {})
+        if row.get('correction'):
+            packet['correction'] = row['correction']
         if row.get('private'):
             identity = row.get('reconstruction', {})
             ref, key = identity.get('data_ref', data_meta.get('data_ref')), identity.get('config_key', data_meta.get('config_key'))
@@ -442,14 +473,23 @@ def collect(api, event, event_name, out, env, source=None, check_id=None):
 def run_provider(out, key):
     root = Path(out)
     control = load(root/'control.json')
+    if control.get('provider_status') == 'completed':
+        return control
+    if control.get('provider_status') == 'partial':
+        # A prior process may have sent the next request before it stopped.
+        # Explicit replay starts with a new collection and reservation.
+        raise ValueError('provider_phase_already_started')
     rows = load(root/'private'/'packets.json')
     results = list(control['reused'])
+    control.update(results=results, provider_status='partial' if rows else 'completed', provider_completed=0)
+    save(root/'control.json', control)
     for row in rows:
         record = diagnose(row['packet'], key=key)
         results.append({'fingerprint':row['fingerprint'], 'record':record})
-    control['results'] = results
-    control['provider_status'] = 'completed'
-    save(root/'control.json', control)
+        control['provider_completed'] += 1
+        if control['provider_completed'] == len(rows):
+            control['provider_status'] = 'completed'
+        save(root/'control.json', control)
     return control
 
 
@@ -459,10 +499,16 @@ def summary(control):
              'Semantic packets selected: ' + str(control['selected']) +
              '; deferred: ' + str(len(control['pending'])) + '.']
     lines.append('Provider stage: `' + control.get('provider_status','not_executed') + '`.')
+    if control.get('provider_status') == 'partial':
+        lines.append('Provider execution was interrupted or incomplete; completed packet results: ' +
+                     str(control.get('provider_completed', 0)) + ' of ' + str(control['selected']) +
+                     '. Unfinished requests are not automatically replayed.')
     states = [row['state'] for row in control.get('backlog', [])]
     lines.append('Retained relationships: ' + str(states.count('tracked')) + ' tracked; ' +
-                 str(sum(state != 'tracked' for state in states)) + ' unfinished; ' +
-                 str(control.get('backlog_overflow', 0)) + ' beyond the retained inventory.')
+                 str(sum(state != 'tracked' for state in states)) + ' unfinished.')
+    if control.get('backlog_overflow', 0):
+        lines.append('Retention has omitted at least ' + str(control['backlog_overflow']) +
+                     ' relationships. This historical lower bound is not a count of current unfinished work.')
     if control.get('baseline_missing'):
         lines.append('No reusable baseline was available in the bounded history window.')
     for violation in control['violations']:
@@ -502,10 +548,21 @@ def publish(api, out):
     rows = control.get('results', [])
     finished = {row['fingerprint'] for row in rows if settled(row['record'])}
     current = set(control.get('current_fingerprints', []))
-    healthy_subjects = {row['record']['subject'] for row in rows if row['fingerprint'] in current and settled(row['record'])}
+    healthy_keys = {row['fingerprint'] for row in rows if row['fingerprint'] in current and settled(row['record'])}
+    resolved_subjects = {row['record']['subject'] for row in rows if row['fingerprint'] in healthy_keys
+                         and row['record'].get('diagnosis', {}).get('answers', {}).get(
+                             'resolution', {}).get('choice') == 'addressed'}
     current_scope = backlog.scope_for(control['source'])
+    corrections = [row.get('correction') for row in control.get('backlog', [])
+                   if row['fingerprint'] in healthy_keys and row['scope'] == current_scope]
     finished.update(row['fingerprint'] for row in control.get('backlog', [])
-                    if row['scope'] == current_scope and row['subject'] in healthy_subjects)
+                    if row['scope'] == current_scope and any(
+                        backlog.corrects(correction, row.get('correction')) for correction in corrections))
+    # Mapped cases have stable identifiers and an explicit resolution question;
+    # public diff ordinals and execution observations do not have that identity.
+    finished.update(row['fingerprint'] for row in control.get('backlog', [])
+                    if row['scope'] == current_scope and row['kind'] == 'data'
+                    and row['subject'] in resolved_subjects)
     reserved = {row['fingerprint'] for row in rows if row['record']['status'] not in {'diagnosed','abstained'}
                 and (row['record'].get('provider_request_attempted') or row['record'].get('provider_request_attempts',0)
                      or row['record']['status'] == 'previous_request_reserved')}

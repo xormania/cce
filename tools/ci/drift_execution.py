@@ -7,6 +7,7 @@ follow-up remains attributed to the actual older producer commit.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timedelta
 from pathlib import Path
 import re
 import urllib.error
@@ -72,6 +73,131 @@ def _steps(text, producer):
     if set(found) != set(_KINDS[producer]):
         raise ValueError("unsupported_producer_definition")
     return found
+
+
+def _run_script(text, title):
+    """Read the literal run script of a named step in the supported YAML subset."""
+    for part in re.split(r"(?m)^\s*- name:\s*", text)[1:]:
+        name, _, body = part.partition("\n")
+        if name.strip().strip("\"'") != title:
+            continue
+        body = re.split(r"(?m)^\s*- (?:name:|uses:|run:)", body, maxsplit=1)[0]
+        match = re.search(r"(?m)^([ ]+)run:[ \t]*(.*)$", body)
+        if not match:
+            return None
+        value = match[2].strip()
+        if value in {"|", "|-", "|+"}:
+            lines = []
+            for line in body[match.end():].splitlines():
+                if line.strip() and len(line) - len(line.lstrip()) <= len(match[1]):
+                    break
+                lines.append(line.strip())
+            return tuple("\n".join(lines).strip().splitlines()) or None
+        if not value or value[0] in "'\"|>":
+            return None
+        return (value,)
+    return None
+
+
+def _log_clock(value):
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z", value):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _step_output(log, step, script):
+    """Bind output to the trusted script and the API step's execution interval.
+
+    Actions rounds step timestamps to seconds. The runner's script preamble
+    separates adjacent steps within that second, and is not test output. This
+    is log attribution, not protection against a producer forging runner output.
+    """
+    start, end = (_log_clock(step.get(key)) for key in ("started_at", "completed_at"))
+    if (not script or start is None or end is None or end < start
+            or type(step.get("number")) is not int or step["number"] < 1):
+        return None
+    lines = []
+    for raw in log.lstrip("\ufeff").splitlines():
+        stamp, _, content = raw.partition(" ")
+        lines.append((_log_clock(stamp), re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", content).strip()))
+    headers = []
+    index = 0
+    while index < len(lines):
+        _, content = lines[index]
+        if not content.startswith("##[group]Run "):
+            index += 1
+            continue
+        tail = index + 1
+        while (tail < len(lines) and lines[tail][1] != "##[endgroup]"
+               and not lines[tail][1].startswith("##[group]Run ")):
+            tail += 1
+        if tail == len(lines) or lines[tail][1] != "##[endgroup]":
+            headers.append((index, index, None, False))
+            index = tail
+            continue
+        shell = next((i for i in range(index + 1, tail) if lines[i][1].startswith("shell: ")), None)
+        if shell is not None:
+            printed = tuple(line for _, line in lines[index + 1:shell])
+            headers.append((index, tail, printed, True))
+        else:
+            action = re.fullmatch(r"##\[group\]Run (?:[\w.-]+/[\w./-]+@[\w.-]+|\./\S+|docker://\S+)", content)
+            # Empty action preambles are valid: uses steps need not have inputs
+            # or explicit environment. Unknown Run groups cannot supply counts.
+            headers.append((index, tail, None, bool(action)))
+        index = tail + 1
+    matches = [(first, last) for first, last, printed, _ in headers
+               if printed == script and lines[first][1] == "##[group]Run " + script[0]
+               and lines[first][0] is not None and start <= lines[first][0] < end + timedelta(seconds=1)]
+    if len(matches) != 1:
+        return None
+    first, last = matches[0]
+    following = next((row for row in headers if row[0] > last), None)
+    boundary = following[0] if following is not None else len(lines)
+    if (following is not None and not following[3]
+            and (lines[boundary][0] is None or lines[boundary][0] < end + timedelta(seconds=1))):
+        return None
+    output = []
+    for stamp, content in lines[last + 1:boundary]:
+        if stamp is None:
+            return None
+        if stamp >= end + timedelta(seconds=1) or content in {"Post job cleanup.", "Cleaning up orphan processes"}:
+            break
+        if stamp < lines[first][0]:
+            return None
+        output.append(content)
+    return "\n".join(output)
+
+
+def _unittest_executed(output):
+    """Interpret the final unittest invocation, including whole-suite skips."""
+    lines = output.splitlines()
+    summaries = [(index, int(match[1])) for index, line in enumerate(lines)
+                 if (match := re.fullmatch(r"Ran (\d+) tests? in .+", line))]
+    if not summaries:
+        return False
+    index, count = summaries[-1]
+    result = next((line for line in lines[index + 1:] if line), "")
+    if not count or not re.fullmatch(r"OK(?: \([^\n]+\))?", result):
+        return False
+    skipped = re.search(r"\bskipped=(\d+)\b", result)
+    if skipped is None or count > int(skipped[1]):
+        return True
+    # unittest counts skipped subtests separately from test methods. A passing
+    # verbose case still proves execution even when skipped >= testsRun.
+    previous = summaries[-2][0] if len(summaries) > 1 else -1
+    verbose = lines[previous + 1:index]
+    for offset, line in enumerate(verbose):
+        if re.fullmatch(r"\S+ \([^\n()]+\) \.\.\. (?:ok|expected failure)", line):
+            return True
+        # With descriptions enabled, unittest puts the test's docstring on the
+        # next line. Keep its preceding case identity, not arbitrary diagnostics.
+        if (re.fullmatch(r"\S+ \([^\n()]+\)", line) and offset + 1 < len(verbose)
+                and re.fullmatch(r".+ \.\.\. (?:ok|expected failure)", verbose[offset + 1])):
+            return True
+    return False
 
 
 REVIEW_PAGES = 10
@@ -393,12 +519,15 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
             status = actual[0][1].get("conclusion") if len(actual) == 1 else None
             job_id = actual[0][0]["id"] if len(actual) == 1 else None
             witness = job_logs.get(job_id, "")
-            ran = status in {"success", "failure"} and bool(witness.strip())
-            if status == "success" and ran:
-                if kind == "test":
-                    ran = any(int(n) > 0 for n in re.findall(r"test result: ok\. (\d+) passed", witness))
-                elif kind == "unittest":
-                    ran = any(int(n) > 0 for n in re.findall(r"Ran (\d+) tests?", witness))
+            ran = status == "failure" or status == "success" and bool(witness.strip())
+            if status == "success" and kind in {"test", "unittest"}:
+                output = _step_output(witness, actual[0][1], _run_script(trusted, title))
+                if output is None:
+                    limits.append("execution_step_output_unavailable")
+                    waiting = True
+                    continue
+                ran = (_unittest_executed(output) if kind == "unittest" else
+                       any(int(n) > 0 for n in re.findall(r"(?m)^test result: ok\. (\d+) passed;[^\n]*$", output)))
             checks.append(_row(title, "pass" if status == "success" else "fail" if status == "failure" else "skipped",
                 ran, run["head_sha"], equivalent=equivalent, run_id=run["id"], job_id=job_id, attempt=run.get("run_attempt", 1),
                 workflow_ref=workflow_ref, workflow_sha256=hashlib.sha256(trusted.encode("utf-8")).hexdigest(),

@@ -133,6 +133,43 @@ class DataTests(unittest.TestCase):
             self.assertEqual(limits, ["data_summary_inventory_bound"])
             self.assertEqual(failed, required)
 
+    def case_inventory(self, count, groups=1, last_state="green"):
+        api = self.api()
+        api.files["records/map.toml"] = "\n".join(
+            '[[cases]]\nid="case-' + str(index) + '"\nslice="slice-' + str(index % groups)
+            + '"\nstatus="' + (last_state if index == count - 1 else "green") + '"'
+            for index in range(count))
+        totals = [len(range(group, count, groups)) for group in range(groups)]
+        api.files["records/status.md"] = "verified-at: " + HEAD + "\n" + "\n".join(
+            "| slice-" + str(group) + " | " + str(total) + "/" + str(total) + " green |"
+            for group, total in enumerate(totals))
+        return api
+
+    def test_supported_case_inventories_reach_contract_evaluation(self):
+        for count in (256, 257, 1000):
+            for groups in (1, 4):
+                for required in (False, True):
+                    with self.subTest(count=count, groups=groups, required=required):
+                        claims, _, limits, failed = self.collect(self.case_inventory(count, groups), self.env(required))
+                        self.assertFalse(failed)
+                        self.assertEqual(limits, ["decision_data_not_configured"])
+                        self.assertEqual(sum(len(row["case_statuses"]) for row in claims), count)
+                        self.assertEqual(len(claims), groups)
+                        self.assertEqual(evaluate({"source": SOURCE, "claims": claims})["violations"], [])
+
+    def test_large_group_preserves_a_late_contradiction(self):
+        claims, _, _, failed = self.collect(self.case_inventory(1000, last_state="partial"))
+        self.assertFalse(failed)
+        result = evaluate({"source": SOURCE, "claims": claims})
+        self.assertEqual([v["code"] for v in result["violations"]], ["claim_case_mismatch"])
+
+    def test_case_inventory_above_supported_bound_keeps_optional_semantics(self):
+        for groups in (1, 4):
+            for required in (False, True):
+                with self.subTest(groups=groups, required=required):
+                    result = self.collect(self.case_inventory(1001, groups), self.env(required))
+                    self.assertEqual(result, ([], [], ["data_source_unavailable"], required))
+
     def test_relative_private_decision_link_is_fetched_at_same_snapshot(self):
         api = self.api()
         api.files["records/status.md"] += "\n[decision](../decisions/retained.md)\n[external](https://arbitrary.invalid/no)\n"
@@ -183,13 +220,13 @@ class DataTests(unittest.TestCase):
             self.collect(api, public_api=FakeApi(), data_ref=BASE, subjects=[target])
         self.assertEqual(mapped.call_args.kwargs, {"data_ref": BASE, "subjects": [target]})
 
-    def mutation(self, disposition="caught", exit_code=101, assertion=True):
+    def mutation(self, disposition="caught", exit_code=101, assertion=True, **run_metadata):
         extra = ('[[mutations]]\nid="mutant-a"\nsource_head="' + HEAD[:7] + '"\n'
                  'disposition="' + disposition + '"\nevidence="records/mutation-a"\n')
         api = self.api(extra=extra)
         api.files["records/mutation-a/result.json"] = json.dumps({
             "source_head": HEAD, "source_dirty": False, "outcome": "caught",
-            "runs": [{"exit": exit_code, "executed": True, "failed_by_assertion": assertion}]})
+            "runs": [{"exit": exit_code, "executed": True, "failed_by_assertion": assertion, **run_metadata}]})
         api.files["records/mutation-a/test-0.log"] = "thread test panicked: assertion left == right failed\n"
         return api
 
@@ -207,6 +244,28 @@ class DataTests(unittest.TestCase):
         self.assertTrue(mutations[0]["runs"][0]["aborted"])
         result = evaluate({"source": SOURCE, "mutations": mutations})
         self.assertEqual(result["violations"][0]["code"], "semantic_catch_not_demonstrated")
+
+    def test_signal_and_application_exits_keep_their_recorded_convention(self):
+        for convention in (None, "shell", "subprocess"):
+            metadata = {} if convention is None else {"exit_convention": convention}
+            for exit_code in (-6, -9, -11, -15, 0, 101, 128, 129, 134, 137, 139, 143, 192, 193):
+                with self.subTest(convention=convention, exit=exit_code):
+                    mutations = []
+                    self.collect(self.mutation(exit_code=exit_code, **metadata), normalized_mutations=mutations)
+                    run = mutations[0]["runs"][0]
+                    self.assertEqual(run["exit"], exit_code)
+                    self.assertEqual(run.get("exit_convention"), convention)
+                    valid = exit_code in (101, 128, 193) or convention == "subprocess" and exit_code > 0
+                    expected = [] if valid else ["semantic_catch_not_demonstrated"]
+                    result = evaluate({"source": SOURCE, "mutations": mutations})
+                    self.assertEqual([v["code"] for v in result["violations"]], expected)
+
+    def test_unknown_exit_convention_is_not_silently_discarded(self):
+        for convention in ("unknown", True, {}, None):
+            for required in (False, True):
+                with self.subTest(convention=convention, required=required):
+                    result = self.collect(self.mutation(exit_convention=convention), self.env(required))
+                    self.assertEqual(result, ([], [], ["data_source_unavailable"], required))
 
     def test_mutation_diagnosis_contains_decisive_real_log_and_accepted_disposition(self):
         api = self.mutation("equivalent")

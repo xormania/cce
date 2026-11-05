@@ -86,6 +86,34 @@ class ContractTests(unittest.TestCase):
                "runs": [{"exit": 0, "executed": True, "failed_by_assertion": True}]}
         self.assertEqual(contracts.evaluate(bundle(mutations=[row]))["violations"][0]["code"], "semantic_catch_not_demonstrated")
 
+    def test_signal_exits_cannot_certify_an_assertion_catch_without_normalization(self):
+        for exit_code in [-9, -11, -15, 137, 139, 143]:
+            with self.subTest(exit=exit_code):
+                row = {"id": "a", "applicable": True, "disposition": "caught", "claimed_semantic": True,
+                       "runs": [{"exit": exit_code, "executed": True, "failed_by_assertion": True}]}
+                result = contracts.evaluate(bundle(mutations=[row]))
+                self.assertEqual([v["code"] for v in result["violations"]], ["semantic_catch_not_demonstrated"])
+
+    def test_explicit_subprocess_convention_distinguishes_positive_application_exit(self):
+        row = {"id": "a", "applicable": True, "disposition": "caught", "claimed_semantic": True,
+               "runs": [{"exit": 134, "exit_convention": "subprocess", "executed": True,
+                         "failed_by_assertion": True}]}
+        self.assertEqual(contracts.evaluate(bundle(mutations=[row]))["violations"], [])
+        row["runs"][0]["aborted"] = True
+        self.assertEqual(contracts.evaluate(bundle(mutations=[row]))["violations"][0]["code"],
+                         "semantic_catch_not_demonstrated")
+
+    def test_claim_case_limit_is_distinct_from_evidence_row_limit(self):
+        row = {"id": "a", "applicable": True, "status": "green", "evidence_sha": HEAD,
+               "case_statuses": ["green"] * 999 + ["partial"]}
+        result = contracts.evaluate(bundle(claims=[row]))
+        self.assertEqual([v["code"] for v in result["violations"]], ["claim_case_mismatch"])
+        row["case_statuses"].append("green")
+        with self.assertRaisesRegex(ValueError, "^Invalid normalized evidence$"):
+            contracts.evaluate(bundle(claims=[row]))
+        with self.assertRaisesRegex(ValueError, "^Invalid normalized evidence$"):
+            contracts.evaluate(bundle(semantic=[{"id": str(index)} for index in range(257)]))
+
     def test_missing_identity_and_case_inventory_are_explicit_limitations(self):
         result = contracts.evaluate(bundle(claims=[{"id": "a", "applicable": True, "status": "green", "case_statuses": []}]))
         self.assertEqual(result["violations"], [])

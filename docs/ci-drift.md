@@ -21,6 +21,13 @@ Missing logs or still-running source jobs leave validation incomplete, not passe
 A collection error replaces the candidate's previous success with failure or an
 in-progress result. The publisher rechecks the branch/PR head and check ownership;
 an older consumer cannot clear a newer candidate or overwrite a newer analysis.
+For a PR, publication also rechecks the collected base revision. A changed base
+invalidates the earlier evaluation even when the branch head has not moved.
+
+Test counts are attributed to the required step's trusted command and execution
+interval. Missing or ambiguous step output leaves evidence incomplete. A positive
+unittest discovery count consisting entirely of skipped cases does not prove test
+execution; a different step's count cannot supply the missing witness.
 
 Producer names and printed test counts alone are insufficient. The collector
 compares producer workflow contents with the trusted checkout before accepting
@@ -149,6 +156,18 @@ receipt is compared per run; raw aggregate `caught` cannot override the accepted
 disposition. The adapter reads at most twelve current mutation receipts and
 reports bounded/incomplete input rather than silently claiming all were checked.
 
+Mapped cases and per-group status evaluation share a 1,000-case bound; the
+separate normalized-evidence inventory remains bounded at 256 rows. An oversized
+optional input reports a coverage limitation; requiring that input makes the
+missing coverage unsuccessful. No late case is silently dropped.
+
+Mutation receipts retain their raw exit codes. Negative subprocess returns and
+Linux shell signal exits (129 through 192) cannot certify an assertion catch.
+An optional `exit_convention = "subprocess"` identifies positive application
+exit codes, while `"shell"` identifies shell encoding. Without that field,
+signal-looking codes are treated conservatively. An explicit `aborted = true`
+always takes precedence; normal assertion exits such as 101 remain usable.
+
 Set repository variable `DRIFT_DATA_REQUIRED=true` only when this data source is
 configured and required for candidate acceptance. Missing credentials, invalid
 data or an unproven data/candidate association then fails required validation.
@@ -173,6 +192,14 @@ history window and reports when no reusable baseline exists. It does not promise
 permanent suppression. Changed evidence or model/tooling configuration reopens
 analysis; unrelated candidate identity alone does not change packet fingerprints.
 
+Completed provider results are checkpointed individually by atomic replacement.
+If a later request is interrupted, publication preserves the completed prefix and
+reports a partial provider stage. It neither repeats unfinished requests nor
+turns an advisory-provider interruption into a deterministic test failure.
+Re-entering a partial phase requires a new explicit replay; a completed phase is
+idempotent. These checkpoints protect against step interruption, not loss of the
+entire runner or an artifact upload that never occurs.
+
 Deferred packet fingerprints remain visible and get priority on the next
 evaluation of that source context. Source jobs, explicit rechecks and the bounded
 scan provide further evaluations. A changed-file comparison is limited to forty
@@ -189,6 +216,19 @@ Unavailable originals stay unfinished. At most two original contexts are rebuilt
 per run, with unfinished work ahead of tracked results and rotation to avoid
 starvation. The retained inventory is bounded at two hundred recipes; overflow is
 reported as continuing coverage loss.
+
+A healthy public change retires an older finding only when correction metadata
+ties it to the affected lines in the same uniquely identified function or
+document section. Another change in the same file or function is insufficient.
+The metadata contains bounded hashes, not source excerpts. A real repair or
+restoration can close the finding; ambiguous identity stays unfinished. Legacy
+recipes can acquire this metadata by reconstructing their pinned original input.
+
+Tooling changes invalidate cached diagnoses while preserving validated unfinished
+recipes and the newest published queue. Retention overflow is a historical lower
+bound, not a current outstanding-work count; repeatedly seeing the same omitted
+inventory does not increase it. Older incompatible counters retain a coverage
+loss indicator without claiming their accumulated number is accurate.
 
 Reservation artifacts preserve these recipes before a provider call, including if
 the job is cancelled before publication. Missing credentials do not reserve an

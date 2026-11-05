@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tools' / 'ci'))
 import drift_runner as runner
 from drift_contracts import evaluate
+from test_drift_execution import command_log, witness_step, PYTHON_COMMAND, RUST_COMMAND
 
 HEAD = 'a' * 40
 BASE = 'b' * 40
@@ -236,11 +237,10 @@ class ExecutionEvidenceTests(unittest.TestCase):
             '/actions/runs?head_sha=' + HEAD + '&per_page=50': {'workflow_runs': runs},
             '/pulls/9':{'state':'open','head':{'sha':HEAD},'base':{'sha':BASE},'merge_commit_sha':TRUSTED},
             '/actions/runs/11/jobs?per_page=50': {'jobs': [{'id': 111, 'conclusion': 'success', 'steps': [
-                {'name': 'Unit and replay tests', 'conclusion': 'success'}]}]},
+                witness_step('Unit and replay tests')]}]},
             '/actions/runs/12/jobs?per_page=50': {'jobs': [{'id': 112, 'conclusion': 'success', 'steps': [
-                {'name': 'Format', 'conclusion': 'success'},
-                {'name': 'Clippy', 'conclusion': 'success'},
-                {'name': 'Test', 'conclusion': test_status}]}]},
+                witness_step('Format'), witness_step('Clippy', number=2),
+                witness_step('Test', test_status, number=3)]}]},
             '/commits/' + HEAD + '/check-runs?check_name=scan&per_page=100': {'check_runs': [{
                 'id': 501, 'app': {'id': 15368}, 'status': 'completed', 'conclusion': 'success',
                 'started_at': '2026-11-04T10:00:00Z',
@@ -253,8 +253,8 @@ class ExecutionEvidenceTests(unittest.TestCase):
         }, files={path: (ROOT / path).read_text() for path in
                   ['.github/workflows/' + name + '.yml' for name in ('drift-input', 'rust', 'leak-scan')]
                   + ['tools/ci/leak_scan_trusted.sh', 'tools/ci/leak_scan.sh']},
-           logs={111: 'Ran 27 tests in 0.3s\nOK\n',
-                 112: 'test result: ok. 10 passed; 0 failed; 0 ignored\n'})
+           logs={111: command_log(PYTHON_COMMAND, 'Ran 27 tests in 0.3s\nOK\n'),
+                 112: command_log(RUST_COMMAND, 'test result: ok. 10 passed; 0 failed; 0 ignored\n')})
 
     def test_successful_steps_are_identified_by_actual_candidate(self):
         checks, limits, waiting = runner.execution_checks(self.api_for(), source(), False)
@@ -298,8 +298,8 @@ class ExecutionEvidenceTests(unittest.TestCase):
 
     def test_success_with_zero_tests_does_not_establish_execution(self):
         api = self.api_for()
-        api.logs[111] = 'Ran 0 tests in 0.0s\nOK\n'
-        api.logs[112] = 'test result: ok. 0 passed; 0 failed; 0 ignored\n'
+        api.logs[111] = command_log(PYTHON_COMMAND, 'Ran 0 tests in 0.0s\nOK\n')
+        api.logs[112] = command_log(RUST_COMMAND, 'test result: ok. 0 passed; 0 failed; 0 ignored\n')
         observations = []
         checks, _, _ = runner.execution_checks(api, source(), False, observations)
         result = evaluate({'source': source(), 'checks': checks})
@@ -416,7 +416,7 @@ class PublishingTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
         runner.save(root / 'control.json', value)
-        api = FakeApi({'/pulls/9': {'state': 'open', 'head': {'sha': current}},
+        api = FakeApi({'/pulls/9': {'state': 'open', 'head': {'sha': current}, 'base': {'sha': BASE}},
                        '/commits/' + HEAD + '/check-runs?check_name=CCE%20drift%20contracts&per_page=100':
                        {'check_runs': []}})
         with patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
@@ -506,10 +506,11 @@ class CollectionIntegrationTests(unittest.TestCase):
                  'head_sha': HEAD, 'head_repository': {'full_name': REPOSITORY}, 'event': 'push', 'run_number': 1,
                  'run_attempt': 1, 'status': 'completed'}]},
             '/actions/runs/7/jobs?per_page=50': {'jobs': [{'id': 71, 'conclusion': 'success', 'steps': [
-                {'name': 'Unit and replay tests', 'conclusion': 'success'}]}]},
+                witness_step('Unit and replay tests')]}]},
         }, {'README.md': 'The reader preserves the expected bytes.',
             **{'.github/workflows/'+name+'.yml':(ROOT/'.github/workflows'/(name+'.yml')).read_text()
-               for name in ('drift-input','rust','leak-guard')}}, logs={71: 'Ran 27 tests in 0.3s\nOK\n'})
+               for name in ('drift-input','rust','leak-guard')}},
+            logs={71: command_log(PYTHON_COMMAND, 'Ran 27 tests in 0.3s\nOK\n')})
         event = {'workflow_run': {'id': 7, 'run_attempt': 1, 'head_sha': HEAD}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
