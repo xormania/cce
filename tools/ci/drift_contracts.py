@@ -126,7 +126,7 @@ def evaluate(bundle: dict) -> dict:
         if not isinstance(status, str) or status not in _CHECK_STATES:
             _invalid()
         definition_status = row.get("definition_status")
-        if definition_status is not None:
+        if "definition_status" in row:
             if (definition_status != "awaiting_acceptance" or row.get("executed", False) is not None
                     or status != "unknown"):
                 _invalid()
