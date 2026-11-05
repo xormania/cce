@@ -1,8 +1,9 @@
 """Authenticate producer definitions and preserve execution applicability/provenance.
 
-Candidate workflows are data. Only definitions byte-identical to the trusted
-checkout may supply execution evidence. Rust evidence reused after a Markdown
-follow-up remains attributed to the actual older producer commit.
+Candidate workflows are data. Definitions must match the trusted checkout,
+preserve its test contract under a supported runtime transformation, or carry
+owner acceptance. Rust evidence reused after a Markdown follow-up remains
+attributed to the actual older producer commit.
 """
 from __future__ import annotations
 
@@ -203,13 +204,51 @@ def _unittest_executed(output):
 REVIEW_PAGES = 10
 
 
+def _python_runtime_basis(text):
+    """Remove one supported provisioning transformation for comparison only.
+
+    The action pin is trusted policy, not a pin supplied by the candidate. The
+    narrow form deliberately excludes additional commands, options and YAML
+    controls. Comparing the whole resulting document keeps everything outside
+    the provisioning step and interpreter wrapper unchanged.
+    """
+    setup_pin = "94527f2e458b27549849d47d273a16bec83a01e9"
+    version = r"[0-9]+\.[0-9]+\.[0-9]+"
+    managed = re.compile(
+        r"(?m)^(?P<indent> +)- uses: astral-sh/setup-uv@" + setup_pin + r"(?: #[^\r\n]*)?\n"
+        r"(?P=indent)  with:\n"
+        r"(?P=indent)    version: '(?P<uv>" + version + r")'\n"
+        r"(?P=indent)    enable-cache: false\n"
+        r"(?P=indent)- name: (?P<title>[^\r\n]+)\n"
+        r"(?P=indent)  run: \|\n"
+        r"(?P=indent)    uv python install (?P<python>3\.[0-9]+\.[0-9]+)\n"
+        r"(?P=indent)    uv run --no-project --python (?P=python) "
+        r"(?P<command>python3? -m unittest discover[^\r\n]*)\n"
+    )
+    matches = list(managed.finditer(text))
+    if len(matches) != 1:
+        return text, False
+    match = matches[0]
+    direct = (match["indent"] + "- name: " + match["title"] + "\n"
+              + match["indent"] + "  run: " + match["command"] + "\n")
+    return text[:match.start()] + direct + text[match.end():], True
+
+
+def _runtime_compatible(trusted, candidate, producer):
+    if producer != "drift-input":
+        return False
+    before, old_runtime = _python_runtime_basis(trusted)
+    after, new_runtime = _python_runtime_basis(candidate)
+    return (old_runtime or new_runtime) and before == after
+
+
 def _owner_acceptance(api, source):
     """Return the repository owner's approving review of exactly this head, if any.
 
-    Candidate output can never certify a changed producer. Only the repository owner's latest
-    review of the candidate's own head commit, on an open PR whose base is the evaluated base,
-    can accept it; a later push needs a new review. Every review page is read; an unreadable or
-    unbounded review list fails closed.
+    For a change outside automatic validation, the repository owner's latest
+    review of the candidate's own head commit, on an open PR whose base is the
+    evaluated base, can accept it; a later push needs a new review. Every review
+    page is read; an unreadable or unbounded review list fails closed.
     """
     owner = api.repository.split("/", 1)[0]
     for number in source.get("pulls", []):
@@ -252,6 +291,10 @@ def _definition(api, source, producer, root):
     candidate = api.file(path, source["head_sha"])
     if candidate == trusted:
         return path, trusted, _steps(trusted, producer), None
+    if _runtime_compatible(trusted, candidate, producer):
+        # Keep the actual producer: later checks bind its exact bytes and full
+        # script to the run and logs. Compatibility alone proves no execution.
+        return path, candidate, _steps(candidate, producer), {"policy": "python-runtime-v1"}
     acceptance = _owner_acceptance(api, source)
     if acceptance is None:
         raise ValueError("producer_definition_unaccepted")
@@ -441,7 +484,8 @@ def execution_checks(api, source, markdown_only, observations=None, trusted_root
             limits += ["producer_definition_unverified", reason]
             continue
         if acceptance is not None:
-            limits.append("producer_definition_owner_accepted_" + producer.replace("-", "_"))
+            method = "auto_validated" if acceptance.get("policy") == "python-runtime-v1" else "owner_accepted"
+            limits.append("producer_definition_" + method + "_" + producer.replace("-", "_"))
         candidates = [r for r in runs if _candidate_run(r, source, api, producer)
                       and (r.get("event") == "pull_request"
                            if producer == "rust" and rust_pr_required else True)]
