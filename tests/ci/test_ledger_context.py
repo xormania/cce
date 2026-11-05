@@ -153,7 +153,9 @@ class BriefTests(unittest.TestCase):
         s = snap()
         text, meta = context.brief(s, {"objective": "eviction", "work": ["W-cache"], "origin": "lead"})
         other = text.split("## Other current records")[1]
-        self.assertIn("A2 on Q2 (owner deferred, paraphrase)", other)
+        self.assertIn("A2 (Q2: Export format)", other)
+        # Named, not loaded: room left in the budget is not filled with unjudged records.
+        self.assertNotIn("Export format waits", text)
         self.assertIn("not judged for this scope", text)
 
     def test_cards_name_every_candidate_before_any_full_text(self):
@@ -255,7 +257,7 @@ quote = "standing {n}"
         self.assertEqual(row, s["model"]["answers"]["A1"])
 
     def test_paraphrase_stays_a_paraphrase(self):
-        s = snap()
+        s = snap(LEDGER.replace('state = "done"\nevidence = "commit 123"', 'state = "open"'))
         text, _ = context.brief(s)
         self.assertIn("A2 on Q2 (owner deferred, paraphrase)", text)
         page = context.read(s, ["A2"])["text"]

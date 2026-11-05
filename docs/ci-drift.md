@@ -244,7 +244,8 @@ instead of printing every record:
   marked `applies = "always"`, each work item with the current answer to its
   question and that answer's `forbids`, and every missing decision, conflict and
   finding. Without a scope it covers all open work and says so. Other current
-  records are listed as candidates, by identity first and in full while they fit.
+  records are only named (identity and question title): the budget is a
+  ceiling, and loading one in full takes a relevance judgment.
   The whole output, including the caller's header, stays within a character and
   byte budget. Text is never cut: governing records that do not fit are named with
   the read that returns them.

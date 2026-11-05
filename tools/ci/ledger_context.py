@@ -16,8 +16,9 @@ Without a scope the brief covers all open work (a broad coordination view) and s
 The brief includes, in full, the records that govern the scope: current answers to questions marked
 ``applies = "always"``, every work item in scope with the current answers to its question, records
 linked to those, and every missing decision, conflict and finding. Other current records are
-*candidates*: they are shown in full while the budget allows, otherwise as one-line cards with their
-identity. A card is a locator, not a loaded record, and its question has not been judged irrelevant.
+*candidates*: they are named (identity and question title), never loaded in full, because loading one
+takes a relevance judgment this brief does not make. A name is a locator, not a loaded record, and
+its question has not been judged irrelevant. The budget is a ceiling, not a target.
 When the governing records alone exceed the budget, the brief names the ones it could not include
 and the read that returns them. The whole delivered text, including the caller's header and footer,
 is measured in characters and UTF-8 bytes; no record text is ever cut.
@@ -273,7 +274,7 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
         lines += ["", "## Other current records (" + str(len(candidates)) + "; not judged for this scope)"]
         lines += [_full(snap, rid) for rid in shown]
         if card_ids:
-            lines.append("- Listed by identity only (read before relying on them): "
+            lines.append("- By identity only; read one before acting on what it covers: "
                          + "; ".join(_card(snap, rid, titled[0]) for rid in card_ids))
         if more_cards:
             lines.append("- " + str(more_cards) + " more not listed: " + reader + " inventory")
@@ -295,8 +296,8 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
             break
     cards = []
     if not pending:
-        # Every candidate is named before any is expanded: identities first (with their question titles
-        # when all of them fit that way), then full text in order while it fits.
+        # Candidates are named, never expanded: the budget is a ceiling, not a target. Loading a
+        # candidate in full takes a relevance judgment, which this deterministic brief does not make.
         for style in (True, False):
             titled[0], cards = style, []
             for rid in candidates:
@@ -307,12 +308,6 @@ def brief(snap, scope=None, head="", foot="", max_chars=DEFAULT_MAX_CHARS, max_b
             more = len(candidates) - len(cards)
             if not more:
                 break
-        if not more:
-            for rid in candidates:
-                remaining = [c for c in cards if c != rid]
-                if fits(assemble(full + [rid], remaining, [], 0)):
-                    full.append(rid)
-                    cards = remaining
     else:
         more = len(candidates)
     text = assemble(full, cards, pending, more)
