@@ -4,8 +4,6 @@ on:
   workflow_run:
     workflows: [rust, drift-input, leak-guard]
     types: [completed]
-  schedule:
-    - cron: '17,47 * * * *'
   workflow_dispatch:
     inputs:
       head_sha:
@@ -22,7 +20,7 @@ permissions:
   actions: read
   checks: write
 
-# Serialize consumers across event types; scheduled rechecks resolve their candidate at runtime.
+# Serialize consumers across source-CI events and manual dispatches.
 concurrency:
   group: jev-drift-consumer
   cancel-in-progress: false
@@ -35,7 +33,6 @@ jobs:
        github.event.workflow_run.head_repository.full_name == github.repository &&
        github.event.workflow_run.conclusion != 'skipped') ||
       (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch)
-      || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
