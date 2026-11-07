@@ -15,6 +15,9 @@ pub(crate) const META_FILE: &str = "meta.cce";
 pub(crate) const CONTENT_FILE: &str = "content.cce";
 pub(crate) const LOCK_FILE: &str = "LOCK";
 
+const LEAF_OPEN_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+const DIRECTORY_OPEN_FLAGS: i32 = libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+
 /// A store file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FileId {
@@ -141,11 +144,12 @@ fn io_err(what: &str, e: std::io::Error) -> StorageError {
 }
 
 struct Files {
+    dir: File,
     meta: File,
     content: File,
     /// Held for the life of the adapter; the OS lock is released when it closes.
     _lock: File,
-    /// Opened for reading only, under a shared lock: writes and syncs are refused.
+    /// Opened for reading only, under shared locks: writes and syncs are refused.
     read_only: bool,
 }
 
@@ -328,6 +332,9 @@ impl Positional for Handle<'_> {
     }
 }
 
+#[cfg(test)]
+type LeafOpenHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
 /// Real filesystem adapter for one store directory.
 pub(crate) struct FsIo {
     dir: PathBuf,
@@ -338,17 +345,24 @@ pub(crate) struct FsIo {
     /// The test seam under the file handles.
     #[cfg(test)]
     faults: Arc<Faults>,
+    /// Runs after a leaf is classified and before it is opened.
+    #[cfg(test)]
+    leaf_open_hook: Mutex<Option<LeafOpenHook>>,
 }
 
 impl FsIo {
     pub fn new(dir: &Path) -> Self {
         Self {
-            dir: dir.to_path_buf(),
+            // Without trailing separators or `.`: a spelling like `link/` makes the system follow a
+            // final symlink even for checks and opens that must not follow it.
+            dir: dir.components().as_path().to_path_buf(),
             files: Mutex::new(None),
             #[cfg(test)]
             synced_dirs: Mutex::new(Vec::new()),
             #[cfg(test)]
             faults: Arc::default(),
+            #[cfg(test)]
+            leaf_open_hook: Mutex::new(None),
         }
     }
 
@@ -360,6 +374,25 @@ impl FsIo {
             ..Self::new(dir)
         }
     }
+
+    /// An adapter that pauses a test between classifying and opening a store leaf.
+    #[cfg(test)]
+    fn with_leaf_open_hook(dir: &Path, hook: LeafOpenHook) -> Self {
+        let io = Self::new(dir);
+        *io.leaf_open_hook.lock().expect("leaf open hook") = Some(hook);
+        io
+    }
+
+    #[cfg(test)]
+    fn before_leaf_open(&self, path: &Path) {
+        let hook = self.leaf_open_hook.lock().expect("leaf open hook").clone();
+        if let Some(hook) = hook {
+            hook(path);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn before_leaf_open(&self, _path: &Path) {}
 
     fn handle<'a>(&'a self, files: &'a Files, f: FileId) -> Handle<'a> {
         Handle {
@@ -390,12 +423,14 @@ impl FsIo {
             Err(StorageError::StoreState(m)) if m.ends_with("does not exist") => {}
             other => other?,
         }
+        self.before_leaf_open(&path);
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(LEAF_OPEN_FLAGS)
             .open(&path)
             .map_err(|e| io_err("open lock file", e))?;
         same_regular_file(&path, &lock)?;
@@ -423,7 +458,12 @@ impl FsIo {
             }
             other => other?,
         }
-        let lock = File::open(&path).map_err(|e| io_err("open lock file", e))?;
+        self.before_leaf_open(&path);
+        let lock = OpenOptions::new()
+            .read(true)
+            .custom_flags(LEAF_OPEN_FLAGS)
+            .open(&path)
+            .map_err(|e| io_err("open lock file", e))?;
         same_regular_file(&path, &lock)?;
         match lock.try_lock_shared() {
             Ok(()) => Ok(lock),
@@ -435,46 +475,65 @@ impl FsIo {
         }
     }
 
+    /// Locks an opened data file so moving it cannot bypass the `LOCK` pathname.
+    fn lock_data_file(&self, file: &File, name: &str, read_only: bool) -> Result<(), StorageError> {
+        let result = if read_only {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(TryLockError::WouldBlock) => Err(StorageError::Busy(format!(
+                "store {} is owned through {name} by another process",
+                self.dir.display()
+            ))),
+            Err(TryLockError::Error(e)) => Err(io_err(&format!("lock {name}"), e)),
+        }
+    }
+
     /// Opens the existing store files with ownership: exclusive for read-write, shared for
     /// read-only (files opened without write access).
     fn open_files(&self, read_only: bool) -> Result<(), StorageError> {
-        if !self.dir.is_dir() {
-            return Err(StorageError::StoreState(format!(
-                "no store directory at {}",
-                self.dir.display()
-            )));
-        }
+        let dir = open_store_directory(&self.dir)?;
         let lock = if read_only {
             self.take_shared_lock()?
         } else {
             self.take_lock()?
         };
-        let existing = |name: &str| match refuse_non_regular(&self.dir.join(name)).and_then(|()| {
-            OpenOptions::new()
-                .read(true)
-                .write(!read_only)
-                .open(self.dir.join(name))
-                .map_err(|e| match e.kind() {
-                    ErrorKind::NotFound => StorageError::StoreState(format!(
+        let existing = |name: &str| {
+            let path = self.dir.join(name);
+            match refuse_non_regular(&path).and_then(|()| {
+                self.before_leaf_open(&path);
+                OpenOptions::new()
+                    .read(true)
+                    .write(!read_only)
+                    .custom_flags(LEAF_OPEN_FLAGS)
+                    .open(&path)
+                    .map_err(|e| match e.kind() {
+                        ErrorKind::NotFound => StorageError::StoreState(format!(
+                            "required store file {name} is missing in {}",
+                            self.dir.display()
+                        )),
+                        _ => io_err(name, e),
+                    })
+            }) {
+                Ok(file) => {
+                    same_regular_file(&path, &file)?;
+                    self.lock_data_file(&file, name, read_only)?;
+                    Ok(file)
+                }
+                Err(StorageError::StoreState(m)) if m.contains("does not exist") => {
+                    Err(StorageError::StoreState(format!(
                         "required store file {name} is missing in {}",
                         self.dir.display()
-                    )),
-                    _ => io_err(name, e),
-                })
-        }) {
-            Ok(f) => {
-                same_regular_file(&self.dir.join(name), &f)?;
-                Ok(f)
+                    )))
+                }
+                Err(e) => Err(e),
             }
-            Err(StorageError::StoreState(m)) if m.contains("does not exist") => {
-                Err(StorageError::StoreState(format!(
-                    "required store file {name} is missing in {}",
-                    self.dir.display()
-                )))
-            }
-            Err(e) => Err(e),
         };
         let files = Files {
+            dir,
             meta: existing(META_FILE)?,
             content: existing(CONTENT_FILE)?,
             _lock: lock,
@@ -499,6 +558,37 @@ impl FsIo {
     }
 }
 
+/// Opens and pins the store directory itself without following a final symlink.
+fn open_store_directory(path: &Path) -> Result<File, StorageError> {
+    let at = fs::symlink_metadata(path).map_err(|e| match e.kind() {
+        ErrorKind::NotFound => {
+            StorageError::StoreState(format!("no store directory at {}", path.display()))
+        }
+        _ => io_err("inspect store directory", e),
+    })?;
+    if !at.file_type().is_dir() {
+        return Err(StorageError::StoreState(format!(
+            "{} is not a directory or is a symlink; refusing it",
+            path.display()
+        )));
+    }
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(DIRECTORY_OPEN_FLAGS)
+        .open(path)
+        .map_err(|e| io_err("open store directory", e))?;
+    let actual = opened
+        .metadata()
+        .map_err(|e| io_err("inspect store directory", e))?;
+    if !actual.file_type().is_dir() || at.dev() != actual.dev() || at.ino() != actual.ino() {
+        return Err(StorageError::StoreState(format!(
+            "{} changed or is not a directory; refusing it",
+            path.display()
+        )));
+    }
+    Ok(opened)
+}
+
 /// Refuses a path that exists but is not a regular file (for example a symlink or a FIFO), before
 /// anything opens it. A missing path is left for the caller to report.
 fn refuse_non_regular(path: &Path) -> Result<(), StorageError> {
@@ -516,13 +606,19 @@ fn refuse_non_regular(path: &Path) -> Result<(), StorageError> {
     }
 }
 
-/// Confirms that the opened handle is the regular file at `path` itself.
+/// Confirms that the opened handle is the regular file at `path` itself and has one name.
 fn same_regular_file(path: &Path, f: &File) -> Result<(), StorageError> {
     let at = fs::symlink_metadata(path).map_err(|e| io_err("inspect store file", e))?;
     let opened = f.metadata().map_err(|e| io_err("inspect store file", e))?;
     if !at.file_type().is_file() || at.dev() != opened.dev() || at.ino() != opened.ino() {
         return Err(StorageError::StoreState(format!(
             "{} changed or is not a regular file; refusing it",
+            path.display()
+        )));
+    }
+    if at.nlink() != 1 || opened.nlink() != 1 {
+        return Err(StorageError::StoreState(format!(
+            "{} has multiple hard links; refusing it",
             path.display()
         )));
     }
@@ -562,6 +658,7 @@ impl Io for FsIo {
                 .unwrap_or(Path::new("."));
             self.sync_path(parent)?;
         }
+        let dir = open_store_directory(&self.dir)?;
         let lock = self.take_lock()?;
         // Only an absent or empty directory (or one holding just the lock file, left by a creation
         // that stopped early) may receive a new store: never initialize beside existing data.
@@ -588,17 +685,20 @@ impl Io for FsIo {
         }
         let new = |name: &str| {
             let path = self.dir.join(name);
-            let f = OpenOptions::new()
+            let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
+                .custom_flags(LEAF_OPEN_FLAGS)
                 .open(&path)
                 .map_err(|e| io_err(name, e))?;
-            same_regular_file(&path, &f)?;
-            Ok::<File, StorageError>(f)
+            same_regular_file(&path, &file)?;
+            self.lock_data_file(&file, name, false)?;
+            Ok::<File, StorageError>(file)
         };
         let files = Files {
+            dir,
             meta: new(META_FILE)?,
             content: new(CONTENT_FILE)?,
             _lock: lock,
@@ -652,10 +752,19 @@ impl Io for FsIo {
     }
 
     fn sync_dir(&self) -> Result<(), StorageError> {
-        if let Ok(files) = self.files() {
-            files.writable()?;
-        }
-        self.sync_path(&self.dir.clone())
+        let Ok(files) = self.files() else {
+            return self.sync_path(&self.dir);
+        };
+        files.writable()?;
+        #[cfg(test)]
+        self.synced_dirs
+            .lock()
+            .expect("synced")
+            .push(self.dir.clone());
+        files
+            .dir
+            .sync_all()
+            .map_err(|e| io_err(&format!("sync directory {}", self.dir.display()), e))
     }
 }
 
@@ -687,6 +796,41 @@ mod tests {
         // Positive neighbour: an existing directory's parent is not required to change.
     }
 
+    #[test]
+    fn directory_sync_uses_the_opened_directory_after_its_name_moves() {
+        let base = scratch("pinned-directory-sync");
+        let store = base.join("store");
+        let moved = base.join("moved");
+        let io = FsIo::new(&store);
+        io.create().unwrap();
+        fs::rename(&store, &moved).unwrap();
+
+        let result = io.sync_dir();
+        assert!(
+            result.is_ok(),
+            "directory sync followed the mutable pathname: {result:?}"
+        );
+
+        assert!(!store.exists());
+        assert!(moved.is_dir());
+    }
+
+    #[test]
+    fn identity_check_refuses_a_path_replaced_after_open() {
+        let base = scratch("post-open-identity");
+        let path = base.join("leaf");
+        let moved = base.join("opened");
+        fs::write(&path, b"opened bytes").unwrap();
+        let opened = File::open(&path).unwrap();
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"replacement bytes").unwrap();
+
+        let err = same_regular_file(&path, &opened).expect_err("replacement was accepted");
+        assert!(matches!(err, StorageError::StoreState(_)), "{err:?}");
+        assert_eq!(fs::read(moved).unwrap(), b"opened bytes");
+        assert_eq!(fs::read(path).unwrap(), b"replacement bytes");
+    }
+
     use crate::test_support::resources::test_dir as scratch;
 
     #[test]
@@ -713,6 +857,64 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(fs::read(&outside).unwrap(), b"must not change");
+    }
+
+    #[test]
+    fn read_only_open_refuses_a_fifo_swapped_after_classification_without_blocking() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::Duration;
+
+        let base = scratch("fifo-swap");
+        let store = base.join("store");
+        FsIo::new(&store).create().unwrap();
+        let lock_path = store.join(LOCK_FILE);
+        let swapped = Arc::new(AtomicBool::new(false));
+        let hook_path = lock_path.clone();
+        let hook_swapped = Arc::clone(&swapped);
+        let hook: LeafOpenHook = Arc::new(move |path| {
+            if path == hook_path && !hook_swapped.swap(true, Ordering::SeqCst) {
+                fs::remove_file(path).unwrap();
+                let status = std::process::Command::new("mkfifo")
+                    .arg(path)
+                    .status()
+                    .expect("run mkfifo");
+                assert!(status.success(), "mkfifo failed: {status}");
+            }
+        });
+        let io = FsIo::with_leaf_open_hook(&store, hook);
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(io.open_read_only());
+        });
+
+        let result = match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                assert!(swapped.load(Ordering::SeqCst), "the FIFO swap did not run");
+                let wake = OpenOptions::new()
+                    .write(true)
+                    .open(&lock_path)
+                    .expect("wake the blocked FIFO open");
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+                drop(wake);
+                worker.join().unwrap();
+                let opened_promptly = false;
+                assert!(
+                    opened_promptly,
+                    "read-only open blocked after a checked path became a FIFO"
+                );
+                unreachable!("the blocking-open assertion always fails");
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                worker.join().unwrap();
+                panic!("read-only open worker exited without a result");
+            }
+        };
+        worker.join().unwrap();
+        let err = result.expect_err("raced FIFO was accepted");
+        assert!(matches!(err, StorageError::StoreState(_)), "{err:?}");
+        assert!(swapped.load(Ordering::SeqCst), "the FIFO swap did not run");
     }
 
     #[test]

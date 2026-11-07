@@ -82,6 +82,7 @@ version = "0.1.0"
 dependencies = [
  "cce-core",
  "crc32fast",
+ "libc",
  "proptest",
  "proptest-state-machine",
  "serde_json",

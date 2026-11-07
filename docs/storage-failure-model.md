@@ -23,7 +23,7 @@ mean trusted.
 | Malformed stored bytes (accidental damage, torn or reordered writes, media errors) | Verifies checksums before decoding, caps every count and length before allocating or reading, and verifies content in chunks before holding it whole (see "Store files on disk"). `cce-verify` reports structural damage without changing the store. | Damage that leaves a valid checksum, which is improbable but possible, is detected only where structure or digests disagree. |
 | Deliberate forgery of stored bytes | Nothing beyond the checks above: checksums are not keyed, and a forged record with a valid checksum is accepted (see the limitations under "Store files on disk"). `cce-verify` reports the inconsistencies it can see, such as an attempt record that the history does not back. | Stored bytes are not authenticated or encrypted. |
 | Filesystem guarantees | Relies on the platform assumptions above for durability and ordering. | It cannot detect a filesystem that acknowledges `fsync` without making data durable. |
-| Concurrent changes to the store directory by another process with write access | At open: refuses a store file that is a symlink or special file, and requires each opened handle to be the regular file at its path (same device and inode). An owning engine process excludes every other engine process through an advisory lock on `LOCK`; read-only inspection opens share that lock with each other, never with an owner. | The store directory itself may be a symlink and is not identity-checked. After open, it does not detect a file that is renamed, replaced or written underneath it, or a directory that is moved. A process that ignores the advisory lock is not stopped. Anyone who can write the directory can change the store. |
+| Concurrent changes to the store directory by another process with write access | At open: refuses a store file that is a symlink or special file, and requires each opened handle to be the regular file at its path (same device and inode). An owning engine process excludes every other engine process through an advisory lock on `LOCK`; read-only inspection opens share that lock with each other, never with an owner. | A store directory replaced by path while an open is in progress is not detected: its files may then come from the replacing directory while directory syncs reach the one opened first, so their directory entries may not be durable. After open, it does not detect a file that is renamed, replaced or written underneath it, or a directory that is moved. A process that ignores the advisory lock is not stopped. Anyone who can write the directory can change the store. |
 
 ## Commit protocol
 
@@ -191,8 +191,11 @@ The tests do **not** explore:
 ## Store files on disk
 
 The store directory is created with mode `0700` and its files with `0600`; the parent of every
-directory the engine creates is synced. Store files must be regular files: a symlink or special file
-in their place is refused before it is opened, and the opened handle must be the file at that path.
+directory the engine creates is synced. The final store-directory entry may not be a symlink. Its
+opened handle is retained so later directory syncs cannot be redirected by renaming the pathname.
+At open, store leaves must be singly linked regular files. Leaf opens neither follow a final symlink
+nor wait on a special file, and the opened handle must still be the file at that path. Symlinks,
+hardlinks, FIFOs, sockets and directories in place of `LOCK`, `meta.cce` or `content.cce` are refused.
 
 Reads stay within the committed content length and require a content record to match the requested
 digest and length. Commits refuse to continue when the generation or page counter would overflow.
@@ -288,15 +291,17 @@ is released.
 
 ## Ownership
 
-One process owns a store at a time, through an exclusive lock on `LOCK` taken at open and held until
-the store handle and every view and content reader derived from it are dropped. A second opener gets
-`Busy`. A read-write open creates `LOCK` if it is missing; creating a store creates it before the
-data files.
+One process owns a store at a time, through exclusive advisory locks on `LOCK`, `meta.cce` and
+`content.cce` taken at open and held until the store handle and every view and content reader derived
+from it are dropped. Locking the opened data files preserves ownership if `LOCK` is replaced or a
+data inode is renamed or moved after open; hardlinks present at open are refused. A second opener
+gets `Busy`. A read-write open creates `LOCK` if it is missing; creating a store creates and locks it
+before the data files.
 
 ### Read-only inspection open
 
-`NativeStore::open_read_only` opens a store that no process owns for reading only. It takes the
-lock on `LOCK` in shared mode and opens the data files without write access:
+`NativeStore::open_read_only` opens a store that no process owns for reading only. It takes shared
+locks on `LOCK` and both data files, and opens the data files without write access:
 
 - While a process owns the store, a read-only open fails with `Busy`, as a read-write open does.
 - While a read-only handle, or any view or content reader derived from it, is alive, read-write opens
@@ -315,8 +320,11 @@ it, but does not sync it, so a power loss before the next read-write open can st
 read-write open makes the recovered state durable. This is why a read-only handle does not answer
 attempt outcomes.
 
-The lock is an advisory `flock` lock: it excludes processes that use this engine, on local
-filesystems. Network filesystems may not provide it.
+The locks are advisory `flock` locks: they exclude processes that use this engine, on local
+filesystems. They do not defend against another process with write permission to the store files or
+their containing namespace; such a process can write an opened file directly or replace path
+components while an open is in progress. Network filesystems may not provide the same locking
+behavior.
 
 The lock belongs to the open lock file, and a child process keeps a copy of every open file from the
 moment it is created. A child that starts another program drops the copy when it does; a child that

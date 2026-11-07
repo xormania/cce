@@ -74,6 +74,84 @@
     "witness": "crates/cce-storage/tests/native_storage_e2e.rs"
   },
   {
+    "id": "hardlink-alias",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "if at.nlink() != 1 || opened.nlink() != 1 {",
+    "new": "if false {",
+    "test": "rw_open_refuses_hardlinked_metadata",
+    "target": "filesystem_security",
+    "witness": "crates/cce-storage/tests/filesystem_security.rs"
+  },
+  {
+    "id": "data-lock-open",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "self.lock_data_file(&file, name, read_only)?;",
+    "new": "let _ = (&file, name, read_only);",
+    "test": "a_reopened_writer_keeps_ownership_after_lock_replacement",
+    "target": "filesystem_security",
+    "witness": "crates/cce-storage/tests/filesystem_security.rs"
+  },
+  {
+    "id": "data-lock-create",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "self.lock_data_file(&file, name, false)?;",
+    "new": "let _ = (&file, name);",
+    "test": "replacing_the_lock_name_does_not_admit_another_owner_or_reader",
+    "target": "filesystem_security",
+    "witness": "crates/cce-storage/tests/filesystem_security.rs"
+  },
+  {
+    "id": "metadata-data-lock",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "let result = if read_only {",
+    "new": "if name == META_FILE { return Ok(()); }\n        let result = if read_only {",
+    "test": "moved_metadata_cannot_be_opened_through_a_second_lock",
+    "target": "filesystem_security",
+    "witness": "crates/cce-storage/tests/filesystem_security.rs"
+  },
+  {
+    "id": "content-data-lock",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "let result = if read_only {",
+    "new": "if name == CONTENT_FILE { return Ok(()); }\n        let result = if read_only {",
+    "test": "moved_content_cannot_be_opened_through_a_second_lock",
+    "target": "filesystem_security",
+    "witness": "crates/cce-storage/tests/filesystem_security.rs"
+  },
+  {
+    "id": "writer-data-lock-shared",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "file.try_lock()",
+    "new": "file.try_lock_shared()",
+    "test": "replacing_the_lock_name_does_not_admit_another_owner_or_reader",
+    "target": "filesystem_security",
+    "witness": "crates/cce-storage/tests/filesystem_security.rs"
+  },
+  {
+    "id": "leaf-open-blocking",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "const LEAF_OPEN_FLAGS: i32 = libc::O_NOFOLLOW | libc::O_NONBLOCK;",
+    "new": "const LEAF_OPEN_FLAGS: i32 = libc::O_NOFOLLOW;",
+    "test": "io::tests::read_only_open_refuses_a_fifo_swapped_after_classification_without_blocking",
+    "witness": "crates/cce-storage/src/io.rs"
+  },
+  {
+    "id": "directory-sync-path",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "files\n            .dir\n            .sync_all()",
+    "new": "File::open(&self.dir).and_then(|dir| dir.sync_all())",
+    "test": "io::tests::directory_sync_uses_the_opened_directory_after_its_name_moves",
+    "witness": "crates/cce-storage/src/io.rs"
+  },
+  {
+    "id": "post-open-identity",
+    "path": "crates/cce-storage/src/io.rs",
+    "old": "if !at.file_type().is_file() || at.dev() != opened.dev() || at.ino() != opened.ino() {",
+    "new": "if false {",
+    "test": "io::tests::identity_check_refuses_a_path_replaced_after_open",
+    "witness": "crates/cce-storage/src/io.rs"
+  },
+  {
     "id": "driver-timeout",
     "scope": "test-helper",
     "path": "crates/cce-storage/tests/common/mod.rs",

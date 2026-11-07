@@ -13,6 +13,7 @@ fuzz-api = []
 [dependencies]
 cce-core = { path = "../cce-core" }
 crc32fast = "1"
+libc = "0.2"
 sha2 = "0.11"
 
 [[bin]]

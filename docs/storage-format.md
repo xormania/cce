@@ -12,7 +12,7 @@ against the code.
 |---|---|
 | `meta.cce` | Metadata pages: two publication slots, then tree nodes. |
 | `content.cce` | Content bytes and retained history entries, addressed by offset. |
-| `LOCK` | Empty file used for the exclusive ownership lock (`flock`-style, held while open). |
+| `LOCK` | Empty file used for the primary ownership lock (`flock`-style, held while open). The data files carry matching advisory locks so moving a locked data inode cannot bypass ownership; hardlinks present at open are refused. |
 
 All integers are little-endian unless stated. Rust memory layout is never written directly.
 
