@@ -138,11 +138,9 @@ not itself a merge restriction. Existing source checks retain their own verdicts
 
 Manual dispatch accepts `head_sha` for an existing candidate. `force` explicitly
 allows repeating an earlier reserved provider request. Dispatch must use the
-default branch's trusted workflow. A twice-hourly bounded scan rechecks an open
-same-repository PR (rotating among the first twenty), or the default branch when
-there are no such PRs. This can pick up data-only corrections without a code edit.
-The scan is not a complete inventory of more than twenty concurrent PRs; dispatch
-an omitted candidate explicitly. Source-CI events continue to analyze each push.
+default branch's trusted workflow. Analysis runs after source-CI events or an
+explicit manual dispatch; there is no periodic schedule. Dispatch the candidate
+to evaluate data-only corrections without a code edit.
 
 ## Optional versioned data input
 
@@ -260,8 +258,8 @@ idempotent. These checkpoints protect against step interruption, not loss of the
 entire runner or an artifact upload that never occurs.
 
 Deferred packet fingerprints remain visible and get priority on the next
-evaluation of that source context. Source jobs, explicit rechecks and the bounded
-scan provide further evaluations. A changed-file comparison is limited to forty
+evaluation of that source context. Source jobs and explicit manual rechecks
+provide further evaluations. A changed-file comparison is limited to forty
 files; omitted files and unavailable logs are reported as coverage limitations.
 Truncated excerpts are marked. Large allocations, crash campaigns and mutation
 commands appearing in logs are never executed by this observer.
