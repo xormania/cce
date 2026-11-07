@@ -2,11 +2,14 @@
 from contextlib import redirect_stderr
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools/perf"))
@@ -215,16 +218,37 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse((base / "crates/cce-storage/tests/common/stale.rs").exists())
 
 
+def unique_sleep():
+    """A sleep duration no other process on the machine is likely to use, so `pgrep` finds only
+    this test's processes."""
+    return f"30.{os.getpid()}{time.monotonic_ns() % 1_000_000}"
+
+
 class CommandTests(unittest.TestCase):
     def test_a_command_past_its_timeout_is_stopped_with_its_children(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "logs" / "slow.log"
-            r = p.run(["sh", "-c", "sleep 30 & sleep 30"], d, log, timeout=1)
+            nap = unique_sleep()
+            r = p.run(["sh", "-c", f"sleep {nap} & sleep {nap}"], d, log, timeout=1)
             self.assertTrue(r["timed_out"])
             self.assertNotEqual(r["exit"], 0)
             self.assertLess(r["seconds"], 15)
-            left = subprocess.run(["pgrep", "-f", "sleep 30"], capture_output=True, text=True)
+            left = subprocess.run(["pgrep", "-f", f"sleep {nap}"], capture_output=True, text=True)
             self.assertEqual(left.stdout.strip(), "")
+
+    def test_a_descendant_that_ignores_sigterm_is_killed(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "logs" / "stubborn.log"
+            nap = unique_sleep()
+            r = p.run(["sh", "-c", f"(trap '' TERM; exec sleep {nap}) & wait"], d, log, timeout=1)
+            self.assertTrue(r["timed_out"])
+            left = subprocess.run(["pgrep", "-f", f"sleep {nap}"], capture_output=True, text=True)
+            self.assertEqual(left.stdout.strip(), "")
+
+    def test_each_side_uses_its_own_target_directory(self):
+        with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "/elsewhere"}):
+            env = p.side_env(Path("/out/checkouts/base"))
+        self.assertEqual(env["CARGO_TARGET_DIR"], "/out/checkouts/base/target")
 
     def test_two_trials_are_required(self):
         with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):

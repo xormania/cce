@@ -104,17 +104,33 @@ def now():
 
 # --- commands -------------------------------------------------------------------------------------
 
-def stop_group(proc):
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(proc.pid, sig)
-        except ProcessLookupError:
-            pass
-        try:
-            proc.wait(timeout=5)
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def stop_group(proc, grace=5):
+    """Stops every process in `proc`'s group: SIGTERM, then SIGKILL for whatever is left after
+    `grace` seconds. The leader exiting does not end the wait; the group must be empty."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        proc.poll()
+        if proc.returncode is not None and not group_alive(proc.pid):
             return
-        except subprocess.TimeoutExpired:
-            continue
+        time.sleep(0.05)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     proc.wait()
 
 
@@ -467,6 +483,13 @@ def write(out, results):
 
 # --- orchestration --------------------------------------------------------------------------------
 
+def side_env(root):
+    """The environment for one side's commands. Its target directory is set explicitly, so an
+    inherited CARGO_TARGET_DIR can neither move the build away from where the binaries are run
+    nor make the two sides share one."""
+    return dict(os.environ, CARGO_TERM_COLOR="never", CARGO_TARGET_DIR=str(root / "target"))
+
+
 def build(side, root, out, timeout, env):
     steps = [run(PERF_BUILD, root, out / "logs" / f"build-{side}-perf.log", timeout, env),
              run(WORKLOADS + ["--no-run"], root, out / "logs" / f"build-{side}-workloads.log",
@@ -526,11 +549,11 @@ def compare(args):
                               "digest": tree_digest(roots["candidate"], HARNESS),
                               "base_own_digest": own,
                               "installed_digest": tree_digest(roots["base"], HARNESS)}
-        env = dict(os.environ, CARGO_TERM_COLOR="never")
+        envs = {side: side_env(roots[side]) for side in roots}
         results["toolchain"] = {"rustc": observe(["rustc", "-vV"]),
                                 "cargo": observe(["cargo", "-V"])}
         for side in ("candidate", "base"):
-            steps, ok = build(side, roots[side], out, args.timeout, env)
+            steps, ok = build(side, roots[side], out, args.timeout, envs[side])
             results["runs"] += [dict(s, side=side, phase="build") for s in steps]
             write(out, results)
             if not ok:
@@ -550,7 +573,7 @@ def compare(args):
         results["order"] = [f"{s}-{n}" for s, n in order]
         trials = {"base": [], "candidate": []}
         for side, n in order:
-            t = trial(side, n, roots[side], out, args.timeout, env)
+            t = trial(side, n, roots[side], out, args.timeout, envs[side])
             results["runs"].append({k: v for k, v in t.items() if k not in ("perf", "workloads")})
             results.setdefault("trial_records", []).append(t)
             trials[side].append(t)
