@@ -1,0 +1,79 @@
+name: perf
+
+# Compares the pushed commit's engine counters with its base (the merge base with master, or the
+# previous master commit on master) using tools/perf/run_perf.py; see docs/testing.md,
+# "Performance comparison". It is separate from the `ci` gate. The job fails unless the
+# comparison passed; the evidence bundle is uploaded and summarized on every outcome. Superseded
+# runs are cancelled. Actions are pinned by commit.
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base ref (defaults to the merge base with origin/master)
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: '0'
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
+
+jobs:
+  compare:
+    name: perf
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cargo-home/registry/index
+            .cargo-home/registry/cache
+          key: cargo-perf-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-perf-${{ runner.os }}-
+      - name: Select the base
+        env:
+          REQUESTED: ${{ inputs.base }}
+        run: |
+          if [ -n "$REQUESTED" ]; then
+            base="$REQUESTED"
+          elif [ "$GITHUB_REF" = "refs/heads/master" ]; then
+            base="$GITHUB_SHA^1"
+          else
+            base="$(git merge-base origin/master "$GITHUB_SHA")"
+          fi
+          echo "BASE=$(git rev-parse --verify "$base^{commit}")" >> "$GITHUB_ENV"
+      - name: Compare
+        run: |
+          python3 tools/perf/run_perf.py --base "$BASE" --candidate "$GITHUB_SHA" \
+            --trials 5 --timeout 900 \
+            --output "$RUNNER_TEMP/perf-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Summary
+        if: always()
+        run: cat "$RUNNER_TEMP"/perf-*/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Retain the evidence bundle
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/perf-*/results.json
+            ${{ runner.temp }}/perf-*/summary.md
+            ${{ runner.temp }}/perf-*/logs/
+            ${{ runner.temp }}/perf-*/work/
+          if-no-files-found: warn
+          retention-days: 30
