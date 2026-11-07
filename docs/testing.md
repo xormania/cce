@@ -161,3 +161,63 @@ The `testkit` workflow runs this bounded campaign on `test-support/**` branches
 and supports manual dispatch with an original-suite ref. It uploads the report,
 logs and test images on success or failure. Routine formatting, Clippy, workspace
 tests and deterministic drift validation keep their existing independent jobs.
+
+## Performance comparison
+
+`tools/perf/run_perf.py` compares a candidate revision with a base revision:
+
+```text
+python3 tools/perf/run_perf.py --base origin/master --candidate HEAD --output /tmp/cce-perf-1
+```
+
+Both revisions are checked out as detached worktrees under the output
+directory, which must be new. The measurement harness (the `perf` example,
+`tests/workloads.rs`, `tests/common/` and the storage driver) is copied from the
+candidate into the base checkout, so both sides run the same harness against
+their own storage code. A base that does not build with it is `not-comparable`.
+Both sides are built in release mode. Each side then runs `--trials` independent
+trials (default 5, at least 2) in an interleaved order drawn from `--seed`
+(random and recorded when omitted). A trial is one `perf` process over every
+scenario, followed by one run of the workload tier, each in a fresh directory.
+`--timeout` bounds each command, together with every process it starts.
+
+The `perf` example (`crates/cce-storage/examples/perf.rs`) uses the public
+storage API only. It touches no file itself, and its directory is supplied by
+the caller. Its scenarios are point reads, relationship paging and lookups,
+commits (admission and completion timed separately), and staging and reading
+32 MiB of content. Each scenario builds deterministic inputs and checks every
+result against expectations computed from those inputs. A wrong result fails
+the scenario rather than producing a measurement. Each scenario prints one
+`PERF` line, which states the work done, the engine counter deltas over the
+measured phase and the elapsed times. The scenario documentation states what
+each interval includes. Counters are read with `stats()` only before and after
+the measured phase. A scenario's version changes whenever its inputs,
+operations or boundaries change.
+
+Engine counters decide the result. Counters and work counts must be identical
+across one side's trials, otherwise the run is `invalid`. A cost counter (lower
+is better) that is higher for the candidate is a regression, and a lower one is
+an improvement. Other counters are reported as changed or unchanged. Timings,
+resident memory, descriptor counts and the workloads' `elapsed_ms` vary between
+runs. They are reported with their median and range over trials and never
+change the result. The OS page cache is not controlled.
+
+`results.json` holds:
+
+- the resolved revisions and the harness digests;
+- the toolchain and the observed environment;
+- the seed and trial order;
+- every command with its exit status, timing and log;
+- every trial's parsed output;
+- the per-metric comparison and the status.
+
+`summary.md` is the readable report, and `logs/` holds each command's output.
+The directory of a failed trial is kept under `work/`. The status is `passed`,
+`regressed`, `incomplete` (an expected scenario, workload or metric is
+missing), `invalid`, `not-comparable` or `error`. The command exits 0 only for
+`passed`.
+
+The `perf` workflow runs this on every branch push. The base is the merge base
+with master, or the previous master commit on master. The workflow is separate
+from the `ci` gate. It writes the summary to the job summary and keeps the
+bundle as an artifact for 30 days.

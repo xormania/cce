@@ -400,6 +400,14 @@ fn storage_public_items_are_exactly_the_listed_ones() {
 }
 
 #[test]
+fn the_perf_harness_uses_only_the_public_api_and_never_touches_files() {
+    assert_eq!(
+        binary_violations(&read("examples/perf.rs"), &["NativeStore", "StoreStats"]),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
 fn the_verify_tool_uses_only_the_public_api_and_never_touches_files() {
     assert_eq!(
         binary_violations(
