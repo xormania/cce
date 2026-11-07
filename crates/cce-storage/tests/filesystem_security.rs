@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cce_core::storage::StorageEngine;
 use cce_storage::NativeStore;
 
-use common::{Driver, Step, test_dir};
+use common::{Driver, Step, answered, test_dir};
 
 const STORE_ID: [u8; 16] = *b"fs-security-test";
 const LOCK: &str = "LOCK";
@@ -428,7 +428,26 @@ fn data_file_locks_preserve_reader_sharing_after_lock_replacement() {
     assert_eq!(snapshot_tree(base.as_ref()), before);
 }
 
-fn directory_symlink_case(label: &str, mode: OpenMode) {
+/// Spellings of a directory path after which the system follows a final symlink, even for checks
+/// and opens that must not follow one.
+const TRAILING_SPELLINGS: [&str; 3] = ["/", "//", "/."];
+
+/// Built from a string because `Path::join` does not produce every such spelling.
+fn spelled(dir: &Path, trailing: &str) -> PathBuf {
+    PathBuf::from(format!("{}{trailing}", dir.display()))
+}
+
+fn symlink_refusal(alias: &Path) -> String {
+    format!("{} is not a directory or is a symlink", alias.display())
+}
+
+fn spelled_directory_symlink_cases(label: &str, mode: OpenMode) {
+    for (i, trailing) in TRAILING_SPELLINGS.into_iter().enumerate() {
+        directory_symlink_case(&format!("{label}-{i}"), mode, trailing);
+    }
+}
+
+fn directory_symlink_case(label: &str, mode: OpenMode, trailing: &str) {
     let base = test_dir(label);
     let store = base.join("store");
     create_store(&store);
@@ -436,19 +455,29 @@ fn directory_symlink_case(label: &str, mode: OpenMode) {
     symlink(&store, &alias).unwrap();
     let before = snapshot_tree(base.as_ref());
 
-    assert_open_refused(&alias, mode, "symlink");
+    assert_open_refused(&spelled(&alias, trailing), mode, &symlink_refusal(&alias));
 
     assert_eq!(snapshot_tree(base.as_ref()), before);
 }
 
 #[test]
 fn read_write_open_refuses_a_symlinked_store_directory() {
-    directory_symlink_case("rw-directory-symlink", OpenMode::ReadWrite);
+    directory_symlink_case("rw-directory-symlink", OpenMode::ReadWrite, "");
 }
 
 #[test]
 fn read_only_open_refuses_a_symlinked_store_directory() {
-    directory_symlink_case("ro-directory-symlink", OpenMode::ReadOnly);
+    directory_symlink_case("ro-directory-symlink", OpenMode::ReadOnly, "");
+}
+
+#[test]
+fn read_write_open_refuses_a_spelled_directory_symlink() {
+    spelled_directory_symlink_cases("rw-spelled-directory-symlink", OpenMode::ReadWrite);
+}
+
+#[test]
+fn read_only_open_refuses_a_spelled_directory_symlink() {
+    spelled_directory_symlink_cases("ro-spelled-directory-symlink", OpenMode::ReadOnly);
 }
 
 fn create_with_special_lock_case(label: &str, special: SpecialFile) {
@@ -509,4 +538,136 @@ fn create_refuses_a_symlinked_store_directory_without_touching_its_target() {
     );
 
     assert_eq!(snapshot_tree(base.as_ref()), before);
+}
+
+#[test]
+fn create_refuses_a_spelled_directory_symlink_without_touching_its_target() {
+    for (i, trailing) in TRAILING_SPELLINGS.into_iter().enumerate() {
+        let base = test_dir(&format!("create-spelled-directory-symlink-{i}"));
+        let target = base.join("target");
+        fs::create_dir(&target).unwrap();
+        let alias = base.join("store-link");
+        symlink(&target, &alias).unwrap();
+        let before = snapshot_tree(base.as_ref());
+
+        assert_driver_refused(
+            &format!("create {}", spelled(&alias, trailing).display()),
+            &format!("create through a directory symlink spelled with {trailing:?}"),
+            &symlink_refusal(&alias),
+        );
+
+        assert_eq!(snapshot_tree(base.as_ref()), before);
+    }
+}
+
+fn finish_cleanly(mut driver: Driver) {
+    answered(driver.step("close"), "close");
+    assert_eq!(driver.finish().and_then(|status| status.code()), Some(0));
+}
+
+fn commit_context(driver: &mut Driver, id: &str) {
+    let put = format!("put-context {id} absent {} -", common::hex(id.as_bytes()));
+    answered(driver.step(&put), &put);
+    answered(driver.step(&format!("commit attempt-{id}")), "commit");
+}
+
+/// Each id must be committed, with the body [`commit_context`] gave it.
+fn assert_holds_contexts(driver: &mut Driver, ids: &[&str]) {
+    let lines = answered(driver.step(&format!("dump {}", ids.join(","))), "dump");
+    for id in ids {
+        let start = format!("context {id} rev:");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with(&start) && line.contains(&common::hex(id.as_bytes()))),
+            "context {id} missing: {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn create_accepts_a_real_directory_spelled_with_a_trailing_separator_or_dot() {
+    for (i, trailing) in TRAILING_SPELLINGS.into_iter().enumerate() {
+        for exists in [false, true] {
+            let base = test_dir(&format!("create-spelled-real-{i}-{exists}"));
+            let store = base.join("store");
+            if exists {
+                fs::create_dir(&store).unwrap();
+            }
+
+            let mut driver = Driver::spawn();
+            let create = format!("create {}", spelled(&store, trailing).display());
+            answered(driver.step(&create), &create);
+            finish_cleanly(driver);
+
+            let created: Vec<_> = snapshot_tree(base.as_ref())
+                .into_iter()
+                .map(|entry| (entry.relative, entry.kind))
+                .collect();
+            let expected: Vec<_> = [
+                (PathBuf::from("store"), "directory"),
+                (Path::new("store").join(LOCK), "file"),
+                (Path::new("store").join(CONTENT), "file"),
+                (Path::new("store").join(META), "file"),
+            ]
+            .into();
+            assert_eq!(created, expected, "created through {create:?}");
+            assert_read_only_open_succeeds(&store);
+        }
+    }
+}
+
+#[test]
+fn a_real_store_directory_is_one_store_through_every_spelling() {
+    let base = test_dir("spelled-real-store");
+    let store = base.join("store");
+
+    let mut driver = Driver::spawn();
+    let create = format!("create {}", spelled(&store, "/").display());
+    answered(driver.step(&create), &create);
+    commit_context(&mut driver, "A");
+    finish_cleanly(driver);
+
+    // Each writer finds what the spellings before it committed, then adds its own.
+    for (trailing, earlier, added) in [("/.", &["A"][..], "B"), ("//", &["A", "B"][..], "C")] {
+        let mut driver = Driver::spawn();
+        let open = OpenMode::ReadWrite.command(&spelled(&store, trailing));
+        answered(driver.step(&open), &open);
+        assert_holds_contexts(&mut driver, earlier);
+        commit_context(&mut driver, added);
+        finish_cleanly(driver);
+    }
+
+    let before = snapshot_tree(base.as_ref());
+    for trailing in ["", "/", "//", "/."] {
+        let mut driver = Driver::spawn();
+        let open = OpenMode::ReadOnly.command(&spelled(&store, trailing));
+        answered(driver.step(&open), &open);
+        assert_holds_contexts(&mut driver, &["A", "B", "C"]);
+        finish_cleanly(driver);
+    }
+    assert_eq!(snapshot_tree(base.as_ref()), before);
+}
+
+#[test]
+fn an_owner_through_one_spelling_excludes_opens_through_the_others() {
+    let base = test_dir("spelled-real-owner");
+    let store = base.join("store");
+    let mut driver = Driver::spawn();
+    answered(
+        driver.step(&format!("create {}", store.display())),
+        "create",
+    );
+    finish_cleanly(driver);
+
+    let mut owner = Driver::spawn();
+    let open = OpenMode::ReadWrite.command(&spelled(&store, "/"));
+    answered(owner.step(&open), &open);
+
+    let owned = "is owned by another process";
+    assert_open_refused(&spelled(&store, "/."), OpenMode::ReadWrite, owned);
+    assert_open_refused(&spelled(&store, "//"), OpenMode::ReadOnly, owned);
+    assert_open_refused(&store, OpenMode::ReadWrite, owned);
+
+    finish_cleanly(owner);
 }

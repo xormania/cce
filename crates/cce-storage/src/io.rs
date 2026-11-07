@@ -353,7 +353,9 @@ pub(crate) struct FsIo {
 impl FsIo {
     pub fn new(dir: &Path) -> Self {
         Self {
-            dir: dir.to_path_buf(),
+            // Without trailing separators or `.`: a spelling like `link/` makes the system follow a
+            // final symlink even for checks and opens that must not follow it.
+            dir: dir.components().as_path().to_path_buf(),
             files: Mutex::new(None),
             #[cfg(test)]
             synced_dirs: Mutex::new(Vec::new()),
